@@ -1,0 +1,45 @@
+Summary of Linear Thompson Sampling:
+Model: LOF_1
+  Mean: [-0.01536992  0.06766945  0.07149282]
+Model: LOF_2
+  Mean: [ 0.09976613  0.09063885 -0.02625929]
+Model: LOF_3
+  Mean: [0.04492578 0.11040632 0.05473148]
+Model: LOF_4
+  Mean: [ 0.19745965 -0.06644234  0.06548311]
+Model: NN_1
+  Mean: [0.79898296 0.77796887 0.71862083]
+Model: NN_2
+  Mean: [ 0.41999771  0.45871675 -0.1020983 ]
+Model: NN_3
+  Mean: [0.23503337 0.32513984 0.66316421]
+Model: RNN_1
+  Mean: [0.48521171 0.52267853 0.46255449]
+Model: RNN_2
+  Mean: [0.37808163 0.14189526 0.29360961]
+Model: RNN_3
+  Mean: [0.35704618 0.5949065  0.31124707]
+Model: RNN_4
+  Mean: [0.33965376 0.45800893 0.3536756 ]
+choses models for each round
+['LOF_4', 'LOF_1', 'RNN_1', 'NN_2', 'RNN_2', 'RNN_4', 'NN_1', 'RNN_3', 'RNN_4', 'RNN_1', 'LOF_2', 'LOF_3', 'RNN_4', 'LOF_2', 'RNN_3', 'NN_1', 'LOF_3', 'LOF_2', 'NN_3', 'NN_2', 'NN_3', 'RNN_4', 'NN_3', 'LOF_2', 'NN_3', 'NN_3', 'LOF_2', 'NN_3', 'NN_1', 'NN_3', 'RNN_4', 'RNN_2', 'LOF_1', 'RNN_1', 'NN_3', 'NN_3', 'RNN_1', 'RNN_1', 'LOF_2', 'RNN_1', 'RNN_1', 'RNN_4', 'LOF_4', 'LOF_2', 'RNN_2', 'NN_3', 'LOF_4', 'NN_3', 'LOF_1', 'NN_2', 'LOF_1', 'RNN_4', 'RNN_3', 'RNN_1', 'LOF_1', 'NN_2', 'LOF_1', 'NN_1', 'NN_2', 'NN_2', 'RNN_2', 'RNN_3', 'RNN_3', 'LOF_2', 'NN_2', 'RNN_2', 'LOF_4', 'LOF_1', 'NN_3', 'RNN_3', 'NN_1', 'NN_3', 'RNN_4', 'LOF_4', 'RNN_3', 'NN_1', 'RNN_1', 'RNN_1', 'LOF_2', 'NN_1', 'NN_1', 'LOF_4', 'RNN_2', 'RNN_3', 'RNN_4', 'LOF_3', 'LOF_4', 'LOF_2', 'RNN_4', 'NN_1', 'LOF_3', 'RNN_3', 'LOF_4', 'NN_3', 'RNN_2', 'RNN_1', 'NN_1', 'RNN_3', 'LOF_1', 'RNN_3', 'LOF_2', 'NN_1', 'LOF_4', 'RNN_2', 'NN_3', 'NN_1', 'RNN_4', 'LOF_4', 'LOF_1', 'RNN_1', 'RNN_3', 'NN_2', 'RNN_3', 'NN_2', 'LOF_2', 'LOF_4', 'LOF_1', 'RNN_3', 'LOF_4', 'RNN_4', 'RNN_2', 'NN_2', 'RNN_2', 'NN_3', 'RNN_1', 'NN_1', 'LOF_1', 'RNN_1', 'NN_3', 'RNN_1', 'RNN_1', 'NN_3', 'RNN_2', 'NN_1', 'NN_2', 'RNN_2', 'NN_1', 'LOF_2', 'RNN_3', 'RNN_4', 'NN_1', 'RNN_1', 'RNN_1', 'RNN_2', 'NN_1', 'NN_1', 'RNN_4', 'RNN_1', 'LOF_3', 'LOF_4', 'LOF_2', 'RNN_3', 'LOF_3', 'LOF_2', 'NN_2', 'RNN_3', 'NN_1', 'RNN_1', 'RNN_2', 'NN_3', 'RNN_3', 'RNN_3', 'NN_1', 'NN_1', 'RNN_4', 'RNN_1', 'NN_1', 'NN_1', 'RNN_3', 'RNN_1', 'LOF_4', 'NN_1', 'RNN_1', 'NN_1', 'RNN_1', 'RNN_4', 'NN_1', 'NN_1', 'RNN_2', 'NN_2', 'LOF_1', 'RNN_1', 'LOF_3', 'RNN_1', 'RNN_4', 'LOF_3', 'NN_1', 'NN_1', 'RNN_1', 'RNN_2', 'NN_1']
+
+Models ranked by mean score:
+1. NN_1 with score 1.760025217641168
+2. RNN_1 with score 0.7225798963213875
+3. NN_3 with score 0.6007433606358403
+4. RNN_3 with score 0.5782704541545314
+5. RNN_4 with score 0.4502232865773977
+6. NN_2 with score 0.39724319600732255
+7. RNN_2 with score 0.2492865850710785
+8. LOF_4 with score 0.04769293379050097
+9. LOF_2 with score 0.01885823228656915
+10. LOF_3 with score 0.017203415620504748
+11. LOF_1 with score 0.009926611945874969
+
+ evaluation for models over the current test data:
+[np.int64(192), np.int64(92), np.int64(193), np.int64(91), np.int64(93), np.int64(193), np.int64(91), np.int64(92), np.int64(92), np.int64(92), np.int64(92)]
+ f1_score list for models over the current test data:
+{'NN_1': np.float64(0.8126574648546334), 'RNN_1': np.float64(0.4289427934864644), 'NN_3': np.float64(0.8327667717868248), 'RNN_3': np.float64(0.4172838171522584), 'RNN_4': np.float64(0.41421110955968143), 'NN_2': np.float64(0.8273444328558883), 'RNN_2': np.float64(0.39658760027526285), 'LOF_4': np.float64(0.012490715144226816), 'LOF_2': np.float64(0.012490715144226816), 'LOF_3': np.float64(0.012490715144226816), 'LOF_1': np.float64(0.012490715144226816)}
+ pr_score list for models over the current test data:
+{'NN_1': np.float64(0.3116089542747043), 'RNN_1': np.float64(0.7133683045558799), 'NN_3': np.float64(0.3201913671965474), 'RNN_3': np.float64(0.6972918413577582), 'RNN_4': np.float64(0.6853630095013259), 'NN_2': np.float64(0.3126760832744707), 'RNN_2': np.float64(0.6216603772317875), 'LOF_4': np.float64(0.6872233048003652), 'LOF_2': np.float64(0.6872233048003652), 'LOF_3': np.float64(0.6872233048003652), 'LOF_1': np.float64(0.6872233048003652)}

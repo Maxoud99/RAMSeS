@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/Mononito/results/anomaly_archive/img_135_UCR_Anomaly_InternalBleeding16" />
+      <excludeFolder url="file://$MODULE_DIR$/Mononito/results/anomaly_archive/img_250_UCR_Anomaly_weallwalk" />
+      <excludeFolder url="file://$MODULE_DIR$/Mononito/trained_models/NASA" />
+      <excludeFolder url="file://$MODULE_DIR$/Mononito/trained_models/anomaly_archive/022_UCR_Anomaly_DISTORTEDGP711MarkerLFM5z4" />
+      <excludeFolder url="file://$MODULE_DIR$/Mononito/trained_models/anomaly_archive/250_UCR_Anomaly_weallwalk" />
+    </content>
+    <orderEntry type="jdk" jdkName="RAMS-TSAD" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

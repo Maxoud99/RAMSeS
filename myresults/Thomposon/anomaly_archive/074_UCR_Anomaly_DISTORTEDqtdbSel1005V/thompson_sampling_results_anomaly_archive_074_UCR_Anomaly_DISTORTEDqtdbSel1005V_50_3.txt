@@ -1,0 +1,45 @@
+Summary of Linear Thompson Sampling:
+Model: LOF_1
+  Mean: [0.12015245 0.00474114 0.26251116]
+Model: LOF_2
+  Mean: [ 0.26818471  0.16728303 -0.02551585]
+Model: LOF_3
+  Mean: [0.12606409 0.12670562 0.06841459]
+Model: LOF_4
+  Mean: [0.12546741 0.10246753 0.07842468]
+Model: NN_1
+  Mean: [0.26212446 0.37514178 0.45864653]
+Model: NN_2
+  Mean: [0.68258108 0.28585341 0.37024326]
+Model: NN_3
+  Mean: [0.61640053 0.54114498 0.40524866]
+Model: RNN_1
+  Mean: [0.38241572 0.29119684 0.20059707]
+Model: RNN_2
+  Mean: [0.39227285 0.47681531 0.20043532]
+Model: RNN_3
+  Mean: [0.47566772 0.55929741 0.1182023 ]
+Model: RNN_4
+  Mean: [0.40400165 0.42733172 0.41173395]
+choses models for each round
+['NN_2', 'RNN_1', 'NN_2', 'NN_3', 'RNN_1', 'RNN_3', 'RNN_1', 'LOF_1', 'NN_1', 'RNN_2', 'RNN_1', 'RNN_4', 'RNN_1', 'RNN_4', 'NN_1', 'RNN_2', 'NN_1', 'NN_2', 'LOF_1', 'RNN_2', 'LOF_4', 'NN_1', 'RNN_4', 'RNN_2', 'LOF_3', 'NN_3', 'LOF_2', 'RNN_3', 'RNN_3', 'LOF_3', 'NN_3', 'NN_2', 'NN_3', 'NN_1', 'LOF_4', 'LOF_3', 'NN_3', 'RNN_3', 'LOF_1', 'RNN_3', 'NN_1', 'RNN_3', 'LOF_1', 'NN_3', 'LOF_2', 'LOF_4', 'RNN_2', 'LOF_1', 'RNN_2', 'RNN_1', 'LOF_4', 'LOF_1', 'LOF_2', 'RNN_1', 'NN_2', 'LOF_1', 'RNN_4', 'NN_3', 'LOF_4', 'NN_3', 'LOF_3', 'RNN_4', 'RNN_4', 'NN_3', 'NN_2', 'NN_3', 'LOF_2', 'LOF_4', 'LOF_4', 'LOF_2', 'RNN_2', 'LOF_4', 'RNN_3', 'RNN_3', 'LOF_1', 'NN_3', 'NN_2', 'LOF_4', 'RNN_3', 'NN_2', 'NN_2', 'RNN_4', 'NN_3', 'NN_2', 'NN_1', 'RNN_1', 'LOF_3', 'LOF_2', 'LOF_3', 'NN_3', 'RNN_1', 'RNN_3', 'LOF_4', 'NN_1', 'RNN_3', 'NN_2', 'RNN_3', 'LOF_2', 'RNN_1', 'RNN_3', 'LOF_4', 'RNN_3', 'LOF_3', 'LOF_2', 'LOF_2', 'RNN_1', 'NN_3', 'RNN_1', 'NN_2', 'RNN_3', 'RNN_1', 'LOF_1', 'NN_1', 'RNN_3', 'RNN_2', 'NN_3', 'RNN_1', 'RNN_4', 'NN_3', 'NN_2', 'RNN_3', 'LOF_4', 'RNN_2', 'LOF_2', 'RNN_4', 'RNN_3', 'RNN_3', 'RNN_4', 'NN_3', 'NN_3', 'LOF_1', 'NN_2', 'LOF_2', 'RNN_4', 'LOF_4', 'NN_3', 'RNN_2', 'RNN_3', 'RNN_4', 'NN_3', 'RNN_1', 'NN_2', 'NN_2', 'RNN_3', 'RNN_4', 'RNN_4', 'LOF_4', 'RNN_2', 'RNN_3', 'RNN_2', 'RNN_4', 'LOF_2', 'RNN_1', 'NN_3', 'LOF_2', 'LOF_3', 'NN_1', 'RNN_3', 'NN_1', 'NN_3', 'RNN_1', 'NN_3', 'LOF_3', 'NN_2', 'LOF_4', 'NN_1', 'NN_1', 'NN_3', 'NN_3', 'LOF_4', 'NN_1', 'LOF_4', 'RNN_4', 'LOF_3', 'NN_2', 'NN_3', 'RNN_4', 'LOF_1', 'LOF_3', 'RNN_3', 'RNN_4', 'RNN_4', 'LOF_4', 'NN_2', 'NN_2', 'LOF_2', 'NN_2', 'RNN_3', 'RNN_1', 'LOF_4', 'LOF_2']
+
+Models ranked by mean score:
+1. NN_3 with score 0.8370139810749297
+2. NN_2 with score 0.6847091711870751
+3. RNN_3 with score 0.5530451627090699
+4. RNN_4 with score 0.5153545796878423
+5. RNN_2 with score 0.4214051419366621
+6. NN_1 with score 0.4197972305611196
+7. RNN_1 with score 0.2712765670403135
+8. LOF_2 with score 0.10055771205720482
+9. LOF_1 with score 0.08337119787013582
+10. LOF_3 with score 0.03662702348622495
+11. LOF_4 with score 0.032392098769956794
+
+ evaluation for models over the current test data:
+[np.int64(193), np.int64(193), np.int64(99), np.int64(99), np.int64(98), np.int64(193), np.int64(99), np.int64(100), np.int64(100), np.int64(100), np.int64(100)]
+ f1_score list for models over the current test data:
+{'NN_3': np.float64(0.8936344460715892), 'NN_2': np.float64(0.8840364131904764), 'RNN_3': np.float64(0.39816453450697176), 'RNN_4': np.float64(0.39515371032051316), 'RNN_2': np.float64(0.4214896669497158), 'NN_1': np.float64(0.8770801988159681), 'RNN_1': np.float64(0.39912963682540636), 'LOF_2': np.float64(0.025198718534652345), 'LOF_1': np.float64(0.025198718534652345), 'LOF_3': np.float64(0.025198718534652345), 'LOF_4': np.float64(0.025198718534652345)}
+ pr_score list for models over the current test data:
+{'NN_3': np.float64(0.42673649196358454), 'NN_2': np.float64(0.34820986447642965), 'RNN_3': np.float64(0.7194096083303404), 'RNN_4': np.float64(0.7442880898773814), 'RNN_2': np.float64(0.7377655553139751), 'NN_1': np.float64(0.3431598993459434), 'RNN_1': np.float64(0.6873861684174459), 'LOF_2': np.float64(0.8159429948799954), 'LOF_1': np.float64(0.8159429948799954), 'LOF_3': np.float64(0.8159429948799954), 'LOF_4': np.float64(0.8159429948799954)}

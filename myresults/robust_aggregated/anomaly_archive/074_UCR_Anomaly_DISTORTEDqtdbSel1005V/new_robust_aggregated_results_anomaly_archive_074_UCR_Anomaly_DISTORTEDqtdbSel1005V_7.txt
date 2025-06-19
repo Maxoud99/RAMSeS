@@ -1,0 +1,6 @@
+Summary of falses:
+chosen model: RNN_4
+[np.int64(69)]
+Falses for the ensebmle:
+chosen ensemble: ['LOF_1', 'LOF_4', 'NN_1', 'NN_2', 'RNN_1']
+[np.int64(83)]
