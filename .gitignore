@@ -1,3 +1,21 @@
-Mononito
-Outputs
-myresults
+# Virtual environments and IDE
+.venv/
+.idea/
+.vscode/
+
+# Python cache / build files
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.pkl
+*.log
+
+# Outputs / results
+Outputs/
+myresults/
+old/
+Mononito/
+
+# OS / Jupyter junk
+.DS_Store
+.ipynb_checkpoints/
