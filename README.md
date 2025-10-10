@@ -101,9 +101,10 @@ python app.py \
   --overwrite false \
   --verbose true \
   --model_architectures "CBLOF,LOF,LSTMVAE,MD,RM,DGHL, ..."
-````
+```
 
 ## Arguments:
+```
 --dataset_path (required): root folder where datasets reside (e.g., Mononito).
 --trained_model_path (required): base directory where training code writes/reads .pth.
 --downsampling (int): downsample factor for series.
@@ -116,8 +117,9 @@ Trained model path:
 app.py currently loads model instances from a hard-coded save_dir at the top of the file:
 save_dir = "/home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/smd/machine-3-10/"
 Either (a) change this to your path, or (b) symlink that path to your actual trained models folder. Make sure it contains *.pth files named like the entries in algorithm_list_instances (e.g., CBLOF_1.pth, LOF_3.pth, …).
-
+```
 ## 🧪 What gets produced
+```
 Rank summaries & aggregations:
 myresults/robust_aggregated/{dataset}/{entity}/
   robust_aggregated_results_{dataset}_{entity}_{iteration}.txt
@@ -131,9 +133,10 @@ Diagnostics & plots:
 myresults/GA_Ens/{dataset}/{entity}/
   ensemble_scores_{dataset}_{entity}_Data_vs_anomalies_[...].png
 Shows injected anomaly segments and scores for quick visual checks.
-
+```
 
  ## 🧩 Base Detectors & Instances
+ ```
 Defined in app.py:
 algorithm_list = ['DGHL', 'LSTMVAE', 'MD', 'RM', 'LOF', 'CBLOFd', ...]
 algorithm_list_instances = [
@@ -144,22 +147,28 @@ algorithm_list_instances = [
   'MD_1',
   'RM_1', 'RM_2', 'RM_3', ...
 ]
+```
 Your training should produce checkpoints named exactly like the entries in algorithm_list_instances. The GA operates on these instances; the meta-learner type is configured inside app.py (currently 'rf' in run_model_selection_algorithms_1).
 
 
 ## 🔁 Sliding Windows & Online Mode
+```
 We use:
 initialize_sliding_windows(data, targets, mask, window_size, stride)
-In app.py, iterations = 1 by default (single pass). Increase it for real-time evaluation; the loop will:
+In app.py, iterations = 1 by default (single pass).
+```
+ Increase it for real-time evaluation; the loop will:
 evaluate current best single model on the new window,
 evaluate the GA-selected ensemble fitness,
 write misclassification summaries, and
 update the selections via a fresh pass through the pipeline.
 
 ## 🧪 Reproducibility Tips
+```
 Fix random seeds (GA, Monte-Carlo, GAN sampling, Thompson).
 Log/save all hyper-params along with results (consider dumping the parsed CLI args).
 Keep dataset_path, trained_model_path, and save_dir consistent and absolute.
+```
 
 ## ❓ Troubleshooting
 
@@ -181,7 +190,9 @@ If you use RAMSeS / RAMS-TSAD in your work, please cite our paper:
 If you use the Mononito datasets, please also cite the original authors (see their paper: arXiv:2210.01078).
 ```
 ## 👤 Contact
+
 Maintainer: Mohamed Abdelmaksoud (mohamed@tu-berlin.de)
+
 For questions/bug reports: please open a GitHub issue.
 
 ## 📝 License
