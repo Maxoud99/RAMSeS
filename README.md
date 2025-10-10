@@ -25,24 +25,27 @@ This repository contains the end-to-end pipeline—data loading, model training/
 
 ## 🧱 Repository Layout (relevant parts)
 
+```text
 RAMSeS_framework/
-├── app.py # main entrypoint (RAMSeS pipeline)
+├── app.py                              # main entrypoint (RAMSeS pipeline)
 ├── Datasets/
-│ └── load.py # data loader wrapper
+│   └── load.py                         # data loader wrapper
 ├── Metrics/
-│ └── Ensemble_GA.py # GA, fitness, evaluation helpers
+│   └── Ensemble_GA.py                  # GA, fitness, evaluation helpers
 ├── Model_Selection/
-│ ├── Thompson_Sampling.py # LinTS + sliding window utils
-│ ├── rank_aggregation.py # Markov-chain rank aggregator
-│ ├── inject_anomalies.py # anomaly injection utilities
-│ └── Sensitivity_robustness/
-│ ├── GAN_test.py # GAN-based robustness tests
-│ ├── Monte_Carlo_Simulation.py # noise stress-test
-│ └── off_by_threshold_testing.py # borderline/off-by-threshold tests
+│   ├── Thompson_Sampling.py            # LinTS + sliding window utils
+│   ├── rank_aggregation.py             # Markov-chain rank aggregator
+│   ├── inject_anomalies.py             # anomaly injection utilities
+│   └── Sensitivity_robustness/
+│       ├── GAN_test.py                 # GAN-based robustness tests
+│       ├── Monte_Carlo_Simulation.py   # noise stress-test
+│       └── off_by_threshold_testing.py # borderline/off-by-threshold tests
 ├── Model_Training/
-│ └── train.py # train base detectors, save .pth
+│   └── train.py                        # train base detectors, save .pth
 └── Utils/
-└── utils.py # CLI arg parsing, misc
+    └── utils.py                        # CLI arg parsing, misc
+
+
 
 
 --------------------------------------------------------
@@ -195,9 +198,3 @@ For questions/bug reports: please open a GitHub issue.
 --------------------------------------------------------
 📝 License
 This repository is released for research purposes. Check dataset licenses for any additional restrictions. See LICENSE for details (or choose a suitable OSI license and update this section).
-
-**Notes you might want to customize before publishing:**
-- Replace the **BibTeX** block with your final citation (title/authors/venue).
-- Decide whether to expose a **config file** for `save_dir` (instead of hard-coding).
-- If you already have a `requirements.txt` or `environment.yml`, include it and list exact versions.
-- Add a short **Results** section (tables/figures) once you finalize numbers for SMD `machine-3-10`.
