@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.11 (RAMS-TSAD) (2)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="RAMS-TSAD" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="RAMS" project-jdk-type="Python SDK" />
 </project>

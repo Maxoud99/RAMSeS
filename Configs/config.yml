@@ -5,8 +5,8 @@ overwrite: True
 
 # Model training parameters
 downsampling: 10
-trained_model_path: "Mononito/trained_models/"
-dataset_path: "Mononito/datasets"
+trained_model_path: "/home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/"
+dataset_path: "/home/maxoud/projects/RAMS-TSAD/Mononito/datasets"
 
 #docker path
 #trained_model_path: '/trained_models/'
@@ -20,7 +20,7 @@ model_architectures: 'all'
 
 # Model evaluation parametersq
 normalize: True
-results_path: "Mononito/results"
+results_path: "/home/maxoud/projects/RAMS-TSAD/Mononito/results"
 
 #docker path
 #results_path: '/results/'

@@ -16,7 +16,7 @@ def plot_nasa(telemetry, labels):
     ax[0].legend(loc='upper right')
     ax[1].plot(labels, label='Anomaly label', c='red')
     ax[1].legend(loc='upper right')
-    plt.show()
+    # plt.show()
 
 
 def download_file(filename:str, directory: str, source_url: str, decompress: bool = False) -> None:

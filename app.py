@@ -22,8 +22,8 @@ from Model_Training.train import TrainModels
 from Utils.utils import get_args_from_cmdline
 
 # save_dir = "Mononito/trained_models/anomaly_archive/031_UCR_Anomaly_DISTORTEDInternalBleeding20/"
-save_dir = "Mononito/trained_models/skab/0/"
-# algorithm_list = ['DGHL', 'LSTMVAE', 'MD', 'RM', 'LOF', 'CBLOF']
+save_dir = "/home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/smd/machine-3-10/"
+# algorithm_list = ['DGHL', 'LSTMVAE', 'MD', 'RM', 'LOF', 'CBLOFd']
 # algorithm_list_instances = ['CBLOF_1', 'CBLOF_2', 'CBLOF_3', 'CBLOF_4', 'DGHL_1', 'DGHL_2', 'DGHL_3', 'DGHL_4', 'LOF_1',
 #                             'LOF_2', 'LOF_3', 'LOF_4', 'LSTMVAE_1', 'LSTMVAE_2', 'LSTMVAE_3', 'LSTMVAE_4', 'MD_1',
 #                             'RM_1', 'RM_2', 'RM_3']
@@ -53,6 +53,17 @@ def load_trained_models(algorithm_list, save_dir):
 
 def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration):
 
+    # # Run genetic algorithm for model selection
+    best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type = genetic_algorithm(
+        dataset, entity, train_data, test_data,
+        algorithm_list_instances, trained_models,
+        population_size=1, generations=1,
+        meta_model_type='rf', mutation_rate=1)
+    logger.info(
+        f"Best ensemble: {best_ensemble} with F1 score {best_f1}, PR AUC {best_pr_auc}, and fitness {best_fitness}")
+    logger.info(
+        f"Best ensemble: {best_ensemble} with F1 score {best_f1}, PR AUC {best_pr_auc}, and fitness {best_fitness}")
+    return
     monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR = run_monte_carlo_simulation(test_data,
                                                                                             trained_models,
                                                                                             algorithm_list_instances,
@@ -80,16 +91,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     logger.info("4- Off by threshold testing (sensitivity)")
     logger.info(ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity)
 
-    # # Run genetic algorithm for model selection
-    best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type = genetic_algorithm(
-        dataset, entity, train_data, test_data,
-        algorithm_list_instances, trained_models,
-        population_size=20, generations=100,
-        meta_model_type='rf', mutation_rate=0.2)
-    logger.info(
-        f"Best ensemble: {best_ensemble} with F1 score {best_f1}, PR AUC {best_pr_auc}, and fitness {best_fitness}")
-    logger.info(
-        f"Best ensemble: {best_ensemble} with F1 score {best_f1}, PR AUC {best_pr_auc}, and fitness {best_fitness}")
+
     #
     # ### Thompson Sampling
     thompson_model_names = run_linear_thompson_sampling(
@@ -167,7 +169,7 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             dataset, entity, train_data, test_data,
             algorithm_list_instances, trained_models,
             population_size=5, generations=10,
-            meta_model_type='rf', mutation_rate=0.1
+            meta_model_type='lr', mutation_rate=0.1
         )
 
         # Thompson Sampling
@@ -286,11 +288,11 @@ def find_num_falses(adjusted_y_pred_ind_current, test_data_copy, dataset, entity
 def run_app(algorithm_list, algorithm_list_instances):
     args = get_args_from_cmdline()
     data_dir = args['dataset_path']
-    train_data = load_data(dataset='skab', group='train',
-                           entities='0', downsampling=10,
+    train_data = load_data(dataset='smd', group='train',
+                           entities='machine-3-10', downsampling=10,
                            min_length=256, root_dir=data_dir, normalize=True, verbose=False)
-    test_data = load_data(dataset='skab', group='test',
-                          entities='0', downsampling=10,
+    test_data = load_data(dataset='smd', group='test',
+                          entities='machine-3-10', downsampling=10,
                           min_length=256, root_dir=data_dir, normalize=True, verbose=False)
 
     # Ensure data is correctly loaded
@@ -301,8 +303,8 @@ def run_app(algorithm_list, algorithm_list_instances):
     if not test_data.entities:
         logger.error("Failed to load test data. Please check the dataset and paths.")
         return
-    entity = '0'
-    dataset = 'skab'
+    entity = 'machine-3-10'
+    dataset = 'smd'
     model_trainer = TrainModels(dataset=dataset,
                                 entity=entity,
                                 algorithm_list=algorithm_list,
@@ -357,7 +359,7 @@ def run_app(algorithm_list, algorithm_list_instances):
         # Save the figure
         plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
-        plt.show()
+        # plt.show()
 
         data = test_data_before.entities[0].Y
         targets = test_data_before.entities[0].labels

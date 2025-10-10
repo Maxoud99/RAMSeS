@@ -34,7 +34,7 @@ def get_args_from_cmdline():
                         required=False,
                         help='path to config file')
     args = parser.parse_args()
-    args = Config(config_file_path=args.config_file_path).parse()
+    args = Config(config_file_path="/home/maxoud/projects/RAMS-TSAD/Configs/config.yml").parse()
     
     return args
 
@@ -107,7 +107,7 @@ def visualize_predictions(predictions: dict, savefig=True):
 
     if savefig:
         plt.savefig('predictions.pdf')
-    plt.show()
+    # plt.show()
 
 
 def visualize_data(train_data, test_data, savefig=False,save_path=None):
@@ -136,7 +136,8 @@ def visualize_data(train_data, test_data, savefig=False,save_path=None):
         plt.clf()
         plt.close()
     else:
-        plt.show()
+        # plt.show()
+        print('Visualization of train and test data is done!')
 
 
 

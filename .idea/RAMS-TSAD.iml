@@ -9,7 +9,7 @@
       <excludeFolder url="file://$MODULE_DIR$/Mononito/trained_models/anomaly_archive/022_UCR_Anomaly_DISTORTEDGP711MarkerLFM5z4" />
       <excludeFolder url="file://$MODULE_DIR$/Mononito/trained_models/anomaly_archive/250_UCR_Anomaly_weallwalk" />
     </content>
-    <orderEntry type="jdk" jdkName="RAMS-TSAD" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="RAMS" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

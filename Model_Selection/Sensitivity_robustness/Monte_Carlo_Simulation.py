@@ -51,6 +51,45 @@ def monte_carlo_simulation(test_data, trained_models, model_names, dataset, enti
     return results
 
 
+def run_monte_carlo_simulation(test_data, trained_models, model_names, dataset, entity, n_simulations=100,
+                               noise_level=0.1):
+    """Run the entire Monte Carlo simulation process."""
+    # Run Monte Carlo simulation
+    results = monte_carlo_simulation(test_data, trained_models, model_names, dataset, entity, n_simulations,
+                                     noise_level)
+
+    # Summarize results
+    summary = summarize_results(results)
+
+    # Print summary and rankings
+    print("Summary of Monte Carlo Simulation:")
+    for model_name, metrics in summary.items():
+        if model_name not in ['ranked_by_f1', 'ranked_by_pr_auc']:
+            print(f"Model: {model_name}")
+            print(f"  F1 Mean: {metrics['f1_mean']:.4f}, F1 Std: {metrics['f1_std']:.4f}")
+            print(f"  PR AUC Mean: {metrics['pr_auc_mean']:.4f}, PR AUC Std: {metrics['pr_auc_std']:.4f}")
+
+    print("\nModels ranked by F1 score:")
+    ranked_models_F1 = []
+    for rank, model_name in enumerate(summary['ranked_by_f1'], 1):
+        print(f"{rank}. {model_name}")
+        ranked_models_F1.append(model_name)
+    ranked_models_PR = []
+    print("\nModels ranked by PR AUC score:")
+    for rank, model_name in enumerate(summary['ranked_by_pr_auc'], 1):
+        print(f"{rank}. {model_name}")
+        ranked_models_PR.append(model_name)
+
+    # Save summary
+    save_summary(summary, dataset, entity)
+
+    # Plot results
+    plot_monte_carlo_results(results, summary, model_names, dataset, entity)
+    return ranked_models_F1, ranked_models_PR
+
+
+
+
 def summarize_results(results):
     """Summarize the results of Monte Carlo simulation and rank models."""
     summary = {}
@@ -112,7 +151,7 @@ def plot_monte_carlo_results(results, summary, model_names, dataset, entity):
         filename = f'{dataset}_{entity}_{model_name}_MonteCarloResults.png'
         plt.savefig(os.path.join(directory, filename), dpi=300)
 
-        plt.show()
+        # plt.show()
 
 
 def save_summary(summary, dataset, entity):
@@ -136,43 +175,3 @@ def save_summary(summary, dataset, entity):
         f.write("\nModels ranked by PR AUC score:\n")
         for rank, model_name in enumerate(summary['ranked_by_pr_auc'], 1):
             f.write(f"{rank}. {model_name}\n")
-
-
-def run_monte_carlo_simulation(test_data, trained_models, model_names, dataset, entity, n_simulations=100,
-                               noise_level=0.1):
-    """Run the entire Monte Carlo simulation process."""
-    # Run Monte Carlo simulation
-    results = monte_carlo_simulation(test_data, trained_models, model_names, dataset, entity, n_simulations,
-                                     noise_level)
-
-    # Summarize results
-    summary = summarize_results(results)
-
-    # Print summary and rankings
-    print("Summary of Monte Carlo Simulation:")
-    for model_name, metrics in summary.items():
-        if model_name not in ['ranked_by_f1', 'ranked_by_pr_auc']:
-            print(f"Model: {model_name}")
-            print(f"  F1 Mean: {metrics['f1_mean']:.4f}, F1 Std: {metrics['f1_std']:.4f}")
-            print(f"  PR AUC Mean: {metrics['pr_auc_mean']:.4f}, PR AUC Std: {metrics['pr_auc_std']:.4f}")
-
-    print("\nModels ranked by F1 score:")
-    ranked_models_F1 = []
-    for rank, model_name in enumerate(summary['ranked_by_f1'], 1):
-        print(f"{rank}. {model_name}")
-        ranked_models_F1.append(model_name)
-    ranked_models_PR = []
-    print("\nModels ranked by PR AUC score:")
-    for rank, model_name in enumerate(summary['ranked_by_pr_auc'], 1):
-        print(f"{rank}. {model_name}")
-        ranked_models_PR.append(model_name)
-
-    # Save summary
-    save_summary(summary, dataset, entity)
-
-    # Plot results
-    plot_monte_carlo_results(results, summary, model_names, dataset, entity)
-    return ranked_models_F1, ranked_models_PR
-
-
-

@@ -453,7 +453,7 @@ def plot_scores_vs_true(data, F1_Score_list, PR_AUC_Score_list, adjusted_y_pred,
         # Save the figure
         plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
-        plt.show()
+        # plt.show()
 
 
 def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity, F1_Score_list_ind_curent,
@@ -544,7 +544,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
     if not os.path.exists(directory):
         os.makedirs(directory)
     plt.savefig(f'{directory}/performance_plot_nigg.png')
-    plt.show()
+    # plt.show()
 
 
 def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, trained_models, meta_model_type,
@@ -714,7 +714,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     # Save the figure
     plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
-    plt.show()
+    # plt.show()
     #
     # # Plot for PR_AUC scores
     plt.figure(figsize=(10, 5))
@@ -737,7 +737,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     # Save the figure
     plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
-    plt.show()
+    # plt.show()
     logger.info(
         f"Best ensemble found: {best_ensemble} with F1 score {best_f1}, PR AUC {best_pr_auc}, and fitness {best_fitness}")
     print(

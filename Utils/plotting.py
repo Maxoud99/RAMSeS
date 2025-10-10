@@ -64,4 +64,4 @@ def box_plot_per_entity(aggregate_stats, dataset, split, metric):
     plt.savefig(
         f"box_plot_{dataset}_{split}_{metric}_{datetime.today().strftime(r'%H-%M-%m-%d-%Y')}.pdf",
         bbox_inches='tight')
-    plt.show()
+    # plt.show()

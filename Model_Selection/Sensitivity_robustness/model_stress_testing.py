@@ -164,7 +164,7 @@ def run_robustness_tests(data, anomaly_types, model_names, trained_models):
         axes[1].plot(_.flatten(), color='pink')
         axes[1].plot(modified_data.entities[0].labels.flatten(), color='red')
         axes[1].set_title('Anomaly Scores', fontsize=16)
-        plt.show()
+        # plt.show()
 
         # Evaluating each model on the modified data
         results[anomaly_type] = []

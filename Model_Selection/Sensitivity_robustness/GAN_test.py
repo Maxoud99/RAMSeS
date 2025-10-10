@@ -160,54 +160,7 @@ def integrate_gan_with_dataset(data, labels):
         injected_anomaly_indices), total_labels_count
 
 
-def plot_data_with_injected_points(original_data, augmented_data, injected_normal_indices, injected_anomaly_indices,
-                                   dataset, entity, feature_index=0):
-    fig, axes = plt.subplots(2, 1, figsize=(20, 10), sharex=True)
 
-    # Plot the original data on the first subplot
-    axes[0].plot(original_data[feature_index, :], color='darkblue', linestyle='--', label='Original Data')
-    axes[0].set_title(f'Original Data for Feature {feature_index}')
-    axes[0].set_ylabel('Feature Value')
-    axes[0].legend()
-    axes[0].grid(True)
-
-    # Plot the augmented data on the second subplot
-    axes[1].plot(augmented_data[feature_index, :], color='lightblue', label='Augmented Data')
-
-    # Highlight injected normal points in green
-    if injected_normal_indices.size > 0:
-        axes[1].scatter(injected_normal_indices,
-                        [augmented_data[feature_index, idx] for idx in injected_normal_indices],
-                        color='green', label='Injected Normal Points', marker='o', s=50)
-
-    # Highlight injected anomaly points in red
-    if injected_anomaly_indices.size > 0:
-        axes[1].scatter(injected_anomaly_indices,
-                        [augmented_data[feature_index, idx] for idx in injected_anomaly_indices],
-                        color='red', label='Injected Anomaly Points', marker='x', s=50)
-
-    axes[1].set_title(f'Augmented Data with Injected Points for Feature {feature_index}')
-    axes[1].set_xlabel('Sample Index')
-    axes[1].set_ylabel('Feature Value')
-    axes[1].legend()
-    axes[1].grid(True)
-    # Specify the directory
-    # Get the current date and time
-    now = datetime.now()
-
-    # Format the date and time as a string
-    date_time_string = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    directory = f'myresults/robustness/GAN/{dataset}/{entity}/'
-    filename = f'{dataset}_{entity}_Data_vs_DataWithAnomalies_{date_time_string}.png'
-    full_path = os.path.join(directory, filename)
-
-    # Check if the directory exists, and if not, create it
-    os.makedirs(directory, exist_ok=True)  # Add exist_ok=True to avoid FileExistsError
-
-    # Save the figure
-    plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
-
-    plt.show()
 
 
 def run_Gan(test_data, trained_models, model_names, dataset, entity):
@@ -291,6 +244,55 @@ def run_Gan(test_data, trained_models, model_names, dataset, entity):
     # Save the figure
     plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
-    plt.show()
+    # plt.show()
 
     return ranked_by_f1, ranked_by_pr_auc, ranked_by_f1_names, ranked_by_pr_auc_names
+
+def plot_data_with_injected_points(original_data, augmented_data, injected_normal_indices, injected_anomaly_indices,
+                                   dataset, entity, feature_index=0):
+    fig, axes = plt.subplots(2, 1, figsize=(20, 10), sharex=True)
+
+    # Plot the original data on the first subplot
+    axes[0].plot(original_data[feature_index, :], color='darkblue', linestyle='--', label='Original Data')
+    axes[0].set_title(f'Original Data for Feature {feature_index}')
+    axes[0].set_ylabel('Feature Value')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # Plot the augmented data on the second subplot
+    axes[1].plot(augmented_data[feature_index, :], color='lightblue', label='Augmented Data')
+
+    # Highlight injected normal points in green
+    if injected_normal_indices.size > 0:
+        axes[1].scatter(injected_normal_indices,
+                        [augmented_data[feature_index, idx] for idx in injected_normal_indices],
+                        color='green', label='Injected Normal Points', marker='o', s=50)
+
+    # Highlight injected anomaly points in red
+    if injected_anomaly_indices.size > 0:
+        axes[1].scatter(injected_anomaly_indices,
+                        [augmented_data[feature_index, idx] for idx in injected_anomaly_indices],
+                        color='red', label='Injected Anomaly Points', marker='x', s=50)
+
+    axes[1].set_title(f'Augmented Data with Injected Points for Feature {feature_index}')
+    axes[1].set_xlabel('Sample Index')
+    axes[1].set_ylabel('Feature Value')
+    axes[1].legend()
+    axes[1].grid(True)
+    # Specify the directory
+    # Get the current date and time
+    now = datetime.now()
+
+    # Format the date and time as a string
+    date_time_string = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    directory = f'myresults/robustness/GAN/{dataset}/{entity}/'
+    filename = f'{dataset}_{entity}_Data_vs_DataWithAnomalies_{date_time_string}.png'
+    full_path = os.path.join(directory, filename)
+
+    # Check if the directory exists, and if not, create it
+    os.makedirs(directory, exist_ok=True)  # Add exist_ok=True to avoid FileExistsError
+
+    # Save the figure
+    plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
+
+    # plt.show()

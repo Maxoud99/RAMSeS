@@ -2,12 +2,14 @@ import copy
 import os
 import random
 import traceback
+from typing import List, Dict, Any
 # from sklearn.metrics import f1_score, precision_recall_curve, auc
-from typing import Tuple, List, Dict, Any
+from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from loguru import logger
+from scipy.ndimage import gaussian_filter1d
 from scipy.stats import multivariate_normal
 
 from Metrics.Ensemble_GA import evaluate_individual_models
@@ -285,39 +287,49 @@ def calculate_score(mean: np.ndarray) -> float:
     return np.dot(mean.flatten(), mean.flatten())
 
 
-def plot_history(history: List[Dict[str, np.ndarray]], models: Dict[str, Any], dataset: str, entity: str,
-                 iterations: int) -> None:
+def plot_history(history: List[Dict[str, np.ndarray]], models: Dict[str, Any],
+                 dataset: str, entity: str, iterations: int) -> None:
     """
-    Plot the history of model scores over time.
+    Plot the history of model scores over time with academic styling.
 
     Parameters:
-    - history (List[Dict[str, np.ndarray]]): List of mean vectors for each iteration.
-    - models (Dict[str, Any]): Dictionary of models.
-    - dataset (str): Name of the dataset.
-    - entity (str): Name of the entity.
+    - history (List[Dict[str, np.ndarray]]): List of mean vectors per iteration.
+    - models (Dict[str, Any]): Dictionary of model names to model objects.
+    - dataset (str): Dataset name.
+    - entity (str): Entity name.
     - iterations (int): Number of iterations.
 
     Returns:
     - None
     """
-    fig, ax = plt.subplots()
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10
+    })
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
 
     for model_name in models.keys():
-        scores_over_time = [calculate_score(h[model_name]) for h in history]  # Calculate the score for each mean vector
-        ax.plot(range(len(history)), scores_over_time, label=model_name)
+        raw_scores = [calculate_score(h[model_name]) for h in history]
+        smoothed_scores = gaussian_filter1d(raw_scores, sigma=2)  # Set sigma=0 to disable smoothing
+        ax.plot(range(len(history)), smoothed_scores, label=model_name, linewidth=1.4)
 
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Score')
-    ax.set_title('Model Scores Over Time')
-    ax.legend()
-    ax.grid(True)
-    plt.tight_layout()
+    ax.set_title('Model Score Trajectories Over Iterations')
+    ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+    ax.legend(loc='upper left', ncol=2, frameon=False)
+    plt.tight_layout(pad=1.2)
 
+    # Save as high-resolution PNG
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    plt.savefig(f'{directory}/history_plot_{iterations}.png')
-    plt.show()
+    os.makedirs(directory, exist_ok=True)
+    plt.savefig(f'{directory}/history_plot_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
+    plt.close()
 
 
 def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity, iterations, F1_Score_list_ind_curent,
@@ -408,7 +420,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
     if not os.path.exists(directory):
         os.makedirs(directory)
     plt.savefig(f'{directory}/performance_plot_{iterations}.png')
-    plt.show()
+    # plt.show()
 
 
 def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset, entity, iterations, iteration,
