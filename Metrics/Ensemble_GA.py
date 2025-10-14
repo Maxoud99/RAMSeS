@@ -585,7 +585,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     population = initialize_population(algorithm_list, population_size)
     print(population)
     evaluated_ensembles = {}  # HashMap to track evaluated ensembles and their scores
-    file_name = f'ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_{date_time_string}.txt'
+    file_name = f'myresults/Outputs/GA_Ens/ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_{date_time_string}.txt'
 
     best_f1 = 0
     best_pr_auc = 0
@@ -688,7 +688,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     f1_scores = [result[0] for result in evaluated_ensembles.values()]
     pr_auc_scores = [result[1] for result in evaluated_ensembles.values()]
     flat_ensemble_names = ['_'.join(names) for names in ensemble_names]
-    plot_name = f'ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_ensemble_{date_time_string}.png'
+    plot_name = f'myresults/Outputs/GA_Ens/ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_ensemble_{date_time_string}.png'
     plot_models_scores(list_ensemble, test_data, adjusted_y_pred_list, dataset, entity, F1_Score_list,
                        PR_AUC_Score_list)
     plot_scores_vs_true(test_data, F1_Score_list, PR_AUC_Score_list, adjusted_y_pred_list, list_ensemble, plot_name,

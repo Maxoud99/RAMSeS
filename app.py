@@ -36,7 +36,7 @@ from Utils.utils import get_args_from_cmdline
 # ------------------------------------------------------------------------------
 
 # save_dir = "Mononito/trained_models/anomaly_archive/031_UCR_Anomaly_DISTORTEDInternalBleeding20/"
-save_dir = "/home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/smd/machine-3-10/"
+save_dir = "/home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/skab/3/"
 
 algorithm_list = ['DGHL', 'LSTMVAE', 'NN', 'RNN', 'MD', 'RM', 'LOF', 'CBLOF']
 algorithm_list_instances = ['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3', 'RNN_1', 'RNN_2', 'RNN_3', 'RNN_4',
@@ -362,13 +362,13 @@ def run_app(algorithm_list, algorithm_list_instances):
 
     data_dir = args['dataset_path']
     train_data = load_data(
-        dataset='smd', group='train',
-        entities='machine-3-10', downsampling=10,
+        dataset='skab', group='train',
+        entities='3', downsampling=10,
         min_length=256, root_dir=data_dir, normalize=True, verbose=False
     )
     test_data = load_data(
-        dataset='smd', group='test',
-        entities='machine-3-10', downsampling=10,
+        dataset='skab', group='test',
+        entities='3', downsampling=10,
         min_length=256, root_dir=data_dir, normalize=True, verbose=False
     )
 
@@ -379,8 +379,8 @@ def run_app(algorithm_list, algorithm_list_instances):
         logger.error("Failed to load test data. Check dataset and paths.")
         return
 
-    dataset = 'smd'
-    entity = 'machine-3-10'
+    dataset = 'skab'
+    entity = '3'
 
     model_trainer = TrainModels(
         dataset=dataset,
