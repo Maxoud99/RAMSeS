@@ -1,0 +1,21 @@
+1- Monte carlo
+['RNN_3', 'RNN_2', 'RNN_1', 'RNN_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_2', 'NN_1', 'NN_3'] 
+['RNN_3', 'RNN_2', 'RNN_1', 'RNN_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_3', 'NN_2']
+2- Gan
+['RNN_1', 'RNN_3', 'RNN_2', 'RNN_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RNN_3', 'RNN_1', 'RNN_2', 'RNN_4', 'NN_1', 'NN_3', 'NN_2']
+4- Off by threshold testing (sensitivity)
+['RNN_3', 'RNN_1', 'RNN_2', 'RNN_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RNN_3', 'RNN_1', 'RNN_2', 'RNN_4', 'NN_1', 'NN_2', 'NN_3']
+
+[RNN_3: 328, 
+LOF_3: 455, 
+LOF_4: 455, 
+LOF_2: 455, 
+RNN_1: 350, 
+RNN_2: 347, 
+RNN_4: 398, 
+LOF_1: 455, 
+NN_1: 1597,  
+NN_3: 1597, 
+NN_2: 1597]

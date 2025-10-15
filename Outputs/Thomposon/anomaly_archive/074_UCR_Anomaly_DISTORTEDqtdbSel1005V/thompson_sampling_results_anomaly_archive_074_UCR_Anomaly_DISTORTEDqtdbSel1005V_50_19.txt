@@ -1,0 +1,45 @@
+Summary of Linear Thompson Sampling:
+Model: LOF_1
+  Mean: [0.25351791 0.78637424 0.51061343]
+Model: LOF_2
+  Mean: [0.45940153 0.04093509 0.54669936]
+Model: LOF_3
+  Mean: [0.42299991 0.66832708 0.2471497 ]
+Model: LOF_4
+  Mean: [0.68154944 0.43468599 0.12237273]
+Model: NN_1
+  Mean: [0.11448663 0.43383963 0.59597917]
+Model: NN_2
+  Mean: [-0.05010098  0.08369296  0.3126371 ]
+Model: NN_3
+  Mean: [0.04281153 0.15161878 0.15923789]
+Model: RNN_1
+  Mean: [0.45108945 0.34373565 0.97039867]
+Model: RNN_2
+  Mean: [0.99443288 0.9345268  0.76640901]
+Model: RNN_3
+  Mean: [1.04052597 1.02393275 0.85253681]
+Model: RNN_4
+  Mean: [0.75680462 0.44779035 0.75788856]
+choses models for each round
+['LOF_1', 'LOF_2', 'NN_3', 'LOF_2', 'NN_3', 'LOF_2', 'RNN_4', 'NN_1', 'RNN_3', 'LOF_3', 'LOF_4', 'NN_3', 'NN_1', 'RNN_2', 'LOF_2', 'NN_1', 'LOF_3', 'NN_2', 'LOF_3', 'RNN_4', 'LOF_3', 'RNN_1', 'RNN_3', 'RNN_3', 'RNN_4', 'RNN_2', 'LOF_1', 'RNN_3', 'LOF_3', 'NN_1', 'LOF_2', 'NN_1', 'RNN_2', 'RNN_4', 'NN_1', 'RNN_3', 'RNN_3', 'RNN_1', 'LOF_3', 'RNN_1', 'LOF_2', 'LOF_1', 'RNN_2', 'LOF_2', 'RNN_3', 'RNN_3', 'RNN_4', 'LOF_3', 'RNN_3', 'RNN_3', 'LOF_4', 'RNN_1', 'NN_1', 'RNN_3', 'RNN_3', 'LOF_1', 'LOF_4', 'LOF_4', 'NN_2', 'NN_2', 'RNN_1', 'RNN_1', 'LOF_2', 'LOF_2', 'RNN_2', 'RNN_2', 'LOF_4', 'RNN_3', 'RNN_2', 'RNN_2', 'NN_2', 'RNN_4', 'RNN_2', 'RNN_2', 'LOF_1', 'RNN_4', 'RNN_3', 'RNN_2', 'RNN_2', 'NN_1', 'NN_1', 'RNN_3', 'NN_2', 'NN_1', 'LOF_2', 'RNN_4', 'RNN_3', 'RNN_2', 'LOF_2', 'LOF_1', 'NN_3', 'RNN_3', 'LOF_4', 'LOF_3', 'LOF_4', 'NN_1', 'LOF_2', 'LOF_1', 'RNN_4', 'NN_2', 'RNN_4', 'RNN_3', 'LOF_4', 'LOF_1', 'LOF_1', 'LOF_4', 'RNN_2', 'RNN_4', 'RNN_3', 'LOF_3', 'LOF_4', 'NN_2', 'LOF_4', 'RNN_3', 'LOF_2', 'RNN_3', 'LOF_4', 'RNN_4', 'NN_3', 'RNN_3', 'RNN_2', 'RNN_4', 'RNN_4', 'RNN_1', 'NN_2', 'LOF_3', 'RNN_2', 'RNN_1', 'RNN_2', 'RNN_3', 'LOF_4', 'RNN_2', 'RNN_3', 'LOF_3', 'RNN_4', 'LOF_1', 'RNN_2', 'RNN_4', 'NN_1', 'RNN_1', 'NN_1', 'RNN_2', 'RNN_2', 'LOF_3', 'NN_1', 'RNN_2', 'NN_3', 'LOF_3', 'RNN_2', 'LOF_4', 'RNN_1', 'LOF_3', 'RNN_1', 'RNN_4', 'RNN_2', 'RNN_3', 'RNN_3', 'RNN_2', 'RNN_3', 'RNN_2', 'RNN_3', 'RNN_3', 'RNN_1', 'LOF_3', 'LOF_1', 'RNN_4', 'RNN_3', 'RNN_4', 'RNN_4', 'RNN_2', 'LOF_2', 'NN_1', 'RNN_4', 'LOF_4', 'RNN_4', 'RNN_3', 'RNN_2', 'RNN_3', 'RNN_3', 'NN_1', 'RNN_2', 'RNN_2', 'RNN_2', 'RNN_4', 'RNN_2', 'LOF_1', 'LOF_4', 'RNN_4', 'LOF_1', 'RNN_3', 'RNN_3']
+
+Models ranked by mean score:
+1. RNN_3 with score 2.857951584670834
+2. RNN_2 with score 2.44961984920024
+3. RNN_4 with score 1.3476644996318128
+4. RNN_1 with score 1.2633094574207995
+5. LOF_1 with score 0.9433818498822358
+6. LOF_3 with score 0.6866729848205935
+7. LOF_4 with score 0.6684366364773794
+8. NN_1 with score 0.5565151826062154
+9. LOF_2 with score 0.5116056349011008
+10. NN_2 with score 0.10725657364176128
+11. NN_3 with score 0.05017778754156634
+
+ evaluation for models over the current test data:
+[22, 68, 26, 23, 36, 36, 36, 100, 36, 100, 100]
+ f1_score list for models over the current test data:
+{'RNN_3': 0.8865928600556862, 'RNN_2': 0.7213067186545744, 'RNN_4': 0.8659743054809507, 'RNN_1': 0.8820462075232375, 'LOF_1': 0.8163214660862087, 'LOF_3': 0.8163214660862087, 'LOF_4': 0.8163214660862087, 'NN_1': 0.6478828982640038, 'LOF_2': 0.8163214660862087, 'NN_2': 0.6478828982640038, 'NN_3': 0.6478828982640038}
+ pr_score list for models over the current test data:
+{'RNN_3': 0.760895667419934, 'RNN_2': 0.6025370810227241, 'RNN_4': 0.7573686863777158, 'RNN_1': 0.7713877586502329, 'LOF_1': 0.7810199874198803, 'LOF_3': 0.7810199874198803, 'LOF_4': 0.7810199874198803, 'NN_1': 0.30241131170882063, 'LOF_2': 0.7810199874198803, 'NN_2': 0.3007153052427983, 'NN_3': 0.3007153052427983}

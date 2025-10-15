@@ -1,0 +1,17 @@
+Summary of robust tests:
+
+1- Monte carlo
+['RNN_4', 'RNN_1', 'RNN_2', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+ ['RNN_2', 'RNN_4', 'RNN_1', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+
+ Gan
+['RNN_4', 'RNN_1', 'RNN_2', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+ ['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RNN_4', 'RNN_2', 'RNN_1', 'RNN_3', 'NN_1', 'NN_2', 'NN_3'] 
+
+ Off by threshold testing (sensitivity)
+['RNN_1', 'RNN_4', 'RNN_3', 'RNN_2', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+ ['RNN_2', 'RNN_4', 'RNN_1', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'] 
+Robust rank aggregates
+(2.112776466098461, ['RNN_4', 'RNN_2', 'RNN_1', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3'])
+All aggregated
+(2.32630578464058, ['RNN_4', 'RNN_2', 'LOF_3', 'LOF_1', 'RNN_3', 'LOF_2', 'LOF_4', 'RNN_1', 'NN_1', 'NN_2', 'NN_3'])

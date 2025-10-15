@@ -1,0 +1,47 @@
+Summary of Linear Thompson Sampling:
+Model: LOF_1
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: LOF_2
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: LOF_3
+  Mean: [0.02148551 0.02361285 0.01042099 0.02254671 0.01526837 0.01586789
+ 0.01739568 0.02880663]
+Model: LOF_4
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: NN_1
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: NN_2
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: NN_3
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: RNN_1
+  Mean: [0.0321665  0.0190411  0.03261959 0.03135854 0.02645946 0.05950989
+ 0.01462452 0.02847628]
+Model: RNN_2
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: RNN_3
+  Mean: [nan nan nan nan nan nan nan nan]
+Model: RNN_4
+  Mean: [nan nan nan nan nan nan nan nan]
+choses models for each round
+['NN_1', 'LOF_1', 'LOF_2', 'NN_2', 'LOF_3', 'NN_2', 'RNN_4', 'LOF_2', 'RNN_3', 'RNN_2', 'LOF_1', 'LOF_4', 'RNN_2', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_4', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'NN_2', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'RNN_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_4', 'LOF_1', 'LOF_1', 'NN_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'NN_1', 'LOF_1', 'LOF_1', 'LOF_1', 'NN_3', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'NN_3', 'RNN_2', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1', 'LOF_1']
+
+Models ranked by mean score:
+1. LOF_1 with score nan
+2. LOF_2 with score nan
+3. LOF_3 with score 0.0032534896465484537
+4. LOF_4 with score nan
+5. NN_1 with score nan
+6. NN_2 with score nan
+7. NN_3 with score nan
+8. RNN_1 with score 0.00871094799151118
+9. RNN_2 with score nan
+10. RNN_3 with score nan
+11. RNN_4 with score nan
+
+ evaluation for models over the current test data:
+[33, 33, 33, 33, 401, 401, 401, 32, 32, 32, 32]
+ f1_score list for models over the current test data:
+{'LOF_1': 0.11285964384881457, 'LOF_2': 0.11285964384881457, 'LOF_3': 0.11285964384881457, 'LOF_4': 0.11285964384881457, 'NN_1': 0.1443864011662955, 'NN_2': 0.1452321877044455, 'NN_3': 0.14644097011541932, 'RNN_1': 0.20350271492941546, 'RNN_2': 0.18963650540495092, 'RNN_3': 0.19915575311614445, 'RNN_4': 0.18942138445343754}
+ pr_score list for models over the current test data:
+{'LOF_1': 0.2444504487468787, 'LOF_2': 0.2444504487468787, 'LOF_3': 0.2444504487468787, 'LOF_4': 0.2444504487468787, 'NN_1': 0.06408218115409821, 'NN_2': 0.06408218115409821, 'NN_3': 0.06408218115409821, 'RNN_1': 0.3129797911297497, 'RNN_2': 0.31000304675431245, 'RNN_3': 0.26974854362744954, 'RNN_4': 0.2722571959703904}

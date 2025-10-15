@@ -1,0 +1,17 @@
+Summary of robust tests:
+
+1- Monte carlo
+['LSTMVAE_2', 'LSTMVAE_3', 'LSTMVAE_1', 'LSTMVAE_4', 'RM_2', 'RM_3', 'DGHL_1', 'DGHL_3', 'RM_1', 'DGHL_2', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'MD_1', 'DGHL_4', 'CBLOF_1', 'CBLOF_4', 'CBLOF_3', 'CBLOF_2'] 
+ ['LSTMVAE_2', 'LSTMVAE_3', 'LSTMVAE_1', 'LSTMVAE_4', 'RM_2', 'RM_3', 'DGHL_1', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'DGHL_3', 'RM_1', 'DGHL_2', 'MD_1', 'DGHL_4', 'CBLOF_1', 'CBLOF_3', 'CBLOF_2', 'CBLOF_4'] 
+
+ Gan
+['LSTMVAE_3', 'LSTMVAE_2', 'LSTMVAE_1', 'LSTMVAE_4', 'RM_3', 'RM_2', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'MD_1', 'DGHL_2', 'DGHL_1', 'DGHL_3', 'RM_1', 'DGHL_4', 'CBLOF_3', 'CBLOF_1', 'CBLOF_2', 'CBLOF_4'] 
+ ['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'MD_1', 'RM_2', 'LSTMVAE_2', 'LSTMVAE_3', 'LSTMVAE_1', 'RM_3', 'LSTMVAE_4', 'DGHL_2', 'RM_1', 'DGHL_1', 'DGHL_3', 'DGHL_4', 'CBLOF_1', 'CBLOF_4', 'CBLOF_3', 'CBLOF_2'] 
+
+ Off by threshold testing (sensitivity)
+['LSTMVAE_2', 'LSTMVAE_1', 'LSTMVAE_3', 'LSTMVAE_4', 'RM_3', 'DGHL_1', 'RM_2', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'DGHL_3', 'DGHL_2', 'MD_1', 'RM_1', 'DGHL_4', 'CBLOF_3', 'CBLOF_4', 'CBLOF_2', 'CBLOF_1'] 
+ ['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'LSTMVAE_3', 'LSTMVAE_2', 'LSTMVAE_1', 'LSTMVAE_4', 'MD_1', 'RM_2', 'DGHL_3', 'DGHL_1', 'RM_3', 'DGHL_2', 'RM_1', 'DGHL_4', 'CBLOF_1', 'CBLOF_3', 'CBLOF_4', 'CBLOF_2'] 
+Robust rank aggregates
+(1.926344042277844, ['LSTMVAE_2', 'LSTMVAE_3', 'LSTMVAE_1', 'LSTMVAE_4', 'RM_2', 'RM_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'DGHL_1', 'DGHL_3', 'MD_1', 'DGHL_2', 'RM_1', 'DGHL_4', 'CBLOF_1', 'CBLOF_3', 'CBLOF_4', 'CBLOF_2'])
+All aggregated
+(2.8989396128621374, ['LSTMVAE_3', 'LSTMVAE_1', 'LSTMVAE_2', 'LSTMVAE_4', 'LOF_2', 'MD_1', 'DGHL_1', 'DGHL_3', 'LOF_4', 'RM_2', 'LOF_3', 'CBLOF_1', 'CBLOF_4', 'LOF_1', 'RM_3', 'CBLOF_3', 'RM_1', 'DGHL_2', 'DGHL_4', 'CBLOF_2'])

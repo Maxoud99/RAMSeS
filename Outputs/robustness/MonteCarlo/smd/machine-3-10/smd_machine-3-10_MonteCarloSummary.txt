@@ -1,0 +1,160 @@
+Summary of Monte Carlo Simulation:
+Model: ABOD_1
+  F1 Mean: 0.8096, F1 Std: 0.0034
+  PR AUC Mean: 0.9038, PR AUC Std: 0.0009
+Model: ABOD_2
+  F1 Mean: 0.8096, F1 Std: 0.0034
+  PR AUC Mean: 0.9038, PR AUC Std: 0.0009
+Model: ABOD_3
+  F1 Mean: 0.8096, F1 Std: 0.0034
+  PR AUC Mean: 0.9038, PR AUC Std: 0.0009
+Model: ABOD_4
+  F1 Mean: 0.8096, F1 Std: 0.0034
+  PR AUC Mean: 0.9038, PR AUC Std: 0.0009
+Model: CBLOF_1
+  F1 Mean: 0.7294, F1 Std: 0.0053
+  PR AUC Mean: 0.8508, PR AUC Std: 0.0032
+Model: CBLOF_2
+  F1 Mean: 0.7350, F1 Std: 0.0019
+  PR AUC Mean: 0.8560, PR AUC Std: 0.0028
+Model: CBLOF_3
+  F1 Mean: 0.7300, F1 Std: 0.0029
+  PR AUC Mean: 0.8507, PR AUC Std: 0.0033
+Model: CBLOF_4
+  F1 Mean: 0.7289, F1 Std: 0.0045
+  PR AUC Mean: 0.8500, PR AUC Std: 0.0032
+Model: DGHL_1
+  F1 Mean: 0.7888, F1 Std: 0.0014
+  PR AUC Mean: 0.7725, PR AUC Std: 0.0040
+Model: DGHL_2
+  F1 Mean: 0.7735, F1 Std: 0.0002
+  PR AUC Mean: 0.7461, PR AUC Std: 0.0039
+Model: DGHL_3
+  F1 Mean: 0.7752, F1 Std: 0.0008
+  PR AUC Mean: 0.7466, PR AUC Std: 0.0040
+Model: DGHL_4
+  F1 Mean: 0.7768, F1 Std: 0.0007
+  PR AUC Mean: 0.7488, PR AUC Std: 0.0040
+Model: LOF_1
+  F1 Mean: 0.7928, F1 Std: 0.0065
+  PR AUC Mean: 0.8924, PR AUC Std: 0.0019
+Model: LOF_2
+  F1 Mean: 0.7928, F1 Std: 0.0065
+  PR AUC Mean: 0.8924, PR AUC Std: 0.0019
+Model: LOF_3
+  F1 Mean: 0.7928, F1 Std: 0.0065
+  PR AUC Mean: 0.8924, PR AUC Std: 0.0019
+Model: LOF_4
+  F1 Mean: 0.7928, F1 Std: 0.0065
+  PR AUC Mean: 0.8924, PR AUC Std: 0.0019
+Model: LSTMVAE_1
+  F1 Mean: 0.8706, F1 Std: 0.0014
+  PR AUC Mean: 0.9388, PR AUC Std: 0.0016
+Model: LSTMVAE_2
+  F1 Mean: 0.8690, F1 Std: 0.0014
+  PR AUC Mean: 0.9382, PR AUC Std: 0.0009
+Model: LSTMVAE_3
+  F1 Mean: 0.8539, F1 Std: 0.0012
+  PR AUC Mean: 0.9298, PR AUC Std: 0.0022
+Model: LSTMVAE_4
+  F1 Mean: 0.8112, F1 Std: 0.0027
+  PR AUC Mean: 0.8992, PR AUC Std: 0.0025
+Model: MD_1
+  F1 Mean: 0.8664, F1 Std: 0.0022
+  PR AUC Mean: 0.9181, PR AUC Std: 0.0010
+Model: NN_1
+  F1 Mean: 0.6234, F1 Std: 0.0000
+  PR AUC Mean: 0.4456, PR AUC Std: 0.0005
+Model: NN_2
+  F1 Mean: 0.6234, F1 Std: 0.0000
+  PR AUC Mean: 0.4429, PR AUC Std: 0.0003
+Model: NN_3
+  F1 Mean: 0.6234, F1 Std: 0.0000
+  PR AUC Mean: 0.4362, PR AUC Std: 0.0001
+Model: RM_1
+  F1 Mean: 0.8296, F1 Std: 0.0016
+  PR AUC Mean: 0.9110, PR AUC Std: 0.0000
+Model: RM_2
+  F1 Mean: 0.9137, F1 Std: 0.0009
+  PR AUC Mean: 0.9637, PR AUC Std: 0.0003
+Model: RM_3
+  F1 Mean: 0.9137, F1 Std: 0.0013
+  PR AUC Mean: 0.9555, PR AUC Std: 0.0002
+Model: RNN_1
+  F1 Mean: 0.8726, F1 Std: 0.0034
+  PR AUC Mean: 0.9466, PR AUC Std: 0.0007
+Model: RNN_2
+  F1 Mean: 0.8750, F1 Std: 0.0029
+  PR AUC Mean: 0.9515, PR AUC Std: 0.0005
+Model: RNN_3
+  F1 Mean: 0.8908, F1 Std: 0.0026
+  PR AUC Mean: 0.9597, PR AUC Std: 0.0007
+Model: RNN_4
+  F1 Mean: 0.8981, F1 Std: 0.0029
+  PR AUC Mean: 0.9606, PR AUC Std: 0.0003
+
+Models ranked by F1 score:
+1. RM_2
+2. RM_3
+3. RNN_4
+4. RNN_3
+5. RNN_2
+6. RNN_1
+7. LSTMVAE_1
+8. LSTMVAE_2
+9. MD_1
+10. LSTMVAE_3
+11. RM_1
+12. LSTMVAE_4
+13. ABOD_1
+14. ABOD_2
+15. ABOD_3
+16. ABOD_4
+17. LOF_1
+18. LOF_2
+19. LOF_3
+20. LOF_4
+21. DGHL_1
+22. DGHL_4
+23. DGHL_3
+24. DGHL_2
+25. CBLOF_2
+26. CBLOF_3
+27. CBLOF_1
+28. CBLOF_4
+29. NN_1
+30. NN_2
+31. NN_3
+
+Models ranked by PR AUC score:
+1. RM_2
+2. RNN_4
+3. RNN_3
+4. RM_3
+5. RNN_2
+6. RNN_1
+7. LSTMVAE_1
+8. LSTMVAE_2
+9. LSTMVAE_3
+10. MD_1
+11. RM_1
+12. ABOD_1
+13. ABOD_2
+14. ABOD_3
+15. ABOD_4
+16. LSTMVAE_4
+17. LOF_1
+18. LOF_2
+19. LOF_3
+20. LOF_4
+21. CBLOF_2
+22. CBLOF_1
+23. CBLOF_3
+24. CBLOF_4
+25. DGHL_1
+26. DGHL_4
+27. DGHL_3
+28. DGHL_2
+29. NN_1
+30. NN_2
+31. NN_3

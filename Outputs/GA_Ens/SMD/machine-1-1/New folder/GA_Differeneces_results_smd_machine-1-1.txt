@@ -1,0 +1,4 @@
+All Ensembles:
+ Evaluated Ensembles: dict_keys([('LOF_2', 'LOF_4', 'NN_1', 'NN_2', 'RNN_3', 'RNN_4'), ('LOF_1', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'RNN_1', 'RNN_2', 'RNN_3', 'RNN_4'), ('LOF_2', 'LOF_3', 'RNN_1', 'RNN_2', 'RNN_4'), ('LOF_4', 'NN_2', 'RNN_2', 'RNN_3', 'RNN_4'), ('LOF_1', 'LOF_2', 'LOF_3', 'NN_1', 'NN_2', 'NN_3', 'RNN_1', 'RNN_2', 'RNN_3', 'RNN_4'), ('LOF_1', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3', 'RNN_1', 'RNN_2', 'RNN_3'), ('LOF_1', 'LOF_4', 'NN_2', 'RNN_1', 'RNN_2', 'RNN_4'), ('LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3', 'RNN_1', 'RNN_4'), ('LOF_2', 'LOF_3', 'RNN_1'), ('LOF_3', 'NN_2', 'NN_3', 'RNN_1', 'RNN_3', 'RNN_4')])
+All Differences:
+[3, 3, 2, 3, 3, 2, 3, 3, 3, 2, 3, 1, 2, 1, 1, 2]

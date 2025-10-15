@@ -1,0 +1,25 @@
+Summary of robust tests:
+
+1- Monte carlo
+['RM_2', 'RM_3', 'RNN_4', 'RNN_3', 'RNN_2', 'RNN_1', 'LSTMVAE_1', 'LSTMVAE_2', 'MD_1', 'LSTMVAE_3', 'RM_1', 'LSTMVAE_4', 'ABOD_1', 'ABOD_2', 'ABOD_3', 'ABOD_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'DGHL_1', 'DGHL_4', 'DGHL_3', 'DGHL_2', 'CBLOF_2', 'CBLOF_3', 'CBLOF_1', 'CBLOF_4', 'NN_1', 'NN_2', 'NN_3'], 
+ ['RM_2', 'RNN_4', 'RNN_3', 'RM_3', 'RNN_2', 'RNN_1', 'LSTMVAE_1', 'LSTMVAE_2', 'LSTMVAE_3', 'MD_1', 'RM_1', 'ABOD_1', 'ABOD_2', 'ABOD_3', 'ABOD_4', 'LSTMVAE_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'CBLOF_2', 'CBLOF_1', 'CBLOF_3', 'CBLOF_4', 'DGHL_1', 'DGHL_4', 'DGHL_3', 'DGHL_2', 'NN_1', 'NN_2', 'NN_3'], 
+
+ Gan
+['LSTMVAE_2', 'LSTMVAE_4', 'LSTMVAE_3', 'LSTMVAE_1', 'RM_3', 'RM_2', 'RNN_4', 'RNN_3', 'RNN_2', 'RNN_1', 'MD_1', 'ABOD_1', 'ABOD_2', 'ABOD_3', 'ABOD_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RM_1', 'CBLOF_3', 'DGHL_1', 'CBLOF_1', 'DGHL_4', 'DGHL_2', 'CBLOF_4', 'DGHL_3', 'CBLOF_2', 'NN_1', 'NN_2', 'NN_3'], 
+ ['LSTMVAE_3', 'LSTMVAE_4', 'LSTMVAE_2', 'LSTMVAE_1', 'ABOD_1', 'ABOD_2', 'ABOD_3', 'ABOD_4', 'RNN_4', 'RNN_3', 'RNN_2', 'RNN_1', 'RM_2', 'RM_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'MD_1', 'RM_1', 'CBLOF_1', 'CBLOF_3', 'CBLOF_4', 'CBLOF_2', 'DGHL_1', 'DGHL_4', 'DGHL_3', 'DGHL_2', 'NN_1', 'NN_2', 'NN_3'], 
+
+ Off by threshold testing (sensitivity)
+['LSTMVAE_3', 'LSTMVAE_4', 'LSTMVAE_2', 'LSTMVAE_1', 'RM_3', 'RM_2', 'RNN_3', 'RNN_4', 'RNN_2', 'RNN_1', 'MD_1', 'ABOD_1', 'ABOD_2', 'ABOD_3', 'ABOD_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RM_1', 'CBLOF_3', 'CBLOF_1', 'DGHL_1', 'CBLOF_4', 'DGHL_4', 'DGHL_2', 'DGHL_3', 'CBLOF_2', 'NN_1', 'NN_2', 'NN_3'], 
+ ['LSTMVAE_3', 'LSTMVAE_4', 'LSTMVAE_2', 'LSTMVAE_1', 'RNN_3', 'RNN_4', 'ABOD_1', 'ABOD_2', 'ABOD_3', 'ABOD_4', 'RNN_2', 'RNN_1', 'RM_2', 'RM_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'MD_1', 'RM_1', 'CBLOF_1', 'CBLOF_3', 'CBLOF_4', 'CBLOF_2', 'DGHL_1', 'DGHL_4', 'DGHL_3', 'DGHL_2', 'NN_1', 'NN_2', 'NN_3']
+
+
+	-------------Thompson--------------
+
+['LSTMVAE_4', 'LSTMVAE_1', 'LSTMVAE_2', 'DGHL_2', 'NN_3', 'RNN_1', 'RNN_2', 'ABOD_4', 'RNN_3', 'RNN_4', 'LOF_3', 'CBLOF_4', 'DGHL_1', 'LOF_1', 'ABOD_3', 'CBLOF_1', 'DGHL_3', 'LOF_2', 'RM_1', 'ABOD_2', 'NN_2', 'LOF_4', 'CBLOF_2', 'MD_1', 'DGHL_4', 'CBLOF_3', 'NN_1', 'RM_2', 'LSTMVAE_3', 'ABOD_1', 'RM_3']
+ 
+---------------------------------------------------------------
+['ABOD_1', 'RNN_2', 'RNN_1', 'RM_3', 'RM_2', 'RM_1', 'NN_2', 'NN_1', 'MD_1', 'LSTMVAE_4', 'LSTMVAE_3', 'LSTMVAE_2', 'LSTMVAE_1', 'RNN_3', 'LOF_4', 'LOF_2', 'LOF_1', 'DGHL_4', 'DGHL_3', 'DGHL_2', 'DGHL_1', 'CBLOF_4', 'CBLOF_3', 'CBLOF_2', 'CBLOF_1', 'ABOD_4', 'ABOD_3', 'ABOD_2', 'LOF_3', 'RNN_4', 'NN_3']
+
+---------------------------------------------------------------
+
+['ABOD_1', 'LSTMVAE_4', 'LSTMVAE_1', 'RNN_3', 'LSTMVAE_2', 'RNN_4', 'NN_3', 'DGHL_2', 'RNN_2', 'RM_3', 'DGHL_1', 'ABOD_4', 'ABOD_3', 'LOF_1', 'CBLOF_4', 'CBLOF_1', 'CBLOF_3', 'DGHL_3', 'CBLOF_2', 'LOF_2', 'LOF_4', 'LSTMVAE_3', 'DGHL_4', 'LOF_3', 'MD_1', 'NN_1', 'ABOD_2', 'NN_2', 'RM_1', 'RNN_1', 'RM_2']

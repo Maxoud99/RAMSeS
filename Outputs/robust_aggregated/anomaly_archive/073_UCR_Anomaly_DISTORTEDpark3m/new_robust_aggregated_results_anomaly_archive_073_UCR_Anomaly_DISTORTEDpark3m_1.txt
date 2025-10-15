@@ -1,0 +1,6 @@
+Summary of falses:
+chosen model: LOF_2
+[300]
+Falses for the ensebmle:
+chosen ensemble: ['LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_2', 'NN_3', 'RNN_1', 'RNN_3', 'RNN_4']
+[104]

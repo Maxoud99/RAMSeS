@@ -1,0 +1,6 @@
+Summary of falses:
+chosen model: LSTMVAE_1
+[12]
+Falses for the ensebmle:
+chosen ensemble: ['CBLOF_2', 'RM_2']
+[26]

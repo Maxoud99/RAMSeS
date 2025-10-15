@@ -1,0 +1,76 @@
+D:\Anaconda\envs\RAMSTSAD\python.exe D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\app.py 
+[[1 3]
+ [4 6]
+ [7 9]]
+2024-06-10 13:46:52.600746: I tensorflow/core/util/port.cc:113] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2024-06-10 13:46:53.433805: I tensorflow/core/util/port.cc:113] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2024-06-10 13:46:58.096 | INFO     | Utils.utils:<module>:18 - D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\Utils\utils.py
+current base dir is path is D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\
+config_path path is D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\configs/config.yml
+2024-06-10 13:46:58.608 | INFO     | Utils.db_utils:<module>:7 - D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\Utils\db_utils.py
+current base dir is path is D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\
+db path is D:\Master\SS_2024_Thesis_ISA\Thesis\Work-docs\RAMS-TSAD\db/tsad.db
+------------------------AnomalyArchive exist-----------------------------
+[<Datasets.dataset.Entity object at 0x000001E02172BA10>]
+006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2-train
+------------------------AnomalyArchive exist-----------------------------
+2024-06-10 13:46:58.703 | INFO     | Model_Training.train:__init__:84 - self.img_dir is D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2
+[<Datasets.dataset.Entity object at 0x000001E02156D990>]
+006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2-test
+------------------------AnomalyArchive exist-----------------------------
+[<Datasets.dataset.Entity object at 0x000001E01FBC9DD0>]
+006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2-train
+------------------------AnomalyArchive exist-----------------------------
+[<Datasets.dataset.Entity object at 0x000001E02172BCD0>]
+006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2-test
+Number of entities: 1
+Using the first 100\% of the training data to train the algorithm.
+2024-06-10 13:46:58.785 | INFO     | Model_Training.train:train_models:134 - model_architectures is ['LOF', 'NN', 'RNN']
+2024-06-10 13:46:58.785 | INFO     | Model_Training.train:train_models:140 - vis_data_path is D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2\data.png
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/LOF_1.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/LOF_2.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/LOF_3.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/LOF_4.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/NN_1.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/NN_2.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/NN_3.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/RNN_1.pth
+2024-06-10 13:46:58.954 | INFO     | Model_Training.train:train_models:152 - exist_model_list is ['LOF', 'RNN', 'NN']
+D:\Anaconda\envs\RAMSTSAD\Lib\site-packages\sklearn\base.py:376: InconsistentVersionWarning: Trying to unpickle estimator LocalOutlierFactor from version 1.3.0 when using version 1.4.2. This might lead to breaking code or invalid results. Use at your own risk. For more info please refer to:
+https://scikit-learn.org/stable/model_persistence.html#security-maintainability-limitations
+  warnings.warn(
+D:\Anaconda\envs\RAMSTSAD\Lib\site-packages\sklearn\base.py:376: InconsistentVersionWarning: Trying to unpickle estimator NearestNeighbors from version 1.3.0 when using version 1.4.2. This might lead to breaking code or invalid results. Use at your own risk. For more info please refer to:
+https://scikit-learn.org/stable/model_persistence.html#security-maintainability-limitations
+  warnings.warn(
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/RNN_2.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/RNN_3.pth
+D:/Master/SS_2024_Thesis_ISA/Thesis/Work-docs/RAMS-TSAD/Mononito/trained_models/anomaly_archive/006_UCR_Anomaly_DISTORTEDCIMIS44AirTemperature2/RNN_4.pth
+2024-06-10 13:48:03.119 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_1 on spikes: F1=0.8735702413919205, PR_AUC=0.9258983351136494
+2024-06-10 13:49:02.342 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_2 on spikes: F1=0.8735702413919205, PR_AUC=0.9258983351136494
+2024-06-10 13:50:03.518 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_3 on spikes: F1=0.8735702413919205, PR_AUC=0.9258983351136494
+2024-06-10 13:51:03.587 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_4 on spikes: F1=0.8735702413919205, PR_AUC=0.9258983351136494
+2024-06-10 13:52:04.329 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated NN_1 on spikes: F1=0.6489990380621445, PR_AUC=0.4509472190090251
+2024-06-10 13:53:04.045 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated NN_2 on spikes: F1=0.6489990380621445, PR_AUC=0.4514501212476798
+2024-06-10 13:54:05.116 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated NN_3 on spikes: F1=0.6489990380621445, PR_AUC=0.45138792027354635
+2024-06-10 13:55:04.512 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_1 on spikes: F1=0.8748916606078551, PR_AUC=0.9296020495337223
+2024-06-10 13:56:04.494 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_2 on spikes: F1=0.8631651118894085, PR_AUC=0.9226011772864603
+2024-06-10 13:57:03.984 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_3 on spikes: F1=0.8711234833041, PR_AUC=0.9294771591009076
+2024-06-10 13:57:52.738 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_4 on spikes: F1=0.8910804471814545, PR_AUC=0.9416490624255459
+2024-06-10 13:57:52.738 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:183 - Models ranked by F1 for spikes: ['RNN_4', 'RNN_1', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RNN_3', 'RNN_2', 'NN_1', 'NN_2', 'NN_3']
+2024-06-10 13:57:52.738 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:185 - Models ranked by PR-AUC for spikes: ['RNN_4', 'RNN_1', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'RNN_2', 'NN_2', 'NN_3', 'NN_1']
+2024-06-10 14:01:13.478 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_1 on flip: F1=0.39542415166104117, PR_AUC=0.1522920740402557
+2024-06-10 14:04:30.749 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_2 on flip: F1=0.39542415166104117, PR_AUC=0.1522920740402557
+2024-06-10 14:07:48.261 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_3 on flip: F1=0.39542415166104117, PR_AUC=0.1522920740402557
+2024-06-10 14:11:06.690 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated LOF_4 on flip: F1=0.39542415166104117, PR_AUC=0.1522920740402557
+2024-06-10 14:14:24.763 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated NN_1 on flip: F1=0.14256730523505143, PR_AUC=0.028876884061865622
+2024-06-10 14:17:42.848 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated NN_2 on flip: F1=0.12397478678936356, PR_AUC=0.02717827553693533
+2024-06-10 14:21:01.945 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated NN_3 on flip: F1=0.12934527281703764, PR_AUC=0.027585019429268772
+2024-06-10 14:24:21.164 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_1 on flip: F1=0.40259024511495684, PR_AUC=0.1780617348903114
+2024-06-10 14:27:38.630 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_2 on flip: F1=0.40437757658234946, PR_AUC=0.1629282280645928
+2024-06-10 14:30:58.116 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_3 on flip: F1=0.41768290308016814, PR_AUC=0.16232647710191947
+{'spikes': [{'model': 'RNN_4', 'f1': 0.8910804471814545, 'pr_auc': 0.9416490624255459}, {'model': 'RNN_1', 'f1': 0.8748916606078551, 'pr_auc': 0.9296020495337223}, {'model': 'RNN_3', 'f1': 0.8711234833041, 'pr_auc': 0.9294771591009076}, {'model': 'LOF_1', 'f1': 0.8735702413919205, 'pr_auc': 0.9258983351136494}, {'model': 'LOF_2', 'f1': 0.8735702413919205, 'pr_auc': 0.9258983351136494}, {'model': 'LOF_3', 'f1': 0.8735702413919205, 'pr_auc': 0.9258983351136494}, {'model': 'LOF_4', 'f1': 0.8735702413919205, 'pr_auc': 0.9258983351136494}, {'model': 'RNN_2', 'f1': 0.8631651118894085, 'pr_auc': 0.9226011772864603}, {'model': 'NN_2', 'f1': 0.6489990380621445, 'pr_auc': 0.4514501212476798}, {'model': 'NN_3', 'f1': 0.6489990380621445, 'pr_auc': 0.45138792027354635}, {'model': 'NN_1', 'f1': 0.6489990380621445, 'pr_auc': 0.4509472190090251}], 'flip': [{'model': 'RNN_1', 'f1': 0.40259024511495684, 'pr_auc': 0.1780617348903114}, {'model': 'RNN_4', 'f1': 0.3985971489252148, 'pr_auc': 0.17295740053019154}, {'model': 'RNN_2', 'f1': 0.40437757658234946, 'pr_auc': 0.1629282280645928}, {'model': 'RNN_3', 'f1': 0.41768290308016814, 'pr_auc': 0.16232647710191947}, {'model': 'LOF_1', 'f1': 0.39542415166104117, 'pr_auc': 0.1522920740402557}, {'model': 'LOF_2', 'f1': 0.39542415166104117, 'pr_auc': 0.1522920740402557}, {'model': 'LOF_3', 'f1': 0.39542415166104117, 'pr_auc': 0.1522920740402557}, {'model': 'LOF_4', 'f1': 0.39542415166104117, 'pr_auc': 0.1522920740402557}, {'model': 'NN_1', 'f1': 0.14256730523505143, 'pr_auc': 0.028876884061865622}, {'model': 'NN_3', 'f1': 0.12934527281703764, 'pr_auc': 0.027585019429268772}, {'model': 'NN_2', 'f1': 0.12397478678936356, 'pr_auc': 0.02717827553693533}]}
+2024-06-10 14:34:17.127 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:179 - Evaluated RNN_4 on flip: F1=0.3985971489252148, PR_AUC=0.17295740053019154
+2024-06-10 14:34:17.127 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:183 - Models ranked by F1 for flip: ['RNN_3', 'RNN_2', 'RNN_1', 'RNN_4', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_3', 'NN_2']
+2024-06-10 14:34:17.127 | INFO     | Model_Selection.Sensitivity_robustness.model_stress_testing:run_robustness_tests:185 - Models ranked by PR-AUC for flip: ['RNN_1', 'RNN_4', 'RNN_2', 'RNN_3', 'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_3', 'NN_2']
+
+Process finished with exit code 0

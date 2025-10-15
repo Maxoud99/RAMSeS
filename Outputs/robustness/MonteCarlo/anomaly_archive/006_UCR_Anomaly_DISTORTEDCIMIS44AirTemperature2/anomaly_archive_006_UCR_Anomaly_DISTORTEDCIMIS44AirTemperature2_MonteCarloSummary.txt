@@ -1,0 +1,60 @@
+Summary of Monte Carlo Simulation:
+Model: LOF_1
+  F1 Mean: 0.2997, F1 Std: 0.0034
+  PR AUC Mean: 0.2326, PR AUC Std: 0.0023
+Model: LOF_2
+  F1 Mean: 0.2997, F1 Std: 0.0034
+  PR AUC Mean: 0.2326, PR AUC Std: 0.0023
+Model: LOF_3
+  F1 Mean: 0.2997, F1 Std: 0.0034
+  PR AUC Mean: 0.2326, PR AUC Std: 0.0023
+Model: LOF_4
+  F1 Mean: 0.2997, F1 Std: 0.0034
+  PR AUC Mean: 0.2326, PR AUC Std: 0.0023
+Model: NN_1
+  F1 Mean: 0.1460, F1 Std: 0.0000
+  PR AUC Mean: 0.0644, PR AUC Std: 0.0010
+Model: NN_2
+  F1 Mean: 0.1460, F1 Std: 0.0000
+  PR AUC Mean: 0.0644, PR AUC Std: 0.0010
+Model: NN_3
+  F1 Mean: 0.1460, F1 Std: 0.0000
+  PR AUC Mean: 0.0654, PR AUC Std: 0.0000
+Model: RNN_1
+  F1 Mean: 0.3581, F1 Std: 0.0086
+  PR AUC Mean: 0.2851, PR AUC Std: 0.0055
+Model: RNN_2
+  F1 Mean: 0.3583, F1 Std: 0.0053
+  PR AUC Mean: 0.2915, PR AUC Std: 0.0077
+Model: RNN_3
+  F1 Mean: 0.3962, F1 Std: 0.0628
+  PR AUC Mean: 0.2672, PR AUC Std: 0.0082
+Model: RNN_4
+  F1 Mean: 0.3396, F1 Std: 0.0025
+  PR AUC Mean: 0.2326, PR AUC Std: 0.0077
+
+Models ranked by F1 score:
+1. RNN_3
+2. RNN_2
+3. RNN_1
+4. RNN_4
+5. LOF_1
+6. LOF_2
+7. LOF_3
+8. LOF_4
+9. NN_1
+10. NN_2
+11. NN_3
+
+Models ranked by PR AUC score:
+1. RNN_2
+2. RNN_1
+3. RNN_3
+4. LOF_1
+5. LOF_2
+6. LOF_3
+7. LOF_4
+8. RNN_4
+9. NN_3
+10. NN_2
+11. NN_1
