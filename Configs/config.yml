@@ -5,8 +5,8 @@ overwrite: True
 
 # Model training parameters
 downsampling: 10
-trained_model_path: "//home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/skab/1"
-dataset_path: "/home/maxoud/projects/RAMS-TSAD/Mononito/datasets/skab/1.csv"
+trained_model_path: "//home/maxoud/projects/RAMS-TSAD/Mononito/trained_models"
+dataset_path: "/home/maxoud/projects/RAMS-TSAD/Mononito/datasets"
 
 #docker path
 #trained_model_path: '/trained_models/'
