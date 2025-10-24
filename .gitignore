@@ -1,0 +1,22 @@
+# Virtual environments and IDE
+.venv/
+.idea/
+.vscode/
+
+# Python cache / build files
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.pkl
+*.log
+
+# Outputs / results
+myresults/
+old/
+Mononito/
+output/
+
+# OS / Jupyter junk
+.DS_Store
+.ipynb_checkpoints/
+RAMS-TSAD-Up-to-date.zip
