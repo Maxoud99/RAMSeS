@@ -1,0 +1,41 @@
+name: RAMS
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - statsmodels
+  - jupyter
+  - joblib
+  - matplotlib
+  - numpy
+  - networkx
+  - pytables
+  - seaborn
+  - notebook
+  - lightgbm
+  - scipy
+  - tqdm
+  - xgboost
+  - scikit-learn
+  - openpyxl
+  - pandas
+  - ipython
+  - pytorch=2.*         # from pytorch channel
+  - torchvision=0.*     # from pytorch channel
+  - torchaudio=2.*      # from pytorch channel
+  - pytorch-cuda=11.8   # from nvidia channel (requires driver >= 520)
+  - typer
+  - ipykernel
+  - rich
+  - dash
+  - jupyterlab
+  - fastapi
+  - pydantic
+  - plotly
+  - cvxpy
+  - pip:
+      - tensorflow-cpu==2.15.*
