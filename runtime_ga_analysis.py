@@ -46,9 +46,9 @@ META_SET = ['rf', 'lr', 'svm']
 
 # Workloads for meta comparison (label -> (P, G))
 WORKLOADS = {
-    "light (P= 5, G= 20)":  (5, 10),
-    "medium (P= 50, G= 100)": (50, 20),
-    "heavy (P= 50, G= 500)":  (100, 50),
+    "light (P= 5, G= 10)":  (5, 10),
+    "medium (P= 50, G= 20)": (50, 20),
+    "heavy (P= 100, G= 50)":  (100, 50),
 }
 
 REPEATS = 3                      # median + IQR

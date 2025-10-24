@@ -2,7 +2,7 @@
 # Reads GA results CSV and draws the 2x3 ICDE figure (Runtime row + F1 row).
 # - Finds the latest output/ga_runtime_*/ga_runtime_results.csv automatically,
 #   or use RESULTS_CSV to hard-set a path.
-# - All y-axes start at 0.
+# - All y-axes start at 0 (F1 axes are capped at 1).
 # - Panel A uses power-law fit (log-log) with R^2 annotation.
 # - F1 row (D/E/F) includes an inset zoom (default 0.80–1.00) with red indicator.
 
@@ -21,13 +21,13 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 # -----------------------------
 # (Optional) hard-set CSV path
 # -----------------------------
-RESULTS_CSV: Optional[str] = "/home/maxoud/projects/RAMS-TSAD/output/ga_runtime_20251013-172427/ga_runtime_results.csv"  # e.g. "/home/maxoud/projects/RAMS-TSAD/output/ga_runtime_20251013-172427/ga_runtime_results.csv"
+RESULTS_CSV: Optional[str] = "/home/maxoud/projects/RAMSeS/output/ga_runtime_20251024-145901/ga_runtime_results.csv"
 
 # Workloads used in the paper/experiments
 WORKLOADS: Dict[str, Tuple[int, int]] = {
-    "P= 5, G= 20":   (5, 20),
-    "P= 20, G= 100": (20, 100),
-    "P= 50, G= 500": (50, 500),
+    "P= 5, G= 10":   (5, 10),
+    "P= 50, G= 20":  (50, 20),
+    "P= 100, G= 50": (100, 50),
 }
 META_SET = ["rf", "lr", "svm"]
 MUTATIONS = [0.0, 0.05, 0.2, 0.5, 1.0]  # for ordering on the x-axis of mutation plots
@@ -37,7 +37,7 @@ P_FIX, G_FIX = 50, 10                   # default for mutation sweep; will auto-
 # Inset (zoom) config for F1 row
 # -----------------------------
 INSET_ENABLED = True
-INSET_YLIM = (0.95, 1.0)     # nominal F1 zoom band
+INSET_YLIM = (0.75, .85)     # nominal F1 zoom band
 INSET_WIDTH = "40%"           # relative to parent axes
 INSET_HEIGHT = "45%"
 INSET_LOC = "center right"     # 'upper left' | 'upper right' | 'lower left' | 'lower right'
@@ -165,7 +165,8 @@ def compute_group_stats(
         out.append(rec)
     return out
 
-def _powerlaw_fit_and_plot(ax, x, y, label=None, show_r2=True):
+# --- UPDATED: accept plot kwargs and use them (for red fit, etc.) ---
+def _powerlaw_fit_and_plot(ax, x, y, label=None, show_r2=True, **plot_kwargs):
     good = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y >= 0)
     if good.sum() < 2:
         return (np.nan, np.nan, np.nan)
@@ -173,7 +174,7 @@ def _powerlaw_fit_and_plot(ax, x, y, label=None, show_r2=True):
     a, b = np.polyfit(lx, ly, deg=1)
     xs = np.logspace(lx.min(), lx.max(), 200)
     ys = 10 ** (a * np.log10(xs) + b)
-    ax.plot(xs, ys, label=label)
+    ax.plot(xs, ys, label=label, **plot_kwargs)
 
     yhat = a * lx + b
     ss_res = np.sum((ly - yhat) ** 2)
@@ -183,6 +184,7 @@ def _powerlaw_fit_and_plot(ax, x, y, label=None, show_r2=True):
         ax.text(0.05, 0.95, f"R²={r2:.3f}", transform=ax.transAxes, ha="left", va="top")
     return (a, 10**b, r2)
 
+# --- UPDATED: allow per-series fit styling via 'fit_kwargs' (for red inset fit) ---
 def _add_inset_zoom(ax, series_list, ylims=INSET_YLIM,
                     width=INSET_WIDTH, height=INSET_HEIGHT,
                     loc=INSET_LOC, borderpad=INSET_BORDERPAD,
@@ -197,6 +199,7 @@ def _add_inset_zoom(ax, series_list, ylims=INSET_YLIM,
         - yhi: np.ndarray or None
         - kwargs: dict for matplotlib plotting (e.g., {'fmt':'o', 'linestyle':'none'})
         - fit_powerlaw: bool (optional) -> draw power-law fit (uses the same x,y)
+        - fit_kwargs: dict (optional) -> kwargs for the fit plot (e.g., {'color':'red'})
     """
     iax = inset_axes(ax, width=width, height=height, loc=loc, borderpad=borderpad)
     iax.set_xscale(ax.get_xscale())
@@ -241,7 +244,11 @@ def _add_inset_zoom(ax, series_list, ylims=INSET_YLIM,
                 iax.plot(x[good], y[good], **kwargs)
 
         if s.get("fit_powerlaw", False) and good.sum() >= 2:
-            _powerlaw_fit_and_plot(iax, x[good], y[good], show_r2=False)
+            _powerlaw_fit_and_plot(
+                iax, x[good], y[good],
+                show_r2=False,
+                **s.get("fit_kwargs", {})  # pass inset fit style (e.g., color='red')
+            )
 
     if draw_box:
         try:
@@ -289,12 +296,32 @@ def plot_runtime_and_f1_from_rows(rows: List[RunResult], out_png: str) -> None:
     y_lo   = np.array([d["median"] - d["q25"] for d in stats_A], dtype=float)
     y_hi   = np.array([d["q75"] - d["median"] for d in stats_A], dtype=float)
     axA.errorbar(x_work, y_med, yerr=[y_lo, y_hi], fmt='o', linestyle='none')
-    _powerlaw_fit_and_plot(axA, x_work, y_med, show_r2=True)
+
+    # --- RED, labeled fit so legend shows a small red line ---
+    _powerlaw_fit_and_plot(
+        axA, x_work, y_med,
+        label="Linear-time fit",
+        show_r2=True,
+        color="red"
+    )
     axA.set_xscale("log")
     axA.set_xlabel("Work (population × generations)")
     axA.set_ylabel("Runtime (s)")
     axA.set_title("A) Runtime vs Work (μ=0.2, meta=rf)")
     axA.set_ylim(bottom=0)
+
+    # Legend for A (small line sample)
+    axA.legend(
+        title="Linear time curve in red",
+        ncols=1,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.20),
+        frameon=True,
+        borderaxespad=0.0,
+        handlelength=1.0,
+        handletextpad=0.4,
+        labelspacing=0.3
+    )
 
     # Determine (P_fix, G_fix) automatically if needed
     global P_FIX, G_FIX
@@ -328,24 +355,32 @@ def plot_runtime_and_f1_from_rows(rows: List[RunResult], out_png: str) -> None:
         borderaxespad=0.0
     )
 
-    # (C) Runtime vs meta at 3 workloads (μ=0.2)
+    # (C) Runtime vs meta at 3 workloads (μ=0.2) — BAR PLOT
     x_positions = np.arange(len(WORKLOADS))
-    width = 0.25
-    offset_map = {'rf': -width, 'lr': 0.0, 'svm': width}
+    BAR_WIDTH = 0.25
+    offset_map = {'rf': -BAR_WIDTH, 'lr': 0.0, 'svm': BAR_WIDTH}
+
     for meta in META_SET:
-        xs, ys, yerr_lo, yerr_hi = [], [], [], []
+        ys, yerr_lo, yerr_hi = [], [], []
         for i, (label, (P, G)) in enumerate(WORKLOADS.items()):
             sub = [r for r in rows if r.P == P and r.G == G and r.meta == meta and abs(r.mu - 0.2) < 1e-9]
             statC = compute_group_stats(sub, key_fields=tuple(), value_selector=lambda r: r.runtime_s)
             if len(statC) == 1:
                 s = statC[0]
-                xs.append(x_positions[i] + offset_map[meta])
                 ys.append(s["median"])
-                yerr_lo.append(s["median"] - s["q25"])
-                yerr_hi.append(s["q75"] - s["median"])
+                yerr_lo.append(max(0.0, s["median"] - s["q25"]))
+                yerr_hi.append(max(0.0, s["q75"] - s["median"]))
             else:
-                xs.append(x_positions[i] + offset_map[meta]); ys.append(np.nan); yerr_lo.append(0.0); yerr_hi.append(0.0)
-        axC.errorbar(xs, ys, yerr=[yerr_lo, yerr_hi], fmt='o', label=meta)
+                ys.append(np.nan); yerr_lo.append(0.0); yerr_hi.append(0.0)
+
+        ys_arr = np.array(ys, float)
+        ys_arr[~np.isfinite(ys_arr)] = 0.0  # avoid warnings for NaN bar heights
+
+        axC.bar(
+            x_positions + offset_map[meta], ys_arr, width=BAR_WIDTH,
+            yerr=[yerr_lo, yerr_hi], capsize=3, label=meta, align='center'
+        )
+
     axC.set_xticks(x_positions, list(WORKLOADS.keys()))
     axC.set_xlabel("Workload")
     axC.set_ylabel("Runtime (s)")
@@ -368,21 +403,40 @@ def plot_runtime_and_f1_from_rows(rows: List[RunResult], out_png: str) -> None:
     ylo = np.array([d["median"] - d["q25"] for d in stats_D], float)
     yhi = np.array([d["q75"] - d["median"] for d in stats_D], float)
     axD.errorbar(xw, ym, yerr=[ylo, yhi], fmt='o', linestyle='none')
-    _powerlaw_fit_and_plot(axD, xw, ym, show_r2=True)
+
+    # --- RED, labeled fit + legend (and red inset fit) ---
+    _powerlaw_fit_and_plot(
+        axD, xw, ym,
+        label="Linear-time fit",
+        show_r2=True,
+        color="red"
+    )
     axD.set_xscale("log")
     axD.set_xlabel("Work (population × generations)")
     axD.set_ylabel("F1")
     axD.set_title("D) F1 vs Work (μ=0.2, meta=rf)")
-    axD.set_ylim(bottom=0)
+    axD.set_ylim(0, 1)  # cap at 1 for F1
     if INSET_ENABLED:
         _add_inset_zoom(
             axD,
             series_list=[{
                 "x": xw, "y": ym, "ylo": ylo, "yhi": yhi,
                 "kwargs": {"fmt": "o", "linestyle": "none"},
-                "fit_powerlaw": True
+                "fit_powerlaw": True,
+                "fit_kwargs": {"color": "red"}  # inset fit also red
             }],
         )
+    axD.legend(
+        title="Linear time curve in red",
+        ncols=1,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.20),
+        frameon=True,
+        borderaxespad=0.0,
+        handlelength=1.0,
+        handletextpad=0.4,
+        labelspacing=0.3
+    )
 
     # (E) F1 vs μ at fixed workload — one line per meta
     inset_series_E = []
@@ -404,7 +458,7 @@ def plot_runtime_and_f1_from_rows(rows: List[RunResult], out_png: str) -> None:
     axE.set_xlabel("Mutation rate (μ)")
     axE.set_ylabel("F1")
     axE.set_title(f"E) F1 vs Mutation (P={P_FIX}, G={G_FIX})")
-    axE.set_ylim(bottom=0)
+    axE.set_ylim(0, 1)  # cap at 1 for F1
     axE.legend(
         title="meta",
         ncols=3,
@@ -416,36 +470,44 @@ def plot_runtime_and_f1_from_rows(rows: List[RunResult], out_png: str) -> None:
     if INSET_ENABLED and inset_series_E:
         _add_inset_zoom(axE, series_list=inset_series_E)
 
-    # (F) F1 vs meta at 3 workloads (μ=0.2)
-    width = 0.25
-    offset_map = {'rf': -width, 'lr': 0.0, 'svm': width}
-    inset_series_F = []
+    # (F) F1 vs meta at 3 workloads (μ=0.2) — BAR PLOT (+ inset bars)
+    BAR_WIDTH = 0.25
+    offset_map = {'rf': -BAR_WIDTH, 'lr': 0.0, 'svm': BAR_WIDTH}
+    x_positions = np.arange(len(WORKLOADS))
+
+    # Keep data for inset
+    bar_Y, bar_Elo, bar_Ehi = {}, {}, {}
+
     for meta in META_SET:
-        xs, ys, yerr_lo, yerr_hi = [], [], [], []
+        ys, yerr_lo, yerr_hi = [], [], []
         for i, (label, (P, G)) in enumerate(WORKLOADS.items()):
             subF = [r for r in rows if r.P == P and r.G == G and r.meta == meta and abs(r.mu - 0.2) < 1e-9]
             statF = compute_group_stats(subF, key_fields=tuple(), value_selector=lambda r: r.best_f1)
             if len(statF) == 1:
                 s = statF[0]
-                xs.append(i + offset_map[meta]); ys.append(s["median"])
-                yerr_lo.append(s["median"] - s["q25"])
-                yerr_hi.append(s["q75"] - s["median"])
+                ys.append(s["median"])
+                yerr_lo.append(max(0.0, s["median"] - s["q25"]))
+                yerr_hi.append(max(0.0, s["q75"] - s["median"]))
             else:
-                xs.append(i + offset_map[meta]); ys.append(np.nan); yerr_lo.append(0.0); yerr_hi.append(0.0)
-        axF.errorbar(xs, ys, yerr=[yerr_lo, yerr_hi], fmt='o', label=meta)
-        if INSET_ENABLED:
-            inset_series_F.append({
-                "x": np.array(xs, float),
-                "y": np.array(ys, float),
-                "ylo": np.array(yerr_lo, float),
-                "yhi": np.array(yerr_hi, float),
-                "kwargs": {"fmt": "o"}
-            })
-    axF.set_xticks(np.arange(len(WORKLOADS)), list(WORKLOADS.keys()))
+                ys.append(np.nan); yerr_lo.append(0.0); yerr_hi.append(0.0)
+
+        ys_arr = np.array(ys, float)
+        ys_arr[~np.isfinite(ys_arr)] = 0.0
+
+        bar_Y[meta] = ys_arr
+        bar_Elo[meta] = np.array(yerr_lo, float)
+        bar_Ehi[meta] = np.array(yerr_hi, float)
+
+        axF.bar(
+            x_positions + offset_map[meta], ys_arr, width=BAR_WIDTH,
+            yerr=[bar_Elo[meta], bar_Ehi[meta]], capsize=3, label=meta, align='center'
+        )
+
+    axF.set_xticks(x_positions, list(WORKLOADS.keys()))
     axF.set_xlabel("Workload")
     axF.set_ylabel("F1")
     axF.set_title("F) F1 vs Meta at 3 Workloads (μ=0.2)")
-    axF.set_ylim(bottom=0)
+    axF.set_ylim(0, 1)  # cap at 1 for F1
     axF.legend(
         title="meta",
         ncols=3,
@@ -454,12 +516,33 @@ def plot_runtime_and_f1_from_rows(rows: List[RunResult], out_png: str) -> None:
         frameon=True,
         borderaxespad=0.0
     )
-    if INSET_ENABLED and inset_series_F:
-        iaxF = _add_inset_zoom(axF, series_list=inset_series_F)
-        iaxF.set_xticklabels([])
 
-    # Layout & save
-    plt.tight_layout(rect=[0, 0.02, 1, 1], h_pad=0.5)
+    # Inset for F: mini grouped bars
+    if INSET_ENABLED:
+        iaxF = inset_axes(axF, width=INSET_WIDTH, height=INSET_HEIGHT, loc=INSET_LOC, borderpad=INSET_BORDERPAD)
+        for meta in META_SET:
+            iaxF.bar(
+                x_positions + offset_map[meta], bar_Y[meta], width=BAR_WIDTH,
+                yerr=[bar_Elo[meta], bar_Ehi[meta]], capsize=3, align='center'
+            )
+        iaxF.set_ylim(*INSET_YLIM)
+        iaxF.set_xlim(axF.get_xlim())
+        iaxF.set_xticks([])
+        iaxF.tick_params(labelsize=INSET_TICK_FONTSIZE)
+        iaxF.grid(False)
+        try:
+            pp, p1, p2 = axF.indicate_inset_zoom(
+                iaxF, edgecolor=INSET_EDGE_COLOR, lw=INSET_EDGE_LW, alpha=INSET_EDGE_ALPHA
+            )
+            pp.set_clip_on(True); pp.set_clip_path(axF.patch)
+            for line in (p1, p2):
+                if line is not None:
+                    line.set_clip_on(True); line.set_clip_path(axF.patch)
+        except Exception:
+            pass
+
+    # Layout & save (more bottom margin to avoid legend clipping)
+    plt.tight_layout(rect=[0, 0.08, 1, 1], h_pad=0.5)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     plt.savefig(out_png, dpi=300)
     print(f"[OK] Saved figure: {out_png}")
