@@ -25,12 +25,12 @@ import matplotlib.pyplot as plt
 # -----------------------------
 
 # EXACT PATHS (as requested)
-TRAINED_MODELS_DIR = "/home/maxoud/projects/RAMS-TSAD/Mononito/trained_models/skab/1"
-DATASET_FILE       = "/home/maxoud/projects/RAMS-TSAD/Mononito/datasets/skab/1.csv"
+TRAINED_MODELS_DIR = "/home/maxoud/projects/RAMSeS/Mononito/trained_models/anomaly_archive/011_UCR_Anomaly_DISTORTEDECG1_10000_11800_12100"
+DATASET_FILE       = "/home/maxoud/projects/RAMSeS/Mononito/datasets/Anomaly_Archive/011_UCR_Anomaly_DISTORTEDECG1_10000_11800_12100.txt"
 
 # Dataset identity (we’ll stage the single CSV into a folder layout the loader expects)
-DATASET_NAME = "skab"
-ENTITY       = "1"
+DATASET_NAME = "Anomaly_Archive"
+ENTITY       = "011_UCR_Anomaly_DISTORTEDECG1_10000_11800_12100"
 
 # Preprocessing
 DOWNSAMPLING = 10
@@ -39,16 +39,16 @@ NORMALIZE    = True
 VERBOSE      = False
 
 # GA sweeps (factorized, ICDE-friendly)
-POP_SET = [1, 2, 5, 10, 20, 50, 100]
-GEN_SET = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+POP_SET = [2, 5, 10, 20, 50, 100]
+GEN_SET = [1, 2, 5, 10, 20, 50, 100, 500]
 MU_SET  = [0.0, 0.05, 0.2, 0.5, 1.0]
 META_SET = ['rf', 'lr', 'svm']
 
 # Workloads for meta comparison (label -> (P, G))
 WORKLOADS = {
-    "light (P= 5, G= 20)":  (5, 20),
-    "medium (P= 50, G= 100)": (20, 100),
-    "heavy (P= 50, G= 500)":  (50, 500),
+    "light (P= 5, G= 20)":  (5, 10),
+    "medium (P= 50, G= 100)": (50, 20),
+    "heavy (P= 50, G= 500)":  (100, 50),
 }
 
 REPEATS = 3                      # median + IQR
@@ -103,10 +103,10 @@ def stage_single_csv_for_loader(csv_file: str, out_root: str, dataset_name: str,
     """
     if not os.path.isfile(csv_file):
         raise FileNotFoundError(f"DATASET_FILE not found: {csv_file}")
-    ds_dir = os.path.join(out_root, dataset_name, entity)
+    ds_dir = os.path.join(out_root, dataset_name)
     ensure_dir(ds_dir)
-    # Copy as-is (name does not matter; loader lists all .csv in the folder)
     dst = os.path.join(ds_dir, os.path.basename(csv_file))
+
     if os.path.abspath(csv_file) != os.path.abspath(dst):
         shutil.copy2(csv_file, dst)
     log.info("Staged CSV -> %s", ds_dir)

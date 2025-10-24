@@ -451,7 +451,7 @@ def plot_scores_vs_true(data, F1_Score_list, PR_AUC_Score_list, adjusted_y_pred,
         os.makedirs(output_dir, exist_ok=True)
 
         # Save the figure
-        plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
+        # plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
         # plt.show()
 
@@ -543,7 +543,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
     if not os.path.exists(directory):
         os.makedirs(directory)
-    plt.savefig(f'{directory}/performance_plot_nigg.png')
+    #plt.savefig(f'{directory}/performance_plot_nigg.png')
     # plt.show()
 
 
@@ -679,11 +679,11 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     directory = plot_path
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(directory, f"GA_Differeneces_results_{dataset}_{entity}.txt")
-    with open(output_file, 'w') as f:
-        f.write("All Ensembles:\n")
-        f.write(f" Evaluated Ensembles: {evaluated_ensembles.keys()}\n")
-        f.write("All Differences:\n")
-        f.write(f"{misclassified_ens}")
+    #with open(output_file, 'w') as f:
+     #   f.write("All Ensembles:\n")
+      #  f.write(f" Evaluated Ensembles: {evaluated_ensembles.keys()}\n")
+       # f.write("All Differences:\n")
+        #f.write(f"{misclassified_ens}")
     ensemble_names = [name for name in evaluated_ensembles.keys()]
     f1_scores = [result[0] for result in evaluated_ensembles.values()]
     pr_auc_scores = [result[1] for result in evaluated_ensembles.values()]
@@ -712,7 +712,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
         os.makedirs(directory)
 
     # Save the figure
-    plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
+    # plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
     # plt.show()
     #
@@ -735,7 +735,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
         os.makedirs(directory)
 
     # Save the figure
-    plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
+    # plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
 
     # plt.show()
     logger.info(
@@ -746,9 +746,9 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     sorted_ensembles = sorted(evaluated_ensembles.items(), key=lambda x: x[1][2], reverse=True)
     # Save the results to a text file
 
-    with open(file_name, "w") as f:
-        for ensemble, result in sorted_ensembles:
-            f.write(f"Ensemble: {list(ensemble)}, f1 : {result[0]}, PR_AUC: {result[1]}, Fitness Score: {result[2]}\n")
+   # with open(file_name, "w") as f:
+    #    for ensemble, result in sorted_ensembles:
+     #       f.write(f"Ensemble: {list(ensemble)}, f1 : {result[0]}, PR_AUC: {result[1]}, Fitness Score: {result[2]}\n")
 
     return best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type
 
