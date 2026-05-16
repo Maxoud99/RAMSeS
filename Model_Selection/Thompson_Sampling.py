@@ -131,15 +131,36 @@ def update_posteriors(means: Dict[str, np.ndarray], covariances: Dict[str, np.nd
         logger.error(f"Shape mismatch: covariance shape {covariance.shape}, features shape {features.shape}")
         raise ValueError("Shape mismatch between covariance matrix and feature vector")
 
-    precision = np.linalg.inv(covariance)
-    old_precision = precision
-    precision += np.outer(features, features)
-    covariance = np.linalg.inv(precision)
-    mean = covariance @ (old_precision @ mean + reward * features)
+    # Sherman-Morrison rank-1 update — avoids all matrix inversions and is numerically
+    # stable for any dimension (no SVD, no ill-conditioning on high-d datasets like SMD).
+    #
+    # Given:  Sigma_new^{-1} = Sigma^{-1} + x x^T
+    # Sherman-Morrison gives Sigma_new directly:
+    #   u     = Sigma @ x
+    #   alpha = 1 + x^T u          (always > 0 because Sigma is PSD)
+    #   Sigma_new = Sigma - (u u^T) / alpha
+    #
+    # Mean update derived from the same formula:
+    #   mu_new = mu + u * (reward - x^T mu) / alpha
+    #
+    # This is mathematically identical to the double-inversion form but avoids:
+    #   (a) np.linalg.inv crashing with "SVD did not converge" on ill-conditioned matrices
+    #   (b) the reference bug where old_precision aliased precision in the previous code
 
-    covariances[model_name] = covariance
-    means[model_name] = mean.flatten()
-    logger.info(f"Updated posteriors for model {model_name}: mean = {mean.flatten()}, covariance = {covariance}")
+    x = features.flatten()
+    mu = mean.flatten()
+    Sigma = covariance
+
+    u = Sigma @ x                          # shape (d,)
+    alpha = 1.0 + float(x @ u)            # scalar, always >= 1 when Sigma is PSD
+    alpha = max(alpha, 1e-10)              # numerical safety guard
+
+    Sigma_new = Sigma - np.outer(u, u) / alpha
+    mu_new = mu + u * (reward - float(x @ mu)) / alpha
+
+    covariances[model_name] = Sigma_new
+    means[model_name] = mu_new
+    logger.info(f"Updated posteriors for model {model_name}: mean = {mu_new}, alpha = {alpha:.4f}")
 
 
 def calculate_reward(f1: float, pr_auc: float, f1_weight: float, pr_auc_weight: float) -> float:
@@ -207,7 +228,11 @@ def fit_linear_thompson_sampling(dataset,
         logger.info(f"Iteration {iteration + 1}")
         try:
             # Pass the current window as context so selection uses theta_tilde^T * x
+            # Normalise to unit length so that datasets with large sensor values
+            # (e.g. SMD with 38 channels) do not cause xxᵀ to explode and collapse Σ.
             context = data_windows[iteration].flatten()
+            context_norm = np.linalg.norm(context)
+            context = context / (context_norm + 1e-10)
             chosen_model_name = sample_model(models, means, covariances, epsilon, context)
         except ValueError as e:
             logger.error(f"Error sampling model: {e}")
@@ -236,21 +261,19 @@ def fit_linear_thompson_sampling(dataset,
 
             pr_auc = prauc(y_true, y_scores)
             reward = calculate_reward(f1, pr_auc, f1_weight, pr_auc_weight)
-            features = X_test_window.flatten()  # Convert the windowed data to a feature vector
+            # Normalise features to unit length — must match the normalisation applied
+            # to context in sample_model so that θ̃ᵀx (selection) and the posterior
+            # update operate in the same feature space.
+            features = X_test_window.flatten()
+            features = features / (np.linalg.norm(features) + 1e-10)
 
             # Log the actual and expected feature vector sizes
             logger.debug(f"Expected feature vector size: {n_features}, actual feature vector size: {features.shape[0]}")
 
-            # Check for feature vector size mismatch and handle it
             if features.shape[0] != n_features:
-                if features.shape[0] > n_features:
-                    logger.warning(
-                        f"Feature vector is larger than expected. Truncating features from {features.shape[0]} to {n_features}.")
-                    features = features[:n_features]
-                else:
-                    logger.warning(
-                        f"Feature vector shape mismatch: expected {n_features}, got {features.shape[0]}. Padding features.")
-                    features = np.pad(features, (0, n_features - features.shape[0]), 'constant')
+                raise ValueError(
+                    f"Feature vector size mismatch: expected {n_features}, got {features.shape[0]}. "
+                    "This should not happen after the n_features fix — check data shapes.")
 
             logger.debug(f"Feature vector shape after adjustment: {features.shape}")
             logger.debug(f"Covariance matrix shape: {covariances[chosen_model_name].shape}")

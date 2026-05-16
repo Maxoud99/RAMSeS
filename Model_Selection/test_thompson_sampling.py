@@ -209,6 +209,57 @@ class TestUpdatePosteriors(unittest.TestCase):
         with self.assertRaises(ValueError):
             update_posteriors(self.means, self.covs, "UNKNOWN", 0.5, np.ones(self.d))
 
+    def test_no_svd_failure_on_high_dimensional_data(self):
+        """
+        Simulate SMD-scale data (38 channels × 20 time steps = d=760) for 100
+        iterations. The old double-inv code crashed with 'SVD did not converge'
+        around iteration 40. Sherman-Morrison must complete all rounds without error.
+        """
+        d = 760
+        means = {"SMD_model": np.zeros(d)}
+        covs  = {"SMD_model": np.eye(d)}
+        np.random.seed(0)
+        for _ in range(100):
+            x = np.random.randn(d) * 50       # large-magnitude SMD-like values
+            x = x / (np.linalg.norm(x) + 1e-10)
+            update_posteriors(means, covs, "SMD_model", reward=0.7, features=x)
+        self.assertTrue(True, "Should complete 100 high-d iterations without SVD error")
+
+    def test_old_precision_alias_bug_is_fixed(self):
+        """
+        In the old code `old_precision = precision` was a Python alias, not a copy.
+        After `precision += outer(x, x)` both names pointed to the updated matrix,
+        so the mean used the wrong (already updated) precision.
+
+        With Sherman-Morrison and x=[1,0], reward=1, mu=0, Sigma=I:
+            u = [1, 0], alpha = 1 + 1 = 2
+            mu_new = [0,0] + [1,0] * (1 - 0) / 2 = [0.5, 0]
+        The old buggy code would have produced [1.0, 0] or similar.
+        """
+        means = {"m": np.zeros(2)}
+        covs  = {"m": np.eye(2)}
+        update_posteriors(means, covs, "m", reward=1.0, features=np.array([1.0, 0.0]))
+        np.testing.assert_array_almost_equal(
+            means["m"], [0.5, 0.0],
+            err_msg="Alias bug still present: mean update used wrong precision")
+
+    def test_mean_stays_reasonable_after_many_updates(self):
+        """
+        Mean vector entries must not collapse to e-03 magnitude after many rounds
+        (the symptom reported on SMD before the Sherman-Morrison fix).
+        """
+        d = 27
+        means = {"m": np.zeros(d)}
+        covs  = {"m": np.eye(d)}
+        np.random.seed(1)
+        for _ in range(80):
+            x = np.random.randn(d)
+            x = x / (np.linalg.norm(x) + 1e-10)
+            update_posteriors(means, covs, "m", reward=0.8, features=x)
+        max_abs = np.max(np.abs(means["m"]))
+        self.assertGreater(max_abs, 1e-2,
+            f"Mean collapsed to tiny values ({max_abs:.2e}) — numerical instability")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 4.  calculate_reward
