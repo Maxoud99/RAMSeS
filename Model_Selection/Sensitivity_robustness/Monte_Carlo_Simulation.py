@@ -4,6 +4,9 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from Metrics.metrics import range_based_precision_recall_f1_auc, prauc, f1_score, f1_soft_score
 from Utils.model_selection_utils import evaluate_model
+from Model_Selection.Sensitivity_robustness.surrogate_fidelity import (
+    held_out_classifier_fidelity, held_out_regressor_fidelity,
+)
 from loguru import logger
 import matplotlib.pyplot as plt
 
@@ -247,6 +250,25 @@ def _mc_data_feasible(test_data) -> bool:
     return True
 
 
+def _best_f1_and_cut(y_true: np.ndarray, y_scores: np.ndarray) -> Tuple[float, float]:
+    """Best point-wise F1 over the data-driven quantile thresholds of y_scores, and
+    the threshold (score cut) that achieves it. Returns (best_f1, best_cut); best_cut
+    is NaN if no threshold yields F1 > 0 (e.g. a degenerate/constant score)."""
+    best_f1, best_cut = 0.0, float('nan')
+    for _t in np.unique(np.quantile(y_scores, np.linspace(0.0, 1.0, 21))):
+        _f1 = f1_score((y_scores >= _t).astype(int), y_true)[0]
+        if _f1 > best_f1:
+            best_f1 = float(_f1); best_cut = float(_t)
+    return best_f1, best_cut
+
+
+def _f1_at_cut(y_true: np.ndarray, y_scores: np.ndarray, cut: float) -> float:
+    """Point-wise F1 at a FIXED score threshold `cut` (no re-optimization). NaN cut → NaN."""
+    if cut is None or np.isnan(cut):
+        return float('nan')
+    return float(f1_score((y_scores >= cut).astype(int), y_true)[0])
+
+
 def monte_carlo_noise_sweep(
     test_data, trained_models, model_names,
     noise_levels=None, repeats: int = 5, random_state: int = 0,
@@ -257,26 +279,40 @@ def monte_carlo_noise_sweep(
     repeat: add Gaussian noise (via add_noise_to_data) to a deep copy, evaluate
     every model, record the row.
 
-    Scoring uses FAST point-wise metrics (best-threshold F1 + PR-AUC), NOT the slow
-    range-based metric the production MC uses: this sweep does hundreds of
-    evaluations, and the range-based windowing metric (~30 s/call on long series)
-    would make it take many hours. The production ranking path is untouched.
+    Scoring uses FAST point-wise metrics (PR-AUC + best-F1 over data-driven quantile
+    thresholds of each trial's own score distribution), NOT the slow range-based
+    metric the production MC uses: this sweep does hundreds of evaluations, and the
+    range-based windowing metric (~30 s/call on long series) would make it take many
+    hours. The production ranking path is untouched.
 
-    evaluate_fn(model_name, level) -> (f1, pr) is injectable for tests; when given,
-    the real noising/evaluation is skipped. Per-model failures → NaN.
+    Two F1 variants are recorded per trial (PR-AUC is threshold-free, so it has only one):
+      • F1       — ADAPTIVE best threshold, re-optimized at every noise level (measures
+                   best-achievable separability vs noise).
+      • F1_fixed — FIXED operating point: each model's best threshold is chosen once at
+                   the LOWEST noise level and held constant across the sweep (measures how
+                   a committed decision threshold degrades as noise shifts the scores).
+    The grid is sorted ascending so its first level is the baseline where thresholds freeze.
 
-    Returns {noise (n=L*R,), grid_levels (L,), F1 (n×M), PR (n×M), model_names}, or
-    None when the data is too small / single-class.
+    evaluate_fn(model_name, level) -> (f1, pr[, f1_fixed]) is injectable for tests; when
+    given, real noising/evaluation is skipped (a 2-tuple sets f1_fixed = f1). Per-model
+    failures → NaN.
+
+    Returns {noise (n=L*R,), grid_levels (L,), F1 (n×M), F1_fixed (n×M), PR (n×M),
+    model_names}, or None when the data is too small / single-class.
     """
     if not _mc_data_feasible(test_data):
         return None
-    grid = np.asarray(DEFAULT_NOISE_LEVELS if noise_levels is None else noise_levels, dtype=float)
+    grid = np.sort(np.asarray(DEFAULT_NOISE_LEVELS if noise_levels is None else noise_levels, dtype=float))
     rng = np.random.RandomState(random_state)
 
     noise_col: List[float] = []
     F1: List[List[float]] = []
+    F1_fixed: List[List[float]] = []
     PR: List[List[float]] = []
+    # Per-model threshold frozen at the baseline (lowest) noise level.
+    baseline_cuts: Dict[str, float] = {}
     for i, level in enumerate(grid):
+        is_baseline = (i == 0)
         logger.info(f"MC explain sweep: noise {level:.3f} ({i + 1}/{len(grid)}), {repeats} repeats")
         for _ in range(repeats):
             noisy = None
@@ -285,38 +321,51 @@ def monte_carlo_noise_sweep(
                 noisy = copy.deepcopy(test_data)
                 noisy.entities[0].Y = add_noise_to_data(noisy.entities[0].Y, float(level))
             row_f1: List[float] = []
+            row_f1_fixed: List[float] = []
             row_pr: List[float] = []
             for m in model_names:
                 try:
                     if evaluate_fn is not None:
-                        f1v, prv = evaluate_fn(m, float(level))
+                        vals = evaluate_fn(m, float(level))
+                        f1v, prv = float(vals[0]), float(vals[1])
+                        f1_fixedv = float(vals[2]) if len(vals) > 2 else f1v
                     else:
                         model = trained_models.get(m)
                         if not model:
-                            row_f1.append(float('nan')); row_pr.append(float('nan')); continue
+                            row_f1.append(float('nan')); row_f1_fixed.append(float('nan'))
+                            row_pr.append(float('nan')); continue
                         ev = evaluate_model(noisy, model, m)
                         y_true = ev['anomaly_labels'].flatten()
                         y_scores = np.asarray(ev['entity_scores'].flatten(), dtype=float)
-                        # Fast point-wise scoring (see docstring): best-threshold F1 + PR-AUC.
+                        # Fast point-wise scoring (see docstring): PR-AUC + best-F1 over
+                        # DATA-DRIVEN quantile thresholds of THIS trial's own score
+                        # distribution (not a fixed 0.1–0.9 grid — detectors emit
+                        # un-normalised scores on different scales, and a fixed grid
+                        # would miss any whose scores saturate high (NN) or low).
                         try:
                             prv = float(prauc(y_true, y_scores))
                         except Exception:
                             prv = float('nan')
-                        f1v = 0.0
-                        for _t in np.linspace(0.1, 0.9, 9):
-                            _f1 = f1_score((y_scores >= _t).astype(int), y_true)[0]
-                            if _f1 > f1v:
-                                f1v = float(_f1)
-                    row_f1.append(float(f1v)); row_pr.append(float(prv))
+                        f1v, cut = _best_f1_and_cut(y_true, y_scores)
+                        # Freeze each model's best threshold at the baseline level, then
+                        # reuse it at every level for the fixed-operating-point F1.
+                        if is_baseline and m not in baseline_cuts:
+                            baseline_cuts[m] = cut
+                        f1_fixedv = _f1_at_cut(y_true, y_scores, baseline_cuts.get(m, float('nan')))
+                    row_f1.append(float(f1v)); row_f1_fixed.append(float(f1_fixedv))
+                    row_pr.append(float(prv))
                 except Exception as e:
                     logger.error(f"MC explain sweep: model {m} failed at noise {level}: {e}")
-                    row_f1.append(float('nan')); row_pr.append(float('nan'))
-            noise_col.append(float(level)); F1.append(row_f1); PR.append(row_pr)
+                    row_f1.append(float('nan')); row_f1_fixed.append(float('nan'))
+                    row_pr.append(float('nan'))
+            noise_col.append(float(level)); F1.append(row_f1)
+            F1_fixed.append(row_f1_fixed); PR.append(row_pr)
 
     return {
         "noise": np.asarray(noise_col, dtype=float),
         "grid_levels": grid,
         "F1": np.asarray(F1, dtype=float),
+        "F1_fixed": np.asarray(F1_fixed, dtype=float),
         "PR": np.asarray(PR, dtype=float),
         "model_names": list(model_names),
     }
@@ -444,6 +493,7 @@ def _fit_noise_winner(noise, score_matrix, model_names, max_depth: int = 3, rand
         return None, {"feasible": True,
                       "rules_text": f"Always {classes[0]} (single winner across the sweep).",
                       "win_rates": win_rates, "train_accuracy": 1.0,
+                      "cv_accuracy": 1.0, "cv_accuracy_std": 0.0, "cv_method": "n/a (single class)",
                       "classes": classes, "root_threshold": None}
     from sklearn.tree import DecisionTreeClassifier, export_text
     X = np.asarray(rows, dtype=float).reshape(-1, 1)
@@ -451,10 +501,18 @@ def _fit_noise_winner(noise, score_matrix, model_names, max_depth: int = 3, rand
     clf = DecisionTreeClassifier(max_depth=max_depth, random_state=random_state)
     clf.fit(X, y)
     acc = float(clf.score(X, y))
+    # In-sample accuracy (above) is what the exported tree/rules were fit to
+    # reproduce; it is not, by itself, evidence that the tree generalizes
+    # rather than having fit noise in this particular sweep. Report a
+    # cross-validated estimate alongside it (see surrogate_fidelity.py).
+    cv = held_out_classifier_fidelity(X, y, max_depth=max_depth, random_state=random_state)
     rules = export_text(clf, feature_names=["noise_level"])
     root_thr = float(clf.tree_.threshold[0]) if clf.tree_.node_count > 1 else None
     return clf, {"feasible": True, "rules_text": rules, "win_rates": win_rates,
-                 "train_accuracy": acc, "classes": classes, "root_threshold": root_thr}
+                 "train_accuracy": acc,
+                 "cv_accuracy": cv["cv_accuracy"], "cv_accuracy_std": cv["cv_accuracy_std"],
+                 "cv_method": cv["method"], "cv_note": cv["note"],
+                 "classes": classes, "root_threshold": root_thr}
 
 
 def train_noise_winner_surrogate(noise, score_matrix, model_names,
@@ -468,8 +526,10 @@ def train_noise_permodel_surrogates(noise, score_matrix, model_names,
                                     max_depth: int = 3, random_state: int = 0) -> Dict[str, Any]:
     """
     Per model: DecisionTreeRegressor(noise → score). Returns per model the in-sample
-    R², the trend ('robust' if Pearson corr of noise vs score ≥ 0 else 'fragile'),
-    and the regressor's predicted score at the lowest and highest swept noise.
+    R² (fit quality on the swept points), a cross-validated R² (held-out
+    generalization estimate — see surrogate_fidelity.py / Molnar 2022), the
+    trend ('robust' if Pearson corr of noise vs score ≥ 0 else 'fragile'), and
+    the regressor's predicted score at the lowest and highest swept noise.
     """
     from sklearn.tree import DecisionTreeRegressor
     noise = np.asarray(noise, dtype=float)
@@ -480,20 +540,24 @@ def train_noise_permodel_surrogates(noise, score_matrix, model_names,
         mask = ~np.isnan(col)
         if int(mask.sum()) < 2:
             out[m] = {"trend": "N/A", "corr": float('nan'), "score_low": float('nan'),
-                      "score_high": float('nan'), "r2": float('nan')}
+                      "score_high": float('nan'), "r2": float('nan'),
+                      "cv_r2": float('nan'), "cv_method": "n/a"}
             continue
         X = noise[mask].reshape(-1, 1)
         ys = col[mask]
         reg = DecisionTreeRegressor(max_depth=max_depth, random_state=random_state)
         reg.fit(X, ys)
         r2 = float(reg.score(X, ys))
+        cv = held_out_regressor_fidelity(X, ys, max_depth=max_depth, random_state=random_state)
         if np.std(noise[mask]) > 0 and np.std(ys) > 0:
             corr = float(np.corrcoef(noise[mask], ys)[0, 1])
         else:
             corr = 0.0
         out[m] = {"trend": "robust" if corr >= 0 else "fragile", "corr": corr,
                   "score_low": float(reg.predict([[lo]])[0]),
-                  "score_high": float(reg.predict([[hi]])[0]), "r2": r2}
+                  "score_high": float(reg.predict([[hi]])[0]), "r2": r2,
+                  "cv_r2": cv.get("cv_r2", float('nan')), "cv_method": cv.get("method", "n/a"),
+                  "cv_mse": cv.get("cv_mse", float('nan'))}
     return out
 
 
@@ -627,9 +691,11 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
 
     noise = sweep["noise"]; grid = sweep["grid_levels"]
     F1 = sweep["F1"]; PR = sweep["PR"]; models = sweep["model_names"]
+    F1_fixed = sweep["F1_fixed"]
 
     curves_f1 = compute_noise_curves(noise, grid, F1, models)
     curves_pr = compute_noise_curves(noise, grid, PR, models)
+    curves_f1_fixed = compute_noise_curves(noise, grid, F1_fixed, models)
     stab_f1 = compute_ranking_stability(noise, grid, F1, models)
     stab_pr = compute_ranking_stability(noise, grid, PR, models)
 
@@ -650,8 +716,10 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
     # Plots.
     plot_noise_curves(curves_f1, models, "F1", dataset, entity)
     plot_noise_curves(curves_pr, models, "PR-AUC", dataset, entity)
+    plot_noise_curves(curves_f1_fixed, models, "F1_fixed", dataset, entity)
     plot_noise_curves(curves_f1, models, "F1", dataset, entity, plain=True)
     plot_noise_curves(curves_pr, models, "PR-AUC", dataset, entity, plain=True)
+    plot_noise_curves(curves_f1_fixed, models, "F1_fixed", dataset, entity, plain=True)
     plot_ranking_stability(stab_f1, stab_pr, dataset, entity)
     plot_surrogate_tree(clf_f1, "F1", dataset, entity)
     plot_surrogate_tree(clf_pr, "PR-AUC", dataset, entity)
@@ -705,7 +773,13 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
                 f.write(f"    {surrogate_note}\n\n"); return
             if not winner.get("feasible"):
                 f.write("    not feasible (no valid trials).\n\n"); return
-            f.write(f"Train accuracy: {winner['train_accuracy']:.3f}\n")
+            f.write(f"Train accuracy (in-sample fit): {winner['train_accuracy']:.3f}\n")
+            cv_acc = winner.get("cv_accuracy", float('nan'))
+            if not np.isnan(cv_acc):
+                f.write(f"Held-out accuracy ({winner.get('cv_method', 'cv')}, "
+                        f"{winner.get('cv_accuracy_std', float('nan')):.3f} std): {cv_acc:.3f}\n")
+            elif winner.get("cv_note"):
+                f.write(f"Held-out accuracy: not estimated ({winner['cv_note']})\n")
             wr = winner["win_rates"]
             top = sorted(wr.items(), key=lambda kv: kv[1], reverse=True)
             f.write("Win rates: " + ", ".join(f"{m} {p:.2f}" for m, p in top if p > 0) + "\n")
@@ -713,31 +787,73 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
             for line in winner["rules_text"].rstrip().splitlines():
                 f.write(f"    {line}\n")
             f.write(f"\n--- Method B · per-model degradation ({metric}) ---\n")
-            f.write(f"      {'model':<12} {'trend':>8} {'score@low':>10} {'score@high':>11} {'R²':>7}\n")
-            f.write("      " + "-" * 50 + "\n")
+            f.write(f"      {'model':<12} {'trend':>8} {'score@low':>10} {'score@high':>11} "
+                    f"{'R² (train)':>11} {'R² (held-out)':>14}\n")
+            f.write("      " + "-" * 65 + "\n")
             for m in models:
                 pm = permodel.get(m, {})
                 tr = pm.get("trend", "N/A")
                 sl = pm.get("score_low", float('nan'))
                 sh = pm.get("score_high", float('nan'))
                 r2 = pm.get("r2", float('nan'))
+                cv_r2 = pm.get("cv_r2", float('nan'))
+                cv_mse = pm.get("cv_mse", float('nan'))
+                if not np.isnan(cv_r2):
+                    cv_str = f"{cv_r2:.3f}"
+                elif not np.isnan(cv_mse):
+                    cv_str = f"MSE={cv_mse:.3f}"
+                else:
+                    cv_str = "N/A"
                 f.write(f"      {m:<12} {tr:>8} "
                         f"{(f'{sl:.3f}' if not np.isnan(sl) else 'N/A'):>10} "
                         f"{(f'{sh:.3f}' if not np.isnan(sh) else 'N/A'):>11} "
-                        f"{(f'{r2:.3f}' if not np.isnan(r2) else 'N/A'):>7}\n")
+                        f"{(f'{r2:.3f}' if not np.isnan(r2) else 'N/A'):>11} "
+                        f"{cv_str:>14}\n")
+            f.write("      R² (train) is the in-sample fit; R² (held-out) is a cross-validated\n"
+                    "      estimate (see surrogate_fidelity.py) and is the number that should be\n"
+                    "      read as the surrogate's actual fidelity.\n")
             f.write("\n")
 
         _methodB(winner_f1, permodel_f1, "F1")
         _methodB(winner_pr, permodel_pr, "PR-AUC")
 
+        # ── Fixed-operating-point degradation ──────────────────────────────
+        # The F1 above (Methods A/B) RE-OPTIMIZES each model's threshold at every
+        # noise level (best-achievable separability). Here the threshold is frozen
+        # once at the lowest noise level and held fixed across the sweep — how a
+        # committed operating point actually degrades as noise shifts the scores.
+        f.write("--- Fixed-operating-point degradation (F1, threshold frozen at lowest noise) ---\n")
+        f.write("Contrast with the adaptive F1 above (threshold re-optimized at every level).\n")
+        f.write(f"      {'model':<12} {'f1@low':>8} {'f1@high(adapt)':>15} "
+                f"{'f1@high(fixed)':>15} {'masked drop':>12}\n")
+        f.write("      " + "-" * 64 + "\n")
+        ad_mean = curves_f1["per_model_mean"]
+        fx_mean = curves_f1_fixed["per_model_mean"]
+
+        def _fnum(v):
+            return f"{v:.3f}" if not np.isnan(v) else "N/A"
+
+        for mi, m in enumerate(models):
+            f_low = ad_mean[mi, 0]
+            f_hi_ad = ad_mean[mi, -1]
+            f_hi_fx = fx_mean[mi, -1]
+            masked = (f_hi_ad - f_hi_fx) if not (np.isnan(f_hi_ad) or np.isnan(f_hi_fx)) else float('nan')
+            f.write(f"      {m:<12} {_fnum(f_low):>8} {_fnum(f_hi_ad):>15} "
+                    f"{_fnum(f_hi_fx):>15} {_fnum(masked):>12}\n")
+        f.write("'masked drop' = adaptive F1 − fixed F1 at the highest noise: the "
+                "operating-point degradation the adaptive (re-optimized) view hides.\n\n")
+
         f.write("Note: Method A relates the noise level to which model leads (curves, "
                 "crossovers, win-regions, breakdown, ranking stability). Method B is a 1-D "
                 "decision tree — it formalizes the curve crossovers as explicit noise "
-                "thresholds and quantifies each model's degradation.\n")
+                "thresholds and quantifies each model's degradation. The fixed-operating-point "
+                "section instead freezes each threshold at baseline to expose committed-cutoff "
+                "robustness.\n")
 
     return {
         "sweep": sweep,
         "curves_f1": curves_f1, "curves_pr": curves_pr,
+        "curves_f1_fixed": curves_f1_fixed,
         "stability_f1": stab_f1, "stability_pr": stab_pr,
         "winner_f1": winner_f1, "winner_pr": winner_pr,
         "permodel_f1": permodel_f1, "permodel_pr": permodel_pr,

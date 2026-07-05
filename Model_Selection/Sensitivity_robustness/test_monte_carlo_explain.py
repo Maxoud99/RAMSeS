@@ -96,6 +96,44 @@ class TestSweep(unittest.TestCase):
         self.assertTrue(np.all(np.isnan(out["F1"][:, 1])))      # bad column all NaN
         self.assertFalse(np.any(np.isnan(out["F1"][:, 0])))     # good column finite
 
+    def test_f1_fixed_two_tuple_mirrors_f1(self):
+        # A 2-tuple evaluate_fn carries no fixed value → F1_fixed == F1.
+        out = mc.monte_carlo_noise_sweep(_fake_data(), {}, ["A"],
+                                         noise_levels=[0.0, 0.25], repeats=2,
+                                         evaluate_fn=lambda m, l: (0.9 - l, 0.5))
+        self.assertEqual(out["F1_fixed"].shape, out["F1"].shape)
+        self.assertTrue(np.allclose(out["F1_fixed"], out["F1"]))
+
+    def test_f1_fixed_three_tuple_used(self):
+        # A 3-tuple evaluate_fn routes its 3rd element into F1_fixed.
+        out = mc.monte_carlo_noise_sweep(_fake_data(), {}, ["A"],
+                                         noise_levels=[0.0, 0.25], repeats=1,
+                                         evaluate_fn=lambda m, l: (0.9 - l, 0.5, 0.3 - l))
+        self.assertTrue(np.allclose(out["F1"].flatten(), [0.9, 0.65]))
+        self.assertTrue(np.allclose(out["F1_fixed"].flatten(), [0.3, 0.05]))
+
+    def test_grid_sorted_ascending(self):
+        out = mc.monte_carlo_noise_sweep(_fake_data(), {}, ["A"],
+                                         noise_levels=[0.5, 0.0, 0.25], repeats=1,
+                                         evaluate_fn=lambda m, l: (0.5, 0.5))
+        self.assertTrue(np.allclose(out["grid_levels"], [0.0, 0.25, 0.5]))
+
+
+class TestFixedThresholdHelpers(unittest.TestCase):
+
+    def test_f1_at_cut_nan(self):
+        self.assertTrue(np.isnan(mc._f1_at_cut(np.array([0, 1]), np.array([0.1, 0.9]), float('nan'))))
+
+    def test_best_f1_and_cut_returns_in_range_cut(self):
+        # f1_score is mocked to a constant, so the first quantile wins; the cut must
+        # be a real score-range value (not NaN) and best_f1 the mocked constant.
+        y_true = np.array([0, 0, 1, 1])
+        y_scores = np.array([0.1, 0.4, 0.6, 0.9])
+        best_f1, cut = mc._best_f1_and_cut(y_true, y_scores)
+        self.assertFalse(np.isnan(cut))
+        self.assertTrue(y_scores.min() <= cut <= y_scores.max())
+        self.assertGreater(best_f1, 0.0)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2.  compute_noise_curves
@@ -191,6 +229,28 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
         self.assertGreater(info["train_accuracy"], 0.9)
         self.assertIsNotNone(info["root_threshold"])
         self.assertTrue(0.25 < info["root_threshold"] < 0.45)
+        # Held-out fidelity (cross-validated) must be reported alongside the
+        # in-sample train_accuracy, not just the optimistic in-sample number.
+        self.assertIn("cv_accuracy", info)
+        self.assertFalse(np.isnan(info["cv_accuracy"]))
+        self.assertGreaterEqual(info["cv_accuracy"], 0.0)
+        self.assertLessEqual(info["cv_accuracy"], 1.0)
+        # This sweep has a clean, noise-free crossover, so the surrogate should
+        # generalize almost as well as it fits in-sample.
+        self.assertGreater(info["cv_accuracy"], 0.8)
+
+    def test_permodel_surrogates_report_cv_r2(self):
+        import importlib
+        if importlib.util.find_spec("sklearn") is None:
+            self.skipTest("scikit-learn not installed")
+        models = ["A", "B"]
+        sweep = mc.monte_carlo_noise_sweep(_fake_data(), {}, models,
+                                           noise_levels=np.linspace(0.0, 0.5, 15),
+                                           repeats=6, evaluate_fn=self._flip_eval)
+        permodel = mc.train_noise_permodel_surrogates(sweep["noise"], sweep["F1"], models)
+        for m in models:
+            self.assertIn("cv_r2", permodel[m])
+            self.assertIn("cv_method", permodel[m])
 
     def test_orchestrator_writes_report_and_plots(self):
         import importlib
@@ -207,9 +267,12 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
                     explain=True, evaluate_fn=self._flip_eval,
                 )
                 self.assertIsInstance(res, dict)
-                for k in ("sweep", "curves_f1", "stability_f1", "winner_f1",
-                          "permodel_f1", "n_trials"):
+                for k in ("sweep", "curves_f1", "curves_f1_fixed", "stability_f1",
+                          "winner_f1", "permodel_f1", "n_trials"):
                     self.assertIn(k, res)
+                # F1_fixed must be present in the sweep output.
+                self.assertIn("F1_fixed", res["sweep"])
+                self.assertEqual(res["sweep"]["F1_fixed"].shape, res["sweep"]["F1"].shape)
                 # A→B crossover should be detected on the F1 curves.
                 self.assertGreaterEqual(len(res["curves_f1"]["crossovers"]), 1)
                 out = os.path.join("myresults", "robustness", "MonteCarlo", "TEST", "e1")
@@ -217,12 +280,19 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
                     "TEST_e1_MonteCarlo_explainability.txt",
                     "TEST_e1_MonteCarlo_noise_curves_F1.png",
                     "TEST_e1_MonteCarlo_noise_curves_PRAUC.png",
+                    "TEST_e1_MonteCarlo_noise_curves_F1_fixed.png",
                     "TEST_e1_MonteCarlo_noise_curves_F1_plain.png",
                     "TEST_e1_MonteCarlo_noise_curves_PRAUC_plain.png",
+                    "TEST_e1_MonteCarlo_noise_curves_F1_fixed_plain.png",
                     "TEST_e1_MonteCarlo_ranking_stability.png",
                     "TEST_e1_MonteCarlo_surrogate_tree_F1.png",
                 ):
                     self.assertTrue(os.path.exists(os.path.join(out, fname)), fname)
+                with open(os.path.join(
+                        out, "TEST_e1_MonteCarlo_explainability.txt")) as fh:
+                    report_txt = fh.read()
+                self.assertIn("Held-out accuracy", report_txt)
+                self.assertIn("R² (held-out)", report_txt)
             finally:
                 os.chdir(cwd)
 
