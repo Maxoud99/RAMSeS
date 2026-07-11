@@ -283,6 +283,7 @@ class TestExplainRankAggregationIntegration(unittest.TestCase):
                     dataset="TEST",
                     entity="e1",
                     iteration=0,
+                    explain=True,
                 )
                 self.assertIsInstance(result, dict)
                 for key in ("loo_scores", "align_scores", "borda_counts",
@@ -374,7 +375,7 @@ class TestKendallOnly(unittest.TestCase):
             os.chdir(tmpdir)
             try:
                 result = explain_rank_aggregation(
-                    sources, names, full, "final", "TEST", "e1", 5)
+                    sources, names, full, "final", "TEST", "e1", 5, explain=True)
             finally:
                 os.chdir(cwd)
         # 2 sources → the nested kendall_only result is populated.

@@ -837,7 +837,7 @@ def explain_rank_aggregation(
     dataset: str,
     entity: str,
     iteration: int,
-    explain: bool = True,
+    explain: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Compute LOO contributions, Kendall τ alignments, Borda alignments, then for

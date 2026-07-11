@@ -604,7 +604,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 
 def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, trained_models, meta_model_type,
-                      population_size, generations, mutation_rate, explain: bool = True):
+                      population_size, generations, mutation_rate, explain: bool = False):
     """
     Run the genetic algorithm to find the best ensemble of models.
 
@@ -863,12 +863,12 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
 
         explain_ga_selection(best_ensemble, evaluated_ensembles, generation_populations,
                              algorithm_list, population_size, _evaluate_fitness,
-                             dataset, entity)
+                             dataset, entity, explain=True)
 
         explain_ga_combination(best_ensemble, algorithm_list,
                                base_model_predictions_train, base_model_predictions_test,
                                y_true_train, y_true_test, meta_model_type,
-                               dataset, entity, meta_model=best_meta_model)
+                               dataset, entity, meta_model=best_meta_model, explain=True)
 
     return best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type
 
@@ -1624,7 +1624,7 @@ def explain_ga_selection(
     evaluate_fitness: Callable[[List[str]], float],
     dataset: str,
     entity: str,
-    explain: bool = True,
+    explain: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     GA-ensemble selection explainability: explain *why* each detector ended up
@@ -2056,7 +2056,7 @@ def explain_ga_combination(
     meta_model: Any = None,
     predict_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     max_explain: int = 200,
-    explain: bool = True,
+    explain: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Combination-layer explainability: attribute the best-ensemble meta-learner's

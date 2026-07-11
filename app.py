@@ -353,7 +353,7 @@ def load_trained_models(model_names, models_dir):
 # Model-Selection Pipelines
 # ------------------------------------------------------------------------------
 
-def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=True, stages=None):
+def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=False, stages=None):
     """
     One-pass model selection pipeline in the order:
       1) GA (stacking ensemble search)
@@ -682,7 +682,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     return _result()
 
 
-def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, iteration, trained_models, model_list=None, test_data_gan=None, skip_gan=False, explain=True):
+def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, iteration, trained_models, model_list=None, test_data_gan=None, skip_gan=False, explain=False):
     """
     PARALLEL VERSION: Runs model selection algorithms concurrently using ThreadPoolExecutor.
     
@@ -1160,7 +1160,7 @@ def run_app(algorithm_list, algorithm_list_instances):
     strategy = args.get('strategy', 'adaptive')  # adaptive, fixed-best, or fixed-random
     inject_online_regime = args.get('inject_online_regime', False)  # Regime shifts on online data only
     max_online_windows = args.get('max_online_windows', None)  # Limit online windows (None = no limit)
-    explain = args.get('explain', True)  # Explainability ON by default; --no_explain disables it
+    explain = args.get('explain', False)  # Explainability OFF by default; --explain enables it
     stages = set(args.get('stages', ALL_STAGES))  # Which stage-6 sub-stages to run
     is_partial = stages != ALL_STAGES  # Strict subset → partial run (stop after selected stages)
 

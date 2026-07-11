@@ -71,9 +71,9 @@ def get_args_from_cmdline():
     parser.add_argument('--skip_gan',
                         action='store_true',
                         help='Skip GAN robustness testing for faster execution (testing/debugging)')
-    parser.add_argument('--no_explain',
+    parser.add_argument('--explain',
                         action='store_true',
-                        help='Disable all explainability outputs (reports/plots). Explainability is ON by default.')
+                        help='Enable all explainability outputs (reports/plots). Explainability is OFF by default.')
     parser.add_argument('--stages',
                         type=str,
                         default='all',
@@ -125,8 +125,8 @@ def get_args_from_cmdline():
     # Skip GAN flag
     args['skip_gan'] = cmd_args.skip_gan
 
-    # Explainability is ON by default; --no_explain disables it everywhere.
-    args['explain'] = not cmd_args.no_explain
+    # Explainability is OFF by default; --explain enables it everywhere.
+    args['explain'] = cmd_args.explain
 
     # Which pipeline sub-stages to run. Normalize the comma list into a set of
     # canonical tokens; 'all' and 'robustness' are convenience groups.

@@ -4,11 +4,26 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from Metrics.metrics import range_based_precision_recall_f1_auc, prauc, f1_score, f1_soft_score
 from Utils.model_selection_utils import evaluate_model
-from Model_Selection.Sensitivity_robustness.surrogate_fidelity import (
-    held_out_classifier_fidelity, held_out_regressor_fidelity,
-)
 from loguru import logger
 import matplotlib.pyplot as plt
+
+
+def _surrogate_fidelity_module():
+    """Import surrogate_fidelity.py, tolerating standalone by-path loading of this
+    module (e.g. via importlib in test harnesses) where the Model_Selection
+    package itself may not be on sys.path — falls back to loading the sibling
+    file directly by its own location, the same trick those harnesses use."""
+    try:
+        from Model_Selection.Sensitivity_robustness import surrogate_fidelity as _sf
+        return _sf
+    except ModuleNotFoundError:
+        import importlib.util
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _spec = importlib.util.spec_from_file_location(
+            "surrogate_fidelity", os.path.join(_here, "surrogate_fidelity.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
 
 
 def add_noise_to_data(data, noise_level=0.1):
@@ -76,7 +91,7 @@ def monte_carlo_simulation(test_data, trained_models, model_names, dataset, enti
 
 
 def run_monte_carlo_simulation(test_data, trained_models, model_names, dataset, entity, n_simulations=100,
-                               noise_level=0.1, explain=True):
+                               noise_level=0.1, explain=False):
     """Run the entire Monte Carlo simulation process."""
     # Run Monte Carlo simulation
     results = monte_carlo_simulation(test_data, trained_models, model_names, dataset, entity, n_simulations,
@@ -123,7 +138,7 @@ def run_monte_carlo_simulation(test_data, trained_models, model_names, dataset, 
     # Explainability (separate, explain-only noise sweep; production ranking above is unchanged)
     if explain:
         try:
-            explain_monte_carlo(test_data, trained_models, model_names, dataset, entity)
+            explain_monte_carlo(test_data, trained_models, model_names, dataset, entity, explain=True)
         except Exception as e:
             logger.error(f"Monte Carlo explainability failed (non-fatal): {e}")
 
@@ -234,7 +249,7 @@ def save_summary(summary, dataset, entity):
 #  The production ranking (fixed noise) is untouched.
 # ════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_NOISE_LEVELS = np.linspace(0.0, 0.5, 8)
+DEFAULT_NOISE_LEVELS = np.linspace(0.0, 0.2, 20)
 
 
 def _mc_data_feasible(test_data) -> bool:
@@ -505,7 +520,8 @@ def _fit_noise_winner(noise, score_matrix, model_names, max_depth: int = 3, rand
     # reproduce; it is not, by itself, evidence that the tree generalizes
     # rather than having fit noise in this particular sweep. Report a
     # cross-validated estimate alongside it (see surrogate_fidelity.py).
-    cv = held_out_classifier_fidelity(X, y, max_depth=max_depth, random_state=random_state)
+    cv = _surrogate_fidelity_module().held_out_classifier_fidelity(
+        X, y, max_depth=max_depth, random_state=random_state)
     rules = export_text(clf, feature_names=["noise_level"])
     root_thr = float(clf.tree_.threshold[0]) if clf.tree_.node_count > 1 else None
     return clf, {"feasible": True, "rules_text": rules, "win_rates": win_rates,
@@ -548,7 +564,8 @@ def train_noise_permodel_surrogates(noise, score_matrix, model_names,
         reg = DecisionTreeRegressor(max_depth=max_depth, random_state=random_state)
         reg.fit(X, ys)
         r2 = float(reg.score(X, ys))
-        cv = held_out_regressor_fidelity(X, ys, max_depth=max_depth, random_state=random_state)
+        cv = _surrogate_fidelity_module().held_out_regressor_fidelity(
+            X, ys, max_depth=max_depth, random_state=random_state)
         if np.std(noise[mask]) > 0 and np.std(ys) > 0:
             corr = float(np.corrcoef(noise[mask], ys)[0, 1])
         else:
@@ -610,6 +627,7 @@ def plot_noise_curves(curves, model_names, metric_name, dataset, entity, plain: 
     else:
         ax.set_title(f"Monte Carlo · {metric_name} vs noise level "
                      "(shaded = win-region; ▼ = breakdown)")
+    ax.set_ylim(bottom=0)
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     ax.legend(loc="upper left", ncol=2, frameon=False, bbox_to_anchor=(1.01, 1), borderaxespad=0)
     plt.tight_layout(pad=1.2)
@@ -668,7 +686,7 @@ def plot_surrogate_tree(clf, metric_name, dataset, entity) -> None:
 
 def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
                         noise_levels=None, repeats: int = 5, random_state: int = 0,
-                        explain: bool = True,
+                        explain: bool = False,
                         evaluate_fn: Optional[Callable[[str, float], Tuple[float, float]]] = None,
                         ) -> Optional[Dict[str, Any]]:
     """

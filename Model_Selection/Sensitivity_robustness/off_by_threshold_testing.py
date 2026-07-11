@@ -9,7 +9,24 @@ from loguru import logger
 
 from Metrics.metrics import range_based_precision_recall_f1_auc
 from Utils.model_selection_utils import evaluate_model
-from Model_Selection.Sensitivity_robustness.surrogate_fidelity import held_out_classifier_fidelity
+
+
+def _surrogate_fidelity_module():
+    """Import surrogate_fidelity.py, tolerating standalone by-path loading of this
+    module (e.g. via importlib in test harnesses) where the Model_Selection
+    package itself may not be on sys.path — falls back to loading the sibling
+    file directly by its own location, the same trick those harnesses use."""
+    try:
+        from Model_Selection.Sensitivity_robustness import surrogate_fidelity as _sf
+        return _sf
+    except ModuleNotFoundError:
+        import importlib.util
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _spec = importlib.util.spec_from_file_location(
+            "surrogate_fidelity", os.path.join(_here, "surrogate_fidelity.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
 
 
 def intersperse_borderline_normal_points(data, labels, factor, min_scale=0.95, max_scale=1.05,
@@ -116,7 +133,7 @@ def intersperse_borderline_normal_points(data, labels, factor, min_scale=0.95, m
 
 
 
-def run_off_by_threshold(test_data, trained_models, model_names, dataset, entity, explain=True):
+def run_off_by_threshold(test_data, trained_models, model_names, dataset, entity, explain=False):
     # Validation: Check if data is too small for off-by-threshold testing
     data = test_data.entities[0].Y
     labels = test_data.entities[0].labels
@@ -226,7 +243,7 @@ def run_off_by_threshold(test_data, trained_models, model_names, dataset, entity
     if explain:
         try:
             explain_off_by_threshold(point_records, adjusted_y_pred_dict, true_values,
-                                     ranked_by_f1_names, model_names, dataset, entity)
+                                     ranked_by_f1_names, model_names, dataset, entity, explain=True)
         except Exception as e:
             logger.error(f"Off-by-threshold explainability failed (non-fatal): {e}")
 
@@ -290,7 +307,7 @@ def plot_data_with_injected_points(original_data, augmented_data, injected_norma
 # decision tree explains the winner's *exclusive wins* — the injected borderline
 # points the winner classified correctly and that competitor did not — in terms
 # of the point's intrinsic properties. Reuses the production run's predictions;
-# no extra model evaluations. Gated by `explain` (opt-out via --no_explain).
+# no extra model evaluations. Gated by `explain` (opt-in via --explain).
 # ════════════════════════════════════════════════════════════════════════════
 
 OFFBY_FEATURE_NAMES = ["boundary_distance", "is_anomaly", "local_volatility", "position"]
@@ -415,7 +432,8 @@ def train_offby_point_surrogates(table, winner, max_depth: int = 3,
         # cross-validated fidelity estimate (see surrogate_fidelity.py,
         # grounded in Molnar 2022's point that surrogate fidelity should be
         # assessed as a held-out property, not read off the training fit).
-        cv = held_out_classifier_fidelity(X, y_int, max_depth=max_depth, random_state=random_state)
+        cv = _surrogate_fidelity_module().held_out_classifier_fidelity(
+            X, y_int, max_depth=max_depth, random_state=random_state)
         per_competitor[k] = {
             "degenerate": False, "clf": clf, "feature_importances": importances,
             "train_accuracy": float(clf.score(X, y_int)),
@@ -484,7 +502,7 @@ def plot_offby_point_importance(per_competitor, dataset, entity, feature_names) 
 
 
 def explain_off_by_threshold(point_records, adjusted_y_pred_dict, true_labels, ranked_f1_names,
-                             model_names, dataset, entity, explain: bool = True) -> Optional[Dict[str, Any]]:
+                             model_names, dataset, entity, explain: bool = False) -> Optional[Dict[str, Any]]:
     """
     Off-by-threshold explainability orchestrator (explain-only). Builds the per-point
     table from the production run, picks the F1 winner, fits per-competitor exclusive-win

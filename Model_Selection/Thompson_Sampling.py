@@ -440,7 +440,7 @@ def fit_linear_thompson_sampling(dataset,
                                  initial_epsilon: float = 0.2,
                                  epsilon_decay: float = 0.99, f1_weight: float = 0.7, pr_auc_weight: float = 0.3,
                                  iterations: int = 100,
-                                 explain: bool = True) -> Tuple[
+                                 explain: bool = False) -> Tuple[
     Dict[str, np.ndarray], Dict[str, np.ndarray], List[Dict[str, float]]]:
     """
     Fit models using Linear Thompson Sampling.
@@ -1504,7 +1504,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset, entity, iterations, iteration,
                                  initial_epsilon=0.2, epsilon_decay=0.99, f1_weight=0.5, pr_auc_weight=0.5,
-                                 explain=True):
+                                 explain=False):
     """
     Run the entire Linear Thompson Sampling process.
 

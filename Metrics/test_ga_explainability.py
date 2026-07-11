@@ -72,7 +72,7 @@ from Metrics.Ensemble_GA import (
     explain_ga_selection,
     compute_meta_shap,
     compute_meta_pfi,
-    borda_aggregate_importances,
+    markov_aggregate_importances,
     explain_ga_combination,
 )
 from Metrics.Ensemble_GA import _assign_archetype, ARCHETYPE_ORDER, _competition_ranks
@@ -237,60 +237,53 @@ class TestArchetypes(unittest.TestCase):
                     'e_absent': float('nan'), 'n_present': 0, 'n_absent': 0}
                 for d, v in contribs.items()}
 
-    @staticmethod
-    def _fh(htotals, feasible=True):
-        return {"H_total": htotals, "H_two_way": {}, "feasible": feasible}
-
-    def test_all_eight_cells_unique(self):
-        # Every (U, C, S) high/low cell maps to its own 3-letter H/L code.
+    def test_all_four_cells_unique(self):
+        # Every (U, S) high/low cell maps to its own 2-letter H/L code.
+        # (Complementarity axis is disabled.)
         from itertools import product
-        codes = {(u, c, s): _assign_archetype(u, c, s, util_nan=False)
-                 for u, c, s in product([True, False], repeat=3)}
-        self.assertEqual(len(set(codes.values())), 8)          # 8 cells, 8 codes
-        # Codes are the (U,C,S) levels as H/L.
-        self.assertEqual(codes[(True, True, True)], "HHH")
-        self.assertEqual(codes[(False, True, True)], "LHH")
-        self.assertEqual(codes[(True, False, True)], "HLH")
-        self.assertEqual(codes[(False, False, False)], "LLL")
+        codes = {(u, s): _assign_archetype(u, s, util_nan=False)
+                 for u, s in product([True, False], repeat=2)}
+        self.assertEqual(len(set(codes.values())), 4)          # 4 cells, 4 codes
+        # Codes are the (U,S) levels as H/L.
+        self.assertEqual(codes[(True, True)], "HH")
+        self.assertEqual(codes[(False, True)], "LH")
+        self.assertEqual(codes[(True, False)], "HL")
+        self.assertEqual(codes[(False, False)], "LL")
         # NaN utility short-circuits to Unclassified.
-        self.assertEqual(_assign_archetype(True, True, True, util_nan=True), "Unclassified")
-        # ARCHETYPE_ORDER = the 8 codes + Unclassified, no duplicates.
-        self.assertEqual(len(ARCHETYPE_ORDER), 9)
-        self.assertEqual(len(set(ARCHETYPE_ORDER)), 9)
+        self.assertEqual(_assign_archetype(True, True, util_nan=True), "Unclassified")
+        # ARCHETYPE_ORDER = the 4 codes + Unclassified, no duplicates.
+        self.assertEqual(len(ARCHETYPE_ORDER), 5)
+        self.assertEqual(len(set(ARCHETYPE_ORDER)), 5)
         self.assertEqual(set(codes.values()), set(ARCHETYPE_ORDER) - {"Unclassified"})
 
     def test_core_support_marginal(self):
-        # Absolute scheme has independent cutoffs (util>0, H>0.1, surv>0.5), so the
-        # three target cells can be realised simultaneously.
+        # Absolute scheme has independent cutoffs (util>0, surv>0.5).
         algos = ["A", "B", "C"]
         mm = self._mm({"A": 0.5, "B": -0.1, "C": -0.2})
-        fh = self._fh({"A": 0.5, "B": 0.9, "C": 0.05})
         surv = {"A": [0.6, 0.7, 0.8], "B": [0.6, 0.7, 0.8], "C": [0.1, 0.1, 0.1]}
-        arch = classify_detector_archetypes(mm, fh, surv, algos)
-        # A = (H,H,H) → HHH ; B = (L,H,H) → LHH ; C = (L,L,L) → LLL.
-        self.assertEqual(arch["A"]["absolute"]["archetype"], "HHH")
-        self.assertEqual(arch["B"]["absolute"]["archetype"], "LHH")
-        self.assertEqual(arch["C"]["absolute"]["archetype"], "LLL")
+        arch = classify_detector_archetypes(mm, surv, algos)
+        # A = (H,H) → HH ; B = (L,H) → LH ; C = (L,L) → LL.
+        self.assertEqual(arch["A"]["absolute"]["archetype"], "HH")
+        self.assertEqual(arch["B"]["absolute"]["archetype"], "LH")
+        self.assertEqual(arch["C"]["absolute"]["archetype"], "LL")
 
     def test_stability_uses_mean_only_not_trend(self):
         # High mean survival (0.6 > 0.5) but DECLINING trend — stability depends
         # only on the mean now, so s_high is True despite the downward trend.
         algos = ["D"]
         mm = self._mm({"D": 0.5})       # util > 0  → H
-        fh = self._fh({"D": 0.05})      # H_j < 0.1 → L
         surv = {"D": [0.9, 0.6, 0.3]}   # mean 0.6 > 0.5 → S high; trend −0.6
-        arch = classify_detector_archetypes(mm, fh, surv, algos)
+        arch = classify_detector_archetypes(mm, surv, algos)
         self.assertTrue(arch["D"]["absolute"]["s_high"])
-        # (H, L, H) → HLH; trend still reported for context.
-        self.assertEqual(arch["D"]["absolute"]["archetype"], "HLH")
+        # (H, H) → HH; trend still reported for context.
+        self.assertEqual(arch["D"]["absolute"]["archetype"], "HH")
         self.assertAlmostEqual(arch["D"]["stability_trend"], -0.6)
 
     def test_unclassified_on_nan_utility(self):
         algos = ["A", "B"]
         mm = self._mm({"A": float("nan"), "B": 0.3})
-        fh = self._fh({"A": 0.5, "B": 0.5})
         surv = {"A": [0.8, 0.8], "B": [0.8, 0.8]}
-        arch = classify_detector_archetypes(mm, fh, surv, algos)
+        arch = classify_detector_archetypes(mm, surv, algos)
         self.assertEqual(arch["A"]["relative"]["archetype"], "Unclassified")
         self.assertEqual(arch["A"]["absolute"]["archetype"], "Unclassified")
 
@@ -299,16 +292,15 @@ class TestArchetypes(unittest.TestCase):
         # (relative → low) → the two schemes disagree for at least one detector.
         algos = ["A", "B", "C"]
         mm = self._mm({"A": 0.2, "B": 0.3, "C": 0.4})
-        fh = self._fh({"A": 0.05, "B": 0.05, "C": 0.05})
         surv = {"A": [0.1, 0.1, 0.1], "B": [0.1, 0.1, 0.1], "C": [0.1, 0.1, 0.1]}
-        arch = classify_detector_archetypes(mm, fh, surv, algos)
+        arch = classify_detector_archetypes(mm, surv, algos)
         differ = any(arch[d]["relative"]["archetype"] != arch[d]["absolute"]["archetype"]
                      for d in algos)
         self.assertTrue(differ)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 6.  Combination layer — SHAP + PFI + Borda
+# 6.  Combination layer — SHAP + PFI + Markov
 # ════════════════════════════════════════════════════════════════════════════
 
 class TestCombination(unittest.TestCase):
@@ -364,16 +356,19 @@ class TestCombination(unittest.TestCase):
         self.assertGreater(pfi["info"], 0.1)
         self.assertLess(abs(pfi["noise"]), 0.05)
 
-    def test_borda_aggregates_two_rankings(self):
+    def test_markov_aggregates_rankings(self):
         feats = ["A", "B", "C"]
         shap = {"A": 0.9, "B": 0.5, "C": 0.1}   # A > B > C
         pfi = {"A": 0.8, "B": 0.1, "C": 0.4}    # A > C > B
-        borda, final = borda_aggregate_importances({"SHAP": shap, "PFI": pfi}, feats)
-        self.assertEqual(final[0], "A")          # wins both → top
-        # A: (2)+(2)=4 ; B: (1)+(0)=1 ; C: (0)+(1)=1
-        self.assertAlmostEqual(borda["A"], 4.0)
-        self.assertAlmostEqual(borda["B"], 1.0)
-        self.assertAlmostEqual(borda["C"], 1.0)
+        scores, final = markov_aggregate_importances({"SHAP": shap, "PFI": pfi}, feats)
+        self.assertEqual(final[0], "A")                       # wins both → top
+        self.assertEqual(scores["A"], max(scores.values()))  # highest stationary prob
+        self.assertAlmostEqual(sum(scores.values()), 1.0)    # π is a distribution
+
+    def test_markov_single_feature(self):
+        scores, final = markov_aggregate_importances({"SHAP": {"only": 0.5}}, ["only"])
+        self.assertEqual(final, ["only"])
+        self.assertAlmostEqual(scores["only"], 1.0)
 
     def test_competition_ranks_share_rank_on_ties(self):
         # B and C tie (1 pt each), D and E tie (3 pts each).
@@ -429,11 +424,11 @@ class TestCombination(unittest.TestCase):
                 result = explain_ga_combination(
                     best_ensemble, algorithm_list, Xtr, Xte, ytr, yte,
                     meta_model_type="rf", dataset="TEST", entity="e1",
-                    predict_fn=predict_fn,
+                    predict_fn=predict_fn, explain=True,
                 )
                 self.assertIsInstance(result, dict)
                 for key in ("feature_names", "shap_importance", "shap_signed_importance",
-                            "pfi_importance", "borda_points", "final_ranking",
+                            "pfi_importance", "markov_scores", "final_ranking",
                             "baseline_f1", "model_source"):
                     self.assertIn(key, result)
                 self.assertEqual(result["feature_names"], ["A", "C"])
@@ -485,25 +480,30 @@ class TestExplainGASelection(unittest.TestCase):
                     best_ensemble, ee, gen_pops, algorithm_list,
                     population_size=4,
                     evaluate_fitness=evaluate_fitness,
-                    dataset="TEST", entity="e1",
+                    dataset="TEST", entity="e1", explain=True,
                 )
                 self.assertIsInstance(result, dict)
                 for key in ("best_ensemble", "lofo", "mean_marginal",
-                            "friedman_h", "H_two_way", "H_total", "survival",
+                            "survival",
                             "archetypes", "n_subsets_evaluated", "n_generations"):
                     self.assertIn(key, result)
                 # Old interaction keys must be gone.
                 self.assertNotIn("interaction", result)
                 self.assertNotIn("e_single", result)
+                # Complementarity (Friedman H) axis is disabled — its keys are gone.
+                self.assertNotIn("friedman_h", result)
+                self.assertNotIn("H_two_way", result)
+                self.assertNotIn("H_total", result)
 
                 out = os.path.join("myresults", "GA_Ens", "TEST", "e1")
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_explainability_TEST_e1.txt")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_utility_TEST_e1.png")))
-                self.assertTrue(os.path.exists(
+                # Complementarity (Friedman H) plots are disabled — must NOT be written.
+                self.assertFalse(os.path.exists(
                     os.path.join(out, "ga_selection_interaction_TEST_e1.png")))
-                self.assertTrue(os.path.exists(
+                self.assertFalse(os.path.exists(
                     os.path.join(out, "ga_selection_total_interaction_TEST_e1.png")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_survival_TEST_e1.png")))
