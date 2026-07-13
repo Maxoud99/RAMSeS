@@ -74,6 +74,17 @@ def get_args_from_cmdline():
     parser.add_argument('--explain',
                         action='store_true',
                         help='Enable all explainability outputs (reports/plots). Explainability is OFF by default.')
+    parser.add_argument('--llm_model',
+                        type=str,
+                        default=None,
+                        help='Model for the automatic LLM narration after an --explain run '
+                             '(default: qwen2.5:7b-instruct). Narration is skipped with a '
+                             'warning if no local LLM server is reachable.')
+    parser.add_argument('--llm_base_url',
+                        type=str,
+                        default=None,
+                        help='OpenAI-compatible base URL for LLM narration '
+                             '(default: http://localhost:11434/v1, i.e. Ollama).')
     parser.add_argument('--stages',
                         type=str,
                         default='all',
@@ -127,6 +138,9 @@ def get_args_from_cmdline():
 
     # Explainability is OFF by default; --explain enables it everywhere.
     args['explain'] = cmd_args.explain
+    # LLM narration overrides (None → Explainability.llm defaults in app.py).
+    args['llm_model'] = cmd_args.llm_model
+    args['llm_base_url'] = cmd_args.llm_base_url
 
     # Which pipeline sub-stages to run. Normalize the comma list into a set of
     # canonical tokens; 'all' and 'robustness' are convenience groups.

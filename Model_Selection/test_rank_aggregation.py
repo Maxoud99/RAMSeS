@@ -200,7 +200,7 @@ class TestBordaVerdictPerSource(unittest.TestCase):
         loo   = {"hi_loo": 0.9, "lo_loo": 0.1, "tied": 0.5}
         align = {"hi_loo": 0.1, "lo_loo": 0.9, "tied": 0.5}
         verdicts = {v["source"]: v for v in borda_verdict_per_source(loo, align)}
-        self.assertEqual(verdicts["hi_loo"]["pattern"], "influential_outlier")
+        self.assertEqual(verdicts["hi_loo"]["pattern"], "influential_disagreer")
         self.assertEqual(verdicts["lo_loo"]["pattern"], "redundant_agreer")
         self.assertEqual(verdicts["tied"]["pattern"], "consistent")
 
@@ -297,6 +297,13 @@ class TestExplainRankAggregationIntegration(unittest.TestCase):
                     os.path.join(out_dir, "aggregation_explainability_robust_0.png")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out_dir, "aggregation_explainability_robust_0.txt")))
+                # Intermediate Representation JSON is emitted alongside.
+                import json
+                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                                       "ir_rank_aggregation_robust_0.json")
+                self.assertTrue(os.path.exists(ir_path), ir_path)
+                with open(ir_path) as fh:
+                    self.assertEqual(json.load(fh)["stage"], "rank_aggregation_robust")
             finally:
                 os.chdir(cwd_before)
 
@@ -376,6 +383,16 @@ class TestKendallOnly(unittest.TestCase):
             try:
                 result = explain_rank_aggregation(
                     sources, names, full, "final", "TEST", "e1", 5, explain=True)
+                # Intermediate Representation JSON with the kendall-only block.
+                import json
+                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                                       "ir_rank_aggregation_final_5.json")
+                self.assertTrue(os.path.exists(ir_path), ir_path)
+                with open(ir_path) as fh:
+                    ir_doc = json.load(fh)
+                self.assertEqual(ir_doc["stage"], "rank_aggregation_final")
+                self.assertIn("ra_final.kendall_only.winner",
+                              [a["id"] for a in ir_doc["evidence"]])
             finally:
                 os.chdir(cwd)
         # 2 sources → the nested kendall_only result is populated.

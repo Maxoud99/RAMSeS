@@ -106,6 +106,18 @@ def held_out_regressor_fidelity(X, y, max_depth: int = 3, random_state: int = 0,
                 "n_splits": 0, "method": "n/a",
                 "note": f"too few samples (n={n}) for any held-out estimate."}
 
+    # Guard the force_finite family only: a target constant up to float noise
+    # (scores are bounded metrics, so a spread below 1e-8 is numerical jitter,
+    # not signal) makes per-fold SS_tot ~ 0, and R^2 either explodes to
+    # astronomically negative values or is silently forced to 0.0/1.0 by
+    # sklearn. Ordinary negative R^2 on varying targets is informative and
+    # passes through untouched.
+    if float(np.ptp(y)) < 1e-8:
+        return {"feasible": True, "cv_r2": float("nan"), "cv_r2_std": float("nan"),
+                "n_splits": 0, "method": "constant_target",
+                "note": "target is (near-)constant across the sweep; held-out "
+                        "R^2 is undefined (no variance to explain)."}
+
     from sklearn.model_selection import KFold, LeaveOneOut, cross_val_score
     from sklearn.tree import DecisionTreeRegressor
 

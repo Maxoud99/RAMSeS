@@ -29,6 +29,21 @@ def _surrogate_fidelity_module():
         return _mod
 
 
+def _ir_module():
+    """Import Explainability.ir with the same standalone-tolerant fallback."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+
+
 def intersperse_borderline_normal_points(data, labels, factor, min_scale=0.95, max_scale=1.05,
                                          return_records=False):
     """
@@ -588,6 +603,17 @@ def explain_off_by_threshold(point_records, adjusted_y_pred_dict, true_labels, r
                 f.write(f"Across competitors, the winner's edge is best explained by: "
                         f"{top[0]} (mean importance {top[1]:.2f}).\n")
 
-    return {"table": table, "winner": winner, "runnerup": runnerup,
-            "surrogates": res, "n_points": table["n_points"]}
+    result = {"table": table, "winner": winner, "runnerup": runnerup,
+              "surrogates": res, "n_points": table["n_points"]}
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        _ir.write_stage_ir(
+            _ir.build_off_by_ir(dataset, entity, result, ranked_f1_names),
+            dataset, entity, "ir_off_by")
+    except Exception as e:
+        logger.error(f"Off-by-threshold IR emission failed (non-fatal): {e}")
+
+    return result
 

@@ -232,6 +232,15 @@ class TestOrchestrator(unittest.TestCase):
                 with open(os.path.join(out, "TEST_e1_off_by_explainability.txt")) as fh:
                     report_txt = fh.read()
                 self.assertIn("held-out accuracy", report_txt.lower())
+                # Intermediate Representation JSON is emitted alongside.
+                import json
+                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                                       "ir_off_by.json")
+                self.assertTrue(os.path.exists(ir_path), ir_path)
+                with open(ir_path) as fh:
+                    ir_doc = json.load(fh)
+                self.assertEqual(ir_doc["stage"], "off_by_threshold")
+                self.assertEqual(ir_doc["output"]["winner"], "A")
             finally:
                 os.chdir(cwd)
 

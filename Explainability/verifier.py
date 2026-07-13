@@ -1,0 +1,366 @@
+"""
+Atom-matching faithfulness verifier for LLM-generated explanation narratives.
+
+A narrative is faithful to its Intermediate Representation (IR) when every
+checkable claim it makes is grounded in an atom, and every REQUIRED atom is
+conveyed. Two rates are reported (the thesis metrics):
+
+  * hallucination_rate — checkable claims in the narrative (numbers and
+    detector-like entity names) that match NO atom, divided by all checkable
+    claims. Numbers that only match after re-rounding to `rounded_decimals`
+    are counted separately as `rounded_matches` and are NOT hallucinations by
+    default (the system prompt demands verbatim copies; re-rounding is a
+    fidelity wobble worth reporting, not an invented fact).
+  * omission_rate — atoms listed in the IR's `required_atom_ids` whose content
+    (an identifying entity and, when the atom carries numbers, at least one of
+    its numbers) does not appear in the narrative, divided by the number of
+    required atoms.
+
+Sentence-scoped attribution (v2): beyond global set membership, every number
+in a sentence that names ≥1 detector must be supported by an atom whose
+SUBJECT is one of the named detectors (or by a stage-level atom). A number
+that exists in the IR but belongs to none of the sentence's detectors is a
+`misattributed_number` and counts toward the hallucination rate — it is a
+factually wrong statement built from individually-true values. Archetype
+phrases ("high utility", "low stability") are checked the same way against
+the named detectors' archetype enums, but land in a separate
+`attribution_warnings` channel (sentence-level enum checks can false-positive
+on contrast sentences), not in the headline rate.
+
+Known limitation: when a sentence names BOTH detectors of a swapped value
+pair ("A and B scored x and y respectively", values exchanged), the union
+over named subjects still covers both numbers and the swap is not caught.
+
+Purely mechanical: regex number extraction + a detector-name token pattern +
+set membership against values harvested from the IR. stdlib-only.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# A number not embedded in an identifier (rejects the "1"s in "LOF_1" and
+# "machine-1-6") while still matching at sentence-final punctuation
+# ("gap 0.287." → 0.287): no word char/hyphen/dot before; no word char/hyphen
+# after; a trailing dot is fine unless it starts more digits.
+_NUM_RE = re.compile(r"(?<![\w.\-])[-+]?\d+(?:\.\d+)?%?(?![\w\-])(?!\.\d)")
+# Detector-like tokens: e.g. LOF_1, CBLOF_4, NN_3, XYZ_9.
+_ENTITY_RE = re.compile(r"\b[A-Za-z]+(?:_\d+)+\b")
+# Sentence boundary: terminal punctuation followed by whitespace. Decimal
+# points are never followed by whitespace, so numbers survive intact.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# Archetype phrase halves, e.g. "high utility" / "low stability".
+_UTIL_RE = re.compile(r"\b(high|low)[-\s]utility\b")
+_STAB_RE = re.compile(r"\b(high|low)[-\s]stability\b")
+
+
+def extract_numbers(text: str) -> List[Tuple[str, float]]:
+    """All number tokens in `text` as (raw_token, float). '%' is stripped for
+    the float but kept in the raw token."""
+    out: List[Tuple[str, float]] = []
+    for m in _NUM_RE.finditer(text or ""):
+        raw = m.group(0)
+        try:
+            out.append((raw, float(raw.rstrip("%"))))
+        except ValueError:
+            continue
+    return out
+
+
+def _walk_strings_and_numbers(obj: Any, numbers: Set[float], strings: Set[str]) -> None:
+    """Recursively harvest floats/ints and strings from any JSON-like object."""
+    if isinstance(obj, bool):
+        return
+    if isinstance(obj, (int, float)):
+        try:
+            numbers.add(float(obj))
+        except (TypeError, ValueError):
+            pass
+        return
+    if isinstance(obj, str):
+        strings.add(obj)
+        for _, v in extract_numbers(obj):
+            numbers.add(v)
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            strings.add(str(k))
+            _walk_strings_and_numbers(v, numbers, strings)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            _walk_strings_and_numbers(v, numbers, strings)
+
+
+def _strip_presentation(obj: Any) -> Any:
+    """Drop atom presentation keys (`order`) before harvesting so layout
+    integers never enter the allowed-number sets."""
+    if isinstance(obj, dict):
+        return {k: _strip_presentation(v) for k, v in obj.items() if k != "order"}
+    if isinstance(obj, list):
+        return [_strip_presentation(v) for v in obj]
+    return obj
+
+
+def _harvest_allowed(ir_doc: Dict[str, Any]) -> Tuple[Set[float], Set[str]]:
+    """
+    Allowed-number set and known-entity vocabulary from an IR document.
+    Works for both stage envelopes (output/evidence/caveats) and the global IR
+    (decision/stages/stage_agreement/caveats) — everything except the
+    bookkeeping keys is walked.
+    """
+    numbers: Set[float] = set()
+    strings: Set[str] = set()
+    for key, val in ir_doc.items():
+        if key in ("ir_version", "required_atom_ids"):
+            continue
+        _walk_strings_and_numbers(_strip_presentation(val), numbers, strings)
+
+    vocab: Set[str] = set()
+    for s in strings:
+        for tok in _ENTITY_RE.findall(s):
+            vocab.add(tok.lower())
+        # Short plain identifiers used as subjects / ranking entries (e.g. "A").
+        if s and re.fullmatch(r"[A-Za-z][\w\-]*", s):
+            vocab.add(s.lower())
+    return numbers, vocab
+
+
+def _number_supported(value: float, allowed: Set[float],
+                      rounded_decimals: int) -> Tuple[bool, bool]:
+    """(exact_match, rounded_match) of a narrative number against the allowed set."""
+    for a in allowed:
+        if value == a:
+            return True, False
+    r = round(value, rounded_decimals)
+    for a in allowed:
+        if r == round(a, rounded_decimals):
+            return False, True
+    return False, False
+
+
+def _word_present(text_lower: str, token: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(token.lower())}(?!\w)", text_lower) is not None
+
+
+# ── Sentence-scoped attribution (v2) ─────────────────────────────────────────
+
+def _per_subject_allowed(ir_doc: Dict[str, Any]) -> Tuple[
+        Dict[str, Set[float]], Set[float], Dict[str, str]]:
+    """
+    Split the IR's numbers by ownership: numbers from atoms whose subject is a
+    detector-like token belong to that subject; everything else (output block,
+    caveats, confidence, non-detector atoms) is stage-level and allowed in any
+    sentence. Also collects each detector's archetype enum where present
+    (atom type 'archetype' with a string value, or any dict value carrying an
+    'archetype' code such as the ga_selection member cards).
+    """
+    subject_numbers: Dict[str, Set[float]] = {}
+    stage_numbers: Set[float] = set()
+    archetype_by_subject: Dict[str, str] = {}
+
+    for key, val in ir_doc.items():
+        if key in ("ir_version", "required_atom_ids", "evidence"):
+            continue
+        nums: Set[float] = set()
+        strs: Set[str] = set()
+        _walk_strings_and_numbers(_strip_presentation(val), nums, strs)
+        stage_numbers |= nums
+
+    for atom in ir_doc.get("evidence", []):
+        nums, strs = set(), set()
+        _walk_strings_and_numbers(_strip_presentation(atom), nums, strs)
+        subj = str(atom.get("subject", ""))
+        if _ENTITY_RE.fullmatch(subj):
+            subject_numbers.setdefault(subj.lower(), set()).update(nums)
+            value = atom.get("value")
+            code = None
+            if atom.get("type") == "archetype" and isinstance(value, str):
+                code = value
+            elif isinstance(value, dict) and isinstance(value.get("archetype"), str):
+                code = value["archetype"]
+            if code and len(code) == 2 and set(code) <= {"H", "L"}:
+                archetype_by_subject[subj.lower()] = code
+        else:
+            stage_numbers |= nums
+    return subject_numbers, stage_numbers, archetype_by_subject
+
+
+def _attribution_checks(text: str, subject_numbers: Dict[str, Set[float]],
+                        stage_numbers: Set[float],
+                        archetype_by_subject: Dict[str, str],
+                        allowed_numbers: Set[float],
+                        rounded_decimals: int) -> Tuple[List[Dict[str, Any]],
+                                                        List[Dict[str, Any]]]:
+    """
+    Per sentence: numbers must belong to a named detector (union over all
+    detectors the sentence names) or be stage-level → `misattributed`;
+    archetype phrases must match at least one named detector's enum letter →
+    `warnings`. Sentences naming no known detector are skipped (the global
+    membership check already covered them).
+    """
+    misattributed: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    for sentence in _SENT_SPLIT_RE.split(text or ""):
+        if not sentence.strip():
+            continue
+        sent_lower = sentence.lower()
+        named = sorted({t.lower() for t in _ENTITY_RE.findall(sentence)}
+                       & set(subject_numbers))
+        if named:
+            local: Set[float] = set(stage_numbers)
+            for e in named:
+                local |= subject_numbers[e]
+            for raw, value in extract_numbers(sentence):
+                g_exact, g_rounded = _number_supported(value, allowed_numbers,
+                                                       rounded_decimals)
+                if not g_exact and not g_rounded:
+                    continue  # already an unsupported number (hallucination)
+                l_exact, l_rounded = _number_supported(value, local,
+                                                       rounded_decimals)
+                if l_exact:
+                    continue
+                # A rounded-only local match is accepted UNLESS the exact
+                # value is owned by a detector the sentence does not name —
+                # exact ownership elsewhere trumps a rounding coincidence
+                # (2-decimal rounding easily collides for values near 0.01).
+                exact_elsewhere = any(
+                    value in nums for subj, nums in subject_numbers.items()
+                    if subj not in named)
+                if l_rounded and not exact_elsewhere:
+                    continue
+                misattributed.append({"number": raw, "subjects": named,
+                                      "sentence": sentence.strip()})
+        arch_named = [e for e in named if e in archetype_by_subject] if named else []
+        if arch_named:
+            claimed_util = {m.group(1)[0].upper()
+                            for m in _UTIL_RE.finditer(sent_lower)}
+            claimed_stab = {m.group(1)[0].upper()
+                            for m in _STAB_RE.finditer(sent_lower)}
+            for e in arch_named:
+                code = archetype_by_subject[e]
+                if claimed_util and code[0] not in claimed_util:
+                    warnings.append({"subject": e, "aspect": "utility",
+                                     "claimed": sorted(claimed_util),
+                                     "actual": code[0],
+                                     "sentence": sentence.strip()})
+                if claimed_stab and code[1] not in claimed_stab:
+                    warnings.append({"subject": e, "aspect": "stability",
+                                     "claimed": sorted(claimed_stab),
+                                     "actual": code[1],
+                                     "sentence": sentence.strip()})
+    return misattributed, warnings
+
+
+def _atom_covered(atom: Dict[str, Any], narrative: str, narrative_lower: str,
+                  allowed_narrative_numbers: List[float],
+                  rounded_decimals: int) -> bool:
+    """
+    A required atom is conveyed when an identifying entity from the atom
+    appears in the narrative and, if the atom's canonical text carries numbers,
+    at least one of those numbers appears (exact or re-rounded).
+    """
+    atom_numbers = {v for _, v in extract_numbers(str(atom.get("text", "")))}
+
+    candidates: Set[str] = set()
+    subj = str(atom.get("subject", ""))
+    if subj and re.fullmatch(r"[A-Za-z][\w\-]*", subj):
+        candidates.add(subj)
+    for tok in _ENTITY_RE.findall(str(atom.get("text", ""))):
+        candidates.add(tok)
+    val_numbers: Set[float] = set()
+    val_strings: Set[str] = set()
+    _walk_strings_and_numbers(atom.get("value"), val_numbers, val_strings)
+    for s in val_strings:
+        if s and re.fullmatch(r"[A-Za-z][\w\-]*", s):
+            candidates.add(s)
+
+    entity_hit = (not candidates) or any(_word_present(narrative_lower, c)
+                                         for c in candidates)
+    if not atom_numbers:
+        return entity_hit
+    number_hit = False
+    for n in atom_numbers:
+        for got in allowed_narrative_numbers:
+            if got == n or round(got, rounded_decimals) == round(n, rounded_decimals):
+                number_hit = True
+                break
+        if number_hit:
+            break
+    return entity_hit and number_hit
+
+
+def verify_narrative(text: str, ir_doc: Dict[str, Any],
+                     rounded_decimals: int = 2) -> Dict[str, Any]:
+    """
+    Verify a generated stage narrative against its IR document. Returns the
+    faithfulness metrics described in the module docstring plus the detail
+    lists needed to inspect individual failures.
+    """
+    text = text or ""
+    text_lower = text.lower()
+    allowed_numbers, vocab = _harvest_allowed(ir_doc)
+
+    # ── Number claims ────────────────────────────────────────────────────────
+    number_claims = extract_numbers(text)
+    unsupported_numbers: List[str] = []
+    rounded_matches: List[str] = []
+    for raw, value in number_claims:
+        exact, rounded = _number_supported(value, allowed_numbers, rounded_decimals)
+        if exact:
+            continue
+        if rounded:
+            rounded_matches.append(raw)
+        else:
+            unsupported_numbers.append(raw)
+
+    # ── Entity claims ────────────────────────────────────────────────────────
+    entity_claims = _ENTITY_RE.findall(text)
+    unsupported_entities = sorted({t for t in entity_claims if t.lower() not in vocab})
+
+    # ── Sentence-scoped attribution (v2) ─────────────────────────────────────
+    subject_numbers, stage_numbers, archetype_by_subject = _per_subject_allowed(ir_doc)
+    misattributed_numbers, attribution_warnings = _attribution_checks(
+        text, subject_numbers, stage_numbers, archetype_by_subject,
+        allowed_numbers, rounded_decimals)
+
+    # ── Omissions ────────────────────────────────────────────────────────────
+    required_ids = list(ir_doc.get("required_atom_ids", []))
+    atoms_by_id = {a.get("id"): a for a in ir_doc.get("evidence", [])}
+    narrative_numbers = [v for _, v in number_claims]
+    missing_required: List[str] = []
+    for rid in required_ids:
+        atom = atoms_by_id.get(rid)
+        if atom is None or not _atom_covered(atom, text, text_lower,
+                                             narrative_numbers, rounded_decimals):
+            missing_required.append(rid)
+
+    n_claims = len(number_claims) + len(entity_claims)
+    n_unsupported = (len(unsupported_numbers) + len(unsupported_entities)
+                     + len(misattributed_numbers))
+    return {
+        "n_required": len(required_ids),
+        "missing_required_ids": missing_required,
+        "omission_rate": (len(missing_required) / len(required_ids)
+                          if required_ids else 0.0),
+        "n_number_claims": len(number_claims),
+        "unsupported_numbers": unsupported_numbers,
+        "n_rounded_matches": len(rounded_matches),
+        "rounded_matches": rounded_matches,
+        "n_entity_claims": len(entity_claims),
+        "unsupported_entities": unsupported_entities,
+        "misattributed_numbers": misattributed_numbers,
+        "n_misattributed": len(misattributed_numbers),
+        "attribution_warnings": attribution_warnings,
+        "n_attribution_warnings": len(attribution_warnings),
+        "n_claims": n_claims,
+        "hallucination_rate": (n_unsupported / n_claims) if n_claims else 0.0,
+    }
+
+
+def verify_global(text: str, global_ir: Dict[str, Any],
+                  rounded_decimals: int = 2) -> Dict[str, Any]:
+    """Verify the global narrative: same mechanics; the global IR carries no
+    required_atom_ids, so only hallucination metrics are meaningful."""
+    return verify_narrative(text, global_ir, rounded_decimals=rounded_decimals)

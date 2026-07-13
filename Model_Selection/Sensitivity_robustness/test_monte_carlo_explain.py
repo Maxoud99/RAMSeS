@@ -252,6 +252,23 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
             self.assertIn("cv_r2", permodel[m])
             self.assertIn("cv_method", permodel[m])
 
+    def test_constant_target_cv_r2_guarded(self):
+        """A flat curve (constant up to float noise) must report cv_r2 as NaN
+        with the constant_target method — never an astronomically negative
+        R^2 from a near-zero-variance fold. The guard fires before the
+        sklearn import, so this test needs no sklearn."""
+        sf = mc._surrogate_fidelity_module()
+        X = np.linspace(0.0, 0.2, 20).reshape(-1, 1)
+        y = np.full(20, 0.618)
+        out = sf.held_out_regressor_fidelity(X, y)
+        self.assertTrue(np.isnan(out["cv_r2"]))
+        self.assertEqual(out["method"], "constant_target")
+        self.assertIn("constant", out["note"])
+        # Jitter below the 1e-8 tolerance is still "constant".
+        y_jit = y + np.random.RandomState(0).uniform(-1e-10, 1e-10, 20)
+        self.assertEqual(sf.held_out_regressor_fidelity(X, y_jit)["method"],
+                         "constant_target")
+
     def test_orchestrator_writes_report_and_plots(self):
         import importlib
         if importlib.util.find_spec("sklearn") is None:
@@ -288,6 +305,14 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
                     "TEST_e1_MonteCarlo_surrogate_tree_F1.png",
                 ):
                     self.assertTrue(os.path.exists(os.path.join(out, fname)), fname)
+                # Intermediate Representation JSON is emitted alongside.
+                import json
+                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                                       "ir_monte_carlo.json")
+                self.assertTrue(os.path.exists(ir_path), ir_path)
+                with open(ir_path) as fh:
+                    ir_doc = json.load(fh)
+                self.assertEqual(ir_doc["stage"], "monte_carlo")
                 with open(os.path.join(
                         out, "TEST_e1_MonteCarlo_explainability.txt")) as fh:
                     report_txt = fh.read()

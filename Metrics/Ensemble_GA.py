@@ -13,6 +13,24 @@ from sklearn.svm import SVC
 from Metrics.metrics import prauc, f1_score
 from Utils.model_selection_utils import evaluate_model
 
+
+def _ir_module():
+    """Import Explainability.ir, tolerating standalone by-path loading of this
+    module where the package root is not on sys.path — falls back to loading
+    ir.py directly by its file location."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+
+
 def initialize_population(algorithm_list, population_size):
     """
     Initialize the population for the genetic algorithm.
@@ -1765,7 +1783,7 @@ def explain_ga_selection(
             summary = ", ".join(f"{nm}: {ct}" for nm, ct in ordered)
             f.write(f"\n  Tally [{scheme}]: {summary}\n")
 
-    return {
+    result = {
         "best_ensemble": list(best_ensemble),
         "lofo": lofo,
         "mean_marginal": mean_marginal,
@@ -1775,6 +1793,16 @@ def explain_ga_selection(
         "n_subsets_evaluated": n_subsets,
         "n_generations": n_generations,
     }
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        _ir.write_stage_ir(_ir.build_ga_selection_ir(dataset, entity, result),
+                           dataset, entity, "ir_ga_selection")
+    except Exception as e:
+        logger.error(f"GA selection IR emission failed (non-fatal): {e}")
+
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2200,7 +2228,7 @@ def explain_ga_combination(
                 "(stationary distribution over the three methods' pairwise preferences) merges the "
                 "rankings; π is each detector's stationary probability (higher = stronger consensus).\n")
 
-    return {
+    result = {
         "best_ensemble": list(best_ensemble),
         "feature_names": feature_names,
         "meta_model_type": meta_model_type,
@@ -2212,3 +2240,13 @@ def explain_ga_combination(
         "markov_scores": markov_scores,
         "final_ranking": final_ranking,
     }
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        _ir.write_stage_ir(_ir.build_ga_combination_ir(dataset, entity, result),
+                           dataset, entity, "ir_ga_combination")
+    except Exception as e:
+        logger.error(f"GA combination IR emission failed (non-fatal): {e}")
+
+    return result

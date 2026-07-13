@@ -438,6 +438,13 @@ class TestCombination(unittest.TestCase):
                     out, "ga_combination_explainability_TEST_e1.txt")))
                 self.assertTrue(os.path.exists(os.path.join(
                     out, "ga_combination_importance_TEST_e1.png")))
+                # Intermediate Representation JSON is emitted alongside.
+                import json
+                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                                       "ir_ga_combination.json")
+                self.assertTrue(os.path.exists(ir_path), ir_path)
+                with open(ir_path) as fh:
+                    self.assertEqual(json.load(fh)["stage"], "ga_combination")
             finally:
                 os.chdir(cwd)
 
@@ -503,6 +510,15 @@ class TestExplainGASelection(unittest.TestCase):
                 # Complementarity (Friedman H) plots are disabled — must NOT be written.
                 self.assertFalse(os.path.exists(
                     os.path.join(out, "ga_selection_interaction_TEST_e1.png")))
+                # Intermediate Representation JSON is emitted alongside.
+                import json
+                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                                       "ir_ga_selection.json")
+                self.assertTrue(os.path.exists(ir_path), ir_path)
+                with open(ir_path) as fh:
+                    ir_doc = json.load(fh)
+                self.assertEqual(ir_doc["stage"], "ga_selection")
+                self.assertNotIn("complementarity", json.dumps(ir_doc).lower())
                 self.assertFalse(os.path.exists(
                     os.path.join(out, "ga_selection_total_interaction_TEST_e1.png")))
                 self.assertTrue(os.path.exists(

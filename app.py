@@ -58,6 +58,12 @@ algorithm_list_instances = [
 # stages + their explainability, then stops before rank aggregation).
 ALL_STAGES = {"ga", "thompson", "gan", "offby", "montecarlo"}
 
+# Iteration tag of the OFFLINE model-selection run. The offline pipeline and its
+# artifacts (rank-aggregation reports, explanation IRs, narration) all use this
+# value; the CLI --iteration arg is the window-sizing parameter, a different
+# concept that must not leak into these filenames.
+OFFLINE_ITERATION = 0
+
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
@@ -1344,7 +1350,7 @@ def run_app(algorithm_list, algorithm_list_instances):
             (best_thompson, robust_agg, full_aggregated, best_ensemble,
              individual_predictions, base_model_predictions_train, base_model_predictions_test,
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_2(
-                train_data, test_data_new, dataset, entity, iteration=0,
+                train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
                 trained_models=trained_models, model_list=loaded_model_names,
                 test_data_gan=test_data_before, explain=explain
             )
@@ -1354,7 +1360,7 @@ def run_app(algorithm_list, algorithm_list_instances):
             (best_thompson, robust_agg, full_aggregated, best_ensemble,
              individual_predictions, base_model_predictions_train, base_model_predictions_test,
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_1(
-                train_data, test_data_new, dataset, entity, iteration=0,
+                train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
                 model_list=loaded_model_names, test_data_gan=test_data_before, explain=explain,
                 stages=stages
             )
@@ -1498,6 +1504,56 @@ def run_app(algorithm_list, algorithm_list_instances):
         # Get memory dict from extra_results
         memory_dict = extra_results.get('memory', None)
         
+        # Global Intermediate Representation: combine the per-stage IR JSONs with
+        # the decision context (grounded LLM input; non-fatal). Runs BEFORE the
+        # comprehensive results are written so the LLM layer's runtime and
+        # memory land in the report like every other pipeline module.
+        if explain:
+            explain_mem_before = get_memory_usage_mb()
+            explain_start = time.time()
+            try:
+                from Explainability.ir import assemble_global_ir
+                ir_path = assemble_global_ir(results_dict, dataset, entity, OFFLINE_ITERATION)
+                logger.info(f"✓ Global explanation IR written to: {ir_path}")
+            except Exception as e:
+                logger.error(f"Global IR assembly failed (non-fatal): {e}")
+
+            # LLM narration over the IR files (non-fatal; skipped with a hint when
+            # no local LLM server is reachable). Regenerable any time via
+            # `python -m Explainability.narrate`.
+            try:
+                from Explainability.llm import (DEFAULT_BASE_URL, DEFAULT_MODEL,
+                                                LLMClient, narrate_entity)
+                llm_client = LLMClient(
+                    base_url=args.get('llm_base_url') or DEFAULT_BASE_URL,
+                    model=args.get('llm_model') or DEFAULT_MODEL)
+                logger.info(f"📝 Generating LLM narratives ({llm_client.model})...")
+                nl_report = narrate_entity(dataset, entity, OFFLINE_ITERATION, llm_client)
+                ov = nl_report['overall']
+                logger.info(f"✓ LLM narratives written "
+                            f"(hallucination {ov['hallucination_rate']:.3f}, "
+                            f"omission {ov['omission_rate']:.3f}): "
+                            f"{nl_report['faithfulness_txt']}")
+            except ConnectionError as e:
+                logger.warning(f"LLM narration skipped — {e}")
+            except Exception as e:
+                logger.error(f"LLM narration failed (non-fatal): {e}")
+
+            explain_mem_after = get_memory_usage_mb()
+            timing_dict['modules']['7_LLM_Explainability'] = time.time() - explain_start
+            if memory_dict is not None:
+                memory_dict.setdefault('modules', {})['7_LLM_Explainability'] = {
+                    'before': explain_mem_before,
+                    'after': explain_mem_after,
+                    'delta': explain_mem_after - explain_mem_before,
+                }
+                # The narration ran after the algorithms' final/peak snapshot;
+                # refresh so the report reflects the whole pipeline.
+                memory_dict['final'] = get_memory_usage_mb()
+                memory_dict['peak'] = get_peak_memory_mb()
+            e2e_time = time.time() - e2e_start_time
+            timing_dict['total'] = e2e_time
+
         logger.info("📝 STAGE 7/7: Writing Comprehensive Results...")
         # Write comprehensive results
         comp_results_dir = f"myresults/comprehensive/{dataset}/{entity}/"

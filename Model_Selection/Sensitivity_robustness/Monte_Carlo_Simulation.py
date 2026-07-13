@@ -26,6 +26,21 @@ def _surrogate_fidelity_module():
         return _mod
 
 
+def _ir_module():
+    """Import Explainability.ir with the same standalone-tolerant fallback."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+
+
 def add_noise_to_data(data, noise_level=0.1):
     """Add Gaussian noise to the data."""
     noise = noise_level * np.random.normal(size=data.shape)
@@ -138,7 +153,9 @@ def run_monte_carlo_simulation(test_data, trained_models, model_names, dataset, 
     # Explainability (separate, explain-only noise sweep; production ranking above is unchanged)
     if explain:
         try:
-            explain_monte_carlo(test_data, trained_models, model_names, dataset, entity, explain=True)
+            explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
+                                explain=True,
+                                production_rankings=(ranked_models_F1, ranked_models_PR))
         except Exception as e:
             logger.error(f"Monte Carlo explainability failed (non-fatal): {e}")
 
@@ -524,7 +541,14 @@ def _fit_noise_winner(noise, score_matrix, model_names, max_depth: int = 3, rand
         X, y, max_depth=max_depth, random_state=random_state)
     rules = export_text(clf, feature_names=["noise_level"])
     root_thr = float(clf.tree_.threshold[0]) if clf.tree_.node_count > 1 else None
-    return clf, {"feasible": True, "rules_text": rules, "win_rates": win_rates,
+    # Structured (machine-readable) rules for the IR layer; non-fatal if the
+    # Explainability package is unavailable in a stripped-down environment.
+    try:
+        rules_structured = _ir_module().tree_to_rules(clf, ["noise_level"])
+    except Exception:
+        rules_structured = []
+    return clf, {"feasible": True, "rules_text": rules, "rules": rules_structured,
+                 "win_rates": win_rates,
                  "train_accuracy": acc,
                  "cv_accuracy": cv["cv_accuracy"], "cv_accuracy_std": cv["cv_accuracy_std"],
                  "cv_method": cv["method"], "cv_note": cv["note"],
@@ -688,6 +712,7 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
                         noise_levels=None, repeats: int = 5, random_state: int = 0,
                         explain: bool = False,
                         evaluate_fn: Optional[Callable[[str, float], Tuple[float, float]]] = None,
+                        production_rankings: Optional[Tuple[List[str], List[str]]] = None,
                         ) -> Optional[Dict[str, Any]]:
     """
     Monte Carlo robustness explainability: sweep the test's `noise_level`, then
@@ -868,7 +893,7 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
                 "section instead freezes each threshold at baseline to expose committed-cutoff "
                 "robustness.\n")
 
-    return {
+    result = {
         "sweep": sweep,
         "curves_f1": curves_f1, "curves_pr": curves_pr,
         "curves_f1_fixed": curves_f1_fixed,
@@ -877,3 +902,15 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
         "permodel_f1": permodel_f1, "permodel_pr": permodel_pr,
         "n_trials": n_trials,
     }
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        ranked_f1, ranked_pr = production_rankings if production_rankings else (None, None)
+        _ir.write_stage_ir(
+            _ir.build_monte_carlo_ir(dataset, entity, result, ranked_f1, ranked_pr),
+            dataset, entity, "ir_monte_carlo")
+    except Exception as e:
+        logger.error(f"Monte Carlo IR emission failed (non-fatal): {e}")
+
+    return result

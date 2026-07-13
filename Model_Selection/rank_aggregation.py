@@ -416,6 +416,23 @@ def enhanced_markov_chain_rank_aggregator_text(rankings: List[List[str]], base_s
 #    • Borda alignment (default arbiter for every source)
 # ════════════════════════════════════════════════════════════════════════════
 
+def _ir_module():
+    """Import Explainability.ir, tolerating standalone by-path loading of this
+    module where the package root is not on sys.path — falls back to loading
+    ir.py directly by its file location."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+
+
 def kendall_tau_restricted(a: List[str], b: List[str]) -> float:
     """
     Kendall's tau in [-1, 1] between two rankings, restricted to the common set
@@ -589,7 +606,7 @@ def borda_verdict_per_source(
         borda_count, borda_rank, pattern, lo_align_rank_delta
 
     'pattern' is descriptive:
-        'influential_outlier' — LOO rank ≪ alignment rank (high LOO, low Kendall)
+        'influential_disagreer' — LOO rank ≪ alignment rank (high LOO, low Kendall)
         'redundant_agreer'    — LOO rank ≫ alignment rank (low LOO, high Kendall)
         'consistent'          — LOO and alignment ranks agree
     """
@@ -605,7 +622,7 @@ def borda_verdict_per_source(
         ar = align_rank[name]
         delta = abs(lr - ar)
         if lr < ar:
-            pattern = "influential_outlier"   # high LOO, lower alignment
+            pattern = "influential_disagreer"   # high LOO, lower alignment
         elif lr > ar:
             pattern = "redundant_agreer"      # lower LOO, higher alignment
         else:
@@ -935,7 +952,7 @@ def explain_rank_aggregation(
         kendall_only = explain_rank_aggregation_kendall_only(
             rankings, source_names, full_ranking, stage_name, dataset, entity, iteration)
 
-    return {
+    result = {
         "loo_scores": loo,
         "align_scores": align,
         "borda_counts": borda_counts,
@@ -943,6 +960,23 @@ def explain_rank_aggregation(
         "prominent_contradictions": prominent,
         "kendall_only": kendall_only,
     }
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        source_top_picks = {
+            name: (rankings[i][0] if rankings[i] else "not_available")
+            for i, name in enumerate(source_names)
+        }
+        ir_doc = _ir.build_rank_aggregation_ir(
+            dataset, entity, stage_name, iteration, result,
+            source_names, source_top_picks, full_ranking)
+        _ir.write_stage_ir(ir_doc, dataset, entity,
+                           f"ir_rank_aggregation_{stage_name}_{iteration}")
+    except Exception as e:
+        logger.error(f"Rank-aggregation IR emission failed (non-fatal): {e}")
+
+    return result
 
 
 def enhanced_markov_chain_rank_aggregator_text_old(rankings: List[List[str]]) -> Tuple[float, List[str]]:

@@ -17,6 +17,23 @@ from Metrics.Ensemble_GA import evaluate_model_consistently
 from Metrics.metrics import prauc, f1_score
 
 
+def _ir_module():
+    """Import Explainability.ir, tolerating standalone by-path loading of this
+    module where the package root is not on sys.path — falls back to loading
+    ir.py directly by its file location."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+
+
 def initialize_sliding_windows(data: np.ndarray, targets: np.ndarray, mask: np.ndarray, window_size: int,
                                step_size: int) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], int]:
     """
@@ -1300,6 +1317,72 @@ def explain_thompson_sampling(
     first_dom = max(set(_valid_doms), key=_valid_doms.count) if _valid_doms else 'N/A'
     regime_segments = reconstruct_regime_segments(regime_shifts, T, fallback_model=first_dom)
 
+    # Per-regime story blocks: regime-mean expected rewards (from the recorded
+    # pre-update beliefs), the leader's SHAP channels on the regime-aggregated
+    # context, and the leader-vs-runner-up preference decomposition. Computed
+    # ONCE here and consumed by BOTH the report below and the Intermediate
+    # Representation, so the two always match.
+    regimes_data: List[Dict[str, Any]] = []
+    try:
+        all_ctx = (shap_payload or {}).get("all_contexts") or []
+        base_ctx = (shap_payload or {}).get("baseline_context")
+        n_ch = int((shap_payload or {}).get("n_channels", 0) or 0)
+        for seg_idx, (seg_s, seg_e, seg_m, seg_dur) in enumerate(regime_segments):
+            seg_end = min(int(seg_e), T - 1)
+            seg_start = max(int(seg_s), 0)
+            reg_rewards: Dict[str, float] = {}
+            for m in model_list:
+                hist = pre_expected_rewards_history.get(m, [])
+                vals = [hist[t] for t in range(seg_start, seg_end + 1)
+                        if t < len(hist) and hist[t] is not None and not np.isnan(hist[t])]
+                if vals:
+                    reg_rewards[m] = float(np.mean(vals))
+            top3 = sorted(reg_rewards.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            gap = (top3[0][1] - top3[1][1]) if len(top3) >= 2 else float('nan')
+            leader = seg_m if seg_m in means else (top3[0][0] if top3 else None)
+            runner = next((m for m, _ in top3 if m != leader), None)
+
+            # Channel contributions are split by SIGN before truncation: a
+            # magnitude-sorted signed list invites "driven by" phrasings whose
+            # top entries actually push the other way. Top-3 per direction.
+            def _split_by_sign(vals: np.ndarray) -> Tuple[list, list]:
+                pos = [(int(c), float(vals[c])) for c in np.argsort(vals)[::-1]
+                       if vals[c] > 0][:3]
+                neg = [(int(c), float(vals[c])) for c in np.argsort(vals)
+                       if vals[c] < 0][:3]
+                return pos, neg
+
+            shap_raising = shap_lowering = None
+            pref_favor_leader = pref_favor_runner = None
+            pref_gap = float('nan')
+            if leader is not None and n_ch > 0 and len(all_ctx) > seg_end:
+                ctx_reg = np.mean([np.asarray(all_ctx[t], dtype=float)
+                                   for t in range(seg_start, seg_end + 1)], axis=0)
+                mu_l = means[leader].flatten()
+                pc_l = aggregate_shap_per_channel(
+                    compute_shap_values(mu_l, ctx_reg, base_ctx), n_ch)
+                shap_raising, shap_lowering = _split_by_sign(pc_l)
+                if runner is not None and runner in means:
+                    mu_r = means[runner].flatten()
+                    pc_r = aggregate_shap_per_channel(
+                        compute_shap_values(mu_r, ctx_reg, base_ctx), n_ch)
+                    delta = pc_l - pc_r
+                    pref_gap = float(np.dot(mu_l - mu_r, ctx_reg))
+                    pref_favor_leader, pref_favor_runner = _split_by_sign(delta)
+
+            regimes_data.append({
+                "index": seg_idx, "start": seg_start, "end": seg_end,
+                "duration": int(seg_dur), "leader": leader,
+                "rewards_top": top3, "reward_gap": gap, "runner_up": runner,
+                "shap_raising": shap_raising, "shap_lowering": shap_lowering,
+                "pref_favor_leader": pref_favor_leader,
+                "pref_favor_runner": pref_favor_runner,
+                "pref_gap": pref_gap,
+            })
+    except Exception as e:
+        logger.error(f"Thompson per-regime computation failed (non-fatal): {e}")
+        regimes_data = []
+
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(directory, f'explainability_{iterations}.txt')
@@ -1342,6 +1425,40 @@ def explain_thompson_sampling(
                 f.write(f"  {b}\n")
         else:
             f.write("No blips detected.\n")
+
+        f.write("\n--- Per-Regime Expected Rewards & SHAP ---\n")
+        f.write("(Mean E[reward] over each regime's windows from the recorded pre-update\n")
+        f.write(" beliefs; SHAP attributes the FINAL posterior means on the regime's\n")
+        f.write(" aggregated context. Matches the Intermediate Representation.)\n")
+        if not regimes_data:
+            f.write("Not available.\n")
+        for r in regimes_data:
+            f.write(f"\nRegime {r['index']}: windows {r['start']}-{r['end']} "
+                    f"({r['duration']} windows), led by {r['leader']}\n")
+            if r["rewards_top"]:
+                rw = ", ".join(f"{m} {v:+.4f}" for m, v in r["rewards_top"])
+                gap_s = (f";  leader-vs-runner-up mean-reward gap {r['reward_gap']:+.4f}"
+                         if not np.isnan(r["reward_gap"]) else "")
+                f.write(f"  Mean E[reward]: {rw}{gap_s}\n")
+            if r["shap_raising"] or r["shap_lowering"]:
+                raise_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["shap_raising"] or [])) or "none"
+                lower_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["shap_lowering"] or [])) or "none"
+                f.write(f"  Channels raising {r['leader']}'s E[reward]: {raise_s}\n")
+                f.write(f"  Channels lowering {r['leader']}'s E[reward]: {lower_s}\n")
+            has_pref = r["pref_favor_leader"] or r["pref_favor_runner"]
+            if has_pref and r["runner_up"] and not np.isnan(r["pref_gap"]):
+                favored = r["leader"] if r["pref_gap"] >= 0 else r["runner_up"]
+                fl = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["pref_favor_leader"] or [])) or "none"
+                fr = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["pref_favor_runner"] or [])) or "none"
+                f.write(f"  Preference {r['leader']} vs {r['runner_up']}: linear "
+                        f"preference score at the regime-average context favors "
+                        f"{favored} by {abs(r['pref_gap']):.4f}\n")
+                f.write(f"    channels favoring {r['leader']}: {fl}\n")
+                f.write(f"    channels favoring {r['runner_up']}: {fr}\n")
 
         f.write("\n--- Selection State Summary ---\n")
         state_order = ["random", "exploitation", "informed_exploration"]
@@ -1409,6 +1526,23 @@ def explain_thompson_sampling(
             f.write(f"  {rank:>4}  {m:>12}  {score:>12.6f}  {peak_scores.get(m, 0.0):>12.6f}\n")
 
     print(f"Explainability report saved to {output_file}")
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    # Reuses regimes_data computed above — the report and the IR always match.
+    try:
+        _ir = _ir_module()
+        ir_doc = _ir.build_thompson_ir(
+            dataset, entity, n_windows=T,
+            final_ranking=ranking,
+            regimes=regimes_data,
+            shifts=regime_shifts,
+            blip_count=len(blip_windows),
+            state_fractions={s: state_counts[s] / state_total for s in state_counts},
+            final_state=selection_states[-1] if selection_states else "not_available",
+        )
+        _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson")
+    except Exception as e:
+        logger.error(f"Thompson IR emission failed (non-fatal): {e}")
 
 
 def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity, iterations, F1_Score_list_ind_curent,
