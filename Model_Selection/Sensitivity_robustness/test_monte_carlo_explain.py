@@ -269,6 +269,24 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
         self.assertEqual(sf.held_out_regressor_fidelity(X, y_jit)["method"],
                          "constant_target")
 
+    def test_mostly_flat_target_scored_per_fold(self):
+        """A mostly-flat curve (global spread > 1e-8, but some folds' test
+        points all on the flat part) must yield a finite cv_r2 via the
+        per-fold force_finite convention — never an astronomical negative."""
+        import importlib
+        if importlib.util.find_spec("sklearn") is None:
+            self.skipTest("scikit-learn not installed")
+        sf = mc._surrogate_fidelity_module()
+        X = np.linspace(0.0, 0.2, 20).reshape(-1, 1)
+        y = np.full(20, 0.022) + np.random.RandomState(1).uniform(-1e-12, 1e-12, 20)
+        y[3] = 0.024
+        y[15] = 0.020
+        out = sf.held_out_regressor_fidelity(X, y)
+        self.assertEqual(out["method"], "kfold")
+        self.assertTrue(np.isfinite(out["cv_r2"]))
+        self.assertGreaterEqual(out["cv_r2"], -100.0)
+        self.assertIn("force_finite", out["note"])
+
     def test_orchestrator_writes_report_and_plots(self):
         import importlib
         if importlib.util.find_spec("sklearn") is None:

@@ -122,18 +122,43 @@ def held_out_regressor_fidelity(X, y, max_depth: int = 3, random_state: int = 0,
     from sklearn.tree import DecisionTreeRegressor
 
     reg = DecisionTreeRegressor(max_depth=max_depth, random_state=random_state)
-    if method == "kfold":
-        cv = KFold(n_splits=n_splits_used, shuffle=True, random_state=random_state)
-    else:
-        cv = LeaveOneOut()
 
     # R^2 is undefined for a single left-out point (LeaveOneOut); fall back to
     # negative-MSE in that regime and note it, rather than emitting NaNs.
-    scoring = "r2" if method == "kfold" else "neg_mean_squared_error"
-    scores = cross_val_score(reg, X, y, cv=cv, scoring=scoring)
-    if scoring == "neg_mean_squared_error":
+    if method != "kfold":
+        scores = cross_val_score(reg, X, y, cv=LeaveOneOut(),
+                                 scoring="neg_mean_squared_error")
         return {"feasible": True, "cv_r2": float("nan"), "cv_mse": float(-np.mean(scores)),
                 "cv_r2_std": float("nan"), "n_splits": n_splits_used, "method": method,
                 "note": "sample too small for K-fold R^2; reporting leave-one-out MSE instead."}
-    return {"feasible": True, "cv_r2": float(np.mean(scores)), "cv_r2_std": float(np.std(scores)),
-            "n_splits": n_splits_used, "method": method, "note": ""}
+
+    # Per-fold R^2 with the force_finite convention extended to float-noise
+    # variance: a mostly-flat curve passes the global constant guard, but a
+    # shuffled fold whose TEST points all sit on the flat part has SS_tot at
+    # float-epsilon scale and its R^2 explodes to astronomical negatives.
+    # sklearn's force_finite only covers exactly-zero variance; here any fold
+    # with test spread < 1e-8 is scored the same way it would be (1.0 when
+    # predictions match within the tolerance, else 0.0). Folds with genuine
+    # variance keep their true — possibly negative — R^2.
+    cv = KFold(n_splits=n_splits_used, shuffle=True, random_state=random_state)
+    fold_scores = []
+    n_degenerate = 0
+    for tr, te in cv.split(X):
+        f = DecisionTreeRegressor(max_depth=max_depth, random_state=random_state)
+        f.fit(X[tr], y[tr])
+        pred = f.predict(X[te])
+        y_te = y[te]
+        if float(np.ptp(y_te)) < 1e-8:
+            n_degenerate += 1
+            fold_scores.append(
+                1.0 if float(np.max(np.abs(pred - y_te))) < 1e-8 else 0.0)
+        else:
+            ss_res = float(np.sum((y_te - pred) ** 2))
+            ss_tot = float(np.sum((y_te - np.mean(y_te)) ** 2))
+            fold_scores.append(1.0 - ss_res / ss_tot)
+    note = ("" if n_degenerate == 0 else
+            f"{n_degenerate} of {n_splits_used} folds had (near-)constant test "
+            f"targets and were scored by the force_finite convention (0/1).")
+    return {"feasible": True, "cv_r2": float(np.mean(fold_scores)),
+            "cv_r2_std": float(np.std(fold_scores)),
+            "n_splits": n_splits_used, "method": method, "note": note}
