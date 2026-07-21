@@ -359,7 +359,31 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("mc.surrogate.rule.0", ids)
         conf = doc["confidence"]
         self.assertEqual(conf["winner_surrogate_f1"]["grade"], "high")
-        self.assertEqual(conf["permodel_cv_r2"]["B"], ir.NOT_AVAILABLE)
+        # Per-model cv R² is graded confidence data, number kept visible.
+        self.assertEqual(conf["permodel_cv_r2"]["B"]["cv_r2"], ir.NOT_AVAILABLE)
+        self.assertEqual(conf["permodel_cv_r2"]["A"]["cv_r2"], 0.7)
+        self.assertIn("grade", conf["permodel_cv_r2"]["A"])
+
+    def test_mc_majority_degenerate_cv_r2_graded_not_available(self):
+        result = _mc_result()
+        # A: 4 of 5 folds degenerate → number kept, graded not_available.
+        # B: 1 of 5 → graded normally.
+        result["permodel_f1"] = {
+            "A": {"cv_r2": 0.6, "cv_n_splits": 5, "cv_degenerate_folds": 4},
+            "B": {"cv_r2": 0.9, "cv_n_splits": 5, "cv_degenerate_folds": 1},
+        }
+        doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
+        conf = doc["confidence"]["permodel_cv_r2"]
+        self.assertEqual(conf["A"]["cv_r2"], 0.6)          # number stays visible
+        self.assertEqual(conf["A"]["grade"], ir.NOT_AVAILABLE)
+        self.assertEqual(conf["A"]["n_degenerate_folds"], 4)
+        self.assertEqual(conf["B"]["cv_r2"], 0.9)
+        self.assertEqual(conf["B"]["grade"], "high")
+        # A caveat names the majority-degenerate model.
+        cav = next(c for c in doc["caveats"] if c["id"] == "mc.caveat.cv_degenerate")
+        self.assertIn("A", cav["value"])
+        self.assertNotIn("B", cav["value"])
+        self.assertIn("not a meaningful fidelity estimate", cav["text"])
 
     def test_off_by_support_gate(self):
         low = ir.build_off_by_ir("DS", "e1", _off_by_result(n_wins=2), ["A", "B"])

@@ -807,7 +807,23 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
                 winner_f1.get("rules_text"),
                 str(winner_f1.get("rules_text")), confidence=grade))
 
-    permodel_cv = {m: _val(pm.get("cv_r2"), 3) for m, pm in sorted(permodel_f1.items())}
+    # Per-model held-out R² as confidence data, each graded for trust. When a
+    # majority of a model's CV folds had (near-)constant test targets the
+    # held-out estimate is not assessable — grade it not_available but keep the
+    # computed number visible for transparency.
+    permodel_cv: Dict[str, Any] = {}
+    degenerate_models: List[str] = []
+    for m, pm in sorted(permodel_f1.items()):
+        n_splits = int(pm.get("cv_n_splits", 0) or 0)
+        n_deg = int(pm.get("cv_degenerate_folds", 0) or 0)
+        majority_degenerate = n_splits > 0 and n_deg > n_splits / 2
+        entry = {"cv_r2": _val(pm.get("cv_r2"), 3),
+                 "n_splits": n_splits, "n_degenerate_folds": n_deg,
+                 "grade": NOT_AVAILABLE if majority_degenerate
+                          else fidelity_grade(pm.get("cv_r2"))}
+        permodel_cv[m] = entry
+        if majority_degenerate:
+            degenerate_models.append(m)
     if permodel_cv:
         conf["permodel_cv_r2"] = permodel_cv
 
@@ -821,6 +837,13 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
                   "robustness; the pipeline's forwarded ranking comes from the "
                   "production run at fixed noise."),
     ]
+    if degenerate_models:
+        caveats.append(make_atom(
+            "mc.caveat.cv_degenerate", "caveat", "confidence", degenerate_models,
+            f"For {', '.join(degenerate_models)} most cross-validation folds had "
+            f"(near-)constant F1 across the sweep, so the held-out R² is not a "
+            f"meaningful fidelity estimate (marked not_available); the number is "
+            f"kept only for transparency."))
     return _envelope("monte_carlo", dataset, entity, output, evidence, caveats,
                      required, confidence=conf)
 

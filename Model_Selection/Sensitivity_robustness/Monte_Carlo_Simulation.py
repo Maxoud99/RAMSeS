@@ -581,7 +581,8 @@ def train_noise_permodel_surrogates(noise, score_matrix, model_names,
         if int(mask.sum()) < 2:
             out[m] = {"trend": "N/A", "corr": float('nan'), "score_low": float('nan'),
                       "score_high": float('nan'), "r2": float('nan'),
-                      "cv_r2": float('nan'), "cv_method": "n/a"}
+                      "cv_r2": float('nan'), "cv_method": "n/a",
+                      "cv_n_splits": 0, "cv_degenerate_folds": 0}
             continue
         X = noise[mask].reshape(-1, 1)
         ys = col[mask]
@@ -598,7 +599,9 @@ def train_noise_permodel_surrogates(noise, score_matrix, model_names,
                   "score_low": float(reg.predict([[lo]])[0]),
                   "score_high": float(reg.predict([[hi]])[0]), "r2": r2,
                   "cv_r2": cv.get("cv_r2", float('nan')), "cv_method": cv.get("method", "n/a"),
-                  "cv_mse": cv.get("cv_mse", float('nan'))}
+                  "cv_mse": cv.get("cv_mse", float('nan')),
+                  "cv_n_splits": cv.get("n_splits", 0),
+                  "cv_degenerate_folds": cv.get("n_degenerate_folds", 0)}
     return out
 
 
@@ -831,7 +834,7 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
                 f.write(f"    {line}\n")
             f.write(f"\n--- Method B · per-model degradation ({metric}) ---\n")
             f.write(f"      {'model':<12} {'trend':>8} {'score@low':>10} {'score@high':>11} "
-                    f"{'R² (train)':>11} {'R² (held-out)':>14}\n")
+                    f"{'R² (train)':>11} {'R² (held-out)':>22}\n")
             f.write("      " + "-" * 65 + "\n")
             for m in models:
                 pm = permodel.get(m, {})
@@ -841,20 +844,33 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
                 r2 = pm.get("r2", float('nan'))
                 cv_r2 = pm.get("cv_r2", float('nan'))
                 cv_mse = pm.get("cv_mse", float('nan'))
+                cv_ns = pm.get("cv_n_splits", 0)
+                cv_deg = pm.get("cv_degenerate_folds", 0)
                 if not np.isnan(cv_r2):
-                    cv_str = f"{cv_r2:.3f}"
+                    # Majority-degenerate folds → the estimate is unassessable;
+                    # keep the number visible but flag it (matches the IR grade).
+                    if cv_ns and cv_deg > cv_ns / 2:
+                        cv_str = f"{cv_r2:.3f} ({cv_deg}/{cv_ns} deg,N/A)"
+                    elif cv_deg:
+                        cv_str = f"{cv_r2:.3f} ({cv_deg}/{cv_ns} deg)"
+                    else:
+                        cv_str = f"{cv_r2:.3f}"
                 elif not np.isnan(cv_mse):
                     cv_str = f"MSE={cv_mse:.3f}"
+                elif pm.get("cv_method") == "constant_target":
+                    cv_str = "N/A (flat)"
                 else:
                     cv_str = "N/A"
                 f.write(f"      {m:<12} {tr:>8} "
                         f"{(f'{sl:.3f}' if not np.isnan(sl) else 'N/A'):>10} "
                         f"{(f'{sh:.3f}' if not np.isnan(sh) else 'N/A'):>11} "
                         f"{(f'{r2:.3f}' if not np.isnan(r2) else 'N/A'):>11} "
-                        f"{cv_str:>14}\n")
+                        f"{cv_str:>22}\n")
             f.write("      R² (train) is the in-sample fit; R² (held-out) is a cross-validated\n"
                     "      estimate (see surrogate_fidelity.py) and is the number that should be\n"
-                    "      read as the surrogate's actual fidelity.\n")
+                    "      read as the surrogate's actual fidelity. '(k/n deg)' marks folds with\n"
+                    "      near-constant targets (force_finite-scored); majority-degenerate\n"
+                    "      estimates are flagged N/A — kept visible but not to be trusted.\n")
             f.write("\n")
 
         _methodB(winner_f1, permodel_f1, "F1")
