@@ -52,6 +52,7 @@ from rank_aggregation import (
     prominent_contradictions,
     explain_rank_aggregation,
     explain_rank_aggregation_kendall_only,
+    _ranks_from_scores,
 )
 
 
@@ -215,11 +216,12 @@ class TestBordaVerdictPerSource(unittest.TestCase):
         # All three have Borda count = 2 (sum of complementary ranks).
         for v in verdicts.values():
             self.assertAlmostEqual(v["borda_count"], 2.0)
-        # With identical counts, ranking is tied (average ranks). Confirm rank
-        # values are equal (or all == 2.0 under the average-rank tie rule).
-        self.assertAlmostEqual(verdicts["s0"]["borda_rank"], 2.0)
-        self.assertAlmostEqual(verdicts["s_mid"]["borda_rank"], 2.0)
-        self.assertAlmostEqual(verdicts["s1"]["borda_rank"], 2.0)
+        # Standard competition ranking ("1224"): three tied sources all share the
+        # smallest rank in their group — rank 1, never the fractional 2.0 that
+        # average ranking produced.
+        self.assertEqual(verdicts["s0"]["borda_rank"], 1)
+        self.assertEqual(verdicts["s_mid"]["borda_rank"], 1)
+        self.assertEqual(verdicts["s1"]["borda_rank"], 1)
 
     def test_borda_count_breaks_an_asymmetric_disagreement(self):
         """If one source is preferred more strongly by one voter than the other
@@ -235,6 +237,40 @@ class TestBordaVerdictPerSource(unittest.TestCase):
         self.assertAlmostEqual(verdicts["s_loser"]["borda_count"],  0.0)
         # s_loser is unambiguously last under Borda.
         self.assertEqual(verdicts["s_loser"]["borda_rank"], 3.0)
+
+    def test_hybrid_tie_handling(self):
+        """Displayed ranks + pattern use competition ranking; the Borda COUNT
+        uses average ranks internally (fair arithmetic). A tie on influence
+        makes the two differ, which this locks in."""
+        # A and B tie for top influence (0.9); agreement is all-distinct.
+        loo   = {"A": 0.9, "B": 0.9, "C": 0.1}
+        align = {"A": 0.9, "B": 0.5, "C": 0.1}
+        verdicts = {v["source"]: v for v in borda_verdict_per_source(loo, align)}
+        # Displayed influence rank: competition → A and B both 1 (ints), not 1.5.
+        self.assertEqual(verdicts["A"]["loo_rank"], 1)
+        self.assertEqual(verdicts["B"]["loo_rank"], 1)
+        self.assertIsInstance(verdicts["A"]["loo_rank"], int)
+        # Borda count uses AVERAGE loo ranks (A,B → 1.5): n=3.
+        #   A = (3-1.5)+(3-1) = 3.5   B = (3-1.5)+(3-2) = 2.5   C = 0
+        # (competition loo ranks would have given A=4, B=3 — the boost we avoid.)
+        self.assertAlmostEqual(verdicts["A"]["borda_count"], 3.5)
+        self.assertAlmostEqual(verdicts["B"]["borda_count"], 2.5)
+        self.assertAlmostEqual(verdicts["C"]["borda_count"], 0.0)
+        # Borda rank = competition rank of those counts.
+        self.assertEqual(verdicts["A"]["borda_rank"], 1)
+        self.assertEqual(verdicts["B"]["borda_rank"], 2)
+        self.assertEqual(verdicts["C"]["borda_rank"], 3)
+        # Patterns from competition ranks: A is tied-top on both → consistent;
+        # B is rank 1 influence but rank 2 agreement → influential_disagreer.
+        self.assertEqual(verdicts["A"]["pattern"], "consistent")
+        self.assertEqual(verdicts["B"]["pattern"], "influential_disagreer")
+
+    def test_ranks_from_scores_method_switch(self):
+        scores = {"a": 0.9, "b": 0.5, "c": 0.5, "d": 0.1}  # b,c tie
+        comp = _ranks_from_scores(scores)                   # default competition
+        avg = _ranks_from_scores(scores, method="average")
+        self.assertEqual(comp, {"a": 1, "b": 2, "c": 2, "d": 4})
+        self.assertEqual(avg, {"a": 1.0, "b": 2.5, "c": 2.5, "d": 4.0})
 
 
 # ════════════════════════════════════════════════════════════════════════════

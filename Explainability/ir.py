@@ -253,8 +253,10 @@ def rule_to_text(rule: Dict[str, Any], outcome_label: str = "the outcome is") ->
 def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
               evidence: List[Dict[str, Any]], caveats: List[Dict[str, Any]],
               required_atom_ids: List[str],
-              confidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return {
+              confidence: Optional[Dict[str, Any]] = None,
+              question: Optional[str] = None,
+              info_footer: Optional[str] = None) -> Dict[str, Any]:
+    env = {
         "ir_version": IR_VERSION,
         "stage": stage,
         "dataset": str(dataset),
@@ -265,6 +267,15 @@ def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
         "required_atom_ids": sorted(required_atom_ids),
         "confidence": _py(confidence or {}),
     }
+    # `question` frames the narration prompt (the stage's headline question);
+    # `info_footer` is a fixed glossary appended verbatim to the .txt AFTER
+    # generation and verification, so definitions are never reworded and never
+    # count toward faithfulness metrics.
+    if question is not None:
+        env["question"] = str(question)
+    if info_footer is not None:
+        env["info_footer"] = str(info_footer)
+    return env
 
 
 def write_stage_ir(ir: Dict[str, Any], dataset: str, entity: str, filename: str,
@@ -436,7 +447,9 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
     util = {d: mm.get(d, {}).get("contribution", float("nan")) for d in detectors}
     finite_sorted = sorted((d for d in detectors if not _is_nan(util[d])),
                            key=lambda d: util[d], reverse=True)
-    util_rank = {d: i + 1 for i, d in enumerate(finite_sorted)}
+    # Standard competition ranking ("1224") so tied contributions share a rank
+    # and the next skips — consistent with every other ranking in the layer.
+    util_rank = _competition_rank(util, finite_sorted)
 
     def _code_words(code: str) -> str:
         if code == "Unclassified" or len(code) != 2:
@@ -612,9 +625,10 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
                               source_top_picks: Dict[str, str],
                               full_ranking: List[str]) -> Dict[str, Any]:
     verdicts = result.get("verdicts", [])
-    prominent = result.get("prominent_contradictions", [])
     kendall_only = result.get("kendall_only")
     prefix = f"ra_{stage_name}"
+    # Human-facing name for the consensus ("robust" → "robustness").
+    stage_word = {"robust": "robustness", "final": "final"}.get(stage_name, stage_name)
 
     evidence: List[Dict[str, Any]] = []
     required: List[str] = []
@@ -627,53 +641,16 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         "sources": sorted(source_names),
     }
     if full_ranking:
+        # "ranking of detectors, first-ranked detector is X" — the winner reads
+        # unmistakably as a DETECTOR (not one of the source rankings analysed
+        # below, which the narrator had conflated), and grounding "first-ranked"
+        # here means the narrator's natural "X ranked first" has the value 1 to
+        # match instead of reading as an ungrounded number.
         evidence.append(make_atom(
             f"{prefix}.output.top", "stage_output", top, top,
-            f"The {stage_name} consensus ranking places {top} first.", order=0))
+            f"The {stage_word} consensus is a ranking of detectors; its "
+            f"first-ranked detector is {top}.", order=0))
         required.append(f"{prefix}.output.top")
-
-    # Present sources best-Borda-rank first: the narrative walks from the most
-    # consensus-aligned source down. Each source's verdict and top-pick atoms
-    # get adjacent order slots so per-source facts stay together in the prompt.
-    def _borda_key(v: Dict[str, Any]) -> Tuple[float, str]:
-        br = v.get("borda_rank")
-        return (float(br) if br is not None else float("inf"), str(v.get("source")))
-
-    source_order = {v["source"]: 10 * (i + 1)
-                    for i, v in enumerate(sorted(verdicts, key=_borda_key))}
-
-    for name in source_names:
-        pick = source_top_picks.get(name, NOT_AVAILABLE)
-        agrees = (pick == top) if (pick != NOT_AVAILABLE and full_ranking) else None
-        agree_txt = ("matches" if agrees else "differs from") if agrees is not None else NOT_AVAILABLE
-        so = source_order.get(name)
-        evidence.append(make_atom(
-            f"{prefix}.source.{name}.top_pick", "source_top_pick", name,
-            {"top_pick": pick, "agrees_with_consensus": agrees},
-            f"{name}'s top pick ({pick}) {agree_txt} the consensus top pick ({top}).",
-            order=(so + 1) if so is not None else None))
-
-    for v in verdicts:
-        name = v["source"]
-        vid = f"{prefix}.source.{name}.verdict"
-        evidence.append(make_atom(
-            vid, "source_verdict", name,
-            {"loo_score": _val(v.get("loo_score"), 4), "loo_rank": v.get("loo_rank"),
-             "kendall_tau": _val(v.get("align_score"), 4), "align_rank": v.get("align_rank"),
-             "borda_rank": v.get("borda_rank"), "pattern": v.get("pattern")},
-            f"{name}: leave-one-out contribution {_fmt(v.get('loo_score'), 4)} "
-            f"(rank {v.get('loo_rank')}), Kendall tau {_fmt(v.get('align_score'), 4)} "
-            f"(rank {v.get('align_rank')}), Borda-resolved rank {v.get('borda_rank')} — "
-            f"pattern: {v.get('pattern')}.", order=source_order.get(name)))
-        required.append(vid)
-
-    for i, v in enumerate(prominent):
-        evidence.append(make_atom(
-            f"{prefix}.contradiction.{i}", "source_contradiction", v.get("source", NOT_AVAILABLE),
-            {"loo_rank": v.get("loo_rank"), "align_rank": v.get("align_rank")},
-            f"{v.get('source')} shows the sharpest disagreement between its "
-            f"pivotality rank ({v.get('loo_rank')}) and its alignment rank "
-            f"({v.get('align_rank')})."))
 
     caveats = [
         make_atom(f"{prefix}.caveat.consensus", "caveat", "aggregation", None,
@@ -682,26 +659,115 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
     ]
 
     if kendall_only:
+        # Two-source case (e.g. the final aggregation: robust consensus vs
+        # Thompson). Influence (leave-one-out) and Borda are degenerate here —
+        # dropping one source leaves a single source — so the per-source role
+        # atoms are omitted entirely and a single AGREEMENT-driven sentence
+        # carries the explanation: which source the consensus followed more.
+        winner = kendall_only.get("winner")
+        runner = kendall_only.get("runner_up")
         kid = f"{prefix}.kendall_only.winner"
         evidence.append(make_atom(
-            kid, "kendall_only", str(kendall_only.get("winner", NOT_AVAILABLE)),
-            {"winner": kendall_only.get("winner"),
-             "winner_tau": _val(kendall_only.get("winner_tau"), 4),
-             "runner_up": kendall_only.get("runner_up"),
-             "runner_up_tau": _val(kendall_only.get("runner_up_tau"), 4),
+            kid, "kendall_only", str(winner),
+            {"winner": winner,
+             "winner_agreement": _val(kendall_only.get("winner_tau"), 4),
+             "runner_up": runner,
+             "runner_up_agreement": _val(kendall_only.get("runner_up_tau"), 4),
              "gap": _val(kendall_only.get("alignment_gap"), 4)},
-            f"The consensus is most aligned with {kendall_only.get('winner')} "
-            f"(tau {_fmt(kendall_only.get('winner_tau'), 4)} vs "
-            f"{_fmt(kendall_only.get('runner_up_tau'), 4)} for "
-            f"{kendall_only.get('runner_up')}; gap {_fmt(kendall_only.get('alignment_gap'), 4)})."))
+            f"{winner} drove the {stage_word} consensus most: it agreed with the "
+            f"consensus more closely than {runner} (agreement "
+            f"{_fmt(kendall_only.get('winner_tau'), 4)} vs "
+            f"{_fmt(kendall_only.get('runner_up_tau'), 4)}, gap "
+            f"{_fmt(kendall_only.get('alignment_gap'), 4)})."))
         required.append(kid)
         caveats.append(make_atom(
             f"{prefix}.caveat.two_sources", "caveat", "loo", None,
-            "With exactly two sources, leave-one-out and Borda resolution are "
-            "degenerate; the Kendall-tau-only diagnostic is the authoritative view."))
+            "With exactly two sources, influence (leave-one-out) and the combined "
+            "(Borda) rank are undefined — dropping one leaves a single source — so "
+            "agreement is the only meaningful diagnostic here."))
+        question = (f"Which of the two sources did the {stage_word} consensus "
+                    f"follow more closely?")
+        # Footer is a pure glossary DEFINITION only; the two-source rationale
+        # (why influence is undefined here) is owned by caveat.two_sources, so
+        # keeping it out of the footer avoids stating it twice in the output.
+        info_footer = (
+            "Agreement compares the consensus ranking with a source's own ranking.")
+    else:
+        # Multi-source case: one human-readable role sentence per source, ordered
+        # by Borda rank (the dominant combined rank), built from its two component
+        # ranks — INFLUENCE (leave-one-out: how much the consensus moves when the
+        # source is dropped) and AGREEMENT (Kendall tau of the source vs the
+        # consensus) — plus its pattern. Raw LOO/tau scores stay in `value` for
+        # provenance; the prose carries only the ranks.
+
+        # Required relational atom: names the source set explicitly and states
+        # that the ranked detectors (incl. the winner) are NOT sources — the
+        # narrator had folded the winning detector into the list of sources.
+        src_list = sorted(source_names)
+        cid = f"{prefix}.context.sources"
+        evidence.append(make_atom(
+            cid, "stage_context", "sources",
+            {"sources": src_list, "n_sources": len(src_list), "winner": top},
+            f"The {len(src_list)} sources aggregated into this consensus are the "
+            f"rankings {', '.join(src_list)}. Every fact below describes one of "
+            f"these source rankings; the detectors they rank — including the "
+            f"winner {top} — are the items being ranked, not sources.",
+            order=5))
+        required.append(cid)
+
+        def _borda_key(v: Dict[str, Any]) -> Tuple[float, str]:
+            br = v.get("borda_rank")
+            return (float(br) if br is not None else float("inf"), str(v.get("source")))
+
+        def _pattern_phrase(p: Any) -> str:
+            if not p or p == NOT_AVAILABLE:
+                return ""
+            article = "an" if str(p)[0].lower() in "aeiou" else "a"
+            return f", {article} {p} pattern"
+
+        for i, v in enumerate(sorted(verdicts, key=_borda_key)):
+            name = v["source"]
+            loo_rank, align_rank = v.get("loo_rank"), v.get("align_rank")
+            pp = _pattern_phrase(v.get("pattern"))
+            if i == 0:
+                if loo_rank == 1 and align_rank == 1:
+                    # State the explicit ranks (not just "leading both") so the
+                    # narrator never has to infer them — it previously filled in
+                    # the lead's agreement rank itself and got it wrong.
+                    text = (f"{name} shaped the {stage_word} consensus most, "
+                            f"topping both the influence ranking (rank 1) and the "
+                            f"agreement ranking (rank 1){pp}.")
+                else:
+                    text = (f"{name} shaped the {stage_word} consensus most overall, "
+                            f"with influence rank {loo_rank} and agreement rank "
+                            f"{align_rank}{pp}.")
+            else:
+                text = (f"{name} followed with influence rank {loo_rank} and "
+                        f"agreement rank {align_rank}{pp}.")
+            rid = f"{prefix}.source.{name}.role"
+            evidence.append(make_atom(
+                rid, "source_role", name,
+                {"influence_rank": loo_rank, "agreement_rank": align_rank,
+                 "borda_rank": v.get("borda_rank"), "pattern": v.get("pattern"),
+                 "influence_score": _val(v.get("loo_score"), 4),
+                 "agreement_score": _val(v.get("align_score"), 4),
+                 "top_pick": source_top_picks.get(name, NOT_AVAILABLE)},
+                text, order=10 * (i + 1)))
+            required.append(rid)
+
+        question = (f"Which source rankings most shaped the {stage_word} consensus, "
+                    f"and how much did each agree with it?")
+        info_footer = (
+            "Influence measures how much a source shaped the consensus: it compares "
+            "the consensus ranking with the ranking that emerges when that source is "
+            "left out. Agreement compares the consensus ranking with the source's own "
+            "ranking. The overall order combines both (Borda). An influential_disagreer "
+            "has high influence but low agreement; a redundant_agreer has high "
+            "agreement but low influence; a consistent source ranks similarly on both.")
 
     ir = _envelope(f"rank_aggregation_{stage_name}", dataset, entity, output,
-                   evidence, caveats, required)
+                   evidence, caveats, required, question=question,
+                   info_footer=info_footer)
     ir["iteration"] = int(iteration)
     return ir
 

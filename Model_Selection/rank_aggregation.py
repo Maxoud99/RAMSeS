@@ -553,6 +553,12 @@ def borda_count_resolution(
     are better-ranked overall. The resulting Borda ranking of sources IS the
     resolution when LOO and Kendall disagree.
 
+    Tie handling: the ranks that feed this ARITHMETIC use AVERAGE (fractional)
+    ranking, whose sum-preserving property keeps tied sources contributing
+    symmetrically to the count — the textbook-fair Borda tie rule. (The
+    displayed influence/agreement/Borda ranks and the pattern labels use
+    competition ranking; see `_ranks_from_scores`.)
+
     Parameters
     ----------
     loo_scores, align_scores : Dict[str, float]
@@ -566,29 +572,42 @@ def borda_count_resolution(
     if set(loo_scores.keys()) != set(align_scores.keys()):
         raise ValueError("loo_scores and align_scores must have identical keys.")
     n = len(loo_scores)
-    loo_rank   = _ranks_from_scores(loo_scores,   descending=True)
-    align_rank = _ranks_from_scores(align_scores, descending=True)
+    loo_rank   = _ranks_from_scores(loo_scores,   descending=True, method="average")
+    align_rank = _ranks_from_scores(align_scores, descending=True, method="average")
     return {name: (n - loo_rank[name]) + (n - align_rank[name])
             for name in loo_scores}
 
 
-def _ranks_from_scores(scores: Dict[str, float], descending: bool = True) -> Dict[str, int]:
-    """Convert a {name: score} mapping into {name: 1-based rank}. Ties get equal
-    average ranks; descending=True means highest score gets rank 1."""
+def _ranks_from_scores(scores: Dict[str, float], descending: bool = True,
+                       method: str = "competition") -> Dict[str, float]:
+    """Convert a {name: score} mapping into {name: 1-based rank}.
+
+    method="competition" (default) — STANDARD COMPETITION RANKING ("1224"):
+        tied scores share the smallest rank in their group and the next score
+        skips (two tied for 2nd are both rank 2, the next is rank 4). Integer
+        ranks, directly interpretable ("k−1 sources are strictly better"). This
+        is what every DISPLAYED rank and the pattern labels use.
+    method="average" — FRACTIONAL / AVERAGE RANKING: a tied group shares the
+        mean of the positions it spans (two tied for 2nd/3rd are both 2.5).
+        Sum-preserving, which is the correct tie handling when ranks feed
+        ARITHMETIC — used only inside the Borda count so tied sources contribute
+        symmetrically instead of getting a min-rank boost.
+
+    descending=True means the highest score gets rank 1.
+    """
     names = list(scores.keys())
     vals = np.array([scores[n] for n in names], dtype=float)
     if descending:
         vals = -vals
-    order = np.argsort(vals, kind="stable")
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(1, len(order) + 1)
-    # Average ranks for ties
+    # np.unique sorts ascending; with vals negated for descending, the first
+    # group is the best. `starts[g]` = number of items in strictly-better groups.
     _, inv, counts = np.unique(vals, return_inverse=True, return_counts=True)
-    sums = np.zeros_like(counts, dtype=float)
-    for idx, group in enumerate(inv):
-        sums[group] += ranks[idx]
-    avg_ranks = sums / counts
-    return {n: float(avg_ranks[inv[i]]) for i, n in enumerate(names)}
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    if method == "average":
+        group_rank = starts + (counts + 1) / 2.0          # min + (size+1)/2
+        return {n: float(group_rank[inv[i]]) for i, n in enumerate(names)}
+    min_rank = (starts + 1).astype(int)                   # competition ("1224")
+    return {n: int(min_rank[inv[i]]) for i, n in enumerate(names)}
 
 
 def borda_verdict_per_source(
@@ -611,6 +630,10 @@ def borda_verdict_per_source(
         'consistent'          — LOO and alignment ranks agree
     """
     names = list(loo_scores.keys())
+    # Hybrid tie handling: displayed ranks and the pattern labels use COMPETITION
+    # ranking (interpretable "1224"); the Borda COUNT alone uses average ranks
+    # internally (via borda_count_resolution) for fair arithmetic. The Borda
+    # RANK shown here is the competition rank OF that fairly-computed count.
     loo_rank    = _ranks_from_scores(loo_scores,   descending=True)
     align_rank  = _ranks_from_scores(align_scores, descending=True)
     borda_count = borda_count_resolution(loo_scores, align_scores)
@@ -917,8 +940,8 @@ def explain_rank_aggregation(
         f.write("-" * 70 + "\n")
         for v in verdicts:
             f.write(
-                f"{v['source']:<22} {v['loo_rank']:>5.1f} {v['align_rank']:>6.1f} "
-                f"{v['borda_rank']:>6.1f}  {v['pattern']}\n"
+                f"{v['source']:<22} {v['loo_rank']:>5.0f} {v['align_rank']:>6.0f} "
+                f"{v['borda_rank']:>6.0f}  {v['pattern']}\n"
             )
 
         # Show the final Borda-voted ranking of sources explicitly.
@@ -928,8 +951,8 @@ def explain_rank_aggregation(
         for i, v in enumerate(borda_sorted, 1):
             f.write(
                 f"  {i}. {v['source']:<22} "
-                f"borda_count = {v['borda_count']:.2f}   (LOO rank {v['loo_rank']:.1f}, "
-                f"Align rank {v['align_rank']:.1f})\n"
+                f"borda_count = {v['borda_count']:.2f}   (LOO rank {v['loo_rank']:.0f}, "
+                f"Align rank {v['align_rank']:.0f})\n"
             )
 
         f.write("\n--- Prominent Contradictions (largest LOO vs Alignment rank gaps) ---\n")
@@ -938,10 +961,10 @@ def explain_rank_aggregation(
         else:
             for v in prominent:
                 f.write(
-                    f"{v['source']}: LOO rank {v['loo_rank']:.1f}, "
-                    f"Alignment rank {v['align_rank']:.1f} "
-                    f"(delta={v['lo_align_rank_delta']:.1f}) → {v['pattern']}\n"
-                    f"   Borda resolution → rank {v['borda_rank']:.1f}"
+                    f"{v['source']}: LOO rank {v['loo_rank']:.0f}, "
+                    f"Alignment rank {v['align_rank']:.0f} "
+                    f"(delta={v['lo_align_rank_delta']:.0f}) → {v['pattern']}\n"
+                    f"   Borda resolution → rank {v['borda_rank']:.0f}"
                     f" (count {v['borda_count']:.2f})\n"
                 )
 

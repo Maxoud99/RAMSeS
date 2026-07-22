@@ -45,6 +45,29 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # ("gap 0.287." → 0.287): no word char/hyphen/dot before; no word char/hyphen
 # after; a trailing dot is fine unless it starts more digits.
 _NUM_RE = re.compile(r"(?<![\w.\-])[-+]?\d+(?:\.\d+)?%?(?![\w\-])(?!\.\d)")
+# Digit ordinals ("3rd", "6th", "21st") → the base integer. The suffix makes
+# _NUM_RE reject them, but a reader writing "3rd" IS conveying the number 3.
+_ORDINAL_DIGIT_RE = re.compile(r"(?<![\w.\-])(\d+)(?:st|nd|rd|th)\b", re.IGNORECASE)
+# Spelled numbers a narrator naturally uses in place of a digit: all ordinals
+# first..twentieth, and cardinals two..twenty. "one"/"zero" cardinals are
+# deliberately EXCLUDED — they are overwhelmingly articles/pronouns ("one of
+# the sources", "leaving one out"), not numeric claims; ordinal "first" still
+# covers the value 1.
+_WORD_NUMS: Dict[str, int] = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+    "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
+    "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15,
+    "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+    "twentieth": 20,
+}
+# Longer alternatives first so "sixth" wins over "six", etc.
+_WORD_NUM_RE = re.compile(
+    r"\b(" + "|".join(sorted(_WORD_NUMS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE)
 # Detector-like tokens: e.g. LOF_1, CBLOF_4, NN_3, XYZ_9.
 _ENTITY_RE = re.compile(r"\b[A-Za-z]+(?:_\d+)+\b")
 # Sentence boundary: terminal punctuation followed by whitespace. Decimal
@@ -56,8 +79,11 @@ _STAB_RE = re.compile(r"\b(high|low)[-\s]stability\b")
 
 
 def extract_numbers(text: str) -> List[Tuple[str, float]]:
-    """All number tokens in `text` as (raw_token, float). '%' is stripped for
-    the float but kept in the raw token."""
+    """All number tokens in `text` as (raw_token, float), covering bare digits
+    ("3", "0.287", "62.5%"), digit ordinals ("3rd"→3), and spelled numbers
+    ("six"→6, "first"→1) — so a readable ordinal/word conveys the same value as
+    the digit for both the omission (coverage) and hallucination checks. '%' is
+    stripped for the float but kept in the raw token."""
     out: List[Tuple[str, float]] = []
     for m in _NUM_RE.finditer(text or ""):
         raw = m.group(0)
@@ -65,6 +91,10 @@ def extract_numbers(text: str) -> List[Tuple[str, float]]:
             out.append((raw, float(raw.rstrip("%"))))
         except ValueError:
             continue
+    for m in _ORDINAL_DIGIT_RE.finditer(text or ""):
+        out.append((m.group(0), float(m.group(1))))
+    for m in _WORD_NUM_RE.finditer(text or ""):
+        out.append((m.group(0), float(_WORD_NUMS[m.group(1).lower()])))
     return out
 
 

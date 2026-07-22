@@ -132,6 +132,20 @@ class TestExtractNumbers(unittest.TestCase):
         self.assertEqual([v for _, v in verifier.extract_numbers("score 0.5000.")],
                          [0.5])
 
+    def test_digit_ordinals(self):
+        self.assertEqual([v for _, v in verifier.extract_numbers("3rd and 6th and 21st")],
+                         [3.0, 6.0, 21.0])
+
+    def test_spelled_numbers(self):
+        vals = [v for _, v in verifier.extract_numbers(
+            "Six sources ranked first, then sixth and twentieth")]
+        self.assertEqual(sorted(vals), [1.0, 6.0, 6.0, 20.0])
+
+    def test_ambiguous_one_excluded(self):
+        # "one"/"zero" cardinals are articles/pronouns here — not numeric claims.
+        self.assertEqual(verifier.extract_numbers("one of the sources, leaving one out"), [])
+        self.assertEqual(verifier.extract_numbers("a single source"), [])
+
 
 class TestVerifier(unittest.TestCase):
 
@@ -184,6 +198,23 @@ class TestVerifier(unittest.TestCase):
         v = verifier.verify_narrative(narrative, doc)
         self.assertEqual(v["hallucination_rate"], 0.0)
         self.assertEqual(v["omission_rate"], 0.0)
+
+    def test_ordinal_conveys_required_number_no_omission(self):
+        # Atom's number is 3 (digit); the narrative writes the readable "3rd".
+        doc = {"ir_version": "1.0", "stage": "toy", "dataset": "D", "entity": "e",
+               "output": {}, "caveats": [], "required_atom_ids": ["r"],
+               "evidence": [{"id": "r", "type": "t", "subject": "LOF_1", "value": 3,
+                             "text": "LOF_1 ranked 3 in influence."}]}
+        v = verifier.verify_narrative("LOF_1 came 3rd in influence.", doc)
+        self.assertEqual(v["omission_rate"], 0.0)
+        self.assertEqual(v["missing_required_ids"], [])
+
+    def test_spelled_number_symmetric_hallucination(self):
+        # "fifth" (=5) is not an allowed number → flagged, same as a bad digit.
+        doc = _tiny_ir()  # allowed numbers: 0.287, 0.1
+        v = verifier.verify_narrative("LOF_1 achieves a score of 0.287, ranked fifth.", doc)
+        self.assertIn("fifth", v["unsupported_numbers"])
+        self.assertGreater(v["hallucination_rate"], 0.0)
 
 
 def _archetype_ir():
@@ -301,9 +332,28 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("STAGES WITHOUT DATA", prompt)
         self.assertIn("150-300 words", prompt)
 
-    def test_stage_prompt_budget_scales_with_atom_count(self):
+    def test_question_frames_the_prompt(self):
         doc = _tiny_ir()
-        self.assertIn("120-220 words", llm.build_stage_prompt(doc))
+        # No question → plain framing.
+        self.assertNotIn("QUESTION THIS STAGE ANSWERS", llm.build_stage_prompt(doc))
+        doc["question"] = "Why did LOF_1 rank first?"
+        prompt = llm.build_stage_prompt(doc)
+        self.assertIn("QUESTION THIS STAGE ANSWERS: Why did LOF_1 rank first?", prompt)
+        self.assertIn("answers the question above, leading with the answer", prompt)
+
+    def test_stage_prompt_budget_scales_with_atom_count(self):
+        # Sparse stage (tiny IR, 2 atoms) → low floor, no 120-word padding.
+        doc = _tiny_ir()
+        self.assertEqual(llm._word_budget(len(doc["evidence"])), (40, 90))
+        self.assertIn("40-90 words", llm.build_stage_prompt(doc))
+        # Mid-size stage → the default 120-220.
+        mid = dict(doc)
+        mid["evidence"] = [
+            {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
+             "text": f"Fact number {i}."} for i in range(7)
+        ]
+        self.assertIn("120-220 words", llm.build_stage_prompt(mid))
+        # Dense stage → ceiling scales above 220.
         dense = dict(doc)
         dense["evidence"] = [
             {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
@@ -418,6 +468,38 @@ class TestNarrateEntity(unittest.TestCase):
                                         base_dir=base, out_dir=out,
                                         stages=["ga_combination"])
             self.assertEqual(list(report["stages"].keys()), ["ga_combination"])
+
+    def test_info_footer_appended_after_verification(self):
+        """The glossary footer is written to the .txt after the narrative, but
+        is not part of the verified narrative (does not affect metrics)."""
+        ra_result = {
+            "verdicts": [
+                {"source": "S1", "loo_score": 0.3, "loo_rank": 1, "align_score": 0.6,
+                 "align_rank": 1, "borda_rank": 1, "pattern": "consistent"},
+                {"source": "S2", "loo_score": 0.1, "loo_rank": 2, "align_score": 0.8,
+                 "align_rank": 2, "borda_rank": 2, "pattern": "redundant_agreer"}],
+            "prominent_contradictions": [], "kendall_only": None}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "explanations_ir")
+            out = os.path.join(tmp, "explanations_nl")
+            ir.write_stage_ir(
+                ir.build_rank_aggregation_ir("DS", "e1", "robust", 0, ra_result,
+                                             ["S1", "S2"], {"S1": "A", "S2": "B"},
+                                             ["A", "B"]),
+                "DS", "e1", "ir_rank_aggregation_robust_0", base_dir=base)
+            report = llm.narrate_entity("DS", "e1", 0, FakeClient(),
+                                        base_dir=base, out_dir=out,
+                                        stages=["rank_aggregation_robust"])
+            info = report["stages"]["rank_aggregation_robust"]
+            self.assertEqual(info["status"], "ok")
+            with open(info["narrative_path"]) as f:
+                content = f.read()
+            body, _, footer = content.partition("\nINFO: ")
+            self.assertTrue(footer, "footer must be appended")
+            self.assertIn("Influence measures how much a source shaped", footer)
+            # The footer text is not part of the scored narrative.
+            self.assertNotIn("INFO:", body)
+            self.assertNotIn("Influence measures", body)
 
     def test_repair_pass_fixes_violating_draft(self):
         """A draft with a hallucinated number triggers ONE verifier-guided

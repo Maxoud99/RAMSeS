@@ -103,7 +103,10 @@ class LLMClient:
 
 SYSTEM_PROMPT = (
     "You turn verified facts about an anomaly-detection model-selection run "
-    "into clear prose for a technical reader.\n"
+    "into clear, plain-language prose for a reader who understands anomaly "
+    "detection but not this framework's internals — explain the framework's "
+    "own terms in plain words, keeping standard metric names (F1, PR-AUC) as "
+    "they are.\n"
     "Rules — follow every one strictly:\n"
     "1. Use ONLY the numbered fact sentences given to you. Do not add facts, "
     "numbers, names, comparisons, or causes of your own.\n"
@@ -141,9 +144,13 @@ def _output_lines(output: Dict[str, Any]) -> List[str]:
 
 
 def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220) -> tuple:
-    """Word budget for the WHOLE narrative, scaled with atom count: dense
-    stages (many detectors/rules) get more room instead of being forced to
-    triage required facts out of a fixed-size paragraph."""
+    """Word budget for the WHOLE narrative, scaled with atom count so the floor
+    matches how much there is to say: dense stages (many detectors/rules) get
+    more room instead of triaging required facts out of a fixed paragraph, and
+    sparse stages (e.g. the 2-source final aggregation — a couple of facts) get
+    a low floor instead of being padded to 120 words of filler."""
+    if n_atoms <= 3:
+        return 40, 90
     return lo, min(400, hi + 8 * max(0, n_atoms - 12))
 
 
@@ -175,9 +182,12 @@ def _caveat_lines(ir_doc: Dict[str, Any]) -> List[str]:
 
 def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
     lo, hi = _word_budget(len(ir_doc.get("evidence", [])))
+    question = ir_doc.get("question")
     lines: List[str] = []
     lines.append(f"STAGE: {ir_doc.get('stage')}")
     lines.append(f"DATASET: {ir_doc.get('dataset')}  |  ENTITY: {ir_doc.get('entity')}")
+    if question:
+        lines.append(f"QUESTION THIS STAGE ANSWERS: {question}")
     lines.append("")
     lines.append("STAGE OUTPUT (context facts):")
     lines.extend(_output_lines(ir_doc.get("output", {})))
@@ -186,11 +196,17 @@ def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
     lines.extend(_fact_lines(ir_doc))
     lines.extend(_caveat_lines(ir_doc))
     lines.append("")
-    lines.append(f"TASK: Write ONE paragraph of {lo}-{hi} words explaining this "
-                 "stage's result to a technical reader. Convey every fact marked "
-                 "as required; copy all numbers and names verbatim, and keep each "
-                 "number attached to the exact metric name it accompanies in the "
-                 "facts.")
+    task = (f"TASK: Write ONE paragraph of {lo}-{hi} words")
+    if question:
+        task += (" that answers the question above, leading with the answer and "
+                 "then presenting the facts in the order given as supporting "
+                 "evidence")
+    else:
+        task += " explaining this stage's result"
+    task += (". Convey every fact marked as required; copy all numbers and names "
+             "verbatim, and keep each number attached to the exact metric name it "
+             "accompanies in the facts.")
+    lines.append(task)
     return "\n".join(lines)
 
 
@@ -355,9 +371,15 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
                 else:
                     entry["repair_discarded"] = True
 
+            # A fixed glossary is appended verbatim AFTER verification, so its
+            # definitions are never reworded by the model and never counted as
+            # claims by the verifier.
+            footer = ir_doc.get("info_footer")
             path = os.path.join(nl_dir, f"{nl_name}.txt")
             with open(path, "w") as f:
                 f.write(narrative + "\n")
+                if footer:
+                    f.write(f"\nINFO: {footer}\n")
             entry.update({"narrative_path": path,
                           "words": len(narrative.split()), "verify": metrics})
             report["stages"][stage_key] = entry

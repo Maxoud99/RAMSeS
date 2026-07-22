@@ -317,21 +317,60 @@ class TestBuilders(unittest.TestCase):
         _check_envelope(self, robust, "rank_aggregation_robust")
         self.assertEqual(robust["output"]["top_pick"], "A")
         ids = {a["id"] for a in robust["evidence"]}
-        self.assertIn("ra_robust.source.S1.verdict", ids)
+        # One human-readable role atom per source; the old verdict/top_pick
+        # atoms and their jargon are gone.
+        self.assertIn("ra_robust.source.S1.role", ids)
+        self.assertNotIn("ra_robust.source.S1.verdict", ids)
+        self.assertNotIn("ra_robust.source.S1.top_pick", ids)
         self.assertNotIn("ra_robust.kendall_only.winner", ids)
+        blob = json.dumps(robust)
+        for jargon in ("leave-one-out", "Kendall tau", "Borda-resolved", "pivotality"):
+            self.assertNotIn(jargon, blob)
+        self.assertIn("influence rank", blob)
+        self.assertIn("agreement rank", blob)
+        # Winner reads as a DETECTOR, not a source; a required context atom
+        # names the source set and says the ranked detectors are not sources.
+        self.assertIn("first-ranked detector is A", blob)
+        self.assertIn("ra_robust.context.sources", robust["required_atom_ids"])
+        ctx = next(a for a in robust["evidence"]
+                   if a["id"] == "ra_robust.context.sources")
+        self.assertIn("are the items being ranked, not sources", ctx["text"])
+        self.assertIn("S1", ctx["text"])
+        self.assertIn("S2", ctx["text"])
+        # Friendly consensus naming + question + glossary footer.
+        self.assertIn("robustness consensus", robust["question"])
+        self.assertIn("influential_disagreer", robust["info_footer"])
 
         final = ir.build_rank_aggregation_ir(
             "DS", "e1", "final", 0, _rank_agg_result(True),
             ["S1", "S2"], {"S1": "A", "S2": "A"}, ["A", "B"])
         _check_envelope(self, final, "rank_aggregation_final")
         ids = {a["id"] for a in final["evidence"]}
+        # Two-source case: NO per-source role atoms (influence/Borda degenerate);
+        # a single agreement-driver sentence carries the explanation.
         self.assertIn("ra_final.kendall_only.winner", ids)
+        self.assertFalse(any(i.endswith(".role") for i in ids),
+                         "two-source final must not emit role atoms")
+        driver = next(a for a in final["evidence"]
+                      if a["id"] == "ra_final.kendall_only.winner")
+        self.assertIn("drove the final consensus most", driver["text"])
+        self.assertIn("agreed with the consensus more closely", driver["text"])
         cav = {c["id"] for c in final["caveats"]}
         self.assertIn("ra_final.caveat.two_sources", cav)
+        # Footer is a pure agreement DEFINITION: no influence/Borda talk, and it
+        # does NOT restate the two-source rationale (that lives in the caveat).
+        self.assertNotIn("Influence measures", final["info_footer"])
+        self.assertIn("Agreement compares", final["info_footer"])
+        two_src_cav = next(c for c in final["caveats"]
+                           if c["id"] == "ra_final.caveat.two_sources")
+        self.assertIn("single source", two_src_cav["text"])       # rationale here
+        self.assertNotIn("single source", final["info_footer"])    # not duplicated
+        self.assertIn("follow more closely", final["question"])
 
     def test_rank_aggregation_presentation_order_by_borda(self):
         """Sources are presented best Borda rank first, the consensus pick
-        leads, and each source's top-pick atom follows its verdict."""
+        leads (order 0), and the Borda-#1 source's role sentence says it
+        shaped the consensus most."""
         result = _rank_agg_result(False)
         result["verdicts"][0]["borda_rank"] = 2  # S1 second
         result["verdicts"][1]["borda_rank"] = 1  # S2 first
@@ -340,10 +379,32 @@ class TestBuilders(unittest.TestCase):
             ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
         atoms = {a["id"]: a for a in doc["evidence"]}
         self.assertEqual(atoms["ra_robust.output.top"]["order"], 0)
-        self.assertLess(atoms["ra_robust.source.S2.verdict"]["order"],
-                        atoms["ra_robust.source.S1.verdict"]["order"])
-        self.assertEqual(atoms["ra_robust.source.S2.top_pick"]["order"],
-                         atoms["ra_robust.source.S2.verdict"]["order"] + 1)
+        self.assertLess(atoms["ra_robust.source.S2.role"]["order"],
+                        atoms["ra_robust.source.S1.role"]["order"])
+        # S2 is Borda #1 → its sentence leads the story; S1 "followed".
+        self.assertIn("shaped the robustness consensus most",
+                      atoms["ra_robust.source.S2.role"]["text"])
+        self.assertIn("followed with influence rank",
+                      atoms["ra_robust.source.S1.role"]["text"])
+        # Component ranks live in value for provenance.
+        self.assertEqual(atoms["ra_robust.source.S1.role"]["value"]["influence_rank"],
+                         result["verdicts"][0]["loo_rank"])
+
+    def test_rank_aggregation_lead_states_explicit_ranks(self):
+        """A source tied-top on both axes must state 'influence rank 1 and
+        agreement rank 1' explicitly, not just 'leading both' — otherwise the
+        narrator infers (and mis-states) the lead's ranks."""
+        result = _rank_agg_result(False)
+        # Make S1 the sole top on both influence and agreement, Borda #1.
+        result["verdicts"][0].update(loo_rank=1, align_rank=1, borda_rank=1)
+        result["verdicts"][1].update(loo_rank=2, align_rank=2, borda_rank=2)
+        doc = ir.build_rank_aggregation_ir(
+            "DS", "e1", "robust", 0, result,
+            ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
+        lead = next(a for a in doc["evidence"]
+                    if a["id"] == "ra_robust.source.S1.role")
+        self.assertIn("the influence ranking (rank 1)", lead["text"])
+        self.assertIn("the agreement ranking (rank 1)", lead["text"])
 
     def test_monte_carlo_lean(self):
         doc = ir.build_monte_carlo_ir("DS", "e1", _mc_result(), ["A", "B"], ["B", "A"])
