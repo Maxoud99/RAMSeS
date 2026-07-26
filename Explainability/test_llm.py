@@ -34,13 +34,13 @@ llm = _load("llm")
 
 def _ga_combination_result():
     return {
-        "best_ensemble": ["A", "B"], "feature_names": ["A", "B"],
+        "best_ensemble": ["A", "B", "C"], "feature_names": ["A", "B", "C"],
         "meta_model_type": "rf", "model_source": "captured", "baseline_f1": 0.87,
-        "shap_importance": {"A": 0.4, "B": 0.1},
-        "shap_signed_importance": {"A": 0.35, "B": -0.05},
-        "pfi_importance": {"A": 0.2, "B": 0.01},
-        "markov_scores": {"A": 0.7, "B": 0.3},
-        "final_ranking": ["A", "B"],
+        "shap_importance": {"A": 0.4, "B": 0.2, "C": 0.1},
+        "shap_signed_importance": {"A": 0.35, "B": 0.15, "C": -0.05},
+        "pfi_importance": {"A": 0.2, "B": 0.05, "C": 0.08},
+        "markov_scores": {"A": 0.5, "B": 0.3, "C": 0.2},
+        "final_ranking": ["A", "B", "C"],
     }
 
 
@@ -306,8 +306,14 @@ class TestVerifierAttribution(unittest.TestCase):
 class TestPrompts(unittest.TestCase):
 
     def test_stage_prompt_contains_all_atoms_and_markers(self):
-        doc = ir.build_monte_carlo_ir("DS", "e1", _mc_result(), ["LOF_1", "NN_3"],
+        result = _mc_result()
+        # MC's run-invariant notes now live in the info footer; force a
+        # run-specific caveat (majority-degenerate CV) to exercise [CAVEAT].
+        result["permodel_f1"] = {"A": {"cv_r2": 0.6, "cv_n_splits": 5,
+                                       "cv_degenerate_folds": 4}}
+        doc = ir.build_monte_carlo_ir("DS", "e1", result, ["LOF_1", "NN_3"],
                                       ["NN_3", "LOF_1"])
+        self.assertTrue(doc["caveats"])  # guard: the marker test needs a caveat
         prompt = llm.build_stage_prompt(doc)
         for atom in doc["evidence"]:
             self.assertIn(atom["text"], prompt)
@@ -332,6 +338,16 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("STAGES WITHOUT DATA", prompt)
         self.assertIn("150-300 words", prompt)
 
+    def test_stage_task_hint_only_for_registered_stages(self):
+        doc = _tiny_ir()
+        doc["stage"] = "rank_aggregation_robust"
+        prompt = llm.build_stage_prompt(doc)
+        self.assertIn("rank is a position", prompt)
+        self.assertIn("never restate a rank as 'high' or 'low'", prompt)
+        # Other stages get no hint.
+        doc["stage"] = "monte_carlo"
+        self.assertNotIn("rank is a position", llm.build_stage_prompt(doc))
+
     def test_question_frames_the_prompt(self):
         doc = _tiny_ir()
         # No question → plain framing.
@@ -344,8 +360,8 @@ class TestPrompts(unittest.TestCase):
     def test_stage_prompt_budget_scales_with_atom_count(self):
         # Sparse stage (tiny IR, 2 atoms) → low floor, no 120-word padding.
         doc = _tiny_ir()
-        self.assertEqual(llm._word_budget(len(doc["evidence"])), (40, 90))
-        self.assertIn("40-90 words", llm.build_stage_prompt(doc))
+        self.assertEqual(llm._word_budget(len(doc["evidence"])), (65, 120))
+        self.assertIn("65-120 words", llm.build_stage_prompt(doc))
         # Mid-size stage → the default 120-220.
         mid = dict(doc)
         mid["evidence"] = [
@@ -496,7 +512,7 @@ class TestNarrateEntity(unittest.TestCase):
                 content = f.read()
             body, _, footer = content.partition("\nINFO: ")
             self.assertTrue(footer, "footer must be appended")
-            self.assertIn("Influence measures how much a source shaped", footer)
+            self.assertIn("Influence measures how much a source moved", footer)
             # The footer text is not part of the scored narrative.
             self.assertNotIn("INFO:", body)
             self.assertNotIn("Influence measures", body)

@@ -437,92 +437,184 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     return _envelope("thompson_sampling", dataset, entity, output, evidence, caveats, required)
 
 
+# Included-member reason buckets, in narration order. `needed` (a low-profile
+# member kept because removing it costs fitness) is emitted per detector, not
+# grouped, because each carries its own LOFO number.
+_GA_SEL_BUCKETS = ("both", "utility", "stability", "marginal")
+
+
 def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> Dict[str, Any]:
     best = list(result.get("best_ensemble", []))
     lofo: Dict[str, float] = result.get("lofo", {})
     mm: Dict[str, Dict[str, float]] = result.get("mean_marginal", {})
     archetypes: Dict[str, Dict[str, Any]] = result.get("archetypes", {})
     detectors = list(archetypes.keys())
-
     util = {d: mm.get(d, {}).get("contribution", float("nan")) for d in detectors}
-    finite_sorted = sorted((d for d in detectors if not _is_nan(util[d])),
-                           key=lambda d: util[d], reverse=True)
-    # Standard competition ranking ("1224") so tied contributions share a rank
-    # and the next skips — consistent with every other ranking in the layer.
-    util_rank = _competition_rank(util, finite_sorted)
 
-    def _code_words(code: str) -> str:
-        if code == "Unclassified" or len(code) != 2:
-            return "unclassified"
-        u = "high" if code[0] == "H" else "low"
-        s = "high" if code[1] == "H" else "low"
-        return f"{u} utility, {s} stability"
+    def _flags(d: str) -> Tuple[Any, Any]:
+        """Relative (median-split) high/low utility & stability flags. Prefers
+        the explicit booleans; falls back to the 2-letter archetype code
+        (e.g. 'HL' -> high utility, low stability) when only the code is given."""
+        rel = archetypes.get(d, {}).get("relative", {})
+        u, s = rel.get("u_high"), rel.get("s_high")
+        if u is None and s is None:
+            code = rel.get("archetype", "")
+            if isinstance(code, str) and len(code) == 2 and set(code) <= {"H", "L"}:
+                return code[0] == "H", code[1] == "H"
+        return u, s
+
+    def _num(d: str) -> Dict[str, Any]:
+        """Per-detector utility/stability, kept in `value` for grounding but out
+        of the prose (the narrative reasons in high/low terms)."""
+        sm = archetypes.get(d, {}).get("stability_mean", float("nan"))
+        return {"utility": _val(util.get(d), 4), "stability": _val(sm, 3)}
+
+    def _were(names: Sequence[str]) -> str:
+        return "was" if len(names) == 1 else "were"
+
+    def _them(names: Sequence[str]) -> str:
+        return "it" if len(names) == 1 else "them"
 
     evidence: List[Dict[str, Any]] = []
     required: List[str] = []
-    output = {"best_ensemble": best, "ensemble_size": len(best)}
+    n = len(best)
+    output = {"best_ensemble": best, "ensemble_size": n}
     evidence.append(make_atom(
         "ga_sel.output.ensemble", "stage_output", "best_ensemble", best,
-        f"The genetic algorithm selected the ensemble {{{', '.join(best)}}}."))
+        (f"The genetic algorithm selected the {n}-detector ensemble "
+         f"{{{', '.join(best)}}}." if best
+         else "The genetic algorithm selected no ensemble."), order=1))
     required.append("ga_sel.output.ensemble")
 
-    # One self-contained "member card" atom per ensemble member. Keeping the
-    # archetype, utility, stability, and LOFO of a detector in a SINGLE
-    # sentence prevents the narrator from re-associating values across
-    # neighboring detectors (observed with the previous four-atoms-per-member
-    # layout: swapped utilities, wrongly generalized archetypes).
+    # ── Included members: one reason per member, then grouped by reason ──
+    buckets: Dict[str, List[str]] = {b: [] for b in _GA_SEL_BUCKETS}
+    needed: List[str] = []
     for d in best:
-        arch = archetypes.get(d, {})
-        code = arch.get("relative", {}).get("archetype", NOT_AVAILABLE)
-        u = util.get(d, float("nan"))
-        sm = arch.get("stability_mean", float("nan"))
+        u_high, s_high = _flags(d)
         lv = lofo.get(d, float("nan"))
+        if u_high and s_high:
+            buckets["both"].append(d)
+        elif u_high:
+            buckets["utility"].append(d)
+        elif s_high:
+            buckets["stability"].append(d)
+        elif not _is_nan(lv) and lv > 0:
+            needed.append(d)          # low profile, but removing it costs fitness
+        else:
+            buckets["marginal"].append(d)
 
-        parts = [f"{d}: archetype {code} ({_code_words(code)}, relative "
-                 f"median-split scheme)"]
-        if not _is_nan(u):
-            parts.append(f"mean marginal contribution {_fmt(u, 4)} "
-                         f"(rank {util_rank.get(d, NOT_AVAILABLE)} of "
-                         f"{len(finite_sorted)})")
-        if not _is_nan(sm):
-            parts.append(f"survived {_fmt(100.0 * sm, 1)}% of GA generations")
-        if not _is_nan(lv):
-            direction = "hurts" if lv > 0 else ("does not hurt" if lv < 0 else "does not change")
-            parts.append(f"removing it changes ensemble fitness by {_fmt(-lv, 4)} "
-                         f"(LOFO {_fmt(lv, 4)}; removal {direction} the ensemble)")
-        cid = f"ga_sel.member.{d}.card"
+    def _bucket_text(b: str, names: Sequence[str]) -> str:
+        w, th = _were(names), _them(names)
+        if b == "both":
+            return (f"{_oxford(names)} {w} chosen for both high utility and high "
+                    f"stability.")
+        if b == "utility":
+            return (f"{_oxford(names)} {w} chosen for high utility, despite lower "
+                    f"stability.")
+        if b == "stability":
+            return (f"{_oxford(names)} {w} chosen for high stability — the genetic "
+                    f"algorithm kept {th} in most generations — despite low utility.")
+        return (f"{_oxford(names)} {w} low on both utility and stability, and "
+                f"removing {th} barely changes fitness; the genetic algorithm "
+                f"retained {th} in its best-scoring subset.")
+
+    order = 10
+    for b in _GA_SEL_BUCKETS:
+        names = buckets[b]
+        if not names:
+            continue
+        bid = f"ga_sel.included.{b}"
         evidence.append(make_atom(
-            cid, "member_card", d,
-            {"archetype": code, "utility": _val(u, 4),
-             "utility_rank": util_rank.get(d), "stability": _val(sm, 3),
-             "lofo": _val(lv, 4)},
-            "; ".join(parts) + "."))
-        required.append(cid)
-        if not _is_nan(lv) and not _is_nan(u) and lv != 0 and u != 0 and (lv > 0) != (u > 0):
+            bid, "member_reason", b,
+            {"detectors": names, "reason": b, "per_detector": {d: _num(d) for d in names}},
+            _bucket_text(b, names), order=order))
+        required.append(bid)
+        order += 10
+    for d in needed:
+        lv = lofo.get(d, float("nan"))
+        rid = f"ga_sel.needed.{d}"
+        evidence.append(make_atom(
+            rid, "member_reason", d,
+            dict(_num(d), reason="needed", lofo=_val(lv, 4)),
+            f"Removing {d} lowers the ensemble's fitness by {_fmt(lv, 4)}, which "
+            f"is why it was kept despite low utility and low stability.",
+            order=order))
+        required.append(rid)
+        order += 10
+
+    # ── Excluded detectors: grouped by profile, notable ones called out ──
+    excluded = sorted((d for d in detectors if d not in best),
+                      key=lambda d: (float("-inf") if _is_nan(util[d]) else util[d]),
+                      reverse=True)
+    exc_stable: List[str] = []
+    exc_plain: List[str] = []
+    exc_nodata: List[str] = []
+    for d in excluded:
+        if _is_nan(util[d]):
+            exc_nodata.append(d)
+            continue
+        u_high, s_high = _flags(d)
+        if u_high:                    # high-utility yet not selected — the anomaly
+            eid = f"ga_sel.excluded.{d}"
+            extra = "and high stability" if s_high else "but low stability"
             evidence.append(make_atom(
-                f"ga_sel.member.{d}.disagreement", "signal_disagreement", d,
-                {"lofo": _val(lv, 4), "mean_marginal": _val(u, 4)},
-                f"For {d}, LOFO ({_fmt(lv, 4)}) and the mean marginal contribution "
-                f"({_fmt(u, 4)}) disagree in sign — the two utility views conflict."))
+                eid, "excluded_detector", d,
+                dict(_num(d), u_high=True, s_high=bool(s_high)),
+                f"{d} was left out even though it had high utility {extra}.",
+                order=order))
+            required.append(eid)
+            order += 10
+        elif s_high:
+            exc_stable.append(d)
+        else:
+            exc_plain.append(d)
+    for gid, names, txt in (
+        ("ga_sel.excluded.stable", exc_stable,
+         lambda ns: f"{_oxford(ns)} {_were(ns)} left out for low utility, despite "
+                    f"high stability."),
+        ("ga_sel.excluded.plain", exc_plain,
+         lambda ns: f"{_oxford(ns)} {_were(ns)} left out for low utility and low "
+                    f"stability."),
+        ("ga_sel.excluded.nodata", exc_nodata,
+         lambda ns: f"{_oxford(ns)} {_were(ns)} left out with no marginal-"
+                    f"contribution data to judge utility."),
+    ):
+        if names:
+            evidence.append(make_atom(
+                gid, "excluded_group", gid.rsplit(".", 1)[1],
+                {"detectors": names, "per_detector": {d: _num(d) for d in names}},
+                txt(names), order=order))
+            required.append(gid)
+            order += 10
 
-    excluded = [d for d in finite_sorted if d not in best]
-    if excluded:
-        d0 = excluded[0]
-        evidence.append(make_atom(
-            "ga_sel.excluded.top_utility", "excluded_detector", d0, _val(util[d0], 4),
-            f"Among detectors not selected, {d0} had the highest mean marginal "
-            f"contribution ({_fmt(util[d0], 4)})."))
-
-    caveats = [
-        make_atom("ga_sel.caveat.relative", "caveat", "archetypes", None,
-                  "Archetype labels use relative (median-split) thresholds, so they "
-                  "describe standing within this detector cohort, not absolute quality."),
-    ]
-    if len(best) < 2:
+    caveats: List[Dict[str, Any]] = []
+    if n < 2:
         caveats.append(make_atom(
             "ga_sel.caveat.lofo_na", "caveat", "lofo", None,
-            "LOFO is undefined for ensembles with fewer than two members."))
-    return _envelope("ga_selection", dataset, entity, output, evidence, caveats, required)
+            "With fewer than two detectors, LOFO (the leave-one-out fitness "
+            "change) is undefined."))
+
+    question = ("Why were the detectors in the ensemble chosen, and why were the "
+                "rest left out?")
+    info_footer = (
+        "The genetic algorithm chooses the subset by searching for the ensemble "
+        "with the highest fitness; it never scores detectors individually. The "
+        "two properties below are measured afterwards, from the subsets that "
+        "search evaluated, to explain the ensemble it arrived at. Utility is a "
+        "detector's mean marginal contribution — the average lift in the "
+        "ensemble's F1 score when "
+        "it is added to a subset, across the subsets the genetic algorithm tried. "
+        "Stability is the fraction of generations in which the algorithm kept the "
+        "detector, so a high-stability detector is one it selected in most of its "
+        "ensembles. High and low are relative to this cohort — a median split "
+        "across the detectors evaluated together — so they mean above or below the "
+        "others, not absolute quality. Fitness is the ensemble's best-threshold F1 "
+        "score, the objective the algorithm maximises. LOFO is how much that "
+        "fitness drops when a single detector is removed from the final ensemble; "
+        "a positive value means the detector was pulling weight.")
+
+    return _envelope("ga_selection", dataset, entity, output, evidence, caveats,
+                     required, question=question, info_footer=info_footer)
 
 
 def _competition_rank(scores: Dict[str, Any], order: List[str]) -> Dict[str, int]:
@@ -539,6 +631,78 @@ def _competition_rank(scores: Dict[str, Any], order: List[str]) -> Dict[str, int
     return ranks
 
 
+# Fixed presentation order of the three attribution measures.
+_GA_METHODS = ("absolute SHAP", "signed SHAP", "PFI")
+
+_WEIGHT_ORD = {1: "the most", 2: "the second-most", 3: "the third-most",
+               4: "the fourth-most", 5: "the fifth-most", 6: "the sixth-most",
+               7: "the seventh-most", 8: "the eighth-most", 9: "the ninth-most",
+               10: "the tenth-most", 11: "the eleventh-most", 12: "the twelfth-most"}
+
+
+def _weight_phrase(final_rank: Any) -> str:
+    """'carries {…} weight' ordinal, driven by the final (Markov) display rank."""
+    if final_rank is None or _is_nan(final_rank):
+        return "weight"
+    fr = int(final_rank)
+    return f"{_WEIGHT_ORD.get(fr, f'the {fr}th-most')} weight"
+
+
+def _oxford(items: Sequence[str]) -> str:
+    items = list(items)
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def _rank_phrase(ranks: Sequence[Any]) -> str:
+    """Render the three method ranks, grouping measures that share a rank:
+    (1, 1, 1) -> 'ranking 1 on absolute SHAP, signed SHAP, and PFI';
+    (2, 2, 3) -> 'ranking 2 on absolute SHAP and signed SHAP, and 3 on PFI'."""
+    order: List[int] = []
+    groups: Dict[int, List[str]] = {}
+    na: List[str] = []
+    for label, rk in zip(_GA_METHODS, ranks):
+        if rk is None or _is_nan(rk):
+            na.append(label)
+            continue
+        rk = int(rk)
+        if rk not in groups:
+            groups[rk] = []
+            order.append(rk)
+        groups[rk].append(label)
+    parts = [f"{rk} on {_oxford(groups[rk])}" for rk in order]
+    if not parts:
+        phrase = "with no method ranking available"
+    elif len(parts) == 1:
+        phrase = "ranking " + parts[0]
+    else:
+        phrase = "ranking " + ", ".join(parts[:-1]) + ", and " + parts[-1]
+    if na:
+        phrase += f" (not ranked on {_oxford(na)})"
+    return phrase
+
+
+def _sign_summary_text(members: Sequence[str], signs: Dict[str, str]) -> str:
+    """One sentence classifying every member as positive- or negative-signed."""
+    pos = [d for d in members if signs.get(d) == "positive"]
+    neg = [d for d in members if signs.get(d) == "negative"]
+    na = [d for d in members if signs.get(d) not in ("positive", "negative")]
+    if pos and neg:
+        text = f"{_oxford(pos)} signed positive, while {_oxford(neg)} signed negative"
+    elif pos:
+        text = f"{_oxford(pos)} signed positive"
+    elif neg:
+        text = f"{_oxford(neg)} signed negative"
+    else:
+        return ""
+    if na:
+        text += f"; {_oxford(na)} had no signed direction"
+    return text + "."
+
+
 def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -> Dict[str, Any]:
     ranking = list(result.get("final_ranking", []))
     members = list(result.get("best_ensemble", []))
@@ -553,71 +717,88 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         return {d: i + 1 for i, d in enumerate(order)}
 
     r_abs, r_sgn, r_pfi = _rank_of(s_abs), _rank_of(s_sgn), _rank_of(pfi)
-    final_rank = _competition_rank(pi, ranking)
+    final_rank = _competition_rank(pi, ranking)  # competition rank, display only
+
+    # Every ensemble member is narrated (no top-k cap): the sign summary must
+    # classify all of them, and GA ensembles are small. `detectors` ARE the
+    # ensemble members — never rank-aggregation sources.
+    detectors = ranking if ranking else members
+    signs: Dict[str, str] = {}
+    for d in detectors:
+        sgn = s_sgn.get(d, float("nan"))
+        signs[d] = (NOT_AVAILABLE if _is_nan(sgn)
+                    else ("positive" if sgn >= 0 else "negative"))
 
     evidence: List[Dict[str, Any]] = []
     required: List[str] = []
     top = ranking[0] if ranking else NOT_AVAILABLE
     output = {
         "top_pick": top,
-        "final_ranking_top_k": [{"detector": d, "final_rank": final_rank.get(d),
-                                 "markov_score": _val(pi.get(d), 4)}
-                                for d in _top_k(ranking)],
-        "k": min(TOP_K, len(ranking)),
         "ensemble_members": members,
+        "ensemble_size": len(members),
         "meta_model_type": result.get("meta_model_type", NOT_AVAILABLE),
-        "model_source": result.get("model_source", NOT_AVAILABLE),
         "baseline_f1": _val(result.get("baseline_f1"), 4),
     }
-    if ranking:
-        evidence.append(make_atom(
-            "ga_comb.output.top", "stage_output", top, _val(pi.get(top), 4),
-            f"The meta-learner weighs {top} most heavily "
-            f"(final rank 1, Markov consensus score {_fmt(pi.get(top), 4)})."))
-        required.append("ga_comb.output.top")
-    if members:
-        # Relational fact: this ranking is INSIDE the ensemble branch — every
-        # ranked detector is a member of the GA-selected ensemble.
-        evidence.append(make_atom(
-            "ga_comb.context.members", "stage_context", "best_ensemble", members,
-            f"This ranking weighs the {len(members)} members of the GA-selected "
-            f"ensemble ({', '.join(members)}); every ranked detector is part of "
-            f"that ensemble."))
-        required.append("ga_comb.context.members")
 
-    for d in _top_k(ranking):
-        sgn = s_sgn.get(d, float("nan"))
-        direction = (NOT_AVAILABLE if _is_nan(sgn)
-                     else ("positive" if sgn >= 0 else "negative"))
+    if detectors:
+        n = len(detectors)
         evidence.append(make_atom(
-            f"ga_comb.detector.{d}.methods", "method_evidence", d,
+            "ga_comb.output.subset", "stage_output", "best_ensemble", list(detectors),
+            f"The genetic algorithm's combination step selected the {n}-detector "
+            f"ensemble {{{', '.join(detectors)}}}; the meta-learner then weighted "
+            f"these detectors by how much each drives its output.", order=1))
+        required.append("ga_comb.output.subset")
+
+    for i, d in enumerate(detectors):
+        sgn = s_sgn.get(d, float("nan"))
+        rid = f"ga_comb.detector.{d}.role"
+        evidence.append(make_atom(
+            rid, "detector_role", d,
             {"final_rank": final_rank.get(d),
              "markov_score": _val(pi.get(d), 4),
              "mean_abs_shap": _val(s_abs.get(d), 6), "mean_abs_shap_rank": r_abs.get(d),
              "signed_shap": _val(sgn, 6), "signed_shap_rank": r_sgn.get(d),
-             "signed_direction": direction,
+             "signed_direction": signs[d],
              "pfi_f1_drop": _val(pfi.get(d), 6), "pfi_rank": r_pfi.get(d)},
-            f"{d}: final rank {final_rank.get(d, NOT_AVAILABLE)} "
-            f"(Markov score {_fmt(pi.get(d), 4)}); "
-            f"mean |SHAP| {_fmt(s_abs.get(d), 4)} (rank {r_abs.get(d, NOT_AVAILABLE)}), "
-            f"signed SHAP {_fmt(sgn, 4)} (rank {r_sgn.get(d, NOT_AVAILABLE)}, "
-            f"{direction} influence), "
-            f"PFI F1-drop {_fmt(pfi.get(d), 4)} (rank {r_pfi.get(d, NOT_AVAILABLE)})."))
-        if r_abs.get(d) == 1 and r_sgn.get(d) == 1 and r_pfi.get(d) == 1:
+            f"{d} carries {_weight_phrase(final_rank.get(d))} in the ensemble, "
+            f"{_rank_phrase((r_abs.get(d), r_sgn.get(d), r_pfi.get(d)))}.",
+            order=10 * (i + 1)))
+        required.append(rid)
+
+    if detectors:
+        sign_text = _sign_summary_text(detectors, signs)
+        if sign_text:
             evidence.append(make_atom(
-                f"ga_comb.detector.{d}.agreement", "method_agreement", d, 3,
-                f"All three attribution methods rank {d} first."))
+                "ga_comb.sign_summary", "sign_summary", "signed_shap",
+                {"positive": [d for d in detectors if signs[d] == "positive"],
+                 "negative": [d for d in detectors if signs[d] == "negative"]},
+                sign_text, order=10 * (len(detectors) + 1)))
+            required.append("ga_comb.sign_summary")
 
     caveats = [
         make_atom("ga_comb.caveat.methods", "caveat", "attribution", None,
-                  "Mean |SHAP| and signed SHAP are label-free (they explain the "
-                  "meta-learner's output); PFI is label-based (it measures the F1 "
-                  "drop when a detector's scores are shuffled)."),
+                  "Absolute SHAP and signed SHAP are label-free — they explain the "
+                  "meta-learner's own output — while PFI is label-based, measuring "
+                  "the F1 drop when a detector's scores are shuffled."),
         make_atom("ga_comb.caveat.aggregation", "caveat", "markov", None,
-                  "The final ranking is the stationary distribution of a Markov "
+                  "The overall weighting is the stationary distribution of a Markov "
                   "chain over the three methods' pairwise preferences."),
     ]
-    return _envelope("ga_combination", dataset, entity, output, evidence, caveats, required)
+
+    question = ("Which detectors does the GA-selected ensemble rely on most, and "
+                "which way does each push the meta-learner's decision?")
+    info_footer = (
+        "A positive sign means the detector, on average, pushes the meta-learner "
+        "toward flagging the point as an anomaly (a higher predicted anomaly "
+        "probability); a negative sign means it pushes toward 'not an anomaly'. "
+        "The three ranks are positions where rank 1 is "
+        "strongest: absolute SHAP ranks detectors by overall importance to the "
+        "meta-learner, PFI by the F1 drop when their scores are shuffled, and "
+        "signed SHAP by net directional push — so a strongly negative detector "
+        "can rank low on signed SHAP even when its absolute-SHAP importance is high.")
+
+    return _envelope("ga_combination", dataset, entity, output, evidence, caveats,
+                     required, question=question, info_footer=info_footer)
 
 
 def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iteration: int,
@@ -725,25 +906,30 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
             article = "an" if str(p)[0].lower() in "aeiou" else "a"
             return f", {article} {p} pattern"
 
+        # "shaped the consensus [Nth] most" — the ordinal is the source's
+        # combined Borda standing: rank 1 → "most", 2 → "second most", … Ties
+        # share an ordinal (two sources at Borda rank 3 are both "third most").
+        _ORD_MOST = {1: "", 2: "second ", 3: "third ", 4: "fourth ", 5: "fifth ",
+                     6: "sixth ", 7: "seventh ", 8: "eighth ", 9: "ninth ",
+                     10: "tenth ", 11: "eleventh ", 12: "twelfth "}
+
+        def _shaped_prefix(br: Any) -> str:
+            if br is None or _is_nan(br):
+                return ""
+            return _ORD_MOST.get(int(br), f"{int(br)}th ")
+
         for i, v in enumerate(sorted(verdicts, key=_borda_key)):
             name = v["source"]
             loo_rank, align_rank = v.get("loo_rank"), v.get("align_rank")
             pp = _pattern_phrase(v.get("pattern"))
-            if i == 0:
-                if loo_rank == 1 and align_rank == 1:
-                    # State the explicit ranks (not just "leading both") so the
-                    # narrator never has to infer them — it previously filled in
-                    # the lead's agreement rank itself and got it wrong.
-                    text = (f"{name} shaped the {stage_word} consensus most, "
-                            f"topping both the influence ranking (rank 1) and the "
-                            f"agreement ranking (rank 1){pp}.")
-                else:
-                    text = (f"{name} shaped the {stage_word} consensus most overall, "
-                            f"with influence rank {loo_rank} and agreement rank "
-                            f"{align_rank}{pp}.")
-            else:
-                text = (f"{name} followed with influence rank {loo_rank} and "
-                        f"agreement rank {align_rank}{pp}.")
+            # Every source is described exactly like the lead: how much it
+            # "shaped the consensus" (its combined Borda standing, as an
+            # ordinal) plus BOTH explicit component ranks and its pattern. Both
+            # ranks are stated so the narrator never infers them, and the shared
+            # shape makes the sources read as one ordered walk.
+            text = (f"{name} shaped the {stage_word} consensus "
+                    f"{_shaped_prefix(v.get('borda_rank'))}most, ranking "
+                    f"{loo_rank} for influence and {align_rank} for agreement{pp}.")
             rid = f"{prefix}.source.{name}.role"
             evidence.append(make_atom(
                 rid, "source_role", name,
@@ -758,18 +944,37 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         question = (f"Which source rankings most shaped the {stage_word} consensus, "
                     f"and how much did each agree with it?")
         info_footer = (
-            "Influence measures how much a source shaped the consensus: it compares "
+            "Influence measures how much a source moved the consensus: it compares "
             "the consensus ranking with the ranking that emerges when that source is "
             "left out. Agreement compares the consensus ranking with the source's own "
-            "ranking. The overall order combines both (Borda). An influential_disagreer "
-            "has high influence but low agreement; a redundant_agreer has high "
-            "agreement but low influence; a consistent source ranks similarly on both.")
+            "ranking. How much a source 'shaped the consensus' (most, second most, and "
+            "so on) is its combined standing — influence and agreement merged into one "
+            "overall Borda order. An influential_disagreer has high influence but low "
+            "agreement; a redundant_agreer has high agreement but low influence; a "
+            "consistent source ranks similarly on both.")
 
     ir = _envelope(f"rank_aggregation_{stage_name}", dataset, entity, output,
                    evidence, caveats, required, question=question,
                    info_footer=info_footer)
     ir["iteration"] = int(iteration)
     return ir
+
+
+def _mc_region_phrase(regions: Sequence[Any]) -> str:
+    """Render win regions as prose. Ranges are written 'from A to B', never
+    'A-B': the verifier's number extraction is sign-aware, so a hyphenated
+    range would be read as the negative number -B and flagged unsupported."""
+    spans = [(a, b) for a, b in regions if a != b]
+    points = [a for a, b in regions if a == b]
+    parts: List[str] = []
+    if spans:
+        parts.append(_oxford([f"from {_fmt(a)} to {_fmt(b)}" for a, b in spans]))
+    if points:
+        pts = _oxford([_fmt(p) for p in points])
+        # Isolated grid points read as bare values; only prefix them with "at"
+        # when they follow spans, so the two kinds stay distinguishable.
+        parts.append(f"at {pts}" if spans else pts)
+    return "at noise levels " + ", and ".join(parts)
 
 
 def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
@@ -786,44 +991,59 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
         "production_ranking_f1_top_k": _top_k(ranked_f1 or []),
         "production_ranking_pr_top_k": _top_k(ranked_pr or []),
         "top_pick_f1": (ranked_f1[0] if ranked_f1 else NOT_AVAILABLE),
-        "k": min(TOP_K, len(ranked_f1 or [])),
+        "top_pick_pr": (ranked_pr[0] if ranked_pr else NOT_AVAILABLE),
     }
-    if ranked_f1:
+    top_f1 = ranked_f1[0] if ranked_f1 else None
+    top_pr = ranked_pr[0] if ranked_pr else None
+    if top_f1 or top_pr:
+        if top_f1 and top_pr and top_f1 == top_pr:
+            lead = (f"In the production Monte Carlo test, {top_f1} ranked first "
+                    f"both by F1 score and by PR-AUC.")
+        elif top_f1 and top_pr:
+            lead = (f"In the production Monte Carlo test, {top_f1} ranked first "
+                    f"by F1 score and {top_pr} ranked first by PR-AUC.")
+        else:
+            only, metric = (top_f1, "F1 score") if top_f1 else (top_pr, "PR-AUC")
+            lead = (f"In the production Monte Carlo test, {only} ranked first "
+                    f"by {metric}.")
         evidence.append(make_atom(
-            "mc.output.top_f1", "stage_output", ranked_f1[0], ranked_f1[0],
-            f"The production Monte Carlo test (fixed noise) ranks {ranked_f1[0]} "
-            f"first by F1."))
-        required.append("mc.output.top_f1")
+            "mc.output.top", "stage_output", str(top_f1 or top_pr),
+            {"top_f1": top_f1 or NOT_AVAILABLE, "top_pr": top_pr or NOT_AVAILABLE},
+            lead, order=1))
+        required.append("mc.output.top")
 
+    # ONE atom per detector, covering BOTH metrics. Two atoms about the same
+    # detector (one per metric) is the same-subject-collapse trap: the narrator
+    # states one and silently drops the other. Crossover atoms are dropped
+    # entirely — a crossover is the derivative of the win regions, so emitting
+    # both floods the prose with "at 0.042 ... at 0.053 ..." without adding a
+    # single fact the regions do not already carry.
+    regions_by_model: Dict[str, Dict[str, Any]] = {}
     for metric, curves in (("F1", curves_f1), ("PR-AUC", curves_pr)):
-        tag = metric.replace("-", "").lower()
         for m, regions in sorted((curves.get("win_regions") or {}).items()):
-            if not regions:
-                continue
-            # Degenerate one-grid-point regions read as "from 0.063 to 0.063"
-            # and flood the narrative; compress them to a list of isolated
-            # levels while real spans keep their interval form.
-            spans = [(a, b) for a, b in regions if a != b]
-            points = [a for a, b in regions if a == b]
-            parts = []
-            if spans:
-                parts.append("for noise levels in "
-                             + ", ".join(f"[{_fmt(a)}, {_fmt(b)}]" for a, b in spans))
-            if points:
-                parts.append("at the isolated noise level(s) "
-                             + ", ".join(_fmt(p) for p in points))
-            wid = f"mc.win_region.{tag}.{m}"
-            evidence.append(make_atom(
-                wid, "win_region", m, [(_val(a), _val(b)) for a, b in regions],
-                f"Under the {metric} sweep, {m} leads " + " and ".join(parts) + "."))
-            required.append(wid)
-        for i, cx in enumerate(curves.get("crossovers") or []):
-            evidence.append(make_atom(
-                f"mc.crossover.{tag}.{i}", "crossover", str(cx.get("to_model")),
-                {"noise": _val(cx.get("noise")), "from": cx.get("from_model"),
-                 "to": cx.get("to_model")},
-                f"On the {metric} curves the leader changes from {cx.get('from_model')} "
-                f"to {cx.get('to_model')} at noise level {_fmt(cx.get('noise'))}."))
+            if regions:
+                regions_by_model.setdefault(m, {})[metric] = regions
+
+    wr_all = (winner_f1.get("win_rates") or {}) if isinstance(winner_f1, dict) else {}
+
+    def _region_order(m: str) -> Any:
+        cov = sum(abs(b - a) for rs in regions_by_model[m].values() for a, b in rs)
+        return (-float(wr_all.get(m, 0.0) or 0.0), -cov, m)
+
+    for i, m in enumerate(sorted(regions_by_model, key=_region_order)):
+        per = regions_by_model[m]
+        # Metric first: "won by F1 at ...; by PR-AUC at ..." keeps the two
+        # metric clauses visibly distinct (the narrator otherwise copies one
+        # metric's ranges into the other) and avoids repeating the preamble.
+        clauses = [f"by {metric} {_mc_region_phrase(per[metric])}"
+                   for metric in ("F1", "PR-AUC") if metric in per]
+        wid = f"mc.win_region.{m}"
+        evidence.append(make_atom(
+            wid, "win_region", m,
+            {metric: [(_val(a), _val(b)) for a, b in rs]
+             for metric, rs in per.items()},
+            f"{m} won {'; '.join(clauses)}.", order=10 + i))
+        required.append(wid)
 
     conf: Dict[str, Any] = {}
     if winner_f1.get("feasible"):
@@ -842,36 +1062,13 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             evidence.append(make_atom(
                 "mc.surrogate.win_rates", "surrogate_win_rates", "winner_surrogate",
                 [(m, _val(r, 3)) for m, r in top_wr],
-                f"Across the noise sweep the trials were won by: {wr_txt}."))
-        rules = winner_f1.get("rules")
-        if rules:
-            # IR-level cleanup: collapse each leaf's redundant same-feature
-            # bounds to one interval, then merge adjacent same-winner
-            # intervals (single-feature tree = partition of the noise axis).
-            rules = [dict(r, conditions=simplify_conditions(r.get("conditions", [])))
-                     for r in rules]
-            rules = merge_single_feature_rules(rules)
-            # A depth-3 tree can have up to 8 leaves; requiring them all in a
-            # fixed word budget inflates omission artifactually. Only the three
-            # best-supported rules are required; the rest stay available.
-            by_support = sorted(range(len(rules)),
-                                key=lambda i: rules[i].get("n_samples", 0),
-                                reverse=True)
-            required_rule_idx = set(by_support[:3])
-            for i, rule in enumerate(rules):
-                rid = f"mc.surrogate.rule.{i}"
-                evidence.append(make_atom(
-                    rid, "surrogate_rule", str(rule.get("outcome")), rule,
-                    rule_to_text(rule, "the noise-sweep F1 winner is"),
-                    confidence=grade))
-                if i in required_rule_idx:
-                    required.append(rid)
-        elif winner_f1.get("rules_text"):
-            evidence.append(make_atom(
-                "mc.surrogate.rule.0", "surrogate_rule",
-                str((winner_f1.get("classes") or [NOT_AVAILABLE])[0]),
-                winner_f1.get("rules_text"),
-                str(winner_f1.get("rules_text")), confidence=grade))
+                f"Across the noise sweep the trials were won by: {wr_txt}.",
+                order=100))
+            required.append("mc.surrogate.win_rates")
+        # The winner-surrogate RULES are deliberately not emitted as evidence:
+        # the tree is fitted on (noise level -> winner), so "the winner is X
+        # when noise <= Y" restates the win regions above in weaker, fitted
+        # form. Its held-out fidelity stays in `confidence` above.
 
     # Per-model held-out R² as confidence data, each graded for trust. When a
     # majority of a model's CV folds had (near-)constant test targets the
@@ -893,16 +1090,11 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
     if permodel_cv:
         conf["permodel_cv_r2"] = permodel_cv
 
-    caveats = [
-        make_atom("mc.caveat.proxy", "caveat", "metric", None,
-                  "The noise sweep scores with a fast point-wise best-threshold F1 "
-                  "and PR-AUC; the production ranking uses a range-based metric, so "
-                  "sweep values are not directly comparable to production values."),
-        make_atom("mc.caveat.scope", "caveat", "sweep", None,
-                  "The sweep (noise 0.0-0.2, 20 levels) exists only to explain "
-                  "robustness; the pipeline's forwarded ranking comes from the "
-                  "production run at fixed noise."),
-    ]
+    # Both the run-invariant notes — the sweep is explain-only, and it scores
+    # with a fast point-wise proxy not comparable to production — now live in
+    # the info footer (appended verbatim, not scored). Only run-specific caveats
+    # (e.g. degenerate CV folds for this entity) stay in the caveats list.
+    caveats: List[Dict[str, Any]] = []
     if degenerate_models:
         caveats.append(make_atom(
             "mc.caveat.cv_degenerate", "caveat", "confidence", degenerate_models,
@@ -910,8 +1102,70 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             f"(near-)constant F1 across the sweep, so the held-out R² is not a "
             f"meaningful fidelity estimate (marked not_available); the number is "
             f"kept only for transparency."))
+    question = ("Which detector is most robust to noise, and does the best "
+                "detector change as the noise level rises?")
+    info_footer = (
+        "The production Monte Carlo test injects Gaussian noise whose standard "
+        "deviation is the noise level, fixed at 0.1, and ranks the detectors "
+        "over 100 such runs. This sweep repeats that same injection across 20 "
+        "noise levels from 0.0 to 0.2, five times each, only to show how the "
+        "ranking behaves as noise grows — it is explanatory and never feeds "
+        "model selection. The sweep scores with a fast point-wise best-threshold "
+        "F1 and PR-AUC, whereas the production ranking uses a range-based metric, "
+        "so sweep values are not directly comparable to production values. A win "
+        "percentage is the share of sweep trials in which that detector scored "
+        "best.")
+
     return _envelope("monte_carlo", dataset, entity, output, evidence, caveats,
-                     required, confidence=conf)
+                     required, confidence=conf, question=question,
+                     info_footer=info_footer)
+
+
+# Clause-shaped labels used inside a surrogate condition ("… when <label> is
+# at most 0.3"), and bare noun forms used when a feature is named on its own.
+_OFFBY_LABELS = {
+    "position": "its position in the series",
+    "local_volatility": "the local volatility",
+    "boundary_distance": "the distance from the boundary",
+}
+
+_OFFBY_NOUNS = {
+    "position": "the point's position in the series",
+    "local_volatility": "the local volatility",
+    "boundary_distance": "the distance from the boundary",
+    "is_anomaly": "whether the point is a real anomaly",
+}
+
+
+def _offby_condition_phrase(conditions: List[Dict[str, Any]]) -> str:
+    """Render simplified surrogate conditions as plain prose. `is_anomaly` is a
+    0/1 label, so its 0.5 split becomes a statement rather than a comparison;
+    the other three features keep their raw thresholds (grounded numbers)."""
+    lower: Dict[str, Any] = {}
+    upper: Dict[str, Any] = {}
+    order: List[str] = []
+    for c in conditions:
+        f = str(c["feature"])
+        if f not in order:
+            order.append(f)
+        if c["op"] == "<=":
+            upper[f] = c["threshold"]
+        else:
+            lower[f] = c["threshold"]
+    parts: List[str] = []
+    for f in order:
+        if f == "is_anomaly":
+            parts.append("the point is not a real anomaly" if f in upper
+                         else "the point is a real anomaly")
+            continue
+        label = _OFFBY_LABELS.get(f, f)
+        if f in lower and f in upper:
+            parts.append(f"{label} is between {lower[f]} and {upper[f]}")
+        elif f in upper:
+            parts.append(f"{label} is at most {upper[f]}")
+        else:
+            parts.append(f"{label} is above {lower[f]}")
+    return " and ".join(parts) if parts else "always"
 
 
 def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
@@ -927,16 +1181,17 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
     output = {
         "winner": winner,
         "production_ranking_top_k": _top_k(ranked_f1_names or []),
-        "k": min(TOP_K, len(ranked_f1_names or [])),
         "n_injected_points": int(n_points),
     }
     evidence.append(make_atom(
         "ob.output.winner", "stage_output", str(winner), winner,
-        f"The off-by-threshold test's F1 winner is {winner}."))
+        f"{winner} was the highest-ranked model of the off-by-threshold stage.",
+        order=1))
     required.append("ob.output.winner")
     evidence.append(make_atom(
         "ob.points", "injected_points", "injection", int(n_points),
-        f"{int(n_points)} borderline points were injected around the decision boundary."))
+        f"{int(n_points)} borderline points were injected around the decision "
+        f"boundary.", order=2))
 
     conf: Dict[str, Any] = {}
     caveats = [
@@ -946,34 +1201,27 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
     ]
 
     agg_imp: Dict[str, List[float]] = {fn: [] for fn in feature_names}
-    # Only the top-3 competitors by exclusive wins are REQUIRED content — with
-    # ~10 competitors a fixed word budget cannot convey them all, and marking
-    # every wins atom required would inflate the omission metric artifactually.
-    non_degenerate = [k for k in per_comp if not per_comp[k].get("degenerate")]
-    top_required = set(sorted(non_degenerate,
-                              key=lambda k: per_comp[k].get("n_exclusive_wins", 0),
-                              reverse=True)[:3])
     # Rules are deduplicated across competitors: the same winner-only condition
     # often separates the winner from several rivals (e.g. all LOF variants),
     # and repeating it per competitor wastes prompt budget.
     rule_groups: Dict[str, Dict[str, Any]] = {}
+    degenerate: List[str] = []
+    per_comp_top: Dict[str, Any] = {}
+    low_support: List[Any] = []
+    # Competitors sharing an identical (count, rate) collapse into one atom:
+    # with ~10 rivals most share the same single-win figure, and repeating it
+    # per rival both burns budget and gives the narrator near-identical
+    # sentences to shuffle model names between.
+    wins_groups: Dict[Any, List[str]] = {}
     for k in sorted(per_comp.keys()):
         info = per_comp[k]
         n_w = info.get("n_exclusive_wins", 0)
         rate = info.get("exclusive_win_rate", 0.0)
         if info.get("degenerate"):
-            evidence.append(make_atom(
-                f"ob.vs.{k}.degenerate", "degenerate_comparison", k,
-                {"n_exclusive_wins": int(n_w)}, str(info.get("rules_text", ""))))
+            degenerate.append(k)
             continue
         sup = support_grade(n_w)
-        wid = f"ob.vs.{k}.wins"
-        evidence.append(make_atom(
-            wid, "exclusive_wins", k, {"count": int(n_w), "rate": _val(rate, 4)},
-            f"{winner} correctly handles {int(n_w)} injected point(s) "
-            f"({_fmt(100.0 * rate, 2)}%) that {k} misses.", confidence=sup))
-        if k in top_required:
-            required.append(wid)
+        wins_groups.setdefault((int(n_w), _val(rate, 4)), []).append(k)
 
         clf = info.get("clf")
         if clf is not None:
@@ -996,12 +1244,7 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
 
         imps = info.get("feature_importances", {})
         if imps:
-            top_f = max(imps.items(), key=lambda kv: kv[1])
-            evidence.append(make_atom(
-                f"ob.vs.{k}.importance", "feature_importance", k,
-                {"feature": top_f[0], "importance": _val(top_f[1], 3)},
-                f"The property that best separates those points is {top_f[0]} "
-                f"(importance {_fmt(top_f[1], 2)})."))
+            per_comp_top[k] = max(imps.items(), key=lambda kv: kv[1])
             for fn, im in imps.items():
                 if fn in agg_imp:
                     agg_imp[fn].append(float(im))
@@ -1013,35 +1256,122 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
             "support": sup,
         }
         if sup == "low":
-            caveats.append(make_atom(
-                f"ob.caveat.support.{k}", "caveat", k, int(n_w),
-                f"The rule for {k} rests on only {int(n_w)} exclusive-win point(s) — "
-                f"fewer than the {N_CV_FOLDS} cross-validation folds — so its held-out "
-                f"fidelity is unstable; treat it as indicative."))
+            low_support.append((k, int(n_w)))
 
-    # Emit one atom per distinct rule, naming every competitor it separates.
-    for gi, sig in enumerate(sorted(rule_groups)):
+    # One exclusive-wins atom per distinct (count, rate), best first. Grouping
+    # keeps the atom count low enough that all of them can be REQUIRED without
+    # inflating the omission metric.
+    for wi, key in enumerate(sorted(wins_groups, key=lambda t: (-t[0], t[1]))):
+        n_w, rate = key
+        names = sorted(wins_groups[key])
+        pct = _fmt(100.0 * float(rate or 0.0), 2)
+        pts = f"{n_w} injected point{'' if n_w == 1 else 's'}"
+        wid = f"ob.wins.{wi}"
+        text = (f"{winner} correctly handles {pts} ({pct}%) that {names[0]} misses."
+                if len(names) == 1 else
+                f"{winner} correctly handles {pts} ({pct}%) apiece that "
+                f"{_oxford(names)} each miss.")
+        evidence.append(make_atom(
+            wid, "exclusive_wins", str(winner),
+            {"count": int(n_w), "rate": rate, "competitors": names},
+            text, order=100 + wi))
+        required.append(wid)
+
+    # ONE consolidated low-support caveat: repeating a near-identical sentence
+    # per competitor is what pushes the narrator into compressing names
+    # ("CBLOF_1 to -4"), which Rule 7 forbids. Per-competitor counts are
+    # already carried by the exclusive-wins atoms, so nothing is lost.
+    if len(low_support) == 1:
+        k0, n0 = low_support[0]
+        caveats.append(make_atom(
+            "ob.caveat.support", "caveat", "support", {k0: n0},
+            f"The rule for {k0} rests on only {n0} exclusive-win "
+            f"point{'' if n0 == 1 else 's'} — fewer than the {N_CV_FOLDS} "
+            f"cross-validation folds — so its held-out fidelity is unstable; "
+            f"treat it as indicative."))
+    elif low_support:
+        caveats.append(make_atom(
+            "ob.caveat.support", "caveat", "support",
+            {k0: n0 for k0, n0 in low_support},
+            f"The rules for {_oxford([k0 for k0, _ in low_support])} each rest "
+            f"on fewer than {N_CV_FOLDS} exclusive-win points — fewer than the "
+            f"{N_CV_FOLDS} cross-validation folds — so their held-out fidelity "
+            f"is unstable; treat them as indicative."))
+
+    # One atom per distinct rule, naming every competitor it separates. Rules
+    # are ranked by the total exclusive wins of the rivals they separate, so the
+    # REQUIRED few are the surrogates covering the most ground — one rule often
+    # explains several competitors at once, which buys room for more surrogates.
+    def _group_weight(grp: Dict[str, Any]) -> int:
+        return sum(int(per_comp.get(c, {}).get("n_exclusive_wins", 0))
+                   for c in set(grp["competitors"]))
+
+    sigs = sorted(rule_groups)
+    ranked = sorted(sigs, key=lambda s: (-_group_weight(rule_groups[s]), s))
+    rule_required = set(ranked[:3])
+    rank_of = {s: i for i, s in enumerate(ranked)}
+    for gi, sig in enumerate(sigs):
         grp = rule_groups[sig]
         comps = sorted(set(grp["competitors"]))
-        cond = " and ".join(f"{c['feature']} {c['op']} {c['threshold']}"
-                            for c in grp["rule"]["conditions"]) or "always"
+        phrase = _offby_condition_phrase(grp["rule"]["conditions"])
+        rid = f"ob.rule.{gi}"
+        text = (f"{winner} uniquely beats {_oxford(comps)} across all injected "
+                f"points." if phrase == "always"
+                else f"{winner} uniquely beats {_oxford(comps)} when {phrase}.")
         evidence.append(make_atom(
-            f"ob.rule.{gi}", "surrogate_rule", winner,
+            rid, "surrogate_rule", winner,
             {"conditions": grp["rule"]["conditions"], "competitors": comps},
-            f"{winner} uniquely beats {', '.join(comps)} when: {cond}.",
-            confidence=grp["support"]))
+            text, confidence=grp["support"], order=10 + rank_of[sig]))
+        if sig in rule_required:
+            required.append(rid)
+
+    if degenerate:
+        evidence.append(make_atom(
+            "ob.degenerate", "degenerate_comparison", str(winner),
+            {"competitors": degenerate},
+            f"{winner} never exclusively beat {_oxford(degenerate)}.", order=200))
 
     mean_imp = {fn: float(np.mean(v)) for fn, v in agg_imp.items() if v}
-    if mean_imp and any(mean_imp.values()):
-        top = max(mean_imp.items(), key=lambda kv: kv[1])
+    top = (max(mean_imp.items(), key=lambda kv: kv[1])
+           if mean_imp and any(mean_imp.values()) else None)
+    # A per-competitor importance atom only earns its place when its driver
+    # DIFFERS from the overall one; otherwise it restates the summary below.
+    for ii, k in enumerate(sorted(per_comp_top)):
+        feat, imp = per_comp_top[k]
+        if top is not None and feat == top[0]:
+            continue
+        evidence.append(make_atom(
+            f"ob.vs.{k}.importance", "feature_importance", k,
+            {"feature": feat, "importance": _val(imp, 3)},
+            f"Against {k}, the property that best separates those points is "
+            f"{_OFFBY_NOUNS.get(feat, feat)} (importance {_fmt(imp, 2)}).",
+            order=300 + ii))
+
+    if top is not None:
         evidence.append(make_atom(
             "ob.summary.top_feature", "summary", top[0], _val(top[1], 3),
-            f"Across all competitors, the winner's edge is best explained by "
-            f"{top[0]} (mean importance {_fmt(top[1], 2)})."))
+            f"Across all competitors, {winner}'s edge is best explained by "
+            f"{_OFFBY_NOUNS.get(top[0], top[0])} (mean importance "
+            f"{_fmt(top[1], 2)}).", order=400))
         required.append("ob.summary.top_feature")
 
+    question = ("Which model handled the injected borderline points best, and "
+                "what distinguishes the points it uniquely got right?")
+    info_footer = (
+        "The surrogate rules describe each injected point with four properties. "
+        "is_anomaly is the point's true label - 1 for a real anomaly, 0 for a "
+        "normal point. boundary_distance is how far the point was scaled away "
+        "from the decision boundary, so 0 sits exactly on it. local_volatility "
+        "is the standard deviation of the series around the injection site - how "
+        "noisy that neighbourhood is. position is where the point falls in the "
+        "series, from 0 at the start to 1 at the end. An exclusive win is a "
+        "point the highest-ranked model classified correctly and the named rival "
+        "did not; the rules come from a decision tree fitted to those wins, so "
+        "they describe where the edge occurred, not why.")
+
     return _envelope("off_by_threshold", dataset, entity, output, evidence,
-                     caveats, required, confidence=conf)
+                     caveats, required, confidence=conf, question=question,
+                     info_footer=info_footer)
 
 
 # ── Global assembly ──────────────────────────────────────────────────────────

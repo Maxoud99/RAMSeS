@@ -104,9 +104,7 @@ class LLMClient:
 SYSTEM_PROMPT = (
     "You turn verified facts about an anomaly-detection model-selection run "
     "into clear, plain-language prose for a reader who understands anomaly "
-    "detection but not this framework's internals — explain the framework's "
-    "own terms in plain words, keeping standard metric names (F1, PR-AUC) as "
-    "they are.\n"
+    "detection but not this framework's internals.\n"
     "Rules — follow every one strictly:\n"
     "1. Use ONLY the numbered fact sentences given to you. Do not add facts, "
     "numbers, names, comparisons, or causes of your own.\n"
@@ -117,7 +115,7 @@ SYSTEM_PROMPT = (
     "3. Every fact marked [REQUIRED] must be conveyed. Unmarked facts may be "
     "omitted if space demands.\n"
     "4. Lines marked [CAVEAT] are limitations, not findings: weave the "
-    "relevant ones in briefly (e.g. 'note that ...').\n"
+    "relevant ones in briefly (e.g. 'note that ...') and do not merge them together.\n"
     "5. If a value reads 'not_available', either omit it or say the data is "
     "not available — never fill it in.\n"
     "6. Write ONE coherent paragraph of plain prose. No headings, lists, "
@@ -148,9 +146,11 @@ def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220) -> tuple:
     matches how much there is to say: dense stages (many detectors/rules) get
     more room instead of triaging required facts out of a fixed paragraph, and
     sparse stages (e.g. the 2-source final aggregation — a couple of facts) get
-    a low floor instead of being padded to 120 words of filler."""
+    a low floor instead of being padded to 120 words of filler. The sparse floor
+    still has to clear the two fact sentences PLUS the woven-in caveat (the
+    2-source note alone is ~35 words), or the model triages the caveat out."""
     if n_atoms <= 3:
-        return 40, 90
+        return 65, 120
     return lo, min(400, hi + 8 * max(0, n_atoms - 12))
 
 
@@ -180,6 +180,78 @@ def _caveat_lines(ir_doc: Dict[str, Any]) -> List[str]:
     return lines
 
 
+# Stage-specific rendering guidance appended to the prompt's TASK. This is a
+# NARRATION concern (how to render), so it lives here in the narrator, not in
+# the grounded IR — and it is the same for every run of a stage, so it is not a
+# per-IR field. Keyed by exact stage name; add other stages here as their
+# narratives need shaping.
+_STAGE_TASK_HINTS: Dict[str, str] = {
+    "rank_aggregation_robust": (
+        " Describe each source ranking in the order given; for each one, state "
+        "its influence rank, its agreement rank, and its pattern. A rank is a "
+        "position — rank 1 is best — so never restate a rank as 'high' or 'low' "
+        "influence or agreement; give the rank number itself. The 'shaped the "
+        "consensus Nth most' phrase is the source's overall standing — never "
+        "attach that ordinal to influence or agreement, which have their own "
+        "separate ranks. NEVER merge two sources into one statement or compare "
+        "ranks of one source against another."
+    ),
+    "ga_combination": (
+        " Describe each detector in the order given; for each one, state its "
+        "rank on absolute SHAP, signed SHAP, and PFI (rank 1 is strongest). "
+        "Then give the sign summary, listing which detectors signed positive "
+        "and which signed negative. The 'carries the Nth-most weight' phrase is "
+        "the detector's overall standing in the ensemble — never attach that "
+        "ordinal to a method rank. These are detectors in the ensemble, not "
+        "ranking sources. NEVER merge two detectors into one statement or "
+        "compare one detector against another."
+    ),
+    "ga_selection": (
+        " Open by naming the chosen ensemble. Then explain why the chosen "
+        "detectors were kept, following the facts in order — keep the detectors "
+        "grouped exactly as the facts group them and never move a detector into "
+        "a group it is not listed in. Then explain why the rest were left out. "
+        "Describe each detector only with the high/low utility and stability "
+        "wording the facts use; do not invent two-letter archetype codes. Write "
+        "every detector name in full, do not merge two groups, and use plain "
+        "prose with no math notation."
+    ),
+    "monte_carlo": (
+        " Open with one sentence restating the production-test result exactly "
+        "as the fact gives it — use the word 'first' — naming the top detector "
+        "for each metric. The F1 and PR-AUC leaders are not always the same "
+        "detector: if the fact names two different ones, keep them separate and "
+        "never merge them into a single winner. That opening is about the "
+        "production test, not the sweep, so do not describe it as being most "
+        "robust across noise levels. Then say that "
+        "different detectors won at different noise levels and give each "
+        "detector's winning noise ranges in the order listed, one detector per "
+        "statement. Finish with the win percentages. Copy each noise range as "
+        "it is written ('from 0.000 to 0.042') — never turn a range into a "
+        "hyphenated pair, and never list individual points where the leader "
+        "changes. Write every detector name in full and do not merge two "
+        "detectors. Use plain prose only: no LaTeX and no math notation."
+    ),
+    "off_by_threshold": (
+        " Open with one short sentence naming the highest-ranked model, then "
+        "the surrogate rules, then the exclusive-win counts and the importance "
+        "figures. Give each rule as its OWN separate sentence, listing every "
+        "condition that rule states and naming exactly the models that rule "
+        "lists — never merge two rules together, and never attach one rule's "
+        "conditions to another rule's models. State each rule's conditions "
+        "exactly as they are worded in the facts — never rewrite a condition "
+        "as a bare variable name with a numeric comparison such as "
+        "'is_anomaly <= 0.5'. Write every model name in full. Use plain prose "
+        "only: no LaTeX, no math notation, no backslashes or escaped "
+        "parentheses around numbers."
+    ),
+}
+
+
+def _stage_task_hint(stage: Any) -> str:
+    return _STAGE_TASK_HINTS.get(str(stage), "")
+
+
 def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
     lo, hi = _word_budget(len(ir_doc.get("evidence", [])))
     question = ir_doc.get("question")
@@ -206,6 +278,7 @@ def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
     task += (". Convey every fact marked as required; copy all numbers and names "
              "verbatim, and keep each number attached to the exact metric name it "
              "accompanies in the facts.")
+    task += _stage_task_hint(ir_doc.get("stage", ""))
     lines.append(task)
     return "\n".join(lines)
 

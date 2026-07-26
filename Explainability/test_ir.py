@@ -41,14 +41,17 @@ def _ga_selection_result():
 
 
 def _ga_combination_result():
+    # A: rank 1 on all three (positive); B: rank 2 on |SHAP|+signed but 3 on PFI
+    # (positive); C: rank 3 on |SHAP|+signed but 2 on PFI (negative). Exercises
+    # the shared-rank collapse and the positive/negative sign grouping.
     return {
-        "best_ensemble": ["A", "B"], "feature_names": ["A", "B"],
+        "best_ensemble": ["A", "B", "C"], "feature_names": ["A", "B", "C"],
         "meta_model_type": "rf", "model_source": "captured", "baseline_f1": 0.87,
-        "shap_importance": {"A": 0.4, "B": 0.1},
-        "shap_signed_importance": {"A": 0.35, "B": -0.05},
-        "pfi_importance": {"A": 0.2, "B": 0.01},
-        "markov_scores": {"A": 0.7, "B": 0.3},
-        "final_ranking": ["A", "B"],
+        "shap_importance": {"A": 0.4, "B": 0.2, "C": 0.1},
+        "shap_signed_importance": {"A": 0.35, "B": 0.15, "C": -0.05},
+        "pfi_importance": {"A": 0.2, "B": 0.05, "C": 0.08},
+        "markov_scores": {"A": 0.5, "B": 0.3, "C": 0.2},
+        "final_ranking": ["A", "B", "C"],
     }
 
 
@@ -253,62 +256,136 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("favors B by 0.12", pref["text"])
         self.assertNotIn("-0.12", pref["text"])
 
-    def test_ga_selection_no_complementarity(self):
+    def test_ga_selection_no_archetype_codes_or_complementarity(self):
         doc = ir.build_ga_selection_ir("DS", "e1", _ga_selection_result())
         _check_envelope(self, doc, "ga_selection")
         self.assertNotIn("complementarity", json.dumps(doc).lower())
-        ids = {a["id"] for a in doc["evidence"]}
-        self.assertIn("ga_sel.member.A.card", ids)
-        self.assertIn("ga_sel.member.B.card", ids)
-        # B: lofo -0.02 vs mean_marginal +0.08 → sign disagreement flagged.
-        self.assertIn("ga_sel.member.B.disagreement", ids)
-        self.assertNotIn("ga_sel.member.A.disagreement", ids)
-        # C is the top excluded detector.
-        exc = next(a for a in doc["evidence"] if a["id"] == "ga_sel.excluded.top_utility")
-        self.assertEqual(exc["subject"], "C")
+        # The prose reasons in plain high/low terms — no archetype codes or the
+        # old member-card jargon. (The footer still DEFINES the terms; that's
+        # its job, so the jargon ban applies to the atom texts only.)
+        prose = " ".join(a["text"] for a in doc["evidence"])
+        for jargon in ("archetype", "HH", "HL", "LH", "LL", "median",
+                       "mean marginal contribution", "survived"):
+            self.assertNotIn(jargon, prose)
+        self.assertNotIn("member_card", json.dumps(doc))
+        # Question + footer replace the standalone relative-threshold caveat.
+        self.assertIn("why were the rest left out", doc["question"].lower())
+        # The footer must not present utility/stability as the GA's selection
+        # criteria: the search optimises ensemble fitness, and the two
+        # properties are measured post hoc to explain the subset it reached.
+        self.assertIn("never scores detectors individually", doc["info_footer"])
+        self.assertIn("measured afterwards", doc["info_footer"])
+        self.assertIn("Utility is a detector's mean marginal contribution",
+                      doc["info_footer"])
+        self.assertNotIn("ga_sel.caveat.relative", {c["id"] for c in doc["caveats"]})
 
-    def test_ga_selection_member_card_is_self_contained(self):
-        """One atom per member carries archetype, utility, stability, and LOFO
-        together, so the narrator never re-associates values across
-        detectors; every card is required."""
+    def test_ga_selection_reason_grouping(self):
+        # Fixture: A = HH (both), B = LL with lofo<=0 (marginal), C = HL excluded
+        # with high utility (individual "why not this one?" callout).
         doc = ir.build_ga_selection_ir("DS", "e1", _ga_selection_result())
-        card = next(a for a in doc["evidence"] if a["id"] == "ga_sel.member.A.card")
-        self.assertEqual(card["type"], "member_card")
-        self.assertEqual(card["value"]["archetype"], "HH")
-        self.assertEqual(card["value"]["utility"], 0.12)
-        self.assertEqual(card["value"]["lofo"], 0.05)
-        for fragment in ("archetype HH", "high utility, high stability",
-                         "mean marginal contribution 0.12",
-                         "survived 62.5% of GA generations",
-                         "LOFO 0.05"):
-            self.assertIn(fragment, card["text"])
-        self.assertIn("ga_sel.member.A.card", doc["required_atom_ids"])
-        self.assertIn("ga_sel.member.B.card", doc["required_atom_ids"])
-        # The old four-atoms-per-member layout is gone.
-        ids = {a["id"] for a in doc["evidence"]}
-        for stale in ("ga_sel.member.A.archetype", "ga_sel.member.A.utility",
-                      "ga_sel.member.A.stability", "ga_sel.member.A.lofo"):
-            self.assertNotIn(stale, ids)
+        by_id = {a["id"]: a for a in doc["evidence"]}
+        self.assertEqual(
+            by_id["ga_sel.included.both"]["text"],
+            "A was chosen for both high utility and high stability.")
+        self.assertIn("B was low on both utility and stability",
+                      by_id["ga_sel.included.marginal"]["text"])
+        self.assertEqual(
+            by_id["ga_sel.excluded.C"]["text"],
+            "C was left out even though it had high utility but low stability.")
+        # Utility/stability numbers stay in `value`, never in the prose.
+        self.assertEqual(
+            by_id["ga_sel.included.both"]["value"]["per_detector"]["A"],
+            {"utility": 0.12, "stability": 0.625})
+        for a in doc["evidence"]:
+            self.assertNotIn("0.12", a["text"])
+        for rid in ("ga_sel.output.ensemble", "ga_sel.included.both",
+                    "ga_sel.included.marginal", "ga_sel.excluded.C"):
+            self.assertIn(rid, doc["required_atom_ids"])
+
+    def test_ga_selection_full_reason_cascade(self):
+        def arch(u, s):
+            return {"stability_mean": 0.5, "relative": {"u_high": u, "s_high": s}}
+        result = {
+            "best_ensemble": ["Mb", "Mu", "Ms", "Mn", "Mm"],
+            "lofo": {"Mb": 0.1, "Mu": 0.1, "Ms": 0.1, "Mn": 0.03, "Mm": -0.01},
+            "mean_marginal": {d: {"contribution": 0.1}
+                              for d in ("Mb", "Mu", "Ms", "Mn", "Mm", "Xh", "Xs", "Xp")},
+            "archetypes": {
+                "Mb": arch(True, True), "Mu": arch(True, False),
+                "Ms": arch(False, True), "Mn": arch(False, False),
+                "Mm": arch(False, False), "Xh": arch(True, False),
+                "Xs": arch(False, True), "Xp": arch(False, False),
+                "Xn": arch(False, False),          # not in mean_marginal → no data
+            },
+        }
+        doc = ir.build_ga_selection_ir("DS", "e1", result)
+        _check_envelope(self, doc, "ga_selection")
+        by_id = {a["id"]: a for a in doc["evidence"]}
+        self.assertEqual(by_id["ga_sel.included.both"]["value"]["detectors"], ["Mb"])
+        self.assertEqual(by_id["ga_sel.included.utility"]["value"]["detectors"], ["Mu"])
+        self.assertEqual(by_id["ga_sel.included.stability"]["value"]["detectors"], ["Ms"])
+        self.assertEqual(by_id["ga_sel.included.marginal"]["value"]["detectors"], ["Mm"])
+        # Mn: low profile but lofo>0 → individual "needed" callout, with number.
+        self.assertIn("Removing Mn lowers the ensemble's fitness by 0.0300",
+                      by_id["ga_sel.needed.Mn"]["text"])
+        # Excluded: high-utility anomaly individual; the rest grouped by profile.
+        self.assertIn("high utility but low stability", by_id["ga_sel.excluded.Xh"]["text"])
+        self.assertEqual(by_id["ga_sel.excluded.stable"]["value"]["detectors"], ["Xs"])
+        self.assertEqual(by_id["ga_sel.excluded.plain"]["value"]["detectors"], ["Xp"])
+        self.assertEqual(by_id["ga_sel.excluded.nodata"]["value"]["detectors"], ["Xn"])
 
     def test_ga_combination_no_matrix(self):
         doc = ir.build_ga_combination_ir("DS", "e1", _ga_combination_result())
         _check_envelope(self, doc, "ga_combination")
         self.assertEqual(doc["output"]["top_pick"], "A")
-        # A is rank 1 by all three methods → agreement atom.
-        ids = {a["id"] for a in doc["evidence"]}
-        self.assertIn("ga_comb.detector.A.agreement", ids)
-        m = next(a for a in doc["evidence"] if a["id"] == "ga_comb.detector.B.methods")
-        self.assertEqual(m["value"]["signed_direction"], "negative")
-        # Every method rank AND the final Markov rank are explicit — the LLM
-        # must never have to infer a rank from list order.
-        self.assertEqual(m["value"]["final_rank"], 2)
-        self.assertEqual(m["value"]["signed_shap_rank"], 2)
-        self.assertIn("final rank 2", m["text"])
-        # Ensemble-membership relation is a required atom.
-        self.assertIn("ga_comb.context.members", doc["required_atom_ids"])
-        members = next(a for a in doc["evidence"] if a["id"] == "ga_comb.context.members")
-        self.assertIn("every ranked detector is part of that ensemble", members["text"])
-        self.assertEqual(doc["output"]["ensemble_members"], ["A", "B"])
+        self.assertEqual(doc["output"]["ensemble_size"], 3)
+        by_id = {a["id"] for a in doc["evidence"]}
+
+        # Lead atom names the subset and frames the members AS the detectors.
+        self.assertIn("ga_comb.output.subset", doc["required_atom_ids"])
+        lead = next(a for a in doc["evidence"] if a["id"] == "ga_comb.output.subset")
+        self.assertIn("3-detector ensemble {A, B, C}", lead["text"])
+
+        # Every member gets a role atom (no top-k cap); ordinal from final rank,
+        # method ranks collapsed when shared, raw magnitudes NOT in the prose.
+        for d in ("A", "B", "C"):
+            self.assertIn(f"ga_comb.detector.{d}.role", by_id)
+            self.assertIn(f"ga_comb.detector.{d}.role", doc["required_atom_ids"])
+        a = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.A.role")
+        self.assertEqual(
+            a["text"],
+            "A carries the most weight in the ensemble, ranking 1 on absolute "
+            "SHAP, signed SHAP, and PFI.")
+        b = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.B.role")
+        self.assertEqual(
+            b["text"],
+            "B carries the second-most weight in the ensemble, ranking 2 on "
+            "absolute SHAP and signed SHAP, and 3 on PFI.")
+        c = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.C.role")
+        self.assertEqual(
+            c["text"],
+            "C carries the third-most weight in the ensemble, ranking 3 on "
+            "absolute SHAP and signed SHAP, and 2 on PFI.")
+        # No raw magnitude leaks into the prose (they stay in `value`).
+        self.assertNotIn("Markov", a["text"])
+        self.assertNotIn("0.35", b["text"])
+        self.assertEqual(b["value"]["signed_direction"], "positive")
+        self.assertEqual(c["value"]["signed_direction"], "negative")
+
+        # One sign-summary atom classifies all members by full name.
+        self.assertIn("ga_comb.sign_summary", doc["required_atom_ids"])
+        sign = next(a for a in doc["evidence"] if a["id"] == "ga_comb.sign_summary")
+        self.assertEqual(sign["text"], "A and B signed positive, while C signed negative.")
+
+        # Retired atoms from the old dense layout are gone.
+        for gone in ("ga_comb.output.top", "ga_comb.context.members",
+                     "ga_comb.detector.A.agreement", "ga_comb.detector.A.methods"):
+            self.assertNotIn(gone, by_id)
+
+        # Envelope carries the headline question and the sign/rank glossary.
+        self.assertIn("push the meta-learner's decision", doc["question"])
+        self.assertIn("A positive sign means", doc["info_footer"])
+        self.assertEqual(doc["output"]["ensemble_members"], ["A", "B", "C"])
 
     def test_rank_aggregation_robust_and_final(self):
         robust = ir.build_rank_aggregation_ir(
@@ -326,8 +403,8 @@ class TestBuilders(unittest.TestCase):
         blob = json.dumps(robust)
         for jargon in ("leave-one-out", "Kendall tau", "Borda-resolved", "pivotality"):
             self.assertNotIn(jargon, blob)
-        self.assertIn("influence rank", blob)
-        self.assertIn("agreement rank", blob)
+        self.assertIn("for influence", blob)
+        self.assertIn("for agreement", blob)
         # Winner reads as a DETECTOR, not a source; a required context atom
         # names the source set and says the ranked detectors are not sources.
         self.assertIn("first-ranked detector is A", blob)
@@ -381,11 +458,17 @@ class TestBuilders(unittest.TestCase):
         self.assertEqual(atoms["ra_robust.output.top"]["order"], 0)
         self.assertLess(atoms["ra_robust.source.S2.role"]["order"],
                         atoms["ra_robust.source.S1.role"]["order"])
-        # S2 is Borda #1 → its sentence leads the story; S1 "followed".
-        self.assertIn("shaped the robustness consensus most",
+        # S2 is Borda #1 → "shaped ... most"; S1 is Borda #2 → "second most".
+        self.assertIn("shaped the robustness consensus most,",
                       atoms["ra_robust.source.S2.role"]["text"])
-        self.assertIn("followed with influence rank",
+        self.assertIn("shaped the robustness consensus second most,",
                       atoms["ra_robust.source.S1.role"]["text"])
+        # Both component ranks are stated for each source (never inferred).
+        self.assertIn("ranking 1 for influence and 2 for agreement",
+                      atoms["ra_robust.source.S1.role"]["text"])
+        # The combined (Borda) standing is carried by the ordinal, plus value.
+        self.assertEqual(atoms["ra_robust.source.S2.role"]["value"]["borda_rank"], 1)
+        self.assertEqual(atoms["ra_robust.source.S1.role"]["value"]["borda_rank"], 2)
         # Component ranks live in value for provenance.
         self.assertEqual(atoms["ra_robust.source.S1.role"]["value"]["influence_rank"],
                          result["verdicts"][0]["loo_rank"])
@@ -403,8 +486,8 @@ class TestBuilders(unittest.TestCase):
             ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
         lead = next(a for a in doc["evidence"]
                     if a["id"] == "ra_robust.source.S1.role")
-        self.assertIn("the influence ranking (rank 1)", lead["text"])
-        self.assertIn("the agreement ranking (rank 1)", lead["text"])
+        self.assertIn("shaped the robustness consensus most,", lead["text"])
+        self.assertIn("ranking 1 for influence and 1 for agreement", lead["text"])
 
     def test_monte_carlo_lean(self):
         doc = ir.build_monte_carlo_ir("DS", "e1", _mc_result(), ["A", "B"], ["B", "A"])
@@ -415,9 +498,20 @@ class TestBuilders(unittest.TestCase):
         self.assertNotIn("robust\"", blob)
         self.assertNotIn("fragile", blob)
         ids = {a["id"] for a in doc["evidence"]}
-        self.assertIn("mc.win_region.f1.A", ids)
-        self.assertIn("mc.crossover.f1.0", ids)
-        self.assertIn("mc.surrogate.rule.0", ids)
+        # One win-region atom per DETECTOR (both metrics in one sentence); the
+        # crossover and surrogate-rule atoms are gone — a crossover is the
+        # derivative of the regions and the rules restate them in fitted form.
+        self.assertIn("mc.win_region.A", ids)
+        self.assertNotIn("mc.win_region.f1.A", ids)
+        self.assertNotIn("mc.crossover.f1.0", ids)
+        self.assertNotIn("mc.surrogate.rule.0", ids)
+        # Lead names BOTH production winners (they differ in this fixture).
+        lead = next(a for a in doc["evidence"] if a["id"] == "mc.output.top")
+        self.assertEqual(
+            lead["text"],
+            "In the production Monte Carlo test, A ranked first by F1 score "
+            "and B ranked first by PR-AUC.")
+        self.assertIn("mc.surrogate.win_rates", doc["required_atom_ids"])
         conf = doc["confidence"]
         self.assertEqual(conf["winner_surrogate_f1"]["grade"], "high")
         # Per-model cv R² is graded confidence data, number kept visible.
@@ -450,18 +544,24 @@ class TestBuilders(unittest.TestCase):
         low = ir.build_off_by_ir("DS", "e1", _off_by_result(n_wins=2), ["A", "B"])
         _check_envelope(self, low, "off_by_threshold")
         self.assertEqual(low["confidence"]["surrogate_vs_B"]["support"], "low")
-        self.assertIn("ob.caveat.support.B", {c["id"] for c in low["caveats"]})
+        # Low-support caveats are consolidated into ONE atom naming the rules.
+        self.assertIn("ob.caveat.support", {c["id"] for c in low["caveats"]})
+        sup = next(c for c in low["caveats"] if c["id"] == "ob.caveat.support")
+        self.assertIn("The rule for B rests on only 2 exclusive-win points", sup["text"])
 
         ok = ir.build_off_by_ir("DS", "e1", _off_by_result(n_wins=8), ["A", "B"])
         self.assertEqual(ok["confidence"]["surrogate_vs_B"]["support"], "adequate")
-        self.assertNotIn("ob.caveat.support.B", {c["id"] for c in ok["caveats"]})
-        # Degenerate competitor appears as a text atom.
+        self.assertNotIn("ob.caveat.support", {c["id"] for c in ok["caveats"]})
+        # Degenerate competitors are consolidated into ONE atom naming them all.
         ids = {a["id"] for a in ok["evidence"]}
-        self.assertIn("ob.vs.C.degenerate", ids)
+        self.assertIn("ob.degenerate", ids)
+        self.assertNotIn("ob.vs.C.degenerate", ids)
+        deg = next(a for a in ok["evidence"] if a["id"] == "ob.degenerate")
+        self.assertEqual(deg["text"], "A never exclusively beat C.")
 
-    def test_off_by_required_curated_to_top3(self):
-        # 4 non-degenerate competitors with wins 10/8/6/1 → only the top 3
-        # wins atoms are required (all 4 remain as evidence).
+    def test_off_by_wins_grouped_by_identical_counts(self):
+        # Distinct win counts → one atom each, ordered best-first and all
+        # required (grouping keeps the atom count low enough to require them).
         result = _off_by_result(n_wins=10)
         pc = result["surrogates"]["per_competitor"]
         for name, wins in (("D", 8), ("E", 6), ("F", 1)):
@@ -470,11 +570,26 @@ class TestBuilders(unittest.TestCase):
         doc = ir.build_off_by_ir("DS", "e1", result, ["A", "B"])
         _check_envelope(self, doc, "off_by_threshold")
         req = set(doc["required_atom_ids"])
-        self.assertIn("ob.vs.B.wins", req)   # 10 wins
-        self.assertIn("ob.vs.D.wins", req)   # 8 wins
-        self.assertIn("ob.vs.E.wins", req)   # 6 wins
-        self.assertNotIn("ob.vs.F.wins", req)  # 1 win → optional
-        self.assertIn("ob.vs.F.wins", {a["id"] for a in doc["evidence"]})
+        for wid in ("ob.wins.0", "ob.wins.1", "ob.wins.2", "ob.wins.3"):
+            self.assertIn(wid, req)
+        wins = {a["id"]: a for a in doc["evidence"] if a["type"] == "exclusive_wins"}
+        self.assertEqual(wins["ob.wins.0"]["value"]["competitors"], ["B"])  # 10
+        self.assertEqual(wins["ob.wins.3"]["value"]["competitors"], ["F"])  # 1
+        self.assertIn("10 injected points", wins["ob.wins.0"]["text"])
+        self.assertIn("1 injected point ", wins["ob.wins.3"]["text"])  # singular
+
+    def test_off_by_wins_merge_when_counts_identical(self):
+        # Rivals sharing the same (count, rate) collapse into ONE atom naming
+        # both — the repetition that pushes the narrator into compressing names.
+        result = _off_by_result(n_wins=1)
+        pc = result["surrogates"]["per_competitor"]
+        for name in ("D", "E"):
+            pc[name] = dict(pc["B"])
+        doc = ir.build_off_by_ir("DS", "e1", result, ["A", "B"])
+        wins = [a for a in doc["evidence"] if a["type"] == "exclusive_wins"]
+        self.assertEqual(len(wins), 1)
+        self.assertEqual(wins[0]["value"]["competitors"], ["B", "D", "E"])
+        self.assertIn("apiece that B, D, and E each miss", wins[0]["text"])
 
     def test_off_by_rules_deduplicated_across_competitors(self):
         import importlib
@@ -494,33 +609,28 @@ class TestBuilders(unittest.TestCase):
         # Identical rule fitted for B and D → ONE merged atom naming both.
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["value"]["competitors"], ["B", "D"])
-        self.assertIn("uniquely beats B, D when:", rules[0]["text"])
+        # Competitors read as a full oxford list and the condition is prose,
+        # never a raw "feature op threshold" comparison.
+        self.assertIn("uniquely beats B and D when ", rules[0]["text"])
+        self.assertIn("the distance from the boundary is at most", rules[0]["text"])
+        self.assertNotIn("boundary_distance <=", rules[0]["text"])
 
-    def test_mc_required_rules_curated_to_top3(self):
+    def test_mc_winner_surrogate_rules_not_emitted_but_fidelity_kept(self):
+        # The winner-surrogate tree restates the win regions in fitted form, so
+        # its rules are no longer evidence — but its held-out fidelity stays.
         result = _mc_result()
         result["winner_f1"]["rules"] = [
             {"conditions": [{"feature": "noise_level", "op": "<=", "threshold": 0.05}],
              "outcome": "A", "n_samples": 50},
             {"conditions": [{"feature": "noise_level", "op": ">", "threshold": 0.15}],
              "outcome": "B", "n_samples": 30},
-            {"conditions": [{"feature": "noise_level", "op": "<=", "threshold": 0.1}],
-             "outcome": "A", "n_samples": 10},
-            {"conditions": [{"feature": "noise_level", "op": ">", "threshold": 0.05}],
-             "outcome": "B", "n_samples": 2},
         ]
         doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
-        req = set(doc["required_atom_ids"])
-        rule_atoms = [a for a in doc["evidence"]
-                      if a["id"].startswith("mc.surrogate.rule.")]
-        self.assertEqual(len(rule_atoms), 4)
-        # The three best-supported rules are required; the 2-sample rule is
-        # evidence-only. (Rules are re-ordered along the noise axis, so
-        # identify them by support, not index.)
-        for a in rule_atoms:
-            if a["value"]["n_samples"] == 2:
-                self.assertNotIn(a["id"], req)
-            else:
-                self.assertIn(a["id"], req)
+        self.assertEqual(
+            [a for a in doc["evidence"] if a["type"] == "surrogate_rule"], [])
+        self.assertNotIn("noise-sweep F1 winner is", json.dumps(doc))
+        self.assertEqual(doc["confidence"]["winner_surrogate_f1"]["grade"], "high")
+        self.assertEqual(doc["confidence"]["winner_surrogate_f1"]["cv_accuracy"], 0.85)
 
     def test_simplify_conditions_tightest_bounds(self):
         conds = [
@@ -559,43 +669,25 @@ class TestBuilders(unittest.TestCase):
                   "outcome": "x", "n_samples": 1}]
         self.assertEqual(ir.merge_single_feature_rules(multi), multi)
 
-    def test_mc_rules_simplified_merged_and_labeled(self):
-        result = _mc_result()
-        result["winner_f1"]["rules"] = [
-            {"conditions": [{"feature": "noise_level", "op": "<=", "threshold": 0.0368},
-                            {"feature": "noise_level", "op": "<=", "threshold": 0.0053}],
-             "outcome": "A", "n_samples": 5},
-            {"conditions": [{"feature": "noise_level", "op": "<=", "threshold": 0.0368},
-                            {"feature": "noise_level", "op": ">", "threshold": 0.0053}],
-             "outcome": "A", "n_samples": 15},
-            {"conditions": [{"feature": "noise_level", "op": ">", "threshold": 0.0368}],
-             "outcome": "B", "n_samples": 80},
-        ]
-        doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
-        rule_atoms = [a for a in doc["evidence"]
-                      if a["id"].startswith("mc.surrogate.rule.")]
-        # The two adjacent A-leaves collapse into one interval fact.
-        self.assertEqual(len(rule_atoms), 2)
-        merged = next(a for a in rule_atoms if a["value"]["outcome"] == "A")
-        self.assertEqual(merged["value"]["n_samples"], 20)
-        self.assertEqual(merged["value"]["conditions"],
-                         [{"feature": "noise_level", "op": "<=", "threshold": 0.0368}])
-        # The rule text names what the outcome means.
-        for a in rule_atoms:
-            self.assertIn("the noise-sweep F1 winner is", a["text"])
-            self.assertNotIn("the outcome is", a["text"])
-
     def test_mc_win_regions_compress_isolated_points(self):
+        # NOTE: the fixture shares one curves dict across F1 and PR-AUC, so
+        # each detector reports the same ranges under both metrics.
         result = _mc_result()
         result["curves_f1"]["win_regions"] = {"A": [(0.0, 0.1), (0.15, 0.15)],
                                               "B": [(0.2, 0.2)]}
         doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], [])
-        a_atom = next(x for x in doc["evidence"] if x["id"] == "mc.win_region.f1.A")
-        self.assertIn("for noise levels in [", a_atom["text"])
-        self.assertIn("isolated noise level", a_atom["text"])
-        b_atom = next(x for x in doc["evidence"] if x["id"] == "mc.win_region.f1.B")
-        self.assertIn("isolated noise level", b_atom["text"])
-        self.assertNotIn("[", b_atom["text"])
+        a_atom = next(x for x in doc["evidence"] if x["id"] == "mc.win_region.A")
+        # Spans read "from A to B" — never "A-B", which the sign-aware number
+        # extractor would parse as the negative number -B.
+        self.assertIn("A won by F1 at noise levels from 0.000 to 0.100, and at 0.150",
+                      a_atom["text"])
+        self.assertNotIn("0.000-0.100", a_atom["text"])
+        # Both metrics live in ONE atom, metric-first, split by a semicolon.
+        self.assertIn("; by PR-AUC at noise levels", a_atom["text"])
+        # Points-only reads as bare levels, with no dangling "at ... at".
+        b_atom = next(x for x in doc["evidence"] if x["id"] == "mc.win_region.B")
+        self.assertIn("B won by F1 at noise levels 0.200", b_atom["text"])
+        self.assertNotIn("from", b_atom["text"])
 
     def test_determinism(self):
         a = json.dumps(ir.build_ga_combination_ir("DS", "e1", _ga_combination_result()),
