@@ -502,6 +502,11 @@ def fit_linear_thompson_sampling(dataset,
     _l2_norm_hist: Dict[str, List[float]] = {m: [] for m in models}
     _selection_states: List[str] = []
     _window_contexts: List[np.ndarray] = []
+    # Posterior means as they stood BEFORE each window's update — the beliefs that
+    # informed the decision. Every explainability quantity (regime detection,
+    # selection states, SHAP) reads from this one vintage so the stage never
+    # compares a detector against itself at two different points in its learning.
+    _pre_means_hist: List[Dict[str, np.ndarray]] = []
 
     for iteration in range(num_windows):
         logger.info(f"Iteration {iteration + 1}")
@@ -526,6 +531,9 @@ def fit_linear_thompson_sampling(dataset,
             _selection_states.append(classify_selection(chosen_model_name, was_random, pre_update_rewards))
             for _m in models:
                 _pre_exp_rewards_hist[_m].append(pre_update_rewards[_m])
+            # Snapshot (copy — means are mutated in place) alongside the rewards
+            # so the two stay index-aligned even when a window is skipped.
+            _pre_means_hist.append({_m: means[_m].flatten().copy() for _m in models})
             # Store the (L2-normalised) context so SHAP can be computed per window later.
             _window_contexts.append(context)
 
@@ -611,6 +619,10 @@ def fit_linear_thompson_sampling(dataset,
             "baseline_context": baseline_context,
             "all_contexts": _window_contexts,
             "n_channels": n_channels,
+            # Per-window pre-update means; SHAP uses means_history[t] with
+            # all_contexts[t] so every attribution reflects the beliefs held
+            # when that window was decided.
+            "means_history": _pre_means_hist,
         }
         return (means, covariances, history, list_of_chosen_models,
                 _exp_rewards_hist, _l2_norm_hist, _selection_states,
@@ -899,6 +911,27 @@ def _per_channel_shap_map(
     }
 
 
+def _fresh_plot_dir(directory: str) -> str:
+    """
+    Create `directory` and drop the .png files a previous run left there.
+
+    Plot filenames embed the window range (e.g. regime_01_w0-4_NN_3.png), so a
+    run with different regime boundaries writes new names and the stale ones
+    linger — leaving several runs' plots side by side in one folder. Only .png
+    files directly inside this generated directory are removed.
+    """
+    os.makedirs(directory, exist_ok=True)
+    try:
+        for name in os.listdir(directory):
+            if name.lower().endswith('.png'):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+    except OSError as e:
+        logger.warning(f"Could not clear stale plots in {directory}: {e}")
+    return directory
+
+
 def _avg_per_channel_shap_map(
     means: Dict[str, np.ndarray],
     top_models: List[str],
@@ -906,6 +939,7 @@ def _avg_per_channel_shap_map(
     baseline: np.ndarray,
     n_channels: int,
     absolute: bool = False,
+    means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Per-channel SHAP for each model, averaged over a list of contexts.
@@ -916,13 +950,25 @@ def _avg_per_channel_shap_map(
                      importance measure. Required for the whole-data average,
                      where the raw signed average is identically zero because
                      the baseline IS the mean of all contexts.
+
+    means_per_context : the pre-update means for each context, index-aligned with
+        `contexts`. When given, context t is explained with the beliefs held at
+        window t. SHAP is bilinear in (mu, x), so the average of the per-window
+        attributions is NOT the attribution of the averaged mean at the averaged
+        context — the per-window loop below is the correct order.
     """
     out: Dict[str, np.ndarray] = {}
     n = max(len(contexts), 1)
     for m in top_models:
-        mu = means[m].flatten()
+        mu_fixed = means[m].flatten() if means_per_context is None else None
         acc = np.zeros(n_channels)
-        for ctx in contexts:
+        for i, ctx in enumerate(contexts):
+            if mu_fixed is not None:
+                mu = mu_fixed
+            else:
+                if i >= len(means_per_context) or m not in means_per_context[i]:
+                    continue
+                mu = np.asarray(means_per_context[i][m]).flatten()
             pc = aggregate_shap_per_channel(compute_shap_values(mu, ctx, baseline), n_channels)
             acc += np.abs(pc) if absolute else pc
         out[m] = acc / n
@@ -1134,18 +1180,22 @@ def plot_shap_per_window(
     base = "shap_per_window_all" if all_models else "shap_per_window"
     if sample_stride and sample_stride > 1:
         base = f"{base}_every{sample_stride}"
-    directory = f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/'
-    os.makedirs(directory, exist_ok=True)
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    mu_hist = shap_payload.get("means_history") or []
     for t, ctx in enumerate(contexts):
         if sample_stride and sample_stride > 1 and t % sample_stride != 0:
             continue
+        # Beliefs held at window t, so the plot explains the decision that was
+        # actually made there rather than re-reading it with end-of-run knowledge.
+        means_t = ({m: v.reshape(-1, 1) for m, v in mu_hist[t].items()}
+                   if t < len(mu_hist) else means)
         if all_models:
             sel_models = every_model
             title = f'SHAP — window {t} (all models)'
         else:
-            sel_models = _top_k_models_by_expected_reward(means, [ctx], top_k_models)
+            sel_models = _top_k_models_by_expected_reward(means_t, [ctx], top_k_models)
             title = f'SHAP — window {t} (top {top_k_models} by E[R] in window)'
-        per_channel = _per_channel_shap_map(means, sel_models, ctx, baseline, n_channels)
+        per_channel = _per_channel_shap_map(means_t, sel_models, ctx, baseline, n_channels)
         _render_shap_comparison(
             per_channel, sel_models, top_n_channels,
             title=title,
@@ -1188,12 +1238,15 @@ def plot_shap_per_regime(
                                            fallback_model=fallback)
     every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
     folder = f'shap_per_regime_all_{iterations}' if all_models else f'shap_per_regime_{iterations}'
-    directory = f'myresults/Thomposon/{dataset}/{entity}/{folder}/'
-    os.makedirs(directory, exist_ok=True)
-    for i, (start, end, model, _duration) in enumerate(segments, 1):
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
+    mu_hist = shap_payload.get("means_history") or []
+    # 0-based to match the report's "Regime 0" and the IR's ts.regime.0.* ids;
+    # the filenames are what a reader cross-references against the prose.
+    for i, (start, end, model, _duration) in enumerate(segments):
         regime_ctx = contexts[start:end + 1]
         if not regime_ctx:
             continue
+        regime_mu = mu_hist[start:end + 1] if mu_hist else None
         if all_models:
             sel_models = every_model
             title = f'SHAP — regime {i} ({model}, windows {start}-{end}, all models)'
@@ -1202,7 +1255,8 @@ def plot_shap_per_regime(
             title = (f'SHAP — regime {i} ({model}, windows {start}-{end}, '
                      f'top {top_k_models} by E[R] in regime)')
         per_channel = _avg_per_channel_shap_map(
-            means, sel_models, regime_ctx, baseline, n_channels, absolute=False)
+            means, sel_models, regime_ctx, baseline, n_channels, absolute=False,
+            means_per_context=regime_mu)
         _render_shap_comparison(
             per_channel, sel_models, top_n_channels,
             title=title,
@@ -1252,7 +1306,8 @@ def plot_shap_average_all(
                  '(global importance)')
 
     per_channel = _avg_per_channel_shap_map(
-        means, sel_models, contexts, baseline, n_channels, absolute=True)
+        means, sel_models, contexts, baseline, n_channels, absolute=True,
+        means_per_context=shap_payload.get("means_history") or None)
     _render_shap_comparison(
         per_channel, sel_models, top_n_channels,
         title=title,
@@ -1327,6 +1382,8 @@ def explain_thompson_sampling(
         all_ctx = (shap_payload or {}).get("all_contexts") or []
         base_ctx = (shap_payload or {}).get("baseline_context")
         n_ch = int((shap_payload or {}).get("n_channels", 0) or 0)
+        # Pre-update means per window; empty falls back to the final means.
+        mu_hist = (shap_payload or {}).get("means_history") or []
         for seg_idx, (seg_s, seg_e, seg_m, seg_dur) in enumerate(regime_segments):
             seg_end = min(int(seg_e), T - 1)
             seg_start = max(int(seg_s), 0)
@@ -1356,18 +1413,37 @@ def explain_thompson_sampling(
             pref_favor_leader = pref_favor_runner = None
             pref_gap = float('nan')
             if leader is not None and n_ch > 0 and len(all_ctx) > seg_end:
-                ctx_reg = np.mean([np.asarray(all_ctx[t], dtype=float)
-                                   for t in range(seg_start, seg_end + 1)], axis=0)
-                mu_l = means[leader].flatten()
-                pc_l = aggregate_shap_per_channel(
-                    compute_shap_values(mu_l, ctx_reg, base_ctx), n_ch)
+                # Per-window attribution with the beliefs held at that window,
+                # then averaged over the regime. SHAP is bilinear in (mu, x), so
+                # this is NOT the same as explaining the averaged mean at the
+                # averaged context — and only this order makes the channel
+                # deltas sum to the regime's reported mean-reward gap.
+                win = range(seg_start, seg_end + 1)
+                mu_at = (lambda t, m: np.asarray(mu_hist[t][m]).flatten()
+                         if t < len(mu_hist) and m in mu_hist[t]
+                         else means[m].flatten())
+                n_win = max(len(win), 1)
+                pc_l = np.zeros(n_ch)
+                pc_r = np.zeros(n_ch)
+                gap_acc = 0.0
+                have_runner = runner is not None and runner in means
+                for t in win:
+                    ctx_t = np.asarray(all_ctx[t], dtype=float)
+                    mu_l = mu_at(t, leader)
+                    pc_l += aggregate_shap_per_channel(
+                        compute_shap_values(mu_l, ctx_t, base_ctx), n_ch)
+                    if have_runner:
+                        mu_r = mu_at(t, runner)
+                        pc_r += aggregate_shap_per_channel(
+                            compute_shap_values(mu_r, ctx_t, base_ctx), n_ch)
+                        gap_acc += float(np.dot(mu_l - mu_r, ctx_t - base_ctx))
+                pc_l /= n_win
                 shap_raising, shap_lowering = _split_by_sign(pc_l)
-                if runner is not None and runner in means:
-                    mu_r = means[runner].flatten()
-                    pc_r = aggregate_shap_per_channel(
-                        compute_shap_values(mu_r, ctx_reg, base_ctx), n_ch)
+                if have_runner:
+                    pc_r /= n_win
                     delta = pc_l - pc_r
-                    pref_gap = float(np.dot(mu_l - mu_r, ctx_reg))
+                    # Baseline-relative, so the channel deltas sum to it exactly.
+                    pref_gap = gap_acc / n_win
                     pref_favor_leader, pref_favor_runner = _split_by_sign(delta)
 
             regimes_data.append({
@@ -1539,6 +1615,10 @@ def explain_thompson_sampling(
             blip_count=len(blip_windows),
             state_fractions={s: state_counts[s] / state_total for s in state_counts},
             final_state=selection_states[-1] if selection_states else "not_available",
+            # Channel names when the loader supplied them; the IR falls back to
+            # "channel N" for datasets whose sources have no column headers.
+            channel_names=(shap_payload or {}).get("channel_names"),
+            n_channels=(shap_payload or {}).get("n_channels"),
         )
         _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson")
     except Exception as e:
@@ -1688,7 +1768,12 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
     plot_history(history, trained_models, dataset, entity, iterations)
 
     if explain:
-        regime_shifts, blip_windows = detect_regime_shifts(exp_rewards_hist)
+        # Regimes are detected on the PRE-update rewards. The post-update history
+        # lets the detector that was just evaluated fold that window's own reward
+        # into its value before being compared against the ones that were not
+        # evaluated — a self-selection bump of up to r/2 on a detector's first
+        # pick, largest exactly where the early regimes form.
+        regime_shifts, blip_windows = detect_regime_shifts(pre_exp_rewards_hist)
         plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
                               dataset, entity, iterations, smooth=False)
         plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),

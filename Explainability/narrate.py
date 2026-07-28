@@ -20,10 +20,12 @@ import sys
 
 try:
     from Explainability.llm import (DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient,
-                                    _stage_file_map, narrate_entity)
+                                    _stage_file_map, narrate_entity,
+                                    GLOBAL_MODES)
 except ImportError:  # executed as a loose script from inside the directory
     from llm import (DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient,  # type: ignore
-                     _stage_file_map, narrate_entity)
+                     _stage_file_map, narrate_entity,  # type: ignore
+                     GLOBAL_MODES)
 
 _STAGE_TOKENS = sorted(set(_stage_file_map(0)) | {"global"})
 
@@ -42,6 +44,10 @@ def main(argv=None) -> int:
     parser.add_argument("--out-dir", default="myresults/explanations_nl")
     parser.add_argument("--stages", default=None,
                         help="Comma-separated subset of: " + ", ".join(_STAGE_TOKENS))
+    parser.add_argument("--global-mode", default="concat", choices=list(GLOBAL_MODES),
+                        help="How to build the global document: 'concat' merges the "
+                             "per-stage narratives deterministically (default); 'llm' "
+                             "narrates the global IR's own atoms and verifies it.")
     args = parser.parse_args(argv)
 
     stages = None
@@ -57,7 +63,7 @@ def main(argv=None) -> int:
     try:
         report = narrate_entity(args.dataset, args.entity, args.iteration, client,
                                 base_dir=args.base_dir, out_dir=args.out_dir,
-                                stages=stages)
+                                stages=stages, global_mode=args.global_mode)
     except ConnectionError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

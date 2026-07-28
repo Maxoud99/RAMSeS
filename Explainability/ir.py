@@ -294,13 +294,28 @@ def _top_k(seq: Sequence[Any], k: int = TOP_K) -> List[Any]:
 
 # ── Stage builders ───────────────────────────────────────────────────────────
 
+def _ts_channel_label(idx: Any, channel_names: Optional[Sequence[str]]) -> str:
+    """Name a channel when the dataset supplies names, else fall back to its
+    index. Names come from the loader, so datasets without column headers
+    (SMD, SMAP/MSL) keep the numeric form."""
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return str(idx)
+    if channel_names and 0 <= i < len(channel_names) and str(channel_names[i]).strip():
+        return str(channel_names[i]).strip()
+    return f"channel {i}"
+
+
 def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
                       final_ranking: List[Tuple[str, float]],
                       regimes: List[Dict[str, Any]],
                       shifts: List[Dict[str, Any]],
                       blip_count: int,
                       state_fractions: Dict[str, float],
-                      final_state: str) -> Dict[str, Any]:
+                      final_state: str,
+                      channel_names: Optional[Sequence[str]] = None,
+                      n_channels: Optional[int] = None) -> Dict[str, Any]:
     """
     `regimes` entries are precomputed by explain_thompson_sampling (it owns the
     SHAP helpers): {"index","start","end","duration","leader",
@@ -312,129 +327,189 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     "pref_gap": float|None}.
     SHAP/preference channels arrive pre-split by sign so no consumer ever has
     to infer direction from a signed list sorted by magnitude.
+
+    `shifts` and `final_state` are accepted for call-site compatibility but are
+    not narrated: a shift is the boundary between two regime spans (the spans
+    already carry it), and the final window's state is one sample of a
+    distribution the state summary reports in full.
     """
     evidence: List[Dict[str, Any]] = []
     required: List[str] = []
+
+    def _ch(idx: Any) -> str:
+        return _ts_channel_label(idx, channel_names)
 
     top_pairs = _top_k(final_ranking)
     top_model = top_pairs[0][0] if top_pairs else NOT_AVAILABLE
     output = {
         "top_pick": top_model,
         "final_ranking_top_k": [{"model": m, "score": _val(s, 6)} for m, s in top_pairs],
-        "k": len(top_pairs),
         "n_windows": int(n_windows),
+        "n_regimes": len(regimes),
     }
+
+    # ── Lead: the forwarded ranking, with the margin over the runner-up ──
     if top_pairs:
-        evidence.append(make_atom(
-            "ts.output.top", "stage_output", top_model, _val(top_pairs[0][1], 6),
-            f"Thompson Sampling ranks {top_model} first "
-            f"(final posterior score {_fmt(top_pairs[0][1], 6)})."))
+        score = top_pairs[0][1]
+        if len(top_pairs) > 1 and not _is_nan(score) and not _is_nan(top_pairs[1][1]):
+            runner, r_score = top_pairs[1][0], top_pairs[1][1]
+            margin = float(score) - float(r_score)
+            lead_val = {"top": top_model, "score": _val(score, 6),
+                        "runner_up": runner, "margin": _val(margin, 6)}
+            lead_txt = (f"Thompson Sampling ranked {top_model} first with a final "
+                        f"score of {_fmt(score, 6)}, ahead of {runner} by "
+                        f"{_fmt(margin, 6)}.")
+        else:
+            lead_val = {"top": top_model, "score": _val(score, 6)}
+            lead_txt = (f"Thompson Sampling ranked {top_model} first with a final "
+                        f"score of {_fmt(score, 6)}.")
+        evidence.append(make_atom("ts.output.top", "stage_output", str(top_model),
+                                  lead_val, lead_txt, order=1))
         required.append("ts.output.top")
 
-    frac_txt = ", ".join(f"{s}: {_fmt(100.0 * f, 1)}%" for s, f in sorted(state_fractions.items()))
-    evidence.append(make_atom(
-        "ts.states.summary", "behavior_summary", "selection_states", state_fractions,
-        f"Selection behavior over {n_windows} windows — {frac_txt}."))
-    required.append("ts.states.summary")
-    evidence.append(make_atom(
-        "ts.states.final", "behavior_final", "selection_states", final_state,
-        f"The final window's selection state was {final_state}."))
+    # ── Family sweep: only when the top three share a name prefix ──
+    if len(top_pairs) >= 3:
+        fams = [str(m).split("_")[0] for m, _ in top_pairs[:3]]
+        if len(set(fams)) == 1 and fams[0]:
+            names = [m for m, _ in top_pairs[:3]]
+            evidence.append(make_atom(
+                "ts.output.family", "family_sweep", fams[0],
+                {"family": fams[0], "detectors": names},
+                f"The {fams[0]} detectors took the top three places: "
+                f"{_oxford(names)}.", order=2))
 
-    evidence.append(make_atom(
-        "ts.shifts.count", "regime_shift_count", "regimes", len(shifts),
-        f"{len(shifts)} regime shift(s) were detected."
-        if shifts else "No regime shifts were detected."))
-    for i, s in enumerate(shifts):
+    # ── How the run divided into regimes ──
+    leaders = [str(r.get("leader")) for r in regimes if r.get("leader")]
+    if regimes:
+        counts: Dict[str, int] = {}
+        for lname in leaders:
+            counts[lname] = counts.get(lname, 0) + 1
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        led = _oxford([f"{m} led {c}" for m, c in ordered])
+        blips = int(blip_count or 0)
+        blip_txt = ("" if not blips else
+                    f" {blips} brief blip window{'' if blips == 1 else 's'} "
+                    f"did not last long enough to count as a regime.")
         evidence.append(make_atom(
-            f"ts.shift.{i}", "regime_shift", str(s.get("to_model", NOT_AVAILABLE)),
-            {"window": s.get("window"), "from": s.get("from_model"),
-             "to": s.get("to_model"), "reward_delta": _val(s.get("reward_delta"), 4)},
-            f"At window {s.get('window')} the expected-reward leader changed from "
-            f"{s.get('from_model')} to {s.get('to_model')} "
-            f"(reward delta {_fmt(s.get('reward_delta'), 4)})."))
-    evidence.append(make_atom(
-        "ts.blips.count", "blip_count", "regimes", int(blip_count),
-        f"{int(blip_count)} brief blip window(s) were observed."
-        if blip_count else "No brief blips were observed."))
+            "ts.regimes.summary", "regime_summary", "regimes",
+            {"n_regimes": len(regimes), "n_windows": int(n_windows),
+             "n_leaders": len(counts), "regimes_led": counts,
+             "blip_count": blips},
+            f"The {int(n_windows)} windows split into {len(regimes)} regimes led "
+            f"by {len(counts)} different detectors: {led}.{blip_txt}", order=3))
+        required.append("ts.regimes.summary")
 
-    for r in regimes:
-        i = r["index"]
-        span_id = f"ts.regime.{i}.span"
+    # ── One sentence per regime, chronological; every one required ──
+    for i, r in enumerate(sorted(regimes, key=lambda x: x.get("index", 0))):
+        idx = r.get("index", i)
+        leader = str(r.get("leader", NOT_AVAILABLE))
+        raising = [c for c, _ in (r.get("shap_raising") or [])][:2]
+        favor = [c for c, _ in (r.get("pref_favor_leader") or [])][:1]
+        runner = r.get("runner_up")
+
+        parts = [f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
+                 f"{r.get('duration')} windows) was led by {leader}."]
+        if raising:
+            # Uppercase only the first letter — .capitalize() would lowercase
+            # the rest, mangling real channel names like Accelerometer1RMS.
+            labels = _oxford([_ch(c) for c in raising])
+            labels = labels[:1].upper() + labels[1:]
+            tail = ""
+            if favor and runner:
+                if favor[0] == raising[0]:
+                    tail = (f", with {_ch(favor[0])} also giving it its biggest "
+                            f"edge over {runner}")
+                else:
+                    tail = (f", and {_ch(favor[0])} gave it its biggest edge "
+                            f"over {runner}")
+            parts.append(f"{labels} raised its expected reward the most{tail}.")
+        elif favor and runner:
+            lbl = _ch(favor[0])
+            parts.append(f"{lbl[:1].upper() + lbl[1:]} gave it its biggest edge "
+                         f"over {runner}.")
+
+        rid = f"ts.regime.{idx}"
         evidence.append(make_atom(
-            span_id, "regime_span", str(r["leader"]),
-            {"start": r["start"], "end": r["end"], "duration": r["duration"]},
-            f"Regime {i}: windows {r['start']}-{r['end']} ({r['duration']} windows), "
-            f"led by {r['leader']}."))
-        required.append(span_id)
+            rid, "regime", leader,
+            {"index": idx, "start": r.get("start"), "end": r.get("end"),
+             "duration": r.get("duration"), "leader": leader,
+             "runner_up": runner,
+             "raising_channels": [(c, _val(v, 4)) for c, v in (r.get("shap_raising") or [])],
+             "edge_channels": [(c, _val(v, 4)) for c, v in (r.get("pref_favor_leader") or [])],
+             "mean_rewards": [(m, _val(v, 4)) for m, v in (r.get("rewards_top") or [])],
+             "mean_reward_gap": _val(r.get("reward_gap"), 4),
+             "preference_score_gap": _val(r.get("pref_gap"), 4)},
+            " ".join(parts), order=10 + i))
+        required.append(rid)
 
-        if r.get("rewards_top"):
-            rw_txt = ", ".join(f"{m} {_fmt(v, 4)}" for m, v in r["rewards_top"])
-            gap_txt = (f"; leader-vs-runner-up mean-reward gap {_fmt(r['reward_gap'], 4)}"
-                       if not _is_nan(r.get("reward_gap")) else "")
-            rid = f"ts.regime.{i}.rewards"
+    # ── Which channel carried the winner, across the regimes it led ──
+    if top_model != NOT_AVAILABLE:
+        totals: Dict[Any, float] = {}
+        for r in regimes:
+            if str(r.get("leader")) != str(top_model):
+                continue
+            for c, v in (r.get("shap_raising") or []):
+                if not _is_nan(v):
+                    totals[c] = totals.get(c, 0.0) + float(v)
+        if totals:
+            best = max(totals.items(), key=lambda kv: kv[1])
             evidence.append(make_atom(
-                rid, "regime_rewards", str(r["leader"]),
-                {"top": [(m, _val(v, 4)) for m, v in r["rewards_top"]],
-                 "mean_reward_gap": _val(r.get("reward_gap"), 4)},
-                f"Mean expected rewards in regime {i}: {rw_txt}{gap_txt}."))
-            required.append(rid)
+                "ts.winner.channels", "winner_channels", str(top_model),
+                {"channel": best[0], "total": _val(best[1], 4),
+                 "per_channel": [(c, _val(v, 4)) for c, v in
+                                 sorted(totals.items(), key=lambda kv: -kv[1])]},
+                f"Across the regimes {top_model} led, {_ch(best[0])} contributed "
+                f"most to its expected reward.", order=150))
+            required.append("ts.winner.channels")
 
-        if r.get("shap_raising") or r.get("shap_lowering"):
-            raising = r.get("shap_raising") or []
-            lowering = r.get("shap_lowering") or []
-            raise_txt = (", ".join(f"channel {c} ({_fmt(v, 4)})" for c, v in raising)
-                         or "none")
-            lower_txt = (", ".join(f"channel {c} ({_fmt(v, 4)})" for c, v in lowering)
-                         or "none")
-            evidence.append(make_atom(
-                f"ts.regime.{i}.shap", "regime_shap", str(r["leader"]),
-                {"raising": [(c, _val(v, 4)) for c, v in raising],
-                 "lowering": [(c, _val(v, 4)) for c, v in lowering]},
-                f"In regime {i}, channels raising {r['leader']}'s expected reward: "
-                f"{raise_txt}; channels lowering it: {lower_txt}."))
+    # ── How the run was spent ──
+    if state_fractions:
+        ordered_states = sorted(state_fractions.items(), key=lambda kv: -kv[1])
+        frac_txt = _oxford([f"{s.replace('_', ' ')} {_fmt(100.0 * f, 1)}% of the time"
+                            for s, f in ordered_states])
+        evidence.append(make_atom(
+            "ts.states.summary", "behavior_summary", "selection_states",
+            state_fractions,
+            f"Over the {int(n_windows)} windows the sampler was in {frac_txt}.",
+            order=200))
+        required.append("ts.states.summary")
 
-        has_pref = r.get("pref_favor_leader") or r.get("pref_favor_runner")
-        if has_pref and r.get("runner_up") and not _is_nan(r.get("pref_gap")):
-            leader, runner = str(r["leader"]), str(r["runner_up"])
-            gap = float(r["pref_gap"])
-            favor_l = r.get("pref_favor_leader") or []
-            favor_r = r.get("pref_favor_runner") or []
-            fl_txt = (", ".join(f"channel {c} ({_fmt(d, 4)})" for c, d in favor_l)
-                      or "none")
-            fr_txt = (", ".join(f"channel {c} ({_fmt(d, 4)})" for c, d in favor_r)
-                      or "none")
-            if gap >= 0:
-                head = (f"In regime {i}, the linear preference score at the "
-                        f"regime-average context favors {leader} over {runner} "
-                        f"by {_fmt(gap, 4)}.")
-            else:
-                # Direction-honest: the selection leader and the posterior
-                # score can disagree; say so instead of leaving a signed
-                # number open to misreading.
-                head = (f"In regime {i}, although {leader} led selections, the "
-                        f"linear preference score at the regime-average context "
-                        f"favors {runner} by {_fmt(abs(gap), 4)}.")
-            evidence.append(make_atom(
-                f"ts.regime.{i}.pref", "regime_preference", leader,
-                {"runner_up": runner, "preference_score_gap": _val(gap, 4),
-                 "favor_leader": [(c, _val(d, 4)) for c, d in favor_l],
-                 "favor_runner": [(c, _val(d, 4)) for c, d in favor_r]},
-                f"{head} Channels favoring {leader}: {fl_txt}. "
-                f"Channels favoring {runner}: {fr_txt}."))
+    caveats: List[Dict[str, Any]] = []
+    if n_channels is not None and int(n_channels) == 1:
+        caveats.append(make_atom(
+            "ts.caveat.single_channel", "caveat", "channels", int(n_channels),
+            "This dataset has a single channel, so splitting a detector's "
+            "expected reward across channels carries no information — that one "
+            "channel necessarily accounts for all of it."))
 
-    caveats = [
-        make_atom("ts.caveat.stochastic", "caveat", "thompson_sampling", None,
-                  "Thompson Sampling is a stochastic (seeded) sampler; a different "
-                  "seed can produce a different selection trajectory."),
-        make_atom("ts.caveat.states", "caveat", "selection_states", None,
-                  "Behavioral states are observational labels derived from the "
-                  "sampler's decisions, not causal mechanisms."),
-        make_atom("ts.caveat.shap_framing", "caveat", "shap", None,
-                  "Per-regime SHAP attributes the FINAL posterior means on each "
-                  "regime's aggregated context; it is not a replay of the beliefs "
-                  "held during that regime."),
-    ]
-    return _envelope("thompson_sampling", dataset, entity, output, evidence, caveats, required)
+    question = ("Why did Thompson Sampling rank the winner first — which channels "
+                "raised its expected reward above its rivals — and how much of the "
+                "run was spent exploring rather than exploiting?")
+    info_footer = (
+        "Thompson Sampling learns a weight vector for each detector and, at every "
+        "window, predicts that detector's reward as the weights applied to the "
+        "window's data; that prediction is its expected reward. The reward it "
+        "learns from is half the F1 score plus half the PR-AUC on that window. "
+        "The final ranking scores each detector by the overall size of its "
+        "learned weights, which converges to the reward level that detector "
+        "earned — so the ranking reflects how well each one scored, not how much "
+        "of the run it led. A regime is a stretch of at least three consecutive "
+        "windows in which one detector holds the highest expected reward; shorter "
+        "changes are counted as blips. Channel contributions are computed with "
+        "SHAP, which splits an expected reward into one number per input channel. "
+        "The three selection states describe each choice: exploitation means the "
+        "sampler picked the detector it already believed was best, informed "
+        "exploration means the random draw over its uncertainty steered it "
+        "elsewhere (a high share means the detectors stayed closely matched and "
+        "the beliefs uncertain), and random means a forced exploration step fired "
+        "(a high share means much of the run was spent sampling blindly). "
+        "Thompson Sampling is a seeded stochastic sampler, so a different seed "
+        "can produce a different trajectory, and the behavioural states are "
+        "observed labels rather than causes.")
+
+    return _envelope("thompson_sampling", dataset, entity, output, evidence,
+                     caveats, required, question=question,
+                     info_footer=info_footer)
 
 
 # Included-member reason buckets, in narration order. `needed` (a low-profile

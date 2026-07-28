@@ -578,5 +578,103 @@ class TestNarrateEntity(unittest.TestCase):
         self.assertNotIn("verify_initial", info)
 
 
+class TestGlobalNarrativeModes(unittest.TestCase):
+    """The global document has two interchangeable builders: a deterministic
+    merge of the per-stage prose (default) and the original atom-based LLM
+    path. Both stay working so switching back is one argument."""
+
+    def _texts(self):
+        return {
+            "monte_carlo": "MC prose.",
+            "ga_selection": "GA selection prose.",
+            "rank_aggregation_final": "Final consensus prose.",
+        }
+
+    def _global_ir(self):
+        return {
+            "stage": "global", "dataset": "DS", "entity": "e1",
+            "evidence": [
+                {"id": "global.decision", "type": "decision", "subject": "d",
+                 "value": None, "text": "The final decision is the ensemble {A, B}."},
+                {"id": "global.agreement.gan", "type": "stage_agreement",
+                 "subject": "gan", "value": None,
+                 "text": "gan's top pick (A) differs from the final pick (B)."},
+            ],
+            "stages": {"monte_carlo": {"status": "ok"},
+                       "ga_selection": {"status": "ok"},
+                       "rank_aggregation_final": {"status": "ok"},
+                       "thompson_sampling": {"status": "not_available"}},
+        }
+
+    def test_compose_orders_by_pipeline_and_flags_absent_stages(self):
+        doc = llm.compose_global_narrative(
+            self._texts(), self._global_ir(), dataset="DS", entity="e1", iteration=3)
+        self.assertIn("RAMSeS model selection — DS / entity e1 (iteration 3)", doc)
+        self.assertIn("The final decision is the ensemble {A, B}.", doc)
+        self.assertIn("- gan's top pick (A) differs", doc)
+        # Pipeline order, not the alphabetical order of the dict.
+        self.assertLess(doc.index("GA selection prose."), doc.index("MC prose."))
+        self.assertLess(doc.index("MC prose."), doc.index("Final consensus prose."))
+        # A stage the run could not narrate is named, so a short document is
+        # never mistaken for a complete one.
+        self.assertIn("Stages without a narrative: thompson_sampling.", doc)
+
+    def test_compose_is_verbatim_and_deterministic(self):
+        texts = self._texts()
+        a = llm.compose_global_narrative(texts, self._global_ir(), dataset="DS",
+                                         entity="e1", iteration=3)
+        b = llm.compose_global_narrative(texts, self._global_ir(), dataset="DS",
+                                         entity="e1", iteration=3)
+        self.assertEqual(a, b)
+        for prose in texts.values():          # reused exactly, never paraphrased
+            self.assertIn(prose, a)
+        # Footers are opt-in; the per-stage .txt files always carry their own.
+        self.assertNotIn("INFO:", a)
+        with_footer = llm.compose_global_narrative(
+            texts, self._global_ir(), dataset="DS", entity="e1", iteration=3,
+            stage_footers={"monte_carlo": "Noise is Gaussian."})
+        self.assertIn("INFO: Noise is Gaussian.", with_footer)
+
+    def _run(self, tmp, **kw):
+        base = os.path.join(tmp, "explanations_ir")
+        out = os.path.join(tmp, "explanations_nl")
+        ir.write_stage_ir(
+            ir.build_ga_combination_ir("DS", "e1", _ga_combination_result()),
+            "DS", "e1", "ir_ga_combination", base_dir=base)
+        ir.assemble_global_ir(_results_dict(), "DS", "e1", 3, base_dir=base)
+        report = llm.narrate_entity("DS", "e1", 3, FakeClient(),
+                                    base_dir=base, out_dir=out, **kw)
+        return report, os.path.join(out, "DS", "e1")
+
+    def test_concat_mode_reuses_stage_prose_and_is_not_rescored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, nl_dir = self._run(tmp)               # concat is the default
+            g = report["stages"]["global"]
+            self.assertEqual(g["status"], "ok")
+            self.assertEqual(g["mode"], "concat")
+            self.assertEqual(g["merged_stages"], ["ga_combination"])
+            # Deterministic merge adds no claims, so it carries no metrics and
+            # cannot double-count the stage prose in the micro-average.
+            self.assertNotIn("verify", g)
+            with open(os.path.join(nl_dir, "nl_global_iter3.txt")) as f:
+                doc = f.read()
+            with open(os.path.join(nl_dir, "nl_ga_combination.txt")) as f:
+                stage = f.read().split("\nINFO:")[0].strip()
+            self.assertIn(stage, doc)
+
+    def test_llm_mode_still_narrates_and_verifies_the_global_ir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, _ = self._run(tmp, global_mode="llm")
+            g = report["stages"]["global"]
+            self.assertEqual(g["status"], "ok")
+            self.assertNotIn("mode", g)
+            self.assertIn("verify", g)
+            self.assertEqual(g["verify"]["omission_rate"], 0.0)
+
+    def test_unknown_global_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            llm.narrate_entity("DS", "e1", 0, FakeClient(), global_mode="summarise")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

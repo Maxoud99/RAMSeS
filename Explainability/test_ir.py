@@ -222,39 +222,112 @@ class TestBuilders(unittest.TestCase):
         doc = ir.build_thompson_ir("DS", "e1", **_thompson_kwargs())
         _check_envelope(self, doc, "thompson_sampling")
         self.assertEqual(doc["output"]["top_pick"], "A")
-        ids = {a["id"] for a in doc["evidence"]}
-        # one span + rewards block per regime; SHAP only where provided
-        self.assertIn("ts.regime.0.span", ids)
-        self.assertIn("ts.regime.1.span", ids)
-        self.assertIn("ts.regime.0.shap", ids)
-        self.assertNotIn("ts.regime.1.shap", ids)
-        self.assertIn("ts.regime.0.pref", ids)
-        self.assertIn("ts.shift.0", ids)
-        # Channels arrive sign-grouped; both directions are spelled out.
-        shap = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0.shap")
-        self.assertIn("channels raising A's expected reward", shap["text"])
-        self.assertIn("channels lowering it", shap["text"])
-        # Preference atom names the favored side and groups channels by sign.
-        pref = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0.pref")
-        self.assertIn("favors A over B by 0.3", pref["text"])
-        self.assertIn("Channels favoring A:", pref["text"])
-        self.assertIn("Channels favoring B:", pref["text"])
-        # The mean-reward gap is labelled distinctly from the preference score.
-        rewards = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0.rewards")
-        self.assertIn("mean-reward gap", rewards["text"])
+        by_id = {a["id"]: a for a in doc["evidence"]}
 
-    def test_thompson_pref_direction_honest_when_gap_negative(self):
-        """A negative preference score must be stated as favoring the runner,
-        never left as a signed number next to 'preferred'."""
+        # Lead carries the forwarded score AND the margin over the runner-up.
+        self.assertEqual(
+            by_id["ts.output.top"]["text"],
+            "Thompson Sampling ranked A first with a final score of 1.500000, "
+            "ahead of B by 0.800000.")
+
+        # ONE atom per regime: span + leader + channels in a single sentence.
+        self.assertEqual(
+            by_id["ts.regime.0"]["text"],
+            "Regime 0 (windows 0 to 2, 3 windows) was led by A. Channel 0 raised "
+            "its expected reward the most, with channel 0 also giving it its "
+            "biggest edge over B.")
+        # Regime 1 has no SHAP/preference data -> just the span sentence.
+        self.assertEqual(
+            by_id["ts.regime.1"]["text"],
+            "Regime 1 (windows 3 to 5, 3 windows) was led by B.")
+        for rid in ("ts.regime.0", "ts.regime.1", "ts.regimes.summary",
+                    "ts.output.top", "ts.states.summary"):
+            self.assertIn(rid, doc["required_atom_ids"])
+
+        # Regime summary counts regimes and distinct leaders.
+        self.assertIn("split into 2 regimes led by 2 different detectors",
+                      by_id["ts.regimes.summary"]["text"])
+        self.assertIn("blip window", by_id["ts.regimes.summary"]["text"])
+
+        # States are narrated as shares, best-first; no final-state atom.
+        self.assertIn("exploitation 60.0% of the time",
+                      by_id["ts.states.summary"]["text"])
+        self.assertNotIn("ts.states.final", by_id)
+
+        # The per-regime split, the shift atoms and the blip atom are gone.
+        for stale in ("ts.regime.0.span", "ts.regime.0.shap", "ts.regime.0.pref",
+                      "ts.regime.0.rewards", "ts.shift.0", "ts.shifts.count",
+                      "ts.blips.count"):
+            self.assertNotIn(stale, by_id)
+
+        # Raw reward numbers stay in `value`, out of the prose.
+        self.assertEqual(by_id["ts.regime.0"]["value"]["mean_reward_gap"], 0.3)
+        prose = " ".join(a["text"] for a in doc["evidence"])
+        self.assertNotIn("0.3000", prose)
+
+        # Envelope: headline question + glossary; the three run-invariant
+        # caveats moved into the footer, leaving no per-run caveat here.
+        self.assertIn("how much of the run was spent exploring", doc["question"])
+        self.assertIn("expected reward", doc["info_footer"])
+        self.assertEqual(doc["caveats"], [])
+
+    def test_thompson_regime_channels_kept_with_their_own_regime(self):
+        """Each regime's channels are named inside that regime's sentence, and a
+        differing edge channel is reported separately from the raising ones."""
+        kwargs = _thompson_kwargs()
+        kwargs["regimes"][0]["shap_raising"] = [(2, 0.5), (5, 0.2)]
+        kwargs["regimes"][0]["pref_favor_leader"] = [(7, 0.3)]
+        doc = ir.build_thompson_ir("DS", "e1", **kwargs)
+        txt = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")["text"]
+        self.assertIn("Channel 2 and channel 5 raised its expected reward the most",
+                      txt)
+        self.assertIn("channel 7 gave it its biggest edge over B", txt)
+
+    def test_thompson_negative_pref_gap_is_not_dramatised(self):
+        """A negative preference score is a level-vs-deviation difference, not a
+        contradiction: the prose names the leader's best channel either way and
+        never editorialises with 'although'."""
         kwargs = _thompson_kwargs()
         kwargs["regimes"][0]["pref_gap"] = -0.12
         kwargs["regimes"][0]["pref_favor_leader"] = [(1, 0.02)]
         kwargs["regimes"][0]["pref_favor_runner"] = [(0, -0.14)]
         doc = ir.build_thompson_ir("DS", "e1", **kwargs)
-        pref = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0.pref")
-        self.assertIn("although A led selections", pref["text"])
-        self.assertIn("favors B by 0.12", pref["text"])
-        self.assertNotIn("-0.12", pref["text"])
+        atom = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")
+        self.assertIn("channel 1 gave it its biggest edge over B", atom["text"])
+        for word in ("although", "however", "despite", "-0.12"):
+            self.assertNotIn(word, atom["text"])
+        # The signed gap is still grounded in `value` for the verifier.
+        self.assertEqual(atom["value"]["preference_score_gap"], -0.12)
+
+    def test_thompson_channel_names_used_when_available(self):
+        kwargs = _thompson_kwargs()
+        kwargs["regimes"][0]["shap_raising"] = [(1, 0.5)]
+        kwargs["regimes"][0]["pref_favor_leader"] = [(1, 0.3)]
+        named = ir.build_thompson_ir(
+            "DS", "e1", channel_names=["Pressure", "Accelerometer1RMS"], **kwargs)
+        txt = next(a for a in named["evidence"] if a["id"] == "ts.regime.0")["text"]
+        # Name is used verbatim — never lower-cased by a blanket .capitalize().
+        self.assertIn("Accelerometer1RMS raised its expected reward", txt)
+        self.assertNotIn("channel 1", txt)
+        # Out-of-range indices fall back to the numeric form.
+        short = ir.build_thompson_ir("DS", "e1", channel_names=["Pressure"], **kwargs)
+        self.assertIn("channel 1", next(
+            a for a in short["evidence"] if a["id"] == "ts.regime.0")["text"])
+
+    def test_thompson_family_sweep_and_single_channel_caveat(self):
+        kwargs = _thompson_kwargs()
+        kwargs["final_ranking"] = [("NN_1", 1.5), ("NN_2", 1.2), ("NN_3", 0.9),
+                                   ("LOF_1", 0.2)]
+        doc = ir.build_thompson_ir("DS", "e1", n_channels=1, **kwargs)
+        fam = next(a for a in doc["evidence"] if a["id"] == "ts.output.family")
+        self.assertEqual(
+            fam["text"],
+            "The NN detectors took the top three places: NN_1, NN_2, and NN_3.")
+        self.assertIn("single channel", doc["caveats"][0]["text"])
+        # A mixed top three gets no family atom.
+        kwargs["final_ranking"] = [("NN_1", 1.5), ("LOF_2", 1.2), ("NN_3", 0.9)]
+        mixed = ir.build_thompson_ir("DS", "e1", **kwargs)
+        self.assertNotIn("ts.output.family", {a["id"] for a in mixed["evidence"]})
 
     def test_ga_selection_no_archetype_codes_or_complementarity(self):
         doc = ir.build_ga_selection_ir("DS", "e1", _ga_selection_result())

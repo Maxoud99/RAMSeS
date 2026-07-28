@@ -154,6 +154,25 @@ def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220) -> tuple:
     return lo, min(400, hi + 8 * max(0, n_atoms - 12))
 
 
+# Stages where the narrative must carry one statement per atom rather than a
+# summary, so the budget has to scale past the default 400-word ceiling.
+# (words_per_atom, base, ceiling), keyed by exact stage name.
+_STAGE_WORD_BUDGETS: Dict[str, tuple] = {
+    # Thompson narrates every regime individually; ~20 words each plus the
+    # lead, regime summary, winner channel and state line.
+    "thompson_sampling": (20, 40, 700),
+}
+
+
+def _stage_word_budget(stage: Any, n_atoms: int) -> Optional[tuple]:
+    cfg = _STAGE_WORD_BUDGETS.get(str(stage))
+    if not cfg:
+        return None
+    per, base, cap = cfg
+    lo = min(cap - 60, base + per * max(0, n_atoms))
+    return lo, min(cap, int(lo * 1.5))
+
+
 def _fact_lines(ir_doc: Dict[str, Any]) -> List[str]:
     required = set(ir_doc.get("required_atom_ids", []))
     evidence = ir_doc.get("evidence", [])
@@ -216,6 +235,20 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
         "every detector name in full, do not merge two groups, and use plain "
         "prose with no math notation."
     ),
+    "thompson_sampling": (
+        " Open with the winner and its margin, then how the run divided into "
+        "regimes. Then give EVERY regime its own sentence, in the order listed, "
+        "keeping each regime's window range, its leader and its channels "
+        "together — never merge two regimes and never carry one regime's "
+        "channels over to another. State each regime on its own terms: never "
+        "say a regime followed suit, continued, repeated or matched another, "
+        "and never write 'also led by' — consecutive regimes have different "
+        "leaders. Finish with the winner's overall channel and "
+        "the selection-state percentages. Do not list the windows where the "
+        "leader changed; the regime ranges already cover them. Write every "
+        "detector and channel name in full, and use plain prose with no math "
+        "notation."
+    ),
     "monte_carlo": (
         " Open with one sentence restating the production-test result exactly "
         "as the fact gives it — use the word 'first' — naming the top detector "
@@ -253,7 +286,9 @@ def _stage_task_hint(stage: Any) -> str:
 
 
 def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
-    lo, hi = _word_budget(len(ir_doc.get("evidence", [])))
+    n_atoms = len(ir_doc.get("evidence", []))
+    lo, hi = (_stage_word_budget(ir_doc.get("stage", ""), n_atoms)
+              or _word_budget(n_atoms))
     question = ir_doc.get("question")
     lines: List[str] = []
     lines.append(f"STAGE: {ir_doc.get('stage')}")
@@ -322,6 +357,86 @@ def narrate_global(global_ir: Dict[str, Any], client: LLMClient) -> str:
     return client.chat(SYSTEM_PROMPT, build_global_prompt(global_ir)).strip()
 
 
+# ── Global narrative: deterministic merge ────────────────────────────────────
+#
+# Two interchangeable ways to produce the global document, selected by
+# `global_mode` on narrate_entity:
+#   "concat" (default) — stitch the already-narrated per-stage prose together.
+#                        Adds no new claims, so it inherits the per-stage
+#                        faithfulness and is not scored again.
+#   "llm"              — narrate the global IR's own atoms (build_global_prompt
+#                        / narrate_global / verify_global), the original path.
+# Both are kept working; switching back is a one-argument change.
+GLOBAL_MODES = ("concat", "llm")
+
+# The merged document follows the pipeline's order so it reads as the run ran,
+# rather than the alphabetical order the IR files happen to load in.
+_GLOBAL_STAGE_ORDER = (
+    "ga_selection", "ga_combination", "thompson_sampling",
+    "monte_carlo", "off_by_threshold",
+    "rank_aggregation_robust", "rank_aggregation_final",
+)
+
+_GLOBAL_STAGE_TITLES = {
+    "ga_selection": "Ensemble selection (genetic algorithm)",
+    "ga_combination": "Ensemble weighting (meta-learner)",
+    "thompson_sampling": "Single-model selection (Thompson Sampling)",
+    "monte_carlo": "Robustness: Monte Carlo noise sweep",
+    "off_by_threshold": "Sensitivity: off-by-threshold test",
+    "rank_aggregation_robust": "Robustness consensus",
+    "rank_aggregation_final": "Final consensus",
+}
+
+
+def compose_global_narrative(stage_texts: Dict[str, str],
+                             global_ir: Optional[Dict[str, Any]] = None,
+                             dataset: str = "", entity: str = "",
+                             iteration: int = 0,
+                             stage_footers: Optional[Dict[str, str]] = None) -> str:
+    """
+    Merge the per-stage narratives into one document, deterministically.
+
+    Pure and LLM-free: the decision block is taken verbatim from the global IR's
+    own atom sentences and each stage contributes the prose already written and
+    verified for it. Nothing is paraphrased, so the result cannot introduce a
+    claim that was not already checked.
+
+    `stage_footers` is optional; when given, each stage's glossary is appended
+    under its section (the per-stage .txt files always carry their own).
+    """
+    head = f"RAMSeS model selection — {dataset} / entity {entity} (iteration {iteration})"
+    lines: List[str] = [head, "=" * len(head)]
+
+    evidence = {a.get("id"): a for a in (global_ir or {}).get("evidence", [])}
+    decision = evidence.get("global.decision")
+    if decision and decision.get("text"):
+        lines += ["", "DECISION", "-" * len("DECISION"), decision["text"]]
+
+    agreement = [a["text"] for _, a in sorted(evidence.items())
+                 if a.get("type") == "stage_agreement" and a.get("text")]
+    if agreement:
+        lines += ["", "Stage agreement"] + [f"  - {t}" for t in agreement]
+
+    ordered = [s for s in _GLOBAL_STAGE_ORDER if stage_texts.get(s)]
+    ordered += [s for s in sorted(stage_texts)
+                if s not in _GLOBAL_STAGE_ORDER and stage_texts.get(s)]
+    for stage in ordered:
+        title = _GLOBAL_STAGE_TITLES.get(stage, stage.replace("_", " ").capitalize())
+        lines += ["", title, "-" * len(title), stage_texts[stage].strip()]
+        footer = (stage_footers or {}).get(stage)
+        if footer:
+            lines += ["", f"INFO: {footer}"]
+
+    # Name the stages the run could not narrate, so a short document is never
+    # mistaken for a complete one.
+    statuses = (global_ir or {}).get("stages", {}) or {}
+    absent = sorted(s for s in statuses if s not in ordered)
+    if absent:
+        lines += ["", "Stages without a narrative: " + ", ".join(absent) + "."]
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # ── Verifier-guided repair ───────────────────────────────────────────────────
 
 def _violation_count(metrics: Dict[str, Any]) -> int:
@@ -383,7 +498,8 @@ def _stage_file_map(iteration: int) -> Dict[str, str]:
 def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
                    base_dir: str = "myresults/explanations_ir",
                    out_dir: str = "myresults/explanations_nl",
-                   stages: Optional[List[str]] = None) -> Dict[str, Any]:
+                   stages: Optional[List[str]] = None,
+                   global_mode: str = "concat") -> Dict[str, Any]:
     """
     Narrate every available IR file for (dataset, entity, iteration) and score
     each narrative with the atom-matching verifier. Writes:
@@ -391,7 +507,15 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
         {out_dir}/{ds}/{ent}/nl_global_iter{n}.txt
         {out_dir}/{ds}/{ent}/faithfulness_iter{n}.json / .txt
     Per-stage failures are recorded, not fatal; missing IR files are 'skipped'.
+
+    global_mode: "concat" (default) merges the per-stage narratives into the
+        global document deterministically — no model call, no new claims, so it
+        is not verified again and does not enter the micro-average (the stage
+        prose it contains is already counted once). "llm" narrates the global
+        IR's own atoms instead, the atom-based path, and is verified normally.
     """
+    if global_mode not in GLOBAL_MODES:
+        raise ValueError(f"global_mode must be one of {GLOBAL_MODES}, got {global_mode!r}")
     verifier = _verifier_module()
     ir_dir = os.path.join(base_dir, str(dataset), str(entity))
     nl_dir = os.path.join(out_dir, str(dataset), str(entity))
@@ -412,6 +536,8 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
 
     file_map = _stage_file_map(iteration)
     wanted = set(stages) if stages else set(file_map) | {"global"}
+    stage_texts: Dict[str, str] = {}
+    stage_footers: Dict[str, str] = {}
     report: Dict[str, Any] = {"dataset": str(dataset), "entity": str(entity),
                               "iteration": int(iteration), "model": client.model,
                               "stages": {}}
@@ -456,6 +582,12 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
             entry.update({"narrative_path": path,
                           "words": len(narrative.split()), "verify": metrics})
             report["stages"][stage_key] = entry
+            # Kept for the deterministic global merge, which reuses the prose
+            # exactly as written here rather than re-narrating it.
+            if not is_global:
+                stage_texts[stage_key] = narrative
+                if footer:
+                    stage_footers[stage_key] = footer
         except ConnectionError:
             raise
         except Exception as e:  # non-fatal per stage
@@ -478,13 +610,37 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
 
     if "global" in wanted:
         global_doc = _load(f"ir_global_iter{iteration}", "ir_global_iter*.json")
-        if global_doc is None:
+        if global_mode == "llm":
+            if global_doc is None:
+                report["stages"]["global"] = {
+                    "status": "skipped",
+                    "reason": f"ir_global_iter{iteration}.json not found"}
+            else:
+                _run_one("global", global_doc, f"nl_global_iter{iteration}",
+                         is_global=True)
+        elif not stage_texts:
             report["stages"]["global"] = {
-                "status": "skipped",
-                "reason": f"ir_global_iter{iteration}.json not found"}
+                "status": "skipped", "mode": "concat",
+                "reason": "no stage narratives to merge"}
         else:
-            _run_one("global", global_doc, f"nl_global_iter{iteration}",
-                     is_global=True)
+            try:
+                merged = compose_global_narrative(
+                    stage_texts, global_doc, dataset=str(dataset),
+                    entity=str(entity), iteration=int(iteration))
+                path = os.path.join(nl_dir, f"nl_global_iter{iteration}.txt")
+                with open(path, "w") as f:
+                    f.write(merged)
+                report["stages"]["global"] = {
+                    "status": "ok", "mode": "concat",
+                    "narrative_path": path, "words": len(merged.split()),
+                    # No `verify`: the merge is deterministic and reuses prose
+                    # already scored per stage, so re-scoring it here would
+                    # double-count those claims in the micro-average.
+                    "merged_stages": sorted(stage_texts),
+                }
+            except Exception as e:  # non-fatal, same as a stage failure
+                report["stages"]["global"] = {"status": "error", "mode": "concat",
+                                              "error": str(e)}
 
     # Micro-averaged overall rates across the verified narratives.
     tot_claims = tot_unsupported = tot_required = tot_missing = 0
