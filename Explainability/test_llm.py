@@ -485,9 +485,10 @@ class TestNarrateEntity(unittest.TestCase):
                                         stages=["ga_combination"])
             self.assertEqual(list(report["stages"].keys()), ["ga_combination"])
 
-    def test_info_footer_appended_after_verification(self):
-        """The glossary footer is written to the .txt after the narrative, but
-        is not part of the verified narrative (does not affect metrics)."""
+    def test_info_footer_leads_file_and_is_outside_verification(self):
+        """The glossary heads the .txt — the reader meets the terms before the
+        prose using them — but is written outside the model's output, so it
+        never enters the verified narrative or the metrics."""
         ra_result = {
             "verdicts": [
                 {"source": "S1", "loo_score": 0.3, "loo_rank": 1, "align_score": 0.6,
@@ -510,12 +511,16 @@ class TestNarrateEntity(unittest.TestCase):
             self.assertEqual(info["status"], "ok")
             with open(info["narrative_path"]) as f:
                 content = f.read()
-            body, _, footer = content.partition("\nINFO: ")
-            self.assertTrue(footer, "footer must be appended")
+            # Glossary first, then a blank line, then the narrative.
+            self.assertTrue(content.startswith("INFO: "), content[:40])
+            footer, _, body = content.partition("\n\n")
             self.assertIn("Influence measures how much a source moved", footer)
-            # The footer text is not part of the scored narrative.
+            # The narrative itself carries neither the marker nor the glossary.
+            self.assertTrue(body.strip())
             self.assertNotIn("INFO:", body)
             self.assertNotIn("Influence measures", body)
+            # Metrics are computed on the narrative alone.
+            self.assertEqual(info["words"], len(body.split()))
 
     def test_repair_pass_fixes_violating_draft(self):
         """A draft with a hallucinated number triggers ONE verifier-guided
@@ -628,12 +633,15 @@ class TestGlobalNarrativeModes(unittest.TestCase):
         self.assertEqual(a, b)
         for prose in texts.values():          # reused exactly, never paraphrased
             self.assertIn(prose, a)
-        # Footers are opt-in; the per-stage .txt files always carry their own.
+        # Footers are opt-in here; narrate_entity always supplies them.
         self.assertNotIn("INFO:", a)
         with_footer = llm.compose_global_narrative(
             texts, self._global_ir(), dataset="DS", entity="e1", iteration=3,
             stage_footers={"monte_carlo": "Noise is Gaussian."})
         self.assertIn("INFO: Noise is Gaussian.", with_footer)
+        # Glossary precedes the prose it explains, as in the per-stage files.
+        self.assertLess(with_footer.index("INFO: Noise is Gaussian."),
+                        with_footer.index("MC prose."))
 
     def _run(self, tmp, **kw):
         base = os.path.join(tmp, "explanations_ir")
@@ -656,6 +664,10 @@ class TestGlobalNarrativeModes(unittest.TestCase):
             # Deterministic merge adds no claims, so it carries no metrics and
             # cannot double-count the stage prose in the micro-average.
             self.assertNotIn("verify", g)
+            # The merged document carries each stage's glossary too.
+            with open(os.path.join(nl_dir, "nl_global_iter3.txt")) as f:
+                merged = f.read()
+            self.assertIn("INFO: ", merged)
             with open(os.path.join(nl_dir, "nl_global_iter3.txt")) as f:
                 doc = f.read()
             with open(os.path.join(nl_dir, "nl_ga_combination.txt")) as f:

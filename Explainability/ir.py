@@ -43,6 +43,12 @@ import numpy as np
 IR_VERSION = "1.0"
 NOT_AVAILABLE = "not_available"
 TOP_K = 5
+
+# Closing line of every stage glossary. The footer describes the methods a
+# stage used; this marks where those definitions stop and the narrative they
+# support begins. Appended centrally in _envelope, never per builder.
+FOOTER_CLOSING_SENTENCE = (
+    "Following claims are based on the aforementioned explanation methods.")
 # Support gate for per-rule confidence: the fidelity estimate is stratified
 # 5-fold CV, and with fewer positives than folds the CV cannot place one
 # positive per fold, so the held-out accuracy for that rule is undefined or
@@ -268,13 +274,18 @@ def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
         "confidence": _py(confidence or {}),
     }
     # `question` frames the narration prompt (the stage's headline question);
-    # `info_footer` is a fixed glossary appended verbatim to the .txt AFTER
-    # generation and verification, so definitions are never reworded and never
-    # count toward faithfulness metrics.
+    # `info_footer` is a fixed glossary written verbatim into the .txt outside
+    # the model's output, so definitions are never reworded and never count
+    # toward faithfulness metrics. The closing sentence is appended here rather
+    # than in each builder, so every stage — including ones added later — ends
+    # the glossary the same way.
     if question is not None:
         env["question"] = str(question)
     if info_footer is not None:
-        env["info_footer"] = str(info_footer)
+        footer = str(info_footer).rstrip()
+        if not footer.endswith(FOOTER_CLOSING_SENTENCE):
+            footer = (footer + " " if footer else "") + FOOTER_CLOSING_SENTENCE
+        env["info_footer"] = footer
     return env
 
 
@@ -290,6 +301,31 @@ def write_stage_ir(ir: Dict[str, Any], dataset: str, entity: str, filename: str,
 
 def _top_k(seq: Sequence[Any], k: int = TOP_K) -> List[Any]:
     return list(seq[:k])
+
+
+def _top_of_ranking(value: Any) -> Any:
+    """
+    First detector of an aggregation result, whatever shape it arrives in.
+
+    Callers pass three different things: the ranking list itself
+    (["LOF_1", "CBLOF_4", ...]), the aggregator's (score, ranking) pair, or —
+    after a re-optimisation overwrite — a bare winner name. Indexing [1][0]
+    blindly turns ["LOF_1", "CBLOF_4"] into "C", the first letter of the
+    SECOND name, so the shape is inspected rather than assumed.
+    """
+    if isinstance(value, str):
+        return value or NOT_AVAILABLE
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return NOT_AVAILABLE
+        # A (score, ranking) pair: non-string head, sequence in second slot.
+        if (len(value) > 1 and not isinstance(value[0], str)
+                and isinstance(value[1], (list, tuple))):
+            return _top_of_ranking(value[1])
+        head = value[0]
+        if isinstance(head, (str, list, tuple)):
+            return _top_of_ranking(head)
+    return NOT_AVAILABLE
 
 
 # ── Stage builders ───────────────────────────────────────────────────────────
@@ -706,8 +742,11 @@ def _competition_rank(scores: Dict[str, Any], order: List[str]) -> Dict[str, int
     return ranks
 
 
-# Fixed presentation order of the three attribution measures.
-_GA_METHODS = ("absolute SHAP", "signed SHAP", "PFI")
+# The measures whose RANKS explain a detector's weight. Signed SHAP is absent
+# on purpose: it no longer feeds the Markov aggregation (it measures direction,
+# not magnitude), so quoting its rank beside these would imply a contribution it
+# does not make. It still supplies the sign summary further down.
+_GA_METHODS = ("absolute SHAP", "PFI")
 
 _WEIGHT_ORD = {1: "the most", 2: "the second-most", 3: "the third-most",
                4: "the fourth-most", 5: "the fifth-most", 6: "the sixth-most",
@@ -733,9 +772,9 @@ def _oxford(items: Sequence[str]) -> str:
 
 
 def _rank_phrase(ranks: Sequence[Any]) -> str:
-    """Render the three method ranks, grouping measures that share a rank:
-    (1, 1, 1) -> 'ranking 1 on absolute SHAP, signed SHAP, and PFI';
-    (2, 2, 3) -> 'ranking 2 on absolute SHAP and signed SHAP, and 3 on PFI'."""
+    """Render the weight-bearing method ranks, grouping measures that share one:
+    (1, 1) -> 'ranking 1 on absolute SHAP and PFI';
+    (2, 3) -> 'ranking 2 on absolute SHAP and 3 on PFI'."""
     order: List[int] = []
     groups: Dict[int, List[str]] = {}
     na: List[str] = []
@@ -751,10 +790,10 @@ def _rank_phrase(ranks: Sequence[Any]) -> str:
     parts = [f"{rk} on {_oxford(groups[rk])}" for rk in order]
     if not parts:
         phrase = "with no method ranking available"
-    elif len(parts) == 1:
-        phrase = "ranking " + parts[0]
     else:
-        phrase = "ranking " + ", ".join(parts[:-1]) + ", and " + parts[-1]
+        # _oxford drops the serial comma for two items ("X and Y"), which is
+        # the common case now that only two measures carry weight.
+        phrase = "ranking " + _oxford(parts)
     if na:
         phrase += f" (not ranked on {_oxford(na)})"
     return phrase
@@ -832,11 +871,13 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
             {"final_rank": final_rank.get(d),
              "markov_score": _val(pi.get(d), 4),
              "mean_abs_shap": _val(s_abs.get(d), 6), "mean_abs_shap_rank": r_abs.get(d),
+             # Signed SHAP keeps its value and rank in the machine-readable
+             # block for transparency; only the prose stops quoting the rank.
              "signed_shap": _val(sgn, 6), "signed_shap_rank": r_sgn.get(d),
              "signed_direction": signs[d],
              "pfi_f1_drop": _val(pfi.get(d), 6), "pfi_rank": r_pfi.get(d)},
             f"{d} carries {_weight_phrase(final_rank.get(d))} in the ensemble, "
-            f"{_rank_phrase((r_abs.get(d), r_sgn.get(d), r_pfi.get(d)))}.",
+            f"{_rank_phrase((r_abs.get(d), r_pfi.get(d)))}.",
             order=10 * (i + 1)))
         required.append(rid)
 
@@ -857,7 +898,8 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
                   "the F1 drop when a detector's scores are shuffled."),
         make_atom("ga_comb.caveat.aggregation", "caveat", "markov", None,
                   "The overall weighting is the stationary distribution of a Markov "
-                  "chain over the three methods' pairwise preferences."),
+                  "chain over the pairwise preferences of the two magnitude "
+                  "measures."),
     ]
 
     question = ("Which detectors does the GA-selected ensemble rely on most, and "
@@ -866,11 +908,14 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         "A positive sign means the detector, on average, pushes the meta-learner "
         "toward flagging the point as an anomaly (a higher predicted anomaly "
         "probability); a negative sign means it pushes toward 'not an anomaly'. "
-        "The three ranks are positions where rank 1 is "
-        "strongest: absolute SHAP ranks detectors by overall importance to the "
-        "meta-learner, PFI by the F1 drop when their scores are shuffled, and "
-        "signed SHAP by net directional push — so a strongly negative detector "
-        "can rank low on signed SHAP even when its absolute-SHAP importance is high.")
+        "The two ranks are positions where rank 1 is strongest: absolute SHAP "
+        "ranks detectors by overall importance to the meta-learner, and PFI by "
+        "the F1 drop when their scores are shuffled. A detector's overall weight "
+        "merges those two rankings only. Signed SHAP is what gives each detector "
+        "its sign, and it is kept out of the weighting on purpose: it measures "
+        "net direction, so a detector that pushes the output hard both ways "
+        "averages toward zero and would look unimportant despite carrying real "
+        "weight.")
 
     return _envelope("ga_combination", dataset, entity, output, evidence, caveats,
                      required, question=question, info_footer=info_footer)
@@ -1546,11 +1591,7 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     }
     agg = results_dict.get("aggregation", {}) or {}
     for key, label in (("robust_agg", "robust_consensus"), ("final_agg", "final_consensus")):
-        val = agg.get(key)
-        try:
-            stage_picks[label] = val[1][0] if val and len(val) > 1 and val[1] else NOT_AVAILABLE
-        except (TypeError, IndexError):
-            stage_picks[label] = NOT_AVAILABLE
+        stage_picks[label] = _top_of_ranking(agg.get(key))
     agreement = {
         name: {"top_pick": _py(pick),
                "agrees_with_final_single": (pick == single_pick)

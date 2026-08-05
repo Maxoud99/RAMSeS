@@ -217,7 +217,7 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
     ),
     "ga_combination": (
         " Describe each detector in the order given; for each one, state its "
-        "rank on absolute SHAP, signed SHAP, and PFI (rank 1 is strongest). "
+        "rank on absolute SHAP and PFI (rank 1 is strongest). "
         "Then give the sign summary, listing which detectors signed positive "
         "and which signed negative. The 'carries the Nth-most weight' phrase is "
         "the detector's overall standing in the ensemble — never attach that "
@@ -422,10 +422,13 @@ def compose_global_narrative(stage_texts: Dict[str, str],
                 if s not in _GLOBAL_STAGE_ORDER and stage_texts.get(s)]
     for stage in ordered:
         title = _GLOBAL_STAGE_TITLES.get(stage, stage.replace("_", " ").capitalize())
-        lines += ["", title, "-" * len(title), stage_texts[stage].strip()]
+        lines += ["", title, "-" * len(title)]
+        # Glossary first, matching the per-stage files: the reader meets the
+        # terms before the prose that uses them.
         footer = (stage_footers or {}).get(stage)
         if footer:
-            lines += ["", f"INFO: {footer}"]
+            lines += [f"INFO: {footer}", ""]
+        lines.append(stage_texts[stage].strip())
 
     # Name the stages the run could not narrate, so a short document is never
     # mistaken for a complete one.
@@ -570,15 +573,17 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
                 else:
                     entry["repair_discarded"] = True
 
-            # A fixed glossary is appended verbatim AFTER verification, so its
-            # definitions are never reworded by the model and never counted as
-            # claims by the verifier.
+            # The fixed glossary is written verbatim and OUTSIDE the model's
+            # output, so its definitions are never reworded and never counted
+            # as claims by the verifier. It leads the file: the terms it
+            # defines are the ones the narrative is about, so a reader meets
+            # them before the prose that uses them.
             footer = ir_doc.get("info_footer")
             path = os.path.join(nl_dir, f"{nl_name}.txt")
             with open(path, "w") as f:
-                f.write(narrative + "\n")
                 if footer:
-                    f.write(f"\nINFO: {footer}\n")
+                    f.write(f"INFO: {footer}\n\n")
+                f.write(narrative + "\n")
             entry.update({"narrative_path": path,
                           "words": len(narrative.split()), "verify": metrics})
             report["stages"][stage_key] = entry
@@ -626,7 +631,8 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
             try:
                 merged = compose_global_narrative(
                     stage_texts, global_doc, dataset=str(dataset),
-                    entity=str(entity), iteration=int(iteration))
+                    entity=str(entity), iteration=int(iteration),
+                    stage_footers=stage_footers)
                 path = os.path.join(nl_dir, f"nl_global_iter{iteration}.txt")
                 with open(path, "w") as f:
                     f.write(merged)

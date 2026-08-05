@@ -424,21 +424,29 @@ class TestBuilders(unittest.TestCase):
         for d in ("A", "B", "C"):
             self.assertIn(f"ga_comb.detector.{d}.role", by_id)
             self.assertIn(f"ga_comb.detector.{d}.role", doc["required_atom_ids"])
+        # Only the two MAGNITUDE measures are quoted: signed SHAP no longer
+        # feeds the aggregation, so citing its rank here would imply a
+        # contribution to the weight that it does not make.
         a = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.A.role")
         self.assertEqual(
             a["text"],
             "A carries the most weight in the ensemble, ranking 1 on absolute "
-            "SHAP, signed SHAP, and PFI.")
+            "SHAP and PFI.")
         b = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.B.role")
         self.assertEqual(
             b["text"],
             "B carries the second-most weight in the ensemble, ranking 2 on "
-            "absolute SHAP and signed SHAP, and 3 on PFI.")
+            "absolute SHAP and 3 on PFI.")
         c = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.C.role")
         self.assertEqual(
             c["text"],
             "C carries the third-most weight in the ensemble, ranking 3 on "
-            "absolute SHAP and signed SHAP, and 2 on PFI.")
+            "absolute SHAP and 2 on PFI.")
+        prose = " ".join(x["text"] for x in doc["evidence"])
+        self.assertNotIn("signed SHAP", prose)
+        # ...but the signed value and its rank stay machine-readable.
+        self.assertEqual(b["value"]["signed_shap"], 0.15)
+        self.assertEqual(b["value"]["signed_shap_rank"], 2)
         # No raw magnitude leaks into the prose (they stay in `value`).
         self.assertNotIn("Markov", a["text"])
         self.assertNotIn("0.35", b["text"])
@@ -771,6 +779,62 @@ class TestBuilders(unittest.TestCase):
 
 
 class TestWriterAndAssembler(unittest.TestCase):
+
+    def test_every_footer_ends_with_the_closing_sentence(self):
+        """The closing line is appended centrally in _envelope, so every stage
+        — including ones added later — ends its glossary the same way."""
+        docs = [
+            ir.build_ga_selection_ir("DS", "e1", _ga_selection_result()),
+            ir.build_ga_combination_ir("DS", "e1", _ga_combination_result()),
+            ir.build_monte_carlo_ir("DS", "e1", _mc_result(), ["A"], ["A"]),
+            ir.build_off_by_ir("DS", "e1", _off_by_result(), ["A", "B"]),
+            ir.build_thompson_ir("DS", "e1", **_thompson_kwargs()),
+            ir.build_rank_aggregation_ir("DS", "e1", "robust", 0,
+                                         _rank_agg_result(), ["S1", "S2"],
+                                         {"S1": "A", "S2": "B"}, ["A", "B"]),
+        ]
+        for doc in docs:
+            footer = doc.get("info_footer", "")
+            self.assertTrue(footer, doc["stage"])
+            self.assertTrue(footer.endswith(ir.FOOTER_CLOSING_SENTENCE),
+                            f"{doc['stage']}: {footer[-80:]!r}")
+            # Exactly once, and separated from the definitions before it.
+            self.assertEqual(footer.count(ir.FOOTER_CLOSING_SENTENCE), 1)
+            self.assertIn(" " + ir.FOOTER_CLOSING_SENTENCE, footer)
+
+    def test_closing_sentence_is_not_doubled(self):
+        env = ir._envelope("s", "DS", "e1", {}, [], [], [],
+                           info_footer="Utility is a lift. "
+                                       + ir.FOOTER_CLOSING_SENTENCE)
+        self.assertEqual(env["info_footer"].count(ir.FOOTER_CLOSING_SENTENCE), 1)
+
+    def test_top_of_ranking_handles_every_caller_shape(self):
+        """The pipeline hands aggregation results in three shapes. Indexing
+        [1][0] blindly turned ["LOF_1", "CBLOF_4"] into "C" — the first letter
+        of the SECOND name — so each shape is checked explicitly."""
+        self.assertEqual(ir._top_of_ranking(["LOF_1", "CBLOF_4"]), "LOF_1")
+        self.assertEqual(ir._top_of_ranking((0.5, ["A", "B"])), "A")
+        self.assertEqual(ir._top_of_ranking("CBLOF_1"), "CBLOF_1")
+        for empty in (None, [], "", (0.0, []), [None, []]):
+            self.assertEqual(ir._top_of_ranking(empty), ir.NOT_AVAILABLE)
+
+    def test_global_consensus_picks_are_whole_detector_names(self):
+        results = _results_dict()
+        # The shape run_model_selection_algorithms_2 actually returns: the
+        # ranking list itself, already unwrapped from the (score, ranking) pair.
+        results["aggregation"] = {"robust_agg": ["LOF_1", "CBLOF_4", "NN_3"],
+                                  "final_agg": ["CBLOF_1", "LOF_1"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "explanations_ir")
+            path = ir.assemble_global_ir(results, "DS", "e1", 0, base_dir=base)
+            with open(path) as f:
+                g = json.load(f)
+        picks = g["stage_agreement"]
+        self.assertEqual(picks["robust_consensus"]["top_pick"], "LOF_1")
+        self.assertEqual(picks["final_consensus"]["top_pick"], "CBLOF_1")
+        text = " ".join(a["text"] for a in g["evidence"])
+        self.assertNotIn("top pick (C)", text)
+        self.assertNotIn("top pick (L)", text)
 
     def test_write_and_assemble(self):
         with tempfile.TemporaryDirectory() as tmp:

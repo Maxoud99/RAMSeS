@@ -2022,7 +2022,9 @@ def plot_ga_combination(
               and PFI importances, each normalised to its own max abs so the three
               methods are comparable (signed SHAP can be negative).
       Right — Markov final ranking: horizontal bars of the stationary-probability
-              score, winner on top.
+              score, winner on top. Aggregated over mean|SHAP| and PFI only —
+              signed SHAP measures direction, not weight, so it is shown on the
+              left but excluded from the ranking.
 
     Saves to ga_combination_importance_{dataset}_{entity}.png.
     """
@@ -2060,7 +2062,7 @@ def plot_ga_combination(
     ax_markov.set_yticklabels([f"{rk[f]}. {f}" for f in ranked])
     ax_markov.invert_yaxis()
     ax_markov.set_xlabel("Markov score (stationary prob.)")
-    ax_markov.set_title("Final ranking (Markov: SHAP + PFI)")
+    ax_markov.set_title("Final ranking (Markov: mean|SHAP| + PFI)")
     ax_markov.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
 
     plt.tight_layout(pad=1.2)
@@ -2089,7 +2091,8 @@ def explain_ga_combination(
     """
     Combination-layer explainability: attribute the best-ensemble meta-learner's
     output to its detector score-columns via SHAP and PFI, then merge the three
-    rankings (mean|SHAP|, signed SHAP, PFI) with a Markov-chain rank aggregation.
+    magnitude rankings (mean|SHAP| and PFI) with a Markov-chain rank aggregation;
+    signed SHAP supplies each detector's direction but is kept out of the ranking.
     Writes a report + plot under myresults/GA_Ens/{dataset}/{entity}/ and returns a
     dict (None if explain=False).
 
@@ -2150,8 +2153,12 @@ def explain_ga_combination(
     shap_abs = compute_meta_shap(predict_fn, X_explain, baseline_row, feature_names, mode="abs")
     shap_signed = compute_meta_shap(predict_fn, X_explain, baseline_row, feature_names, mode="signed")
     pfi_imp = compute_meta_pfi(predict_fn, X_test_f, y_true_test, feature_names)
+    # Signed SHAP is deliberately NOT an aggregation input. The aggregate answers
+    # "how much weight does this detector carry", and signed SHAP measures net
+    # direction — a detector that pushes hard both ways cancels toward zero and
+    # would rank as unimportant. It still supplies the per-detector sign below.
     markov_scores, final_ranking = markov_aggregate_importances(
-        {"SHAP_abs": shap_abs, "SHAP_signed": shap_signed, "PFI": pfi_imp}, feature_names)
+        {"SHAP_abs": shap_abs, "PFI": pfi_imp}, feature_names)
 
     baseline_f1 = _best_threshold_f1(
         y_true_test, np.nan_to_num(np.asarray(predict_fn(X_test_f), float),
@@ -2204,13 +2211,15 @@ def explain_ga_combination(
             vs = f"{v:+.6f}" if not np.isnan(v) else "N/A"
             f.write(f"      {f_:<14} {vs:>12} {pfi_rank[f_]:>6}\n")
 
-        f.write("\n--- Markov aggregation (SHAP |.| + SHAP signed + PFI) ---\n")
-        f.write(f"      {'detector':<14} {'|SHAP| rk':>9} {'SHAP rk':>8} "
-                f"{'PFI rk':>7} {'Markov π':>10}\n")
-        f.write("      " + "-" * 52 + "\n")
+        f.write("\n--- Markov aggregation (SHAP |.| + PFI) ---\n")
+        f.write(f"      {'detector':<14} {'|SHAP| rk':>9} {'PFI rk':>7} "
+                f"{'sign':>6} {'Markov π':>10}\n")
+        f.write("      " + "-" * 50 + "\n")
         for f_ in final_ranking:
-            f.write(f"      {f_:<14} {shap_abs_rank[f_]:>9} {shap_signed_rank[f_]:>8} "
-                    f"{pfi_rank[f_]:>7} {markov_scores[f_]:>10.4f}\n")
+            sv = shap_signed[f_]
+            sign = "N/A" if np.isnan(sv) else ("+" if sv >= 0 else "-")
+            f.write(f"      {f_:<14} {shap_abs_rank[f_]:>9} {pfi_rank[f_]:>7} "
+                    f"{sign:>6} {markov_scores[f_]:>10.4f}\n")
         # Final ranking with ties shown as equals (e.g. "1.A > 2.B = C > 4.D").
         ranks = _competition_ranks(markov_scores, final_ranking)
         groups: List[Tuple[int, List[str]]] = []
@@ -2225,8 +2234,12 @@ def explain_ga_combination(
         f.write("\nNote: mean|SHAP| = magnitude of the detector's influence on the meta-learner's "
                 "output; mean SHAP = its net (signed) direction; both are label-free. PFI = F1 drop "
                 "when the column is shuffled (label-based). A Markov-chain rank aggregation "
-                "(stationary distribution over the three methods' pairwise preferences) merges the "
-                "rankings; π is each detector's stationary probability (higher = stronger consensus).\n")
+                "(stationary distribution over the pairwise preferences of mean|SHAP| and PFI) "
+                "merges the two magnitude rankings; π is each detector's stationary probability "
+                "(higher = stronger consensus). Signed SHAP is excluded from the aggregation on "
+                "purpose: it measures net direction, so a detector that pushes the output hard in "
+                "both directions cancels toward zero and would rank as unimportant despite "
+                "carrying real weight. It contributes only the sign column above.\n")
 
     result = {
         "best_ensemble": list(best_ensemble),
