@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}RAMSeS{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/ramses.css') }}">
+<script>
+  // Set the theme before first paint, or the page flashes the wrong one.
+  (function () {
+    try {
+      var saved = localStorage.getItem("ramses-theme");
+      if (saved === "light" || saved === "dark") {
+        document.documentElement.setAttribute("data-theme", saved);
+      }
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header no-print">
+  <div class="page row-between">
+    <div class="row">
+      <a class="brand" href="/">RAMSeS <span>· explainable model selection</span></a>
+    </div>
+    <div class="row">
+      {% block headeractions %}{% endblock %}
+      <button id="theme-toggle" type="button" title="Switch theme" aria-label="Switch theme">◐</button>
+    </div>
+  </div>
+</header>
+
+<main id="main" class="page">
+  {% block content %}{% endblock %}
+</main>
+
+<script type="module" src="{{ url_for('static', filename='js/dom.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

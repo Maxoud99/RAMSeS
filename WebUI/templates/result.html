@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset }} / {{ entity }} — RAMSeS explanation{% endblock %}
+
+{% block headeractions %}
+<a class="button" id="open-report" href="#" hidden
+   title="The pipeline's own numeric report">Comprehensive results</a>
+<button id="toggle-all-info" type="button" title="Show or hide every glossary">ⓘ Definitions</button>
+<button id="toggle-all-full" type="button" title="Expand or collapse every explanation">Expand all</button>
+{% endblock %}
+
+{% block content %}
+<div id="result-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
+  <p class="muted">Loading explanation…</p>
+</div>
+
+<div class="lightbox no-print" id="lightbox" hidden>
+  <div class="lightbox-bar">
+    <span id="lightbox-title" class="small"></span>
+    <button type="button" id="lightbox-close" aria-label="Close">Close ✕</button>
+  </div>
+  <div class="lightbox-stage"><img id="lightbox-img" alt=""></div>
+  <div class="lightbox-bar">
+    <button type="button" id="lightbox-prev">← Previous</button>
+    <span id="lightbox-count" class="small"></span>
+    <button type="button" id="lightbox-next">Next →</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ url_for('static', filename='js/result.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,1138 @@
+"""
+Tests for the WebUI backend.
+
+Follows the repo's test style (unittest, no network). Every test builds a
+synthetic artifact tree in a temporary directory and repoints WebUI.paths at
+it, so nothing depends on the contents of the real myresults/ and no test ever
+starts the pipeline or the LLM.
+"""
+
+import json
+import os
+import pickle
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from WebUI import artifacts, catalog, paths, summarize  # noqa: E402
+
+# Flask lives in the project venv (3.11) while pytest lives in the framework
+# interpreter (3.13), so the route tests skip rather than fail when the suite
+# is run under the one without Flask. Run them with:
+#     .venv/bin/python3 -m unittest WebUI.test_webui
+try:
+    import flask  # noqa: F401
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
+
+
+# ── Fixture builders ─────────────────────────────────────────────────────────
+
+def _ir(stage, **kw):
+    doc = {"ir_version": "1.0", "stage": stage, "dataset": "SKAB", "entity": "7",
+           "output": kw.pop("output", {}), "evidence": kw.pop("evidence", []),
+           "caveats": kw.pop("caveats", []), "required_atom_ids": [],
+           "confidence": {}, "question": kw.pop("question", "Why?"),
+           "info_footer": kw.pop("info_footer", "Glossary text.")}
+    doc.update(kw)
+    return doc
+
+
+def _write(path: Path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, (dict, list)):
+        path.write_text(json.dumps(content, indent=2))
+    else:
+        path.write_text(content)
+
+
+def _nl(info, narrative):
+    """The on-disk per-stage format: glossary first, blank line, narrative."""
+    return f"INFO: {info}\n\n{narrative}\n"
+
+
+RULE = "=" * 80
+
+# A faithful shape of run_app's report: rule/title/rule around every section.
+REPORT_TEXT = "\n".join([
+    RULE, "RAMSeS Framework - Comprehensive Results",
+    "Dataset: skab | Entity: 7 | Iteration: 5", "Timestamp: 2026-08-06 19:07:24", RULE,
+    "", RULE, "COMPUTATIONAL OVERHEAD (seconds)", RULE, "",
+    "Per-Module Timing:", "  1_Genetic_Algorithm            :    39.6792s", "",
+    RULE, "FRAMEWORK FINAL DECISION", RULE, "",
+    "Final Choice:", "  ✓ ENSEMBLE SELECTED", "",
+    RULE, "END OF REPORT", RULE, "",
+])
+
+
+class ArtifactTreeCase(unittest.TestCase):
+    """Builds a realistic tree and points WebUI.paths at it."""
+
+    DATASET = "SKAB"
+    ENTITY = "7"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.myresults = root / "myresults"
+        self.ir_dir = self.myresults / "explanations_ir" / self.DATASET / self.ENTITY
+        self.nl_dir = self.myresults / "explanations_nl" / self.DATASET / self.ENTITY
+        self.report_dir = self.myresults / "comprehensive" / self.DATASET / self.ENTITY
+        self._saved = (paths.MYRESULTS, paths.EXPLANATIONS_IR, paths.EXPLANATIONS_NL,
+                       paths.COMPREHENSIVE)
+        paths.MYRESULTS = self.myresults
+        paths.EXPLANATIONS_IR = self.myresults / "explanations_ir"
+        paths.EXPLANATIONS_NL = self.myresults / "explanations_nl"
+        paths.COMPREHENSIVE = self.myresults / "comprehensive"
+        artifacts.paths = paths
+        self.build()
+
+    def tearDown(self):
+        (paths.MYRESULTS, paths.EXPLANATIONS_IR, paths.EXPLANATIONS_NL,
+         paths.COMPREHENSIVE) = self._saved
+        self._tmp.cleanup()
+
+    def build(self):
+        _write(self.ir_dir / "ir_thompson.json", _ir(
+            "thompson_sampling",
+            output={"top_pick": "NN_1", "n_regimes": 2, "n_windows": 173},
+            evidence=[
+                {"id": "ts.output.top", "type": "stage_output", "subject": "NN_1",
+                 "value": {}, "text": "Thompson Sampling ranked NN_1 first."},
+                {"id": "ts.regime.1", "type": "regime", "subject": "NN_2",
+                 "value": {"start": 5, "end": 18, "duration": 14, "leader": "NN_2"},
+                 "text": "Regime 1 (windows 5 to 18) was led by NN_2."},
+                {"id": "ts.regime.0", "type": "regime", "subject": "NN_3",
+                 "value": {"start": 0, "end": 4, "duration": 5, "leader": "NN_3"},
+                 "text": "Regime 0 (windows 0 to 4) was led by NN_3."},
+            ]))
+        _write(self.nl_dir / "nl_thompson.txt",
+               _nl("Expected reward is the weights applied to the window.",
+                   "Thompson Sampling ranked NN_1 first."))
+
+        _write(self.ir_dir / "ir_monte_carlo.json", _ir(
+            "monte_carlo", output={"top_pick_f1": "LOF_1", "top_pick_pr": "LOF_1"},
+            caveats=[{"id": "mc.c", "type": "caveat", "subject": "x", "value": None,
+                      "text": "Degenerate folds."}]))
+        _write(self.nl_dir / "nl_monte_carlo.txt",
+               _nl("The sweep injects Gaussian noise.", "LOF_1 ranked first."))
+
+        # Rank aggregation carries an iteration suffix.
+        _write(self.ir_dir / "ir_rank_aggregation_robust_0.json",
+               _ir("rank_aggregation_robust", output={"top_pick": "LOF_1"}))
+        _write(self.nl_dir / "nl_rank_aggregation_robust_0.txt",
+               _nl("Influence compares rankings.", "GAN_F1 shaped the consensus most."))
+
+        _write(self.ir_dir / "ir_global_iter0.json", {
+            "ir_version": "1.0", "stage": "global", "dataset": self.DATASET,
+            "entity": self.ENTITY, "iteration": 0,
+            "decision": {"framework_choice": "ensemble", "chosen": ["A", "B"],
+                         "ensemble_f1": 0.9, "single_model": "NN_3"},
+            "stage_agreement": {"thompson": {"top_pick": "NN_1",
+                                             "agrees_with_final_single": False}},
+            "stages": {"thompson_sampling": {"status": "ok"},
+                       "monte_carlo": {"status": "ok"},
+                       "gan": {"status": "not_available",
+                               "note": "no explainability layer implemented for the GAN test"}},
+            "evidence": [{"id": "global.decision", "type": "decision", "subject": "d",
+                          "value": None, "text": "The final decision is the ensemble {A, B}."}],
+            "caveats": [], "required_atom_ids": []})
+
+        # The pipeline's own report, in its own tree, under the CLI --iteration
+        # (5) rather than the explanations' OFFLINE_ITERATION (0).
+        _write(self.report_dir / f"comprehensive_results_{self.DATASET}_{self.ENTITY}_iter5.txt",
+               REPORT_TEXT)
+
+        _write(self.nl_dir / "nl_global_iter0.txt", "RAMSeS model selection — SKAB / entity 7\n")
+        _write(self.nl_dir / "faithfulness_iter0.json", {
+            "dataset": self.DATASET, "entity": self.ENTITY, "iteration": 0,
+            "model": "qwen2.5:7b-instruct",
+            "overall": {"hallucination_rate": 0.0, "omission_rate": 0.016,
+                        "n_claims": 259, "n_required": 61},
+            "stages": {"thompson_sampling": {"status": "ok", "words": 466,
+                                             "verify": {"hallucination_rate": 0.0,
+                                                        "omission_rate": 0.0,
+                                                        "n_claims": 58, "n_required": 18}},
+                       "global": {"status": "ok", "mode": "concat", "words": 2100}}})
+
+
+# ── split_info ───────────────────────────────────────────────────────────────
+
+class TestSplitInfo(unittest.TestCase):
+
+    def test_glossary_leads_the_file(self):
+        info, narrative = artifacts.split_info("INFO: A glossary.\n\nThe narrative.\n")
+        self.assertEqual(info, "A glossary.")
+        self.assertEqual(narrative, "The narrative.")
+
+    def test_no_glossary(self):
+        info, narrative = artifacts.split_info("Just prose.\n")
+        self.assertIsNone(info)
+        self.assertEqual(narrative, "Just prose.")
+
+    def test_info_appearing_mid_narrative_is_not_a_glossary(self):
+        raw = "The narrative mentions INFO: not as a marker.\n"
+        info, narrative = artifacts.split_info(raw)
+        self.assertIsNone(info)
+        self.assertIn("INFO:", narrative)
+
+    def test_crlf_and_missing_trailing_newline(self):
+        info, narrative = artifacts.split_info("INFO: G.\r\n\r\nN.")
+        self.assertEqual(info, "G.")
+        self.assertEqual(narrative, "N.")
+
+    def test_multi_paragraph_narrative_is_kept_whole(self):
+        info, narrative = artifacts.split_info("INFO: G.\n\nPara one.\n\nPara two.")
+        self.assertEqual(info, "G.")
+        self.assertEqual(narrative, "Para one.\n\nPara two.")
+
+    def test_empty_and_none(self):
+        self.assertEqual(artifacts.split_info(""), (None, ""))
+        self.assertEqual(artifacts.split_info(None), (None, ""))
+
+    def test_glossary_with_no_narrative(self):
+        info, narrative = artifacts.split_info("INFO: Only a glossary.\n")
+        self.assertEqual(info, "Only a glossary.")
+        self.assertEqual(narrative, "")
+
+
+# ── build_payload ────────────────────────────────────────────────────────────
+
+class TestBuildPayload(ArtifactTreeCase):
+
+    def test_assembles_stages_in_pipeline_order(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        self.assertEqual([s["key"] for s in p["stages"]],
+                         ["thompson_sampling", "monte_carlo", "rank_aggregation_robust"])
+        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 6])
+
+    def test_case_insensitive_dataset_and_entity(self):
+        # The pipeline writes the dataset string verbatim, so `skab` and `SKAB`
+        # both occur; on Linux they are different directories.
+        self.assertIsNotNone(artifacts.build_payload("skab", "7"))
+        self.assertIsNotNone(artifacts.build_payload("SKAB", "7"))
+
+    def test_glossary_is_separated_from_narrative(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
+        self.assertEqual(ts["info"], "Expected reward is the weights applied to the window.")
+        self.assertEqual(ts["full"], "Thompson Sampling ranked NN_1 first.")
+        self.assertNotIn("INFO:", ts["full"])
+
+    def test_headline_pick_handles_each_stages_naming(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        by = {s["key"]: s for s in p["stages"]}
+        self.assertEqual(by["thompson_sampling"]["top_pick"], "NN_1")
+        self.assertEqual(by["monte_carlo"]["top_pick"], "LOF_1")   # top_pick_f1
+
+    def test_regimes_are_ordered_and_carry_their_window_range(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
+        self.assertEqual([r["index"] for r in ts["regimes"]], [0, 1])
+        self.assertEqual(ts["regimes"][0]["leader"], "NN_3")
+        self.assertEqual((ts["regimes"][1]["start"], ts["regimes"][1]["end"]), (5, 18))
+
+    def test_iteration_suffixed_stage_is_found(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        ra = next(s for s in p["stages"] if s["key"] == "rank_aggregation_robust")
+        self.assertEqual(ra["top_pick"], "LOF_1")
+
+    def test_missing_stage_carries_its_reason(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        gan = next(m for m in p["missing_stages"] if m["key"] == "gan")
+        self.assertEqual(gan["status"], "not_available")
+        self.assertIn("no explainability layer", gan["note"])
+
+    def test_decision_and_agreement_come_from_the_global_ir(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        self.assertEqual(p["decision_text"], "The final decision is the ensemble {A, B}.")
+        self.assertEqual(p["decision"]["framework_choice"], "ensemble")
+        self.assertEqual(p["agreement"][0]["source"], "thompson")
+        self.assertFalse(p["agreement"][0]["agrees"])
+        self.assertFalse(p["degraded"])
+
+    def test_final_consensus_is_filtered_from_agreement(self):
+        """Older result trees still carry the tautological row; the reader hides
+        it so existing results read correctly without re-running anything."""
+        doc = json.loads((self.ir_dir / "ir_global_iter0.json").read_text())
+        doc["stage_agreement"]["final_consensus"] = {
+            "top_pick": "NN_3", "agrees_with_final_single": True}
+        _write(self.ir_dir / "ir_global_iter0.json", doc)
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        sources = [a["source"] for a in p["agreement"]]
+        self.assertNotIn("final_consensus", sources)
+        self.assertIn("thompson", sources)
+
+    def test_faithfulness_overall_and_per_stage(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        self.assertEqual(p["model"], "qwen2.5:7b-instruct")
+        self.assertEqual(p["faithfulness"]["n_claims"], 259)
+        ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
+        self.assertEqual(ts["faithfulness"]["n_claims"], 58)
+        self.assertFalse(ts["faithfulness"]["repaired"])
+
+    def test_iteration_mismatch_takes_the_newest_global_ir(self):
+        # Real on SMD/machine-1-6: the comprehensive tree uses --iteration while
+        # explanations use OFFLINE_ITERATION, so both can sit side by side.
+        import time
+        newer = dict(json.loads((self.ir_dir / "ir_global_iter0.json").read_text()))
+        newer["iteration"] = 5
+        newer["decision"] = {"framework_choice": "single_model"}
+        _write(self.ir_dir / "ir_global_iter5.json", newer)
+        os.utime(self.ir_dir / "ir_global_iter5.json", (time.time() + 10, time.time() + 10))
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        self.assertEqual(p["iteration"], 5)
+        self.assertEqual(p["decision"]["framework_choice"], "single_model")
+
+    def test_missing_global_ir_degrades_but_still_serves_stages(self):
+        (self.ir_dir / "ir_global_iter0.json").unlink()
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        self.assertTrue(p["degraded"])
+        self.assertIsNone(p["decision_text"])
+        self.assertTrue(p["stages"])          # per-stage prose still readable
+        self.assertEqual(p["missing_stages"], [])
+
+    def test_unknown_entity_returns_none(self):
+        self.assertIsNone(artifacts.build_payload("SKAB", "999"))
+        self.assertIsNone(artifacts.build_payload("NOPE", "7"))
+
+    def test_entity_summary_and_known_entities(self):
+        self.assertEqual(artifacts.known_entities(), [("SKAB", "7")])
+        s = artifacts.entity_summary(self.DATASET, self.ENTITY)
+        self.assertEqual(s["framework_choice"], "ensemble")
+        self.assertEqual(s["n_stages"], 2)
+        self.assertEqual(s["hallucination_rate"], 0.0)
+
+
+# ── the summary seam ─────────────────────────────────────────────────────────
+
+class TestComprehensiveReport(ArtifactTreeCase):
+    """The pipeline's numeric report — the binding record for those numbers."""
+
+    def test_payload_links_the_report_without_inlining_it(self):
+        payload = artifacts.build_payload("SKAB", "7")
+        report = payload["comprehensive"]
+        self.assertEqual(report["iteration"], 5)
+        self.assertEqual(report["url"], "/report/SKAB/7")
+        self.assertTrue(report["name"].endswith("_iter5.txt"))
+        # The page links to it; the payload must not carry the whole file.
+        self.assertNotIn("text", report)
+
+    def test_absent_report_is_none_not_an_error(self):
+        for path in self.report_dir.iterdir():
+            path.unlink()
+        self.assertIsNone(artifacts.comprehensive_info("SKAB", "7"))
+        self.assertIsNone(artifacts.build_payload("SKAB", "7")["comprehensive"])
+
+    def test_newest_iteration_wins(self):
+        # Two iterations can coexist; the index is never derived from the name.
+        newer = self.report_dir / "comprehensive_results_SKAB_7_iter9.txt"
+        _write(newer, REPORT_TEXT)
+        os.utime(newer, (time.time() + 10, time.time() + 10))
+        self.assertEqual(artifacts.comprehensive_info("SKAB", "7")["iteration"], 9)
+
+    def test_report_body_is_served_verbatim(self):
+        report = artifacts.comprehensive_report("skab", "7")   # case-insensitive
+        self.assertEqual(report["text"], REPORT_TEXT)
+
+    def test_case_insensitive_and_unknown_entity(self):
+        self.assertIsNotNone(artifacts.comprehensive_path("skab", "7"))
+        self.assertIsNone(artifacts.comprehensive_path("SKAB", "999"))
+        self.assertIsNone(artifacts.comprehensive_path("NOPE", "7"))
+
+
+class TestSummarizeSeam(ArtifactTreeCase):
+
+    def test_today_the_summary_is_the_full_text(self):
+        out = summarize.summarize("Some narrative.")
+        self.assertEqual(out["summary"], "Some narrative.")
+        self.assertTrue(out["is_full"])
+        self.assertEqual(out["mode"], "full")
+
+    def test_payload_never_has_an_empty_summary_for_a_non_empty_narrative(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        for s in p["stages"]:
+            if s["full"]:
+                self.assertTrue(s["summary"], s["key"])
+
+    def test_swapping_the_summariser_is_one_function(self):
+        """The seam's actual contract: replace `summarize` and the payload keeps
+        its shape, with `summary_is_full` flipping so the frontend knows to
+        offer an expand."""
+        original = artifacts.summarize
+        try:
+            artifacts.summarize = lambda text, stage=None: {
+                "summary": text.split(".")[0] + ".", "is_full": False, "mode": "stub"}
+            p = artifacts.build_payload(self.DATASET, self.ENTITY)
+            ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
+            self.assertEqual(ts["summary"], "Thompson Sampling ranked NN_1 first.")
+            self.assertFalse(ts["summary_is_full"])
+            self.assertEqual(ts["summary_mode"], "stub")
+            self.assertTrue(ts["full"])       # full text still present alongside
+        finally:
+            artifacts.summarize = original
+
+    def test_first_paragraph_mode_is_a_working_second_implementation(self):
+        saved = summarize.SUMMARY_MODE
+        try:
+            summarize.SUMMARY_MODE = "first_paragraph"
+            out = summarize.summarize("Head para.\n\nTail para.")
+            self.assertEqual(out["summary"], "Head para.")
+            self.assertFalse(out["is_full"])
+            single = summarize.summarize("Only one para.")
+            self.assertTrue(single["is_full"])
+        finally:
+            summarize.SUMMARY_MODE = saved
+
+    def test_glossary_is_never_summarised(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
+        self.assertNotIn("Expected reward is", ts["summary"])
+
+
+# ── catalog ──────────────────────────────────────────────────────────────────
+
+class TestCatalog(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.models = root / "trained_models"
+        self.data = root / "datasets"
+        for name in ("LOF_1", "NN_2"):
+            p = self.models / "SKAB" / "7" / f"{name}.pth"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x")
+        meta = {"train_hyperparameters": {"seed": 1},
+                "model_hyperparameters": {"contamination": 0.1, "window_size": 64}}
+        (self.models / "SKAB" / "7" / "LOF_1.meta").write_bytes(pickle.dumps(meta))
+        (self.models / "SKAB" / "7" / "NN_2.meta").write_bytes(b"not a pickle")
+        (self.models / "SKAB" / "7" / "RNN_1.pth").write_bytes(b"x")   # stale
+        (self.models / "NASA").mkdir()                                  # not loadable
+
+        # The data root mirrors the real layouts: SKAB as one CSV per entity,
+        # UCR as suffixed .txt files, SMD split across two aliased directories
+        # with a train/test/test_label structure.
+        for entity in ("0", "7", "12"):
+            f = self.data / "SKAB" / f"{entity}.csv"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("x")
+        ucr = self.data / "Anomaly_Archive"
+        ucr.mkdir(parents=True)
+        (ucr / "001_UCR_Anomaly_DISTORTED1sddb40_35000_52000_52620.txt").write_text("x")
+        for directory, machine in (("SMD", "machine-1-1"), ("ServerMachineDataset", "machine-2-1")):
+            train = self.data / directory / "train"
+            train.mkdir(parents=True)
+            (train / f"{machine}.txt").write_text("x")
+            (self.data / directory / "test").mkdir()
+
+        paths.reset_config_cache()
+        paths._CONFIG_CACHE = {"trained_model_path": str(self.models),
+                               "dataset_path": str(self.data), "results_path": None,
+                               "overwrite": True}
+        catalog.reset_cache()
+
+    def tearDown(self):
+        paths.reset_config_cache()
+        catalog.reset_cache()
+        self._tmp.cleanup()
+
+    def test_only_loadable_datasets_are_listed(self):
+        names = [d["name"] for d in catalog.datasets()]
+        self.assertIn("skab", names)
+        self.assertNotIn("nasa", names)     # on disk but not in VALID_DATASETS
+        self.assertNotIn("NASA", names)
+
+    def test_display_labels(self):
+        labels = {d["name"]: d["label"] for d in catalog.datasets()}
+        self.assertEqual(labels["skab"], "SKAB")
+        self.assertEqual(labels["smd"], "SMD")
+        self.assertEqual(labels["anomaly_archive"], "UCR")
+
+    def test_entities_come_from_the_data_root_not_just_trained_models(self):
+        """An entity with no checkpoint is still runnable — it trains first —
+        so discovery must not be limited to trained_models."""
+        entities = catalog.entities_for("skab")
+        self.assertEqual(entities, ["0", "7", "12"])
+        self.assertEqual(catalog.trained_entities("skab"), {"7"})
+
+    def test_aliased_directories_merge_into_one_dataset(self):
+        """SMD and ServerMachineDataset are the same dataset on disk."""
+        names = [d["name"] for d in catalog.datasets()]
+        self.assertEqual(names.count("smd"), 1)
+        self.assertEqual(catalog.entities_for("smd"), ["machine-1-1", "machine-2-1"])
+        self.assertEqual(catalog.entities_for("ServerMachineDataset"),
+                         ["machine-1-1", "machine-2-1"])
+
+    def test_ucr_entity_names_drop_the_index_suffix(self):
+        """The loader keys on the first four underscore fields, so the UI must
+        offer the same name the trained_models tree uses."""
+        self.assertEqual(catalog.entities_for("anomaly_archive"),
+                         ["001_UCR_Anomaly_DISTORTED1sddb40"])
+
+    def test_detector_availability_and_labels(self):
+        dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
+        self.assertEqual(len(dets), 11)      # always the canonical eleven
+        self.assertTrue(dets["LOF_1"]["available"])
+        self.assertFalse(dets["CBLOF_4"]["available"])
+        self.assertEqual(dets["LOF_1"]["params"]["label"], "contamination 0.1")
+        self.assertNotIn("RNN_1", dets)      # stale checkpoints are not selectable
+
+    def test_corrupt_meta_degrades_to_no_params(self):
+        dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
+        self.assertTrue(dets["NN_2"]["available"])
+        self.assertIsNone(dets["NN_2"]["params"])
+
+    def test_case_insensitive_entity_lookup(self):
+        self.assertTrue(any(d["available"] for d in catalog.detectors_for("skab", "7")))
+
+    def test_overwrite_warning_is_surfaced(self):
+        self.assertIn("overwrite_on", [w["code"] for w in catalog.warnings()])
+
+    def test_valid_datasets_matches_the_loader(self):
+        """The list is copied rather than imported (importing Datasets.load
+        would pull in pandas/sklearn); assert the copy is still accurate."""
+        src = Path(__file__).resolve().parent.parent / "Datasets" / "load.py"
+        text = src.read_text()
+        line = next(l for l in text.splitlines() if l.strip().startswith("VALID_DATASETS"))
+        listed = {t.strip().strip("'\"") for t in
+                  line.split("[", 1)[1].rsplit("]", 1)[0].split(",") if t.strip()}
+        self.assertEqual(listed, set(catalog.VALID_DATASETS))
+
+
+# ── plots ────────────────────────────────────────────────────────────────────
+
+class TestPlots(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import plots
+        self.plots = plots
+        self._tmp = tempfile.TemporaryDirectory()
+        self.myresults = Path(self._tmp.name) / "myresults"
+        self._saved = paths.MYRESULTS
+        paths.MYRESULTS = self.myresults
+
+    def tearDown(self):
+        paths.MYRESULTS = self._saved
+        self._tmp.cleanup()
+
+    def _touch(self, rel):
+        p = self.myresults / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x89PNG")
+        return p
+
+    def test_dedupe_keeps_newest_of_each_real_pattern(self):
+        """The four naming irregularities that actually occur on disk."""
+        d = self.myresults / "robustness" / "off_by" / "SKAB" / "7"
+        files = []
+        for ts in ("2026-01-01_00-00-00", "2026-08-05_19-19-42", "2026-03-02_11-11-11"):
+            # off-by: trailing underscore, and a literal SPACE in the stem
+            files.append(self._touch(f"robustness/off_by/SKAB/7/Data_vs_DataWithAnomalies_{ts}_.png"))
+            files.append(self._touch(f"robustness/off_by/SKAB/7/SKAB_7_Misclassified Anomalies_{ts}.png"))
+            # GAN: underscore stem AND trailing underscore
+            files.append(self._touch(f"robustness/off_by/SKAB/7/SKAB_7_Misclassified_Anomalies_{ts}_.png"))
+        plain = self._touch("robustness/off_by/SKAB/7/SKAB_7_off_by_point_importance.png")
+        out = self.plots.dedupe_timestamped(sorted(d.glob("*.png")))
+        by_name = {e["path"].name: e for e in out}
+        self.assertEqual(len(out), 4)          # 3 collapsed groups + 1 untouched
+        for name, entry in by_name.items():
+            if entry["timestamp"] is None:
+                self.assertEqual(name, plain.name)
+                self.assertEqual(entry["n_older"], 0)
+            else:
+                self.assertEqual(entry["timestamp"], "2026-08-05_19-19-42", name)
+                self.assertEqual(entry["n_older"], 2, name)
+
+    def test_glob_escaping_handles_the_bracketed_filename(self):
+        """ensemble_scores_..._['spikes'].png would otherwise be read as a
+        glob character class and silently never match."""
+        self._touch("GA_Ens/SKAB/7/ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png")
+        self._touch("GA_Ens/SKAB/7/ga_selection_utility_SKAB_7.png")
+        headline, gallery = self.plots._ga_selection("SKAB", "7")
+        self.assertIn("['spikes']", " ".join(f["name"] for f in gallery))
+
+    def test_regime_plots_key_on_the_zero_based_index(self):
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        self._touch("Thomposon/SKAB/7/shap_per_regime_50/regime_00_w0-4_NN_3.png")
+        self._touch("Thomposon/SKAB/7/shap_per_regime_50/regime_13_w147-172_NN_2.png")
+        r = self.plots.regime_plots("SKAB", "7")
+        self.assertEqual(sorted(r), [0, 13])
+        self.assertIn("Windows 147\u2013172, led by NN_2", r[13]["caption"])
+
+    def test_monte_carlo_defaults_to_the_plain_variant(self):
+        for suffix in ("F1_plain", "F1", "PRAUC_plain"):
+            self._touch(f"robustness/MonteCarlo/SKAB/7/SKAB_7_MonteCarlo_noise_curves_{suffix}.png")
+        headline, _ = self.plots._monte_carlo("SKAB", "7")
+        self.assertEqual(headline[0]["default"], 0)
+        self.assertIn("_F1_plain.png", headline[0]["variants"][0]["name"])
+
+    def test_aggregation_is_glob_driven(self):
+        """_kendall_only only exists for two-source aggregations, so the set is
+        whatever is on disk rather than a fixed list."""
+        self._touch("robust_aggregated/SKAB/7/aggregation_explainability_final_0.png")
+        self._touch("robust_aggregated/SKAB/7/aggregation_explainability_final_kendall_only_0.png")
+        self._touch("robust_aggregated/SKAB/7/aggregation_explainability_robust_0.png")
+        final, _ = self.plots._aggregation("SKAB", "7", "final")
+        robust, _ = self.plots._aggregation("SKAB", "7", "robust")
+        self.assertEqual(len(final), 2)
+        self.assertEqual(len(robust), 1)
+
+    def test_large_galleries_are_described_not_listed(self):
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        for i in range(120):
+            self._touch(f"Thomposon/SKAB/7/shap_per_window_50/window_{i:03d}.png")
+        descriptors = self.plots.gallery_descriptors("SKAB", "7")
+        self.assertEqual(descriptors[0]["count"], 120)
+        page = self.plots.gallery_page("SKAB", "7", "thompson/shap_per_window_50", 0, 60)
+        self.assertEqual(len(page["items"]), 60)
+        self.assertEqual(page["total"], 120)
+        page2 = self.plots.gallery_page("SKAB", "7", "thompson/shap_per_window_50", 100, 60)
+        self.assertEqual(len(page2["items"]), 20)
+
+    def test_gallery_id_cannot_traverse(self):
+        for bad in ("thompson/../../etc", "thompson/.hidden", "other/x", ""):
+            self.assertEqual(
+                self.plots.gallery_page("SKAB", "7", bad)["items"], [])
+
+    def test_missing_directories_yield_empty_manifest_not_an_error(self):
+        m = self.plots.manifest("NOPE", "999")
+        self.assertTrue(all(v["headline"] == [] for k, v in m.items() if not k.startswith("_")))
+
+
+class TestSafeMediaPath(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import plots
+        self.plots = plots
+        self._tmp = tempfile.TemporaryDirectory()
+        self.myresults = Path(self._tmp.name) / "myresults"
+        (self.myresults / "GA_Ens").mkdir(parents=True)
+        self.png = self.myresults / "GA_Ens" / "plot.png"
+        self.png.write_bytes(b"\x89PNG")
+        self.secret = Path(self._tmp.name) / "secret.png"
+        self.secret.write_bytes(b"\x89PNG")
+        (self.myresults / "model.pth").write_bytes(b"x")
+        (self.myresults / "report.json").write_text("{}")
+        self._saved = paths.MYRESULTS
+        paths.MYRESULTS = self.myresults
+
+    def tearDown(self):
+        paths.MYRESULTS = self._saved
+        self._tmp.cleanup()
+
+    def test_serves_a_png_inside_the_tree(self):
+        self.assertIsNotNone(self.plots.safe_media_path("GA_Ens/plot.png"))
+
+    def test_bracketed_filename_is_servable(self):
+        odd = self.myresults / "GA_Ens" / "ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png"
+        odd.write_bytes(b"\x89PNG")
+        self.assertIsNotNone(self.plots.safe_media_path(
+            "GA_Ens/ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png"))
+
+    def test_rejects_traversal_and_absolute_paths(self):
+        for bad in ("../secret.png", "GA_Ens/../../secret.png", "/etc/passwd",
+                    "\\etc\\passwd", "", "C:/Windows/x.png"):
+            self.assertIsNone(self.plots.safe_media_path(bad), bad)
+
+    def test_rejects_a_symlink_pointing_outside(self):
+        """resolve() runs before the containment check, so a symlink out of the
+        tree is caught — send_from_directory alone would follow it."""
+        link = self.myresults / "GA_Ens" / "escape.png"
+        try:
+            link.symlink_to(self.secret)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self.assertIsNone(self.plots.safe_media_path("GA_Ens/escape.png"))
+
+    def test_rejects_non_image_extensions(self):
+        self.assertIsNone(self.plots.safe_media_path("model.pth"))
+        self.assertIsNone(self.plots.safe_media_path("report.json"))
+
+    def test_rejects_directories_and_missing_files(self):
+        self.assertIsNone(self.plots.safe_media_path("GA_Ens"))
+        self.assertIsNone(self.plots.safe_media_path("GA_Ens/nope.png"))
+
+
+# ── markers ──────────────────────────────────────────────────────────────────
+
+class TestMarkers(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import markers
+        self.m = markers
+
+    def test_phase_lines(self):
+        e = self.m.classify("INFO:app:📂 STAGE 1/7: Loading Training Data...")
+        self.assertEqual((e["type"], e["number"]), ("phase", 1))
+        e = self.m.classify("INFO:app:📝 STAGE 7/7: Writing Comprehensive Results...")
+        self.assertEqual(e["number"], 7)
+
+    def test_substage_running(self):
+        e = self.m.classify("INFO:app:  📊 Sub-stage 6.2: Thompson Sampling - Online model selection...")
+        self.assertEqual((e["type"], e["key"], e["status"]), ("stage", "thompson", "running"))
+
+    def test_skipped_is_not_running(self):
+        """The SKIPPED rule must win, or a skipped stage lights up as running
+        and never clears."""
+        e = self.m.classify("INFO:app:  ⏩ Sub-stage 6.3: GAN Robustness Testing SKIPPED (partial run)")
+        self.assertEqual((e["key"], e["status"]), ("gan", "skipped"))
+
+    def test_stage_result_lines(self):
+        e = self.m.classify("INFO:app:  ✓ [GA] Best ensemble=['LOF_1'] | F1=0.9000 | Time=37.0s")
+        self.assertEqual((e["key"], e["status"]), ("ga", "done"))
+        self.assertIn("Best ensemble", e["text"])
+        for tag, key in (("Thompson", "thompson"), ("GAN", "gan"),
+                         ("Borderline", "offby"), ("MonteCarlo", "montecarlo")):
+            e = self.m.classify(f"INFO:app:  ✓ [{tag}] top-5: x | Time=1.0s")
+            self.assertEqual(e["key"], key, tag)
+
+    def test_completion_markers_are_distinguished(self):
+        full = self.m.classify("INFO:app:🎉 EXECUTION COMPLETE! Total Time: 244.5s")
+        self.assertEqual((full["type"], full["partial"]), ("complete", False))
+        part = self.m.classify("INFO:app:✅ Partial run complete (stages=montecarlo).")
+        self.assertEqual((part["type"], part["partial"]), ("complete", True))
+
+    def test_banner_fields_are_parsed(self):
+        e = self.m.classify("INFO:app:🚀 STARTING RAMSeS EXECUTION: dataset=SKAB, entity=7, "
+                            "parallel=False, stages=ga,thompson, detectors=3/11")
+        self.assertEqual(e["type"], "run_started")
+        self.assertEqual(e["fields"]["dataset"], "SKAB")
+        self.assertEqual(e["fields"]["detectors"], "3/11")
+
+    def test_warnings_and_fatal_signature(self):
+        w = self.m.classify("WARNING:app:LLM narration skipped — server unreachable")
+        self.assertEqual(w["code"], "llm_unreachable")
+        w = self.m.classify("WARNING:app:⚠ Requested detectors with no trained model (skipped): NN_2")
+        self.assertEqual(w["code"], "detectors_missing")
+        f = self.m.classify("INFO:app:Traceback for Entity: 7 Dataset: SKAB")
+        self.assertEqual(f["type"], "fatal_marker")
+
+    def test_noise_is_ignored(self):
+        for line in ("", "   ", "INFO:app:Evaluating fitness for ensemble: ['LOF_1']"):
+            self.assertIsNone(self.m.classify(line))
+
+    def test_emoji_loss_does_not_break_progress(self):
+        """Matching is on the text after the emoji, so a mangled encoding still
+        advances the rail."""
+        e = self.m.classify("INFO:app: Sub-stage 6.1: Genetic Algorithm...")
+        self.assertEqual(e["key"], "ga")
+
+
+# ── build_argv ───────────────────────────────────────────────────────────────
+
+class TestBuildArgv(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+        self.base = {"dataset": "SKAB", "entity": "7"}
+
+    def _argv(self, **kw):
+        return self.jobs.build_argv({**self.base, **kw})
+
+    def test_minimal_command(self):
+        argv = self._argv()
+        self.assertEqual(argv[1:3], ["-u", "app.py"])
+        self.assertIn("--dataset", argv)
+        self.assertEqual(argv[argv.index("--dataset") + 1], "SKAB")
+        self.assertEqual(argv[argv.index("--parallel") + 1], "false")
+        self.assertIn("--explain", argv)          # the UI defaults explain on
+
+    def test_defaults_emit_no_stages_or_detectors_flag(self):
+        argv = self._argv(stages=["ga", "thompson", "gan", "offby", "montecarlo"],
+                          detectors=list(self.jobs.ALL_DETECTORS))
+        self.assertNotIn("--stages", argv)
+        self.assertNotIn("--detectors", argv)
+
+    def test_subsets_are_emitted_in_canonical_order(self):
+        argv = self._argv(stages=["montecarlo", "ga"],
+                          detectors=["NN_1", "LOF_1", "NN_1"])
+        self.assertEqual(argv[argv.index("--stages") + 1], "ga,montecarlo")
+        self.assertEqual(argv[argv.index("--detectors") + 1], "LOF_1,NN_1")
+
+    def test_equivalent_selections_produce_identical_argv(self):
+        a = self._argv(detectors=["NN_1", "LOF_1"])
+        b = self._argv(detectors=["LOF_1", "NN_1", "LOF_1"])
+        self.assertEqual(a, b)
+
+    def test_flag_shapes(self):
+        argv = self._argv(parallel=True, explain=False, enable_online=True,
+                          max_online_windows=50, iteration=3, strategy="fixed-best")
+        self.assertEqual(argv[argv.index("--parallel") + 1], "true")
+        self.assertNotIn("--explain", argv)       # bare flag, omitted when off
+        self.assertIn("--enable_online", argv)
+        self.assertEqual(argv[argv.index("--max_online_windows") + 1], "50")
+        self.assertEqual(argv[argv.index("--iteration") + 1], "3")
+        self.assertEqual(argv[argv.index("--strategy") + 1], "fixed-best")
+
+    def test_overwrite_is_always_explicit(self):
+        """config.yml ships with overwrite: True, so omitting the flag would
+        silently retrain every detector on every run."""
+        argv = self._argv()
+        self.assertEqual(argv[argv.index("--overwrite") + 1], "false")
+        argv = self._argv(overwrite=True)
+        self.assertEqual(argv[argv.index("--overwrite") + 1], "true")
+
+    def test_llm_overrides_are_omitted_when_unset(self):
+        self.assertNotIn("--llm_model", self._argv())
+        argv = self._argv(llm_model="qwen2.5:7b-instruct", llm_base_url="http://x/v1")
+        self.assertEqual(argv[argv.index("--llm_model") + 1], "qwen2.5:7b-instruct")
+
+    def test_missing_dataset_or_entity_is_rejected(self):
+        for bad in ({"dataset": "SKAB"}, {"entity": "7"}, {"dataset": "", "entity": "7"}):
+            with self.assertRaises(ValueError):
+                self.jobs.build_argv(bad)
+
+    def test_narrate_argv(self):
+        argv = self.jobs.build_narrate_argv("SKAB", "7")
+        self.assertIn("Explainability.narrate", argv)
+        self.assertEqual(argv[argv.index("--iteration") + 1], "0")
+
+
+# ── classify_outcome: the exit-0-is-a-lie matrix ─────────────────────────────
+
+class TestClassifyOutcome(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+
+    def _job(self, lines=(), exit_code=0, **kw):
+        job = self.jobs.Job("t", ["x"], kw.pop("params", {}))
+        for line in lines:
+            job._record(line)
+        job.exit_code = exit_code
+        for key, value in kw.items():
+            setattr(job, key, value)
+        return job
+
+    FULL = "INFO:app:🎉 EXECUTION COMPLETE! Total Time: 1.0s"
+    PARTIAL = "INFO:app:✅ Partial run complete (stages=montecarlo)."
+
+    def test_full_run_with_marker_succeeds(self):
+        out = self.jobs.classify_outcome(self._job([self.FULL]), expect_partial=False)
+        self.assertEqual(out["status"], "succeeded")
+
+    def test_partial_run_with_partial_marker_succeeds(self):
+        out = self.jobs.classify_outcome(self._job([self.PARTIAL]), expect_partial=True)
+        self.assertEqual(out["status"], "succeeded")
+
+    def test_exit_zero_without_a_marker_is_a_failure(self):
+        """run_app swallows exceptions and still exits 0 — the headline risk."""
+        out = self.jobs.classify_outcome(self._job(["INFO:app:working..."]),
+                                         expect_partial=False)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("without reaching completion", out["reason"])
+
+    def test_traceback_signature_is_reported_as_the_reason(self):
+        job = self._job(["INFO:app:Traceback for Entity: 7 Dataset: SKAB"])
+        out = self.jobs.classify_outcome(job, expect_partial=False)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("raised an exception", out["reason"])
+
+    def test_partial_marker_on_a_full_run_is_a_mismatch(self):
+        out = self.jobs.classify_outcome(self._job([self.PARTIAL]), expect_partial=False)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("does not match", out["reason"])
+
+    def test_non_zero_exit_is_a_failure(self):
+        out = self.jobs.classify_outcome(
+            self._job(["INFO:app:boom"], exit_code=2), expect_partial=False)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("code 2", out["reason"])
+
+    def test_cancel_and_timeout_win_over_everything(self):
+        job = self._job([self.FULL], cancel_requested=True)
+        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "cancelled")
+        job = self._job([self.FULL], status="timeout")
+        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "timeout")
+
+    def test_explain_requested_but_nothing_written(self):
+        out = self.jobs.classify_outcome(self._job([self.FULL]), expect_partial=False,
+                                         explain_requested=True, artifacts_written=False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("no explanation artifacts", out["reason"])
+
+    def test_error_line_is_preferred_over_the_generic_reason(self):
+        job = self._job(["INFO:app:starting", "ERROR:app:Could not load models"])
+        out = self.jobs.classify_outcome(job, expect_partial=False)
+        self.assertIn("Could not load models", out["reason"])
+
+
+# ── job lifecycle against a fake pipeline ────────────────────────────────────
+
+_FAKE_PIPELINE = r"""
+import sys, time
+def log(msg): print(msg, file=sys.stderr, flush=True)
+log("INFO:app:STARTING RAMSeS EXECUTION: dataset=SKAB, entity=7, detectors=11/11")
+log("INFO:app:STAGE 1/7: Loading Training Data...")
+log("INFO:app:  Sub-stage 6.1: Genetic Algorithm...")
+log("INFO:app:  ✓ [GA] Best ensemble=['LOF_1'] | Time=1.0s")
+log("INFO:app:  ⏩ Sub-stage 6.3: GAN Robustness Testing SKIPPED (partial run)")
+sys.stdout.write("progress 1/3\rprogress 2/3\rprogress 3/3\n"); sys.stdout.flush()
+log("MARKER")
+"""
+
+
+class TestJobLifecycle(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+        self._tmp = tempfile.TemporaryDirectory()
+        # COMPREHENSIVE too: the report decides whether a finished job links to
+        # it, and a test must never read the developer's real myresults/ tree.
+        self._saved = (paths.WEBUI_LOGS, paths.COMPREHENSIVE)
+        paths.WEBUI_LOGS = Path(self._tmp.name) / "webui_logs"
+        paths.COMPREHENSIVE = Path(self._tmp.name) / "myresults" / "comprehensive"
+        self.mgr = jobs.JobManager(repo_root=Path(self._tmp.name))
+
+    def tearDown(self):
+        (paths.WEBUI_LOGS, paths.COMPREHENSIVE) = self._saved
+        self._tmp.cleanup()
+
+    def _run(self, script, params=None, timeout=30):
+        job = self.mgr.start(params or {"dataset": "SKAB", "entity": "7", "explain": False},
+                             argv=[sys.executable, "-u", "-c", script], timeout=timeout)
+        for _ in range(300):
+            if job.is_done():
+                break
+            time.sleep(0.02)
+        return job
+
+    def test_markers_drive_the_stage_rail(self):
+        job = self._run(_FAKE_PIPELINE.replace("MARKER", "\U0001F389 EXECUTION COMPLETE! 1.0s"))
+        self.assertEqual(job.status, "succeeded")
+        self.assertEqual(job.stages["ga"]["status"], "done")
+        self.assertEqual(job.stages["gan"]["status"], "skipped")
+        self.assertEqual(job.phase["number"], 1)
+        self.assertEqual(job.exit_code, 0)
+
+    def test_report_url_is_offered_only_when_the_report_exists(self):
+        """A partial run returns before the pipeline writes the report, so the
+        link must follow the file on disk, not the run's success."""
+        done = _FAKE_PIPELINE.replace("MARKER", "\U0001F389 EXECUTION COMPLETE! 1.0s")
+        job = self._run(done)
+        self.assertEqual(job.result_url, "/result/SKAB/7")
+        self.assertIsNone(job.report_url)
+
+        _write(paths.COMPREHENSIVE / "SKAB" / "7" / "comprehensive_results_SKAB_7_iter5.txt",
+               REPORT_TEXT)
+        job = self._run(done)
+        self.assertEqual(job.report_url, "/report/SKAB/7")
+        self.assertEqual(job.snapshot()["report_url"], "/report/SKAB/7")
+
+    def test_the_rail_carries_no_stage_timings(self):
+        """Wall-clock deltas between log lines disagreed with the timings the
+        pipeline measures and writes to the comprehensive report; that report
+        is the binding record, so the rail reports status only."""
+        job = self._run(_FAKE_PIPELINE.replace("MARKER", "\U0001F389 EXECUTION COMPLETE! 1.0s"))
+        for entry in job.stages.values():
+            self.assertNotIn("started_at", entry)
+            self.assertNotIn("finished_at", entry)
+
+    def test_carriage_returns_are_split_into_separate_lines(self):
+        """tqdm rewrites its bar with \\r; without splitting on it one progress
+        bar becomes a single enormous line."""
+        job = self._run(_FAKE_PIPELINE.replace("MARKER", "\U0001F389 EXECUTION COMPLETE! 1.0s"))
+        text = "\n".join(job.lines)
+        self.assertIn("progress 1/3", text)
+        self.assertIn("progress 3/3", text)
+        self.assertFalse(any(len(l) > 500 for l in job.lines))
+
+    def test_log_is_also_written_to_disk(self):
+        job = self._run(_FAKE_PIPELINE.replace("MARKER", "\U0001F389 EXECUTION COMPLETE! 1.0s"))
+        self.assertTrue(job.log_path.exists())
+        self.assertIn("Sub-stage 6.1", job.log_path.read_text())
+
+    def test_exit_zero_without_completion_marker_fails(self):
+        job = self._run(_FAKE_PIPELINE.replace('log("MARKER")', 'pass'))
+        self.assertEqual(job.status, "failed")
+
+    def test_tail_supports_incremental_reads(self):
+        job = self._run(_FAKE_PIPELINE.replace("MARKER", "\U0001F389 EXECUTION COMPLETE! 1.0s"))
+        first = job.tail(0)
+        self.assertGreater(len(first["lines"]), 3)
+        self.assertEqual(job.tail(first["cursor"])["lines"], [])
+
+    def test_one_job_at_a_time(self):
+        script = "import time; time.sleep(5)"
+        job = self.mgr.start({"dataset": "SKAB", "entity": "7"},
+                             argv=[sys.executable, "-u", "-c", script], timeout=30)
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                self.mgr.start({"dataset": "SKAB", "entity": "8"},
+                               argv=[sys.executable, "-u", "-c", script])
+            self.assertEqual(str(cm.exception), job.id)   # 409 carries the active id
+        finally:
+            self.mgr.cancel(job.id)
+
+    def test_cancel_kills_the_whole_process_group(self):
+        """start_new_session puts the child in its own group so a cancel takes
+        its worker threads/children with it."""
+        script = ("import subprocess, sys, time\n"
+                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                  "time.sleep(30)\n")
+        job = self.mgr.start({"dataset": "SKAB", "entity": "7"},
+                             argv=[sys.executable, "-u", "-c", script], timeout=30)
+        time.sleep(0.6)
+        self.assertTrue(self.mgr.cancel(job.id))
+        for _ in range(200):
+            if job.is_done():
+                break
+            time.sleep(0.02)
+        self.assertEqual(job.status, "cancelled")
+
+    def test_timeout_is_enforced(self):
+        job = self._run("import time; time.sleep(30)", timeout=1)
+        self.assertIn(job.status, ("timeout", "failed"))
+
+    def test_unstartable_command_fails_cleanly(self):
+        job = self.mgr.start({"dataset": "SKAB", "entity": "7"},
+                             argv=["/nonexistent/binary"])
+        self.assertEqual(job.status, "failed")
+        self.assertIsNone(self.mgr.active())     # the slot is released
+
+
+# ── routes ───────────────────────────────────────────────────────────────────
+
+@unittest.skipUnless(HAS_FLASK, "Flask is not installed in this interpreter")
+class TestRoutes(ArtifactTreeCase):
+    """Exercised through Flask's test client so no server or port is needed."""
+
+    def setUp(self):
+        super().setUp()
+        from WebUI import jobs, server
+        jobs.reset_manager()
+        self.jobs = jobs
+        self.client = server.create_app(TESTING=True).test_client()
+
+    def tearDown(self):
+        self.jobs.reset_manager()
+        super().tearDown()
+
+    def test_pages_render(self):
+        self.assertEqual(self.client.get("/").status_code, 200)
+        self.assertEqual(self.client.get("/result/SKAB/7").status_code, 200)
+        self.assertEqual(self.client.get("/report/SKAB/7").status_code, 200)
+        self.assertEqual(self.client.get("/run/nope").status_code, 404)
+
+    def test_comprehensive_report_is_served_and_downloadable(self):
+        r = self.client.get("/api/comprehensive/SKAB/7")
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertEqual(body["text"], REPORT_TEXT)
+        self.assertEqual(body["iteration"], 5)
+
+        download = self.client.get("/api/comprehensive/SKAB/7?download=1")
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.data.decode(), REPORT_TEXT)
+        self.assertIn("attachment", download.headers["Content-Disposition"])
+
+    def test_comprehensive_report_404_explains_partial_runs(self):
+        r = self.client.get("/api/comprehensive/SKAB/999")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.get_json()["error"], "no_report")
+        self.assertIn("partial", r.get_json()["hint"])
+        self.assertEqual(
+            self.client.get("/api/comprehensive/SKAB/999?download=1").status_code, 404)
+
+    def test_catalog_lists_existing_results(self):
+        r = self.client.get("/api/catalog")
+        self.assertEqual(r.status_code, 200)
+        results = r.get_json()["results"]
+        self.assertEqual([(x["dataset"], x["entity"]) for x in results], [("SKAB", "7")])
+
+    def test_explanations_payload_and_404(self):
+        r = self.client.get("/api/explanations/SKAB/7")
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertIn("stages", body)
+        self.assertIn("plots", body)
+        missing = self.client.get("/api/explanations/SKAB/999")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.get_json()["error"], "no_artifacts")
+
+    def test_download_serves_the_verbatim_file(self):
+        r = self.client.get("/api/explanations/SKAB/7/download?stage=thompson_sampling")
+        self.assertEqual(r.status_code, 200)
+        # The download is byte-identical to disk, glossary included.
+        self.assertTrue(r.data.decode().startswith("INFO: "))
+        self.assertEqual(self.client.get(
+            "/api/explanations/SKAB/7/download?stage=nope").status_code, 404)
+
+    def test_dry_run_returns_argv_without_starting_anything(self):
+        r = self.client.post("/api/runs", json={"dataset": "SKAB", "entity": "7",
+                                                "stages": ["montecarlo"], "dry_run": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("--stages", r.get_json()["argv"])
+        self.assertIsNone(self.jobs.manager().active())
+
+    def test_run_validation_errors(self):
+        for body, fragment in (
+            ({"entity": "7"}, "dataset"),
+            ({"dataset": "S"}, "entity"),
+            ({"dataset": "S", "entity": "7", "stages": ["nope"]}, "unknown stage"),
+            ({"dataset": "S", "entity": "7", "detectors": ["LOF_1"]}, "at least two"),
+        ):
+            r = self.client.post("/api/runs", json=body)
+            self.assertEqual(r.status_code, 400, body)
+            self.assertIn(fragment, r.get_json()["error"])
+
+    def test_second_concurrent_run_is_refused_with_the_active_id(self):
+        script = "import time; time.sleep(5)"
+        job = self.jobs.manager().start({"dataset": "SKAB", "entity": "7"},
+                                        argv=[sys.executable, "-c", script])
+        try:
+            r = self.client.post("/api/runs", json={"dataset": "SKAB", "entity": "8"})
+            self.assertEqual(r.status_code, 409)
+            self.assertEqual(r.get_json()["active_job_id"], job.id)
+        finally:
+            self.jobs.manager().cancel(job.id)
+
+    def test_sse_route_content_type(self):
+        job = self.jobs.manager().start({"dataset": "SKAB", "entity": "7"},
+                                        argv=[sys.executable, "-c", "pass"])
+        for _ in range(200):
+            if job.is_done():
+                break
+            time.sleep(0.02)
+        r = self.client.get(f"/api/runs/{job.id}/events")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.headers["Content-Type"].startswith("text/event-stream"))
+        body = r.get_data(as_text=True)
+        self.assertIn("event: hello", body)
+        self.assertIn("event: status", body)     # already finished -> closes
+
+    def test_media_route_enforces_the_path_rules(self):
+        png = self.myresults / "GA_Ens" / "x.png"
+        png.parent.mkdir(parents=True, exist_ok=True)
+        png.write_bytes(b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(self.client.get("/media/GA_Ens/x.png").status_code, 200)
+        for bad in ("../../app.py", "GA_Ens/../../../app.py",
+                    "explanations_ir/SKAB/7/ir_thompson.json"):
+            self.assertEqual(self.client.get(f"/media/{bad}").status_code, 404, bad)
+
+    def test_log_endpoint_is_incremental(self):
+        job = self.jobs.manager().start(
+            {"dataset": "SKAB", "entity": "7"},
+            argv=[sys.executable, "-c", "import sys; print('hello', file=sys.stderr)"])
+        for _ in range(200):
+            if job.is_done():
+                break
+            time.sleep(0.02)
+        first = self.client.get(f"/api/runs/{job.id}/log").get_json()
+        self.assertTrue(any("hello" in l for l in first["lines"]))
+        again = self.client.get(
+            f"/api/runs/{job.id}/log?offset={first['cursor']}").get_json()
+        self.assertEqual(again["lines"], [])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

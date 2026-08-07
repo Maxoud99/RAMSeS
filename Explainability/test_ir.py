@@ -831,10 +831,24 @@ class TestWriterAndAssembler(unittest.TestCase):
                 g = json.load(f)
         picks = g["stage_agreement"]
         self.assertEqual(picks["robust_consensus"]["top_pick"], "LOF_1")
-        self.assertEqual(picks["final_consensus"]["top_pick"], "CBLOF_1")
         text = " ".join(a["text"] for a in g["evidence"])
         self.assertNotIn("top pick (C)", text)
         self.assertNotIn("top pick (L)", text)
+
+    def test_final_consensus_is_not_an_agreement_row(self):
+        """The final consensus produces the single-model pick, so comparing the
+        two would always report agreement and carry no information."""
+        results = _results_dict()
+        results["aggregation"] = {"robust_agg": ["LOF_1", "CBLOF_4"],
+                                  "final_agg": ["A", "B"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = ir.assemble_global_ir(results, "DS", "e1", 0,
+                                         base_dir=os.path.join(tmp, "ir"))
+            with open(path) as f:
+                g = json.load(f)
+        self.assertNotIn("final_consensus", g["stage_agreement"])
+        self.assertIn("robust_consensus", g["stage_agreement"])
+        self.assertNotIn("final_consensus", json.dumps(g["evidence"]))
 
     def test_write_and_assemble(self):
         with tempfile.TemporaryDirectory() as tmp:

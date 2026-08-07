@@ -1590,8 +1590,10 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
         "monte_carlo": (results_dict.get("monte_carlo", {}) or {}).get("best_model_f1", NOT_AVAILABLE),
     }
     agg = results_dict.get("aggregation", {}) or {}
-    for key, label in (("robust_agg", "robust_consensus"), ("final_agg", "final_consensus")):
-        stage_picks[label] = _top_of_ranking(agg.get(key))
+    # Only the robust consensus is compared. The final consensus IS the source
+    # of the single-model pick, so asking whether they agree is tautological —
+    # it would always report agreement and tell the reader nothing.
+    stage_picks["robust_consensus"] = _top_of_ranking(agg.get("robust_agg"))
     agreement = {
         name: {"top_pick": _py(pick),
                "agrees_with_final_single": (pick == single_pick)

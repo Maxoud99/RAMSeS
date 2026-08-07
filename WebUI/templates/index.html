@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}RAMSeS — configure a run{% endblock %}
+
+{% block content %}
+<div class="stack-lg">
+  <section class="stack">
+    <h1>Configure a run</h1>
+    <p class="muted" style="max-width: 60ch;">
+      Pick a dataset and entity, choose which detectors compete and which stages run,
+      then watch the pipeline work and read the explanation it produces.
+    </p>
+    <div id="warnings" class="stack"></div>
+  </section>
+
+  <form id="run-form" class="stack-lg">
+    <section class="card stack">
+      <h2>Data</h2>
+      <div class="row" style="gap: var(--sp-5); align-items: flex-end;">
+        <div class="field grow" style="max-width: 260px;">
+          <label for="dataset">Dataset</label>
+          <select id="dataset" name="dataset"></select>
+        </div>
+        <div class="field grow" style="max-width: 320px;">
+          <label for="entity">Entity</label>
+          <input id="entity-filter" type="search" placeholder="Filter entities…" class="no-print">
+          <select id="entity" name="entity" size="1"></select>
+        </div>
+      </div>
+    </section>
+
+    <section class="card stack">
+      <div class="row-between">
+        <h2>Detectors</h2>
+        <div class="row small">
+          <span id="detector-count" class="muted"></span>
+          <button type="button" data-select="all">All</button>
+          <button type="button" data-select="none">None</button>
+        </div>
+      </div>
+      <p class="muted small" style="margin:0;">
+        Only the families you pick are trained. At least two are required — with one there
+        is nothing to select between.
+      </p>
+      <div id="detectors" class="stack"></div>
+      <p id="detector-error" class="banner banner-error" hidden></p>
+    </section>
+
+    <section class="card stack">
+      <div class="row-between">
+        <h2>Stages</h2>
+        <div class="row small">
+          <button type="button" data-stages="all">All</button>
+          <button type="button" data-stages="robustness">Robustness only</button>
+        </div>
+      </div>
+      <div id="stages" class="row"></div>
+      <div id="partial-banner" class="banner banner-warn stack" hidden></div>
+    </section>
+
+    <section class="card stack">
+      <h2>Options</h2>
+      <div class="row">
+        <label class="toggle">
+          <input type="checkbox" id="explain" checked>
+          <span>Generate explanations</span>
+          <span class="hint">--explain</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="parallel">
+          <span>Run stages in parallel</span>
+          <span class="hint">--parallel</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="enable_online">
+          <span>Online phase</span>
+          <span class="hint">experimental</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="overwrite">
+          <span>Retrain base detectors</span>
+          <span class="hint">--overwrite</span>
+        </label>
+      </div>
+      <p class="small muted" style="margin:0;">
+        Retraining dominates the runtime. Leave it off to reuse the checkpoints already
+        on disk; detectors with no checkpoint are trained either way.
+      </p>
+      <div id="llm-health" class="small muted"></div>
+
+      <details>
+        <summary>Advanced</summary>
+        <div class="stack" style="margin-top: var(--sp-3);">
+          <div class="row">
+            <div class="field"><label for="iteration">Iteration (window sizing)</label>
+              <input id="iteration" type="number" value="5" min="1" style="width: 8ch;"></div>
+            <div class="field"><label for="timeout">Timeout (seconds)</label>
+              <input id="timeout" type="number" value="7200" min="60" style="width: 10ch;"></div>
+          </div>
+          <div class="field"><label for="llm_base_url">LLM base URL</label>
+            <input id="llm_base_url" type="text" placeholder="http://localhost:11434/v1"></div>
+          <div class="field"><label for="llm_model">LLM model</label>
+            <input id="llm_model" type="text" placeholder="qwen2.5:7b-instruct"></div>
+        </div>
+      </details>
+    </section>
+
+    <section class="card stack">
+      <div class="row-between">
+        <h2>Command</h2>
+        <button type="button" id="copy-command" class="small">Copy</button>
+      </div>
+      <pre id="command" class="mono" style="margin:0; white-space: pre-wrap; word-break: break-all;"></pre>
+      <div class="row">
+        <button type="submit" class="primary" id="start">Run pipeline</button>
+        <span id="start-error" class="small" style="color: var(--error);"></span>
+      </div>
+    </section>
+  </form>
+
+  <section class="stack">
+    <h2>Previous results</h2>
+    <div id="results" class="stack"></div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ url_for('static', filename='js/configure.js') }}"></script>
+{% endblock %}

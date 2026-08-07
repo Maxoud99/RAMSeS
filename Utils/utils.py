@@ -3,6 +3,7 @@ import torch as t
 import matplotlib.pyplot as plt
 from argparse import ArgumentParser
 from Utils.config import Config
+from Utils.pipeline_spec import parse_detectors, parse_stages
 from pathlib import Path
 import os
 from loguru import logger
@@ -94,6 +95,23 @@ def get_args_from_cmdline():
                              "any strict subset runs only those stages + their explainability, then stops "
                              "(no rank aggregation / final decision / online phase) and runs sequentially.")
 
+    parser.add_argument('--overwrite',
+                        type=str,
+                        default=None,
+                        choices=['true', 'false'],
+                        help="Retrain the base detectors even when checkpoints already exist. "
+                             "Overrides `overwrite` in the config file. Training dominates the "
+                             "runtime, so 'false' reuses existing models and is much faster.")
+
+    parser.add_argument('--detectors',
+                        type=str,
+                        default=None,
+                        help="Comma-separated base detectors to select among, e.g. "
+                             "'LOF_1,NN_2,CBLOF_3'. Default: all 11. Only the families of the "
+                             "requested detectors are trained. Detectors with no trained model "
+                             "for the chosen dataset/entity are skipped with a warning; at least "
+                             "two must remain.")
+
     cmd_args = parser.parse_args()
     
     # Load config from file
@@ -142,20 +160,22 @@ def get_args_from_cmdline():
     args['llm_model'] = cmd_args.llm_model
     args['llm_base_url'] = cmd_args.llm_base_url
 
-    # Which pipeline sub-stages to run. Normalize the comma list into a set of
-    # canonical tokens; 'all' and 'robustness' are convenience groups.
-    _ALL_STAGES = {"ga", "thompson", "gan", "offby", "montecarlo"}
-    _GROUPS = {"all": _ALL_STAGES, "robustness": {"gan", "offby", "montecarlo"}}
-    selected = set()
-    for tok in (t.strip().lower() for t in cmd_args.stages.split(",") if t.strip()):
-        if tok in _GROUPS:
-            selected |= _GROUPS[tok]
-        elif tok in _ALL_STAGES:
-            selected.add(tok)
-        else:
-            parser.error(f"--stages: unknown stage '{tok}'. Valid tokens: "
-                         f"{', '.join(sorted(_ALL_STAGES))}, all, robustness")
-    args['stages'] = selected if selected else set(_ALL_STAGES)
+    # Which pipeline sub-stages to run, and which detectors to select among.
+    # Both vocabularies live in Utils/pipeline_spec.py so app.py and the web UI
+    # read the same definitions ('all' and 'robustness' are stage groups).
+    try:
+        args['stages'] = parse_stages(cmd_args.stages)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        args['detectors'] = parse_detectors(cmd_args.detectors)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # CLI overrides the config file, so a caller can reuse checkpoints without
+    # editing Configs/config.yml.
+    if cmd_args.overwrite is not None:
+        args['overwrite'] = cmd_args.overwrite == 'true'
 
     return args
 

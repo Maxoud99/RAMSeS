@@ -37,6 +37,14 @@ from Model_Selection.rank_aggregation import (
     explain_rank_aggregation,
 )
 from Model_Training.train import TrainModels
+from Utils.pipeline_spec import (
+    ALL_DETECTORS,
+    DETECTOR_FAMILIES,
+    MIN_DETECTORS,
+    families_for,
+)
+from Utils.pipeline_spec import ALL_STAGES as _SPEC_ALL_STAGES
+from Utils.pipeline_spec import OFFLINE_ITERATION as _SPEC_OFFLINE_ITERATION
 from Utils.utils import get_args_from_cmdline
 # from comprehensive_results_writer import write_comprehensive_results
 
@@ -47,22 +55,21 @@ from Utils.utils import get_args_from_cmdline
 # save_dir removed - now dynamically determined from command-line args
 # Old hardcoded path was causing wrong models to load for different datasets
 
-algorithm_list = ['NN', 'LOF', 'CBLOF']
-algorithm_list_instances = [
-        'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3',
-        'CBLOF_1', 'CBLOF_2', 'CBLOF_3', 'CBLOF_4'
-    ]
+# The detector/stage vocabulary lives in Utils/pipeline_spec.py so that app.py,
+# Utils/utils.py (the CLI) and the web UI all read one definition.
+algorithm_list = list(DETECTOR_FAMILIES)
+algorithm_list_instances = list(ALL_DETECTORS)
 
 # Sub-stages of the offline model-selection pipeline (stage 6). The --stages CLI
 # flag selects a subset; a strict subset is a "partial run" (runs only those
 # stages + their explainability, then stops before rank aggregation).
-ALL_STAGES = {"ga", "thompson", "gan", "offby", "montecarlo"}
+ALL_STAGES = set(_SPEC_ALL_STAGES)
 
 # Iteration tag of the OFFLINE model-selection run. The offline pipeline and its
 # artifacts (rank-aggregation reports, explanation IRs, narration) all use this
 # value; the CLI --iteration arg is the window-sizing parameter, a different
 # concept that must not leak into these filenames.
-OFFLINE_ITERATION = 0
+OFFLINE_ITERATION = _SPEC_OFFLINE_ITERATION
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -462,7 +469,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         thompson_model_names = run_linear_thompson_sampling(
             test_data=test_data,
             trained_models=trained_models,
-            model_names=algorithm_list_instances,
+            model_names=models_to_use,
             dataset=dataset,
             entity=entity,
             iterations=50,
@@ -490,7 +497,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         # GAN creates its own perturbations internally
         test_data_for_gan = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
         gan_results = run_Gan(
-            test_data_for_gan, trained_models, algorithm_list_instances, dataset, entity
+            test_data_for_gan, trained_models, models_to_use, dataset, entity
         )
         timing_dict['3_GAN_Robustness'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -523,7 +530,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         test_data_for_borderline = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
         ranked_by_f1, ranked_by_pr_auc, \
         ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity = run_off_by_threshold(
-            test_data_for_borderline, trained_models, algorithm_list_instances, dataset, entity, explain=explain
+            test_data_for_borderline, trained_models, models_to_use, dataset, entity, explain=explain
         )
         timing_dict['4_Borderline_Sensitivity'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -546,7 +553,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         # Use original un-injected data for the same reason
         test_data_for_mc = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
         monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR = run_monte_carlo_simulation(
-            test_data_for_mc, trained_models, algorithm_list_instances, dataset, entity,
+            test_data_for_mc, trained_models, models_to_use, dataset, entity,
             n_simulations=2, noise_level=0.1, explain=explain,
         )
         timing_dict['5_Monte_Carlo'] = time.time() - start_time
@@ -1170,10 +1177,16 @@ def run_app(algorithm_list, algorithm_list_instances):
     stages = set(args.get('stages', ALL_STAGES))  # Which stage-6 sub-stages to run
     is_partial = stages != ALL_STAGES  # Strict subset → partial run (stop after selected stages)
 
+    # Which base detectors to select among. None (the default) means all of
+    # them; only the families of the requested detectors get trained.
+    requested_detectors = args.get('detectors')
+    detectors_to_load = list(requested_detectors or algorithm_list_instances)
+    families_to_train = families_for(detectors_to_load)
+
     data_dir = args['dataset_path']
-    
+
     logger.info("="*80)
-    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}")
+    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}, stages={','.join(sorted(stages))}, detectors={len(detectors_to_load)}/{len(algorithm_list_instances)}")
     logger.info("="*80)
     
     logger.info("📂 STAGE 1/7: Loading Training Data...")
@@ -1203,7 +1216,7 @@ def run_app(algorithm_list, algorithm_list_instances):
     model_trainer = TrainModels(
         dataset=dataset,
         entity=entity,
-        algorithm_list=algorithm_list,
+        algorithm_list=families_to_train,
         downsampling=args['downsampling'],
         min_length=args['min_length'],
         root_dir=args['dataset_path'],
@@ -1223,12 +1236,27 @@ def run_app(algorithm_list, algorithm_list_instances):
         logger.info("  → Loading trained models from disk...")
         global trained_models
         models_dir = os.path.join(args['trained_model_path'], dataset, entity)
-        trained_models = load_trained_models(algorithm_list_instances, models_dir)
+        trained_models = load_trained_models(detectors_to_load, models_dir)
         if not trained_models:
             raise ValueError("No models loaded. Check model paths and ensure models are trained.")
-        
-        # Filter algorithm_list_instances to only include successfully loaded models
+
+        # Filter to only the detectors that actually loaded. A requested detector
+        # with no checkpoint degrades to "run without it, say so loudly" rather
+        # than failing the run — but below two detectors there is nothing to
+        # select between, and GA fitness / rank aggregation / the off-by
+        # pairwise surrogates would all be vacuous.
         loaded_model_names = list(trained_models.keys())
+        missing = [d for d in detectors_to_load if d not in trained_models]
+        if missing:
+            logger.warning(f"⚠ Requested detectors with no trained model (skipped): {', '.join(missing)}")
+        if len(loaded_model_names) < MIN_DETECTORS:
+            raise ValueError(
+                f"Need at least {MIN_DETECTORS} trained detectors to run model selection; "
+                f"got {len(loaded_model_names)} ({', '.join(loaded_model_names) or 'none'}). "
+                f"Train the missing models or widen --detectors.")
+        if len(loaded_model_names) < 3:
+            logger.warning(f"⚠ Only {len(loaded_model_names)} detectors available — ensemble and "
+                           f"ranking explanations will be degenerate.")
         logger.info(f"✓ Loaded {len(loaded_model_names)} models: {', '.join(loaded_model_names)}")
 
         logger.info("💉 STAGE 4/7: Injecting Synthetic Anomalies...")
@@ -1725,7 +1753,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                         anomaly_list, individual_predictions, base_model_predictions_train,
                         base_model_predictions_test, y_true_train, y_true_test, meta_model_type,
                         use_parallel, test_data_before, logger, current_best_ensemble, current_best_single,
-                        algorithm_list_instances
+                        loaded_model_names
                     )
                     pending_reopt_window = i
                     logger.info(f"  🚀 Background re-optimization task submitted for window {i}")
@@ -1771,7 +1799,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                     test_data_new_copy = copy.deepcopy(test_data_new)
                     values = fitness_function(
                         best_ensemble, train_data, test_data_new_copy, trained_models_new,
-                        individual_predictions, base_model_predictions_train, algorithm_list_instances,
+                        individual_predictions, base_model_predictions_train, loaded_model_names,
                         base_model_predictions_test, y_true_train, y_true_test,
                         meta_model_type=meta_model_type
                     )

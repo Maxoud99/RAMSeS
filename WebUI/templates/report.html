@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset }} / {{ entity }} — comprehensive results{% endblock %}
+
+{% block headeractions %}
+<a class="button" id="to-explanation" href="/result/{{ dataset }}/{{ entity }}">Explanation →</a>
+{% endblock %}
+
+{% block content %}
+<div id="report-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
+  <p class="muted">Loading the comprehensive report…</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ url_for('static', filename='js/report.js') }}"></script>
+{% endblock %}
