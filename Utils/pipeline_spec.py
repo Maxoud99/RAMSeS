@@ -39,6 +39,13 @@ OFFLINE_ITERATION = 0
 # aggregation and the off-by pairwise surrogates are all vacuous with one.
 MIN_DETECTORS = 2
 
+# The narrator. Owned here rather than in Explainability/llm.py because the web
+# UI reports which model produced a set of explanations, and a second copy of
+# the string would eventually disagree with the one that actually ran — telling
+# the reader their narratives came from a model that never saw them.
+DEFAULT_LLM_MODEL = "qwen2.5:14b-instruct"
+DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
+
 
 def family_of(detector: str) -> str:
     """'CBLOF_2' -> 'CBLOF'."""

@@ -16,7 +16,8 @@ from typing import Any, Dict, Iterator, Optional
 from flask import (Flask, Response, abort, jsonify, render_template, request,
                    send_file)
 
-from Utils.pipeline_spec import ALL_DETECTORS, ALL_STAGES
+from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES, DEFAULT_LLM_BASE_URL,
+                                 DEFAULT_LLM_MODEL)
 from WebUI import artifacts, catalog, jobs, markers, paths, plots
 
 SSE_KEEPALIVE_SECONDS = 15
@@ -26,8 +27,8 @@ SSE_MAX_SUBSCRIBERS = 8
 
 def _health() -> Dict[str, Any]:
     """Is the LLM server up? Checked before a run, not after a 4-minute wait."""
-    base_url = os.environ.get("RAMSES_LLM_BASE_URL", "http://localhost:11434/v1")
-    model = os.environ.get("RAMSES_LLM_MODEL", "qwen2.5:7b-instruct")
+    base_url = os.environ.get("RAMSES_LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
+    model = os.environ.get("RAMSES_LLM_MODEL", DEFAULT_LLM_MODEL)
     reachable = False
     try:
         import requests

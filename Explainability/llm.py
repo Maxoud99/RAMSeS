@@ -4,7 +4,7 @@ natural-language explanations with a LOCAL open-weights model, and scores every
 narrative with the atom-matching faithfulness verifier.
 
 The client speaks the OpenAI-compatible chat API (default: Ollama at
-http://localhost:11434/v1, default model qwen2.5:7b-instruct) at temperature 0
+http://localhost:11434/v1, default model qwen2.5:14b-instruct) at temperature 0
 with a fixed seed. Any local server exposing the same API (LM Studio,
 llama.cpp server, vLLM) works via `base_url`. The pipeline never depends on
 this layer: narratives are generated on demand from the IR files an
@@ -24,8 +24,12 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional
 
-DEFAULT_BASE_URL = "http://localhost:11434/v1"
-DEFAULT_MODEL = "qwen2.5:7b-instruct"
+from Utils.pipeline_spec import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+
+# Re-exported under the names this module has always used, so callers and tests
+# keep working; the values themselves live in the shared spec.
+DEFAULT_BASE_URL = DEFAULT_LLM_BASE_URL
+DEFAULT_MODEL = DEFAULT_LLM_MODEL
 
 _SETUP_HINT = (
     "No LLM server reachable at {url}. Start one first, e.g.:\n"

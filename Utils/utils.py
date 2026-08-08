@@ -79,7 +79,7 @@ def get_args_from_cmdline():
                         type=str,
                         default=None,
                         help='Model for the automatic LLM narration after an --explain run '
-                             '(default: qwen2.5:7b-instruct). Narration is skipped with a '
+                             '(default: qwen2.5:14b-instruct). Narration is skipped with a '
                              'warning if no local LLM server is reachable.')
     parser.add_argument('--llm_base_url',
                         type=str,
