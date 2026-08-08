@@ -27,6 +27,17 @@ the named detectors' archetype enums, but land in a separate
 `attribution_warnings` channel (sentence-level enum checks can false-positive
 on contrast sentences), not in the headline rate.
 
+Rival-set attribution (v3): an atom whose `value` names a SET of other
+detectors — the competitors a winner beat, the rivals a rule separates — has
+that set checked against the narrative sentence carrying the atom's numbers.
+A detector that does not belong to the set is `intruded`, one that belongs but
+is absent is `dropped`, and each such NAME counts toward the hallucination
+rate. Neither earlier check could see this: the rivals are not the atom's
+subject, so the sentence-scoped number check skips them, and `_atom_covered`
+is satisfied by the subject alone. A narrative that replaced every NN_* with
+the CBLOF_* of the same index scored 0.000 on both rates while asserting the
+exact negation of the run's findings.
+
 Known limitation: when a sentence names BOTH detectors of a swapped value
 pair ("A and B scored x and y respectively", values exchanged), the union
 over named subjects still covers both numbers and the swap is not caught.
@@ -73,9 +84,17 @@ _ENTITY_RE = re.compile(r"\b[A-Za-z]+(?:_\d+)+\b")
 # Sentence boundary: terminal punctuation followed by whitespace. Decimal
 # points are never followed by whitespace, so numbers survive intact.
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-# Archetype phrase halves, e.g. "high utility" / "low stability".
-_UTIL_RE = re.compile(r"\b(high|low)[-\s]utility\b")
-_STAB_RE = re.compile(r"\b(high|low)[-\s]stability\b")
+# Archetype phrase halves, e.g. "high utility" / "low stability". Comparatives
+# count: a narrator writing "lower stability" is making the same claim as "low
+# stability", and reading only the plain form let a wrong profile through.
+_PROFILE_ADJ = r"(?:high|low)(?:er)?"
+_UTIL_RE = re.compile(rf"\b({_PROFILE_ADJ})[-\s]utility\b")
+_STAB_RE = re.compile(rf"\b({_PROFILE_ADJ})[-\s]stability\b")
+# The shared-adjective form: in "low utility and stability" the second noun
+# inherits the first's adjective, so the stability claim has no adjective of
+# its own for _STAB_RE to find.
+_SHARED_PROFILE_RE = re.compile(
+    rf"\b({_PROFILE_ADJ})[-\s](?:utility|stability)\s+and\s+(utility|stability)\b")
 
 
 def extract_numbers(text: str) -> List[Tuple[str, float]]:
@@ -202,18 +221,29 @@ def _per_subject_allowed(ir_doc: Dict[str, Any]) -> Tuple[
         nums, strs = set(), set()
         _walk_strings_and_numbers(_strip_presentation(atom), nums, strs)
         subj = str(atom.get("subject", ""))
+        value = atom.get("value")
+        code = None
+        if atom.get("type") == "archetype" and isinstance(value, str):
+            code = value
+        elif isinstance(value, dict) and isinstance(value.get("archetype"), str):
+            code = value["archetype"]
+        if not (code and len(code) == 2 and set(code) <= {"H", "L"}):
+            code = None
+
         if _ENTITY_RE.fullmatch(subj):
             subject_numbers.setdefault(subj.lower(), set()).update(nums)
-            value = atom.get("value")
-            code = None
-            if atom.get("type") == "archetype" and isinstance(value, str):
-                code = value
-            elif isinstance(value, dict) and isinstance(value.get("archetype"), str):
-                code = value["archetype"]
-            if code and len(code) == 2 and set(code) <= {"H", "L"}:
+            if code:
                 archetype_by_subject[subj.lower()] = code
         else:
             stage_numbers |= nums
+        # A grouped atom ("A, B and C were chosen for both high utility and high
+        # stability") asserts the same profile for every detector it lists, so
+        # the claim is checkable per member even though the atom's subject is the
+        # bucket name rather than a detector.
+        if code and isinstance(value, dict):
+            for name in value.get("detectors") or []:
+                if _ENTITY_RE.fullmatch(str(name)):
+                    archetype_by_subject.setdefault(str(name).lower(), code)
     return subject_numbers, stage_numbers, archetype_by_subject
 
 
@@ -236,8 +266,8 @@ def _attribution_checks(text: str, subject_numbers: Dict[str, Set[float]],
         if not sentence.strip():
             continue
         sent_lower = sentence.lower()
-        named = sorted({t.lower() for t in _ENTITY_RE.findall(sentence)}
-                       & set(subject_numbers))
+        mentioned = {t.lower() for t in _ENTITY_RE.findall(sentence)}
+        named = sorted(mentioned & set(subject_numbers))
         if named:
             local: Set[float] = set(stage_numbers)
             for e in named:
@@ -262,52 +292,173 @@ def _attribution_checks(text: str, subject_numbers: Dict[str, Set[float]],
                     continue
                 misattributed.append({"number": raw, "subjects": named,
                                       "sentence": sentence.strip()})
-        arch_named = [e for e in named if e in archetype_by_subject] if named else []
+        # Independent of `named`: a detector can carry a profile without owning
+        # any numbers (it may only ever appear inside a grouped bucket atom).
+        arch_named = sorted(mentioned & set(archetype_by_subject))
         if arch_named:
             claimed_util = {m.group(1)[0].upper()
                             for m in _UTIL_RE.finditer(sent_lower)}
             claimed_stab = {m.group(1)[0].upper()
                             for m in _STAB_RE.finditer(sent_lower)}
-            for e in arch_named:
-                code = archetype_by_subject[e]
-                if claimed_util and code[0] not in claimed_util:
-                    warnings.append({"subject": e, "aspect": "utility",
-                                     "claimed": sorted(claimed_util),
-                                     "actual": code[0],
+            for m in _SHARED_PROFILE_RE.finditer(sent_lower):
+                letter = m.group(1)[0].upper()
+                (claimed_util if m.group(2) == "utility" else claimed_stab).add(letter)
+            # A sentence naming ONE profiled detector must not claim both
+            # levels of an aspect. "LOF_3 had high utility and high stability
+            # but was still left out due to its low utility" contradicts itself,
+            # yet the set {H, L} contains the true value so the check below
+            # passes. Two named detectors can legitimately carry both levels
+            # (the contrast sentence), so this only applies to a lone subject.
+            sole = arch_named[0] if len(arch_named) == 1 else None
+            for aspect, claimed, idx in (("utility", claimed_util, 0),
+                                         ("stability", claimed_stab, 1)):
+                if sole and len(claimed) > 1:
+                    warnings.append({"subject": sole, "aspect": aspect,
+                                     "claimed": sorted(claimed),
+                                     "actual": archetype_by_subject[sole][idx],
+                                     "contradictory": True,
                                      "sentence": sentence.strip()})
-                if claimed_stab and code[1] not in claimed_stab:
-                    warnings.append({"subject": e, "aspect": "stability",
-                                     "claimed": sorted(claimed_stab),
-                                     "actual": code[1],
-                                     "sentence": sentence.strip()})
+                    continue
+                for e in arch_named:
+                    code = archetype_by_subject[e]
+                    if claimed and code[idx] not in claimed:
+                        warnings.append({"subject": e, "aspect": aspect,
+                                         "claimed": sorted(claimed),
+                                         "actual": code[idx],
+                                         "sentence": sentence.strip()})
     return misattributed, warnings
+
+
+# ── Rival-set attribution (v3) ───────────────────────────────────────────────
+#
+# Atoms whose `value` carries one of these keys name a SET of other detectors
+# the atom's claim is about — the rivals a winner beat, the competitors a rule
+# separates. The set is the load-bearing part of the claim, and nothing else
+# checks it: the rivals are not the atom's subject, so the sentence-scoped
+# number check never sees them, and `_atom_covered` is satisfied by the
+# subject alone. A narrator that swapped every NN_* for the CBLOF_* of the same
+# index scored 0.000 hallucination and 0.000 omission while asserting the exact
+# negation of the run's findings.
+_RIVAL_KEYS = ("competitors", "rivals", "beaten", "against")
+
+
+def _rival_atoms(ir_doc: Dict[str, Any]) -> List[Tuple[Dict[str, Any], Set[str], Set[float]]]:
+    """(atom, rival tokens, atom numbers) for every atom that names a rival set."""
+    out: List[Tuple[Dict[str, Any], Set[str], Set[float]]] = []
+    for atom in ir_doc.get("evidence", []):
+        value = atom.get("value")
+        if not isinstance(value, dict):
+            continue
+        rivals: Set[str] = set()
+        for key in _RIVAL_KEYS:
+            for name in value.get(key) or []:
+                if _ENTITY_RE.fullmatch(str(name)):
+                    rivals.add(str(name).lower())
+        if not rivals:
+            continue
+        numbers = {v for _, v in extract_numbers(str(atom.get("text", "")))}
+        out.append((atom, rivals, numbers))
+    return out
+
+
+def _rival_checks(text: str, ir_doc: Dict[str, Any],
+                  rounded_decimals: int) -> List[Dict[str, Any]]:
+    """
+    Locate each rival-set atom's sentence in the narrative by its numbers, then
+    require the rival set to match. Extra detectors are `intruded` (a rival that
+    belongs to a different atom, or none); missing ones are `dropped`.
+
+    Only sentences carrying one of the atom's numbers are examined, so a
+    narrative that simply never mentions the atom is an omission (already
+    measured) rather than a swap. Atoms whose numbers are ambiguous — shared
+    with another rival-set atom — are skipped: without a unique anchor the
+    sentence cannot be attributed with confidence.
+    """
+    atoms = _rival_atoms(ir_doc)
+    if not atoms:
+        return []
+    # Numbers that identify more than one rival-set atom cannot anchor either.
+    seen: Dict[float, int] = {}
+    for _, _, numbers in atoms:
+        for n in numbers:
+            seen[n] = seen.get(n, 0) + 1
+
+    sentences = [s for s in _SENT_SPLIT_RE.split(text or "") if s.strip()]
+    problems: List[Dict[str, Any]] = []
+    for atom, rivals, numbers in atoms:
+        anchors = {n for n in numbers if seen.get(n, 0) == 1}
+        if not anchors:
+            continue
+        for sentence in sentences:
+            values = {v for _, v in extract_numbers(sentence)}
+            if not any(
+                any(v == a or round(v, rounded_decimals) == round(a, rounded_decimals)
+                    for v in values)
+                for a in anchors
+            ):
+                continue
+            mentioned = {t.lower() for t in _ENTITY_RE.findall(sentence)}
+            subject = str(atom.get("subject", "")).lower()
+            # The subject (usually the winner) legitimately appears in its own
+            # sentence and is not a rival — unless it IS one of them, which
+            # happens when a single-rival atom takes that rival as its subject.
+            candidates = mentioned - ({subject} - rivals)
+            if not candidates:
+                continue          # rivals dropped entirely: an omission, not a swap
+            intruded = sorted(candidates - rivals)
+            dropped = sorted(rivals - candidates)
+            if intruded or dropped:
+                problems.append({"atom_id": atom.get("id"),
+                                 "expected": sorted(rivals),
+                                 "found": sorted(candidates),
+                                 "intruded": intruded, "dropped": dropped,
+                                 "sentence": sentence.strip()})
+            break
+    return problems
+
+
+def _required_names(atom: Dict[str, Any]) -> Set[str]:
+    """Names the atom's own text uses, ALL of which the narrative must carry.
+
+    Conjunctive on purpose. The old rule harvested any name-shaped string out
+    of `value` and accepted any ONE of them, which made two whole classes of
+    omission invisible:
+
+      * `value` carries names that are not the atom's topic at all — a source
+        atom's `top_pick` is a detector, its `pattern` is an enum — so a
+        narrative that never mentioned GAN_PR_AUC still "conveyed" its atom
+        because "LOF_1" and "redundant_agreer" appear elsewhere in the text.
+      * A grouped atom names a SET ("NN_2, CBLOF_4, CBLOF_3, and CBLOF_1 were
+        left out"), and one member stood in for all four, so dropping NN_2
+        cost nothing.
+
+    The subject is added only when it is identifier-shaped (an uppercase letter
+    somewhere: GAN_PR_AUC, LOF_1) and actually appears in the atom's text —
+    bucket labels like "sources", "plain" or "both" are prompt-internal names a
+    narrative has no reason to repeat.
+    """
+    text = str(atom.get("text", ""))
+    names = set(_ENTITY_RE.findall(text))
+    subj = str(atom.get("subject", ""))
+    if (subj and any(ch.isupper() for ch in subj)
+            and re.fullmatch(r"[A-Za-z][\w\-]*", subj)
+            and _word_present(text.lower(), subj)):
+        names.add(subj)
+    return names
 
 
 def _atom_covered(atom: Dict[str, Any], narrative: str, narrative_lower: str,
                   allowed_narrative_numbers: List[float],
                   rounded_decimals: int) -> bool:
     """
-    A required atom is conveyed when an identifying entity from the atom
-    appears in the narrative and, if the atom's canonical text carries numbers,
-    at least one of those numbers appears (exact or re-rounded).
+    A required atom is conveyed when EVERY name its own text uses appears in the
+    narrative and, if the atom's canonical text carries numbers, at least one of
+    those numbers appears (exact or re-rounded).
     """
     atom_numbers = {v for _, v in extract_numbers(str(atom.get("text", "")))}
 
-    candidates: Set[str] = set()
-    subj = str(atom.get("subject", ""))
-    if subj and re.fullmatch(r"[A-Za-z][\w\-]*", subj):
-        candidates.add(subj)
-    for tok in _ENTITY_RE.findall(str(atom.get("text", ""))):
-        candidates.add(tok)
-    val_numbers: Set[float] = set()
-    val_strings: Set[str] = set()
-    _walk_strings_and_numbers(atom.get("value"), val_numbers, val_strings)
-    for s in val_strings:
-        if s and re.fullmatch(r"[A-Za-z][\w\-]*", s):
-            candidates.add(s)
-
-    entity_hit = (not candidates) or any(_word_present(narrative_lower, c)
-                                         for c in candidates)
+    names = _required_names(atom)
+    entity_hit = all(_word_present(narrative_lower, c) for c in names)
     if not atom_numbers:
         return entity_hit
     number_hit = False
@@ -355,6 +506,9 @@ def verify_narrative(text: str, ir_doc: Dict[str, Any],
         text, subject_numbers, stage_numbers, archetype_by_subject,
         allowed_numbers, rounded_decimals)
 
+    # ── Rival-set attribution (v3) ───────────────────────────────────────────
+    swapped_rivals = _rival_checks(text, ir_doc, rounded_decimals)
+
     # ── Omissions ────────────────────────────────────────────────────────────
     required_ids = list(ir_doc.get("required_atom_ids", []))
     atoms_by_id = {a.get("id"): a for a in ir_doc.get("evidence", [])}
@@ -367,8 +521,15 @@ def verify_narrative(text: str, ir_doc: Dict[str, Any],
             missing_required.append(rid)
 
     n_claims = len(number_claims) + len(entity_claims)
+    # Counted per wrong NAME — each intruded or dropped detector is one false
+    # entity claim, and those names are already in the denominator (they pass
+    # global membership, which is why this check exists). Deduplicated by
+    # (sentence, name): one sentence often carries several atoms, and a name
+    # wrong there is one error however many atoms anchor to it.
+    n_swapped_names = len({(p["sentence"], name) for p in swapped_rivals
+                           for name in p["intruded"] + p["dropped"]})
     n_unsupported = (len(unsupported_numbers) + len(unsupported_entities)
-                     + len(misattributed_numbers))
+                     + len(misattributed_numbers) + n_swapped_names)
     return {
         "n_required": len(required_ids),
         "missing_required_ids": missing_required,
@@ -382,6 +543,9 @@ def verify_narrative(text: str, ir_doc: Dict[str, Any],
         "unsupported_entities": unsupported_entities,
         "misattributed_numbers": misattributed_numbers,
         "n_misattributed": len(misattributed_numbers),
+        "swapped_rivals": swapped_rivals,
+        "n_swapped_rivals": len(swapped_rivals),
+        "n_swapped_rival_names": n_swapped_names,
         "attribution_warnings": attribution_warnings,
         "n_attribution_warnings": len(attribution_warnings),
         "n_claims": n_claims,

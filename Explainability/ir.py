@@ -549,9 +549,15 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
 
 
 # Included-member reason buckets, in narration order. `needed` (a low-profile
-# member kept because removing it costs fitness) is emitted per detector, not
-# grouped, because each carries its own LOFO number.
+# member kept because removing it costs fitness) is grouped by LOFO cost below.
 _GA_SEL_BUCKETS = ("both", "utility", "stability", "marginal")
+
+# The utility/stability profile each bucket asserts, as the two-letter code the
+# verifier's attribution channel checks claimed "high/low utility" wording
+# against. The code never reaches the prompt (only atom `text` does) — the
+# terminology stays out of the prose while the claim stays machine-checkable.
+_GA_SEL_BUCKET_CODES = {"both": "HH", "utility": "HL", "stability": "LH",
+                        "marginal": "LL"}
 
 
 def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -582,6 +588,9 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
 
     def _were(names: Sequence[str]) -> str:
         return "was" if len(names) == 1 else "were"
+
+    def _have(names: Sequence[str]) -> str:
+        return "had" if len(names) == 1 else "each had"
 
     def _them(names: Sequence[str]) -> str:
         return "it" if len(names) == 1 else "them"
@@ -637,19 +646,44 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
         bid = f"ga_sel.included.{b}"
         evidence.append(make_atom(
             bid, "member_reason", b,
-            {"detectors": names, "reason": b, "per_detector": {d: _num(d) for d in names}},
+            {"detectors": names, "reason": b,
+             "archetype": _GA_SEL_BUCKET_CODES[b],
+             "per_detector": {d: _num(d) for d in names}},
             _bucket_text(b, names), order=order))
         required.append(bid)
         order += 10
+    # Detectors kept only because removing them costs fitness are grouped by
+    # that cost. Emitting one near-identical sentence each — same verb, same
+    # structure, often the same LOFO number — is what made a narrator open the
+    # second with "Similarly," and then reach for the dominant "high utility and
+    # high stability" phrasing from the group above, inverting the very fact the
+    # sentence was carrying. One sentence per distinct cost has nothing to drift
+    # into. `despite` is avoided for the same reason: a concessive clause
+    # backgrounds the low/low finding and invites restatement as a positive.
+    needed_by_cost: Dict[str, List[str]] = {}
     for d in needed:
-        lv = lofo.get(d, float("nan"))
-        rid = f"ga_sel.needed.{d}"
+        needed_by_cost.setdefault(_fmt(lofo.get(d, float("nan")), 4), []).append(d)
+    for cost, names in sorted(needed_by_cost.items(),
+                              key=lambda kv: (-len(kv[1]), kv[0])):
+        rid = ("ga_sel.needed." + names[0] if len(names) == 1
+               else "ga_sel.needed.group" + str(len(needed_by_cost)))
+        if len(names) == 1:
+            text = (f"{names[0]} has low utility and low stability, yet removing "
+                    f"it lowers the ensemble's fitness by {cost}, which is why it "
+                    f"was kept.")
+        else:
+            text = (f"{_oxford(names)} each have low utility and low stability, "
+                    f"yet removing any one of them lowers the ensemble's fitness "
+                    f"by {cost} apiece, which is why all of them were kept.")
         evidence.append(make_atom(
-            rid, "member_reason", d,
-            dict(_num(d), reason="needed", lofo=_val(lv, 4)),
-            f"Removing {d} lowers the ensemble's fitness by {_fmt(lv, 4)}, which "
-            f"is why it was kept despite low utility and low stability.",
-            order=order))
+            rid, "member_reason", names[0] if len(names) == 1 else "needed",
+            {"detectors": names, "reason": "needed",
+             "lofo": _val(lofo.get(names[0], float("nan")), 4),
+             "per_detector": {d: _num(d) for d in names},
+             # The verifier's archetype channel checks claimed high/low wording
+             # against this code; without it the inversion above was invisible.
+             "archetype": "LL"},
+            text, order=order))
         required.append(rid)
         order += 10
 
@@ -667,11 +701,18 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
         u_high, s_high = _flags(d)
         if u_high:                    # high-utility yet not selected — the anomaly
             eid = f"ga_sel.excluded.{d}"
-            extra = "and high stability" if s_high else "but low stability"
+            # The profile LEADS the sentence. Three excluded atoms in a row all
+            # opened "X was left out …" and differed only in the high/low tail,
+            # so a narrator merged them and gave one detector another's profile.
+            # Fronting the distinguishing clause is the same reshape that fixed
+            # the `needed` atoms; it also stops the reader meeting the verdict
+            # before the property that makes it surprising.
+            stab = "high stability" if s_high else "low stability"
             evidence.append(make_atom(
                 eid, "excluded_detector", d,
-                dict(_num(d), u_high=True, s_high=bool(s_high)),
-                f"{d} was left out even though it had high utility {extra}.",
+                dict(_num(d), u_high=True, s_high=bool(s_high),
+                     archetype="HH" if s_high else "HL"),
+                f"{d} had high utility and {stab}, but was still left out.",
                 order=order))
             required.append(eid)
             order += 10
@@ -679,21 +720,25 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
             exc_stable.append(d)
         else:
             exc_plain.append(d)
-    for gid, names, txt in (
-        ("ga_sel.excluded.stable", exc_stable,
-         lambda ns: f"{_oxford(ns)} {_were(ns)} left out for low utility, despite "
-                    f"high stability."),
-        ("ga_sel.excluded.plain", exc_plain,
-         lambda ns: f"{_oxford(ns)} {_were(ns)} left out for low utility and low "
-                    f"stability."),
-        ("ga_sel.excluded.nodata", exc_nodata,
+    for gid, names, code, txt in (
+        ("ga_sel.excluded.stable", exc_stable, "LH",
+         lambda ns: f"{_oxford(ns)} {_have(ns)} low utility and high stability, "
+                    f"and {_were(ns)} left out."),
+        ("ga_sel.excluded.plain", exc_plain, "LL",
+         lambda ns: f"{_oxford(ns)} {_have(ns)} low utility and low stability, "
+                    f"and {_were(ns)} left out."),
+        # No utility data means no profile to assert, so no code to check.
+        ("ga_sel.excluded.nodata", exc_nodata, None,
          lambda ns: f"{_oxford(ns)} {_were(ns)} left out with no marginal-"
                     f"contribution data to judge utility."),
     ):
         if names:
+            value: Dict[str, Any] = {"detectors": names,
+                                     "per_detector": {d: _num(d) for d in names}}
+            if code:
+                value["archetype"] = code
             evidence.append(make_atom(
-                gid, "excluded_group", gid.rsplit(".", 1)[1],
-                {"detectors": names, "per_detector": {d: _num(d) for d in names}},
+                gid, "excluded_group", gid.rsplit(".", 1)[1], value,
                 txt(names), order=order))
             required.append(gid)
             order += 10
@@ -728,18 +773,50 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
                      required, question=question, info_footer=info_footer)
 
 
+# Markov scores that differ by less than this are one tie. The chain behind
+# them is fed by only two measures, so C[j,i] - C[i,j] takes three values and
+# exact ties are the norm; np.linalg.eig then returns those ties a few ulp
+# apart. Comparing raw floats turned a 1.1e-16 wobble into "carries the most
+# weight", with the eigen-solver — not the data — deciding which detector led.
+_RANK_TIE_ATOL = 1e-9
+
+
+def _tied(a: Any, b: Any) -> bool:
+    """Are two scores the same rank? Tolerant, and NaN-safe."""
+    if a is None or b is None:
+        return a is b
+    if _is_nan(a) or _is_nan(b):
+        return _is_nan(a) and _is_nan(b)
+    try:
+        return abs(float(a) - float(b)) <= _RANK_TIE_ATOL
+    except (TypeError, ValueError):
+        return a == b
+
+
 def _competition_rank(scores: Dict[str, Any], order: List[str]) -> Dict[str, int]:
-    """Competition ranking ('1224') over `order` (already score-descending)."""
+    """Competition ranking ('1224') over `order` (already score-descending).
+
+    Ties are compared against the running block's score, not the immediately
+    preceding item: with a tolerance, pairwise chaining would let a long drift
+    of near-equal values collapse into one rank even when the ends differ.
+    """
     ranks: Dict[str, int] = {}
-    prev = None
+    block = None
     rank = 0
     for i, d in enumerate(order):
         v = scores.get(d)
-        if prev is None or v != prev:
+        if block is None or not _tied(v, block):
             rank = i + 1
-            prev = v
+            block = v
         ranks[d] = rank
     return ranks
+
+
+def _leaders(scores: Dict[str, Any], order: List[str]) -> List[str]:
+    """Every item sharing the top rank — usually one, but a tie is a real tie."""
+    if not order:
+        return []
+    return [d for d in order if _tied(scores.get(d), scores.get(order[0]))]
 
 
 # The measures whose RANKS explain a detector's weight. Signed SHAP is absent
@@ -754,12 +831,23 @@ _WEIGHT_ORD = {1: "the most", 2: "the second-most", 3: "the third-most",
                10: "the tenth-most", 11: "the eleventh-most", 12: "the twelfth-most"}
 
 
-def _weight_phrase(final_rank: Any) -> str:
-    """'carries {…} weight' ordinal, driven by the final (Markov) display rank."""
+def _weight_phrase(final_rank: Any, n_total: int, tied: bool = False) -> str:
+    """'carries the Nth-most weight in the ensemble (overall weight rank N of M)'.
+
+    The parenthetical is not redundant: the ordinal is the only quantity in the
+    sentence with no digit, and it sits beside two digit method ranks on the
+    same small-integer scale. Narrators re-derived it from whichever digit was
+    nearest ("coming in fourth" from an absolute-SHAP rank of 4), so it now
+    carries its own label and its own number and cannot be inferred wrongly.
+    """
     if final_rank is None or _is_nan(final_rank):
-        return "weight"
+        return "weight in the ensemble (overall weight rank not available)"
     fr = int(final_rank)
-    return f"{_WEIGHT_ORD.get(fr, f'the {fr}th-most')} weight"
+    ordinal = _WEIGHT_ORD.get(fr, f"the {fr}th-most")
+    verb_obj = f"{ordinal} weight in the ensemble"
+    if tied:
+        return f"{verb_obj} (overall weight rank {fr} of {n_total}, a tie)"
+    return f"{verb_obj} (overall weight rank {fr} of {n_total})"
 
 
 def _oxford(items: Sequence[str]) -> str:
@@ -832,6 +920,14 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
 
     r_abs, r_sgn, r_pfi = _rank_of(s_abs), _rank_of(s_sgn), _rank_of(pfi)
     final_rank = _competition_rank(pi, ranking)  # competition rank, display only
+    # How many detectors share each rank, so a tied member says so instead of
+    # claiming a lead that rests on eigen-solver noise.
+    rank_counts: Dict[int, int] = {}
+    for d in ranking:
+        r = final_rank.get(d)
+        if r is not None:
+            rank_counts[r] = rank_counts.get(r, 0) + 1
+    leaders = _leaders(pi, ranking)
 
     # Every ensemble member is narrated (no top-k cap): the sign summary must
     # classify all of them, and GA ensembles are small. `detectors` ARE the
@@ -848,6 +944,10 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
     top = ranking[0] if ranking else NOT_AVAILABLE
     output = {
         "top_pick": top,
+        # When several detectors tie for the top, `top_pick` is the first of an
+        # arbitrary order — record the whole tied set so a reader is not misled
+        # into treating it as a sole winner.
+        "top_pick_tied_with": [d for d in leaders if d != top],
         "ensemble_members": members,
         "ensemble_size": len(members),
         "meta_model_type": result.get("meta_model_type", NOT_AVAILABLE),
@@ -869,6 +969,7 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         evidence.append(make_atom(
             rid, "detector_role", d,
             {"final_rank": final_rank.get(d),
+             "final_rank_tied": rank_counts.get(final_rank.get(d), 1) > 1,
              "markov_score": _val(pi.get(d), 4),
              "mean_abs_shap": _val(s_abs.get(d), 6), "mean_abs_shap_rank": r_abs.get(d),
              # Signed SHAP keeps its value and rank in the machine-readable
@@ -876,7 +977,8 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
              "signed_shap": _val(sgn, 6), "signed_shap_rank": r_sgn.get(d),
              "signed_direction": signs[d],
              "pfi_f1_drop": _val(pfi.get(d), 6), "pfi_rank": r_pfi.get(d)},
-            f"{d} carries {_weight_phrase(final_rank.get(d))} in the ensemble, "
+            f"{d} carries "
+            f"{_weight_phrase(final_rank.get(d), len(detectors), tied=rank_counts.get(final_rank.get(d), 1) > 1)}, "
             f"{_rank_phrase((r_abs.get(d), r_pfi.get(d)))}.",
             order=10 * (i + 1)))
         required.append(rid)
@@ -910,8 +1012,10 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         "probability); a negative sign means it pushes toward 'not an anomaly'. "
         "The two ranks are positions where rank 1 is strongest: absolute SHAP "
         "ranks detectors by overall importance to the meta-learner, and PFI by "
-        "the F1 drop when their scores are shuffled. A detector's overall weight "
-        "merges those two rankings only. Signed SHAP is what gives each detector "
+        "the F1 drop when their scores are shuffled. The overall weight rank is "
+        "a third, separate position that merges those two rankings only; because "
+        "it merges just two, detectors often tie for it, and a tie is reported as "
+        "one rather than split. Signed SHAP is what gives each detector "
         "its sign, and it is kept out of the weighting on purpose: it measures "
         "net direction, so a detector that pushes the output hard both ways "
         "averages toward zero and would look unimportant despite carrying real "
@@ -1038,17 +1142,24 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
                 return ""
             return _ORD_MOST.get(int(br), f"{int(br)}th ")
 
+        n_src = len(src_list)
         for i, v in enumerate(sorted(verdicts, key=_borda_key)):
             name = v["source"]
             loo_rank, align_rank = v.get("loo_rank"), v.get("align_rank")
+            br = v.get("borda_rank")
             pp = _pattern_phrase(v.get("pattern"))
             # Every source is described exactly like the lead: how much it
-            # "shaped the consensus" (its combined Borda standing, as an
-            # ordinal) plus BOTH explicit component ranks and its pattern. Both
-            # ranks are stated so the narrator never infers them, and the shared
-            # shape makes the sources read as one ordered walk.
+            # "shaped the consensus" (its combined Borda standing) plus BOTH
+            # explicit component ranks and its pattern. The combined standing
+            # gets its own NAME and its own NUMBER ("overall standing rank N of
+            # M"): expressed only as a bare verb phrase it was the one ordinal
+            # in the sentence without a label, so narrators borrowed the nearest
+            # rank-noun and reported it as influence — the same value described
+            # twice, contradictorily ("ranked sixth for influence (rank 4)").
+            standing = ("" if br is None or _is_nan(br)
+                        else f" (overall standing rank {int(br)} of {n_src})")
             text = (f"{name} shaped the {stage_word} consensus "
-                    f"{_shaped_prefix(v.get('borda_rank'))}most, ranking "
+                    f"{_shaped_prefix(br)}most{standing}, ranking "
                     f"{loo_rank} for influence and {align_rank} for agreement{pp}.")
             rid = f"{prefix}.source.{name}.role"
             evidence.append(make_atom(
@@ -1067,9 +1178,11 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
             "Influence measures how much a source moved the consensus: it compares "
             "the consensus ranking with the ranking that emerges when that source is "
             "left out. Agreement compares the consensus ranking with the source's own "
-            "ranking. How much a source 'shaped the consensus' (most, second most, and "
-            "so on) is its combined standing — influence and agreement merged into one "
-            "overall Borda order. An influential_disagreer has high influence but low "
+            "ranking. The overall standing rank is a third, separate position: it is "
+            "influence and agreement merged into one Borda order, and it is what 'shaped "
+            "the consensus most, second most, and so on' reports. A source can stand "
+            "high overall on the strength of one component while ranking low on the "
+            "other. An influential_disagreer has high influence but low "
             "agreement; a redundant_agreer has high agreement but low influence; a "
             "consistent source ranks similarly on both.")
 
@@ -1378,25 +1491,6 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
         if sup == "low":
             low_support.append((k, int(n_w)))
 
-    # One exclusive-wins atom per distinct (count, rate), best first. Grouping
-    # keeps the atom count low enough that all of them can be REQUIRED without
-    # inflating the omission metric.
-    for wi, key in enumerate(sorted(wins_groups, key=lambda t: (-t[0], t[1]))):
-        n_w, rate = key
-        names = sorted(wins_groups[key])
-        pct = _fmt(100.0 * float(rate or 0.0), 2)
-        pts = f"{n_w} injected point{'' if n_w == 1 else 's'}"
-        wid = f"ob.wins.{wi}"
-        text = (f"{winner} correctly handles {pts} ({pct}%) that {names[0]} misses."
-                if len(names) == 1 else
-                f"{winner} correctly handles {pts} ({pct}%) apiece that "
-                f"{_oxford(names)} each miss.")
-        evidence.append(make_atom(
-            wid, "exclusive_wins", str(winner),
-            {"count": int(n_w), "rate": rate, "competitors": names},
-            text, order=100 + wi))
-        required.append(wid)
-
     # ONE consolidated low-support caveat: repeating a near-identical sentence
     # per competitor is what pushes the narrator into compressing names
     # ("CBLOF_1 to -4"), which Rule 7 forbids. Per-competitor counts are
@@ -1418,53 +1512,106 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
             f"{N_CV_FOLDS} cross-validation folds — so their held-out fidelity "
             f"is unstable; treat them as indicative."))
 
-    # One atom per distinct rule, naming every competitor it separates. Rules
-    # are ranked by the total exclusive wins of the rivals they separate, so the
-    # REQUIRED few are the surrogates covering the most ground — one rule often
-    # explains several competitors at once, which buys room for more surrogates.
-    def _group_weight(grp: Dict[str, Any]) -> int:
-        return sum(int(per_comp.get(c, {}).get("n_exclusive_wins", 0))
-                   for c in set(grp["competitors"]))
+    # ── One atom per rival group: its rule(s) AND its win count together ──
+    #
+    # These used to be two families — a rule atom per condition signature and a
+    # wins atom per (count, rate) — which expressed the SAME rivals twice, in
+    # two different groupings and two different orders. That redundancy is what
+    # let a narrator merge across them and emit one sentence carrying a rule
+    # from one group and names from another. Grouping by (rules, count, rate)
+    # means every rival set is named exactly once, with everything said about
+    # it in a single sentence: there is no second sentence to cross-contaminate.
+    comp_sigs: Dict[str, List[str]] = {}
+    for sig in sorted(rule_groups):
+        for c in rule_groups[sig]["competitors"]:
+            if sig not in comp_sigs.setdefault(c, []):
+                comp_sigs[c].append(sig)
 
-    sigs = sorted(rule_groups)
-    ranked = sorted(sigs, key=lambda s: (-_group_weight(rule_groups[s]), s))
-    rule_required = set(ranked[:3])
-    rank_of = {s: i for i, s in enumerate(ranked)}
-    for gi, sig in enumerate(sigs):
-        grp = rule_groups[sig]
-        comps = sorted(set(grp["competitors"]))
-        phrase = _offby_condition_phrase(grp["rule"]["conditions"])
-        rid = f"ob.rule.{gi}"
-        text = (f"{winner} uniquely beats {_oxford(comps)} across all injected "
-                f"points." if phrase == "always"
-                else f"{winner} uniquely beats {_oxford(comps)} when {phrase}.")
+    edges: Dict[Any, List[str]] = {}
+    for key, names in wins_groups.items():
+        for c in names:
+            edges.setdefault((tuple(comp_sigs.get(c, ())), key), []).append(c)
+
+    def _edge_order(item: Any) -> Any:
+        """Biggest edge first; the rival name breaks ties deterministically."""
+        (_sigs, (n_w, _rate)), names = item
+        return (-int(n_w), sorted(names)[0])
+
+    for ei, ((sigs, (n_w, rate)), names) in enumerate(
+            sorted(edges.items(), key=_edge_order)):
+        names = sorted(names)
+        pct = _fmt(100.0 * float(rate or 0.0), 2)
+        pts = f"{n_w} injected point{'' if n_w == 1 else 's'}"
+        head = (f"{winner} correctly handles {pts} ({pct}%) that {names[0]} misses"
+                if len(names) == 1 else
+                f"{winner} correctly handles {pts} ({pct}%) apiece that "
+                f"{_oxford(names)} each miss")
+        phrases = [_offby_condition_phrase(rule_groups[s]["rule"]["conditions"])
+                   for s in sigs]
+        conditions = [rule_groups[s]["rule"]["conditions"] for s in sigs]
+        them = "it" if len(names) == 1 else "them"
+        if not phrases:
+            text = f"{head}."
+        elif "always" in phrases:
+            text = f"{head}, beating {them} across all injected points."
+        else:
+            # Separate leaves of the surrogate tree are ALTERNATIVES. Joining
+            # them with "and" (as _oxford does) both inverts the logic and, since
+            # each condition already contains its own "and", collapses two rules
+            # into one unreadable conjunction. "; or when" keeps them disjunctive
+            # and makes the nesting legible.
+            text = f"{head}, uniquely beating {them} when {'; or when '.join(phrases)}."
+        support = ("low" if any(rule_groups[s]["support"] == "low" for s in sigs)
+                   else "adequate")
+        eid = f"ob.edge.{ei}"
         evidence.append(make_atom(
-            rid, "surrogate_rule", winner,
-            {"conditions": grp["rule"]["conditions"], "competitors": comps},
-            text, confidence=grp["support"], order=10 + rank_of[sig]))
-        if sig in rule_required:
-            required.append(rid)
+            eid, "exclusive_wins", str(winner),
+            {"count": int(n_w), "rate": rate, "competitors": names,
+             "conditions": conditions},
+            text, confidence=support if sigs else None, order=10 + ei))
+        required.append(eid)
 
     if degenerate:
+        # Stated LAST and REQUIRED. It is the only place these names appear as a
+        # group, and sitting next to the win atoms it became a ready-made trio
+        # for a narrator to lift into them — while the negation it carried, the
+        # hardest thing for a small model to keep, was dropped. Placed after the
+        # summary, the win sentences are already written before these names are
+        # seen at all, and stating it explicitly makes any such swap
+        # self-contradictory within the narrative.
         evidence.append(make_atom(
             "ob.degenerate", "degenerate_comparison", str(winner),
             {"competitors": degenerate},
-            f"{winner} never exclusively beat {_oxford(degenerate)}.", order=200))
+            f"{winner} never exclusively beat {_oxford(degenerate)}, so "
+            f"{'none of them appears' if len(degenerate) > 1 else 'it does not appear'} "
+            f"above.", order=500))
+        required.append("ob.degenerate")
 
     mean_imp = {fn: float(np.mean(v)) for fn, v in agg_imp.items() if v}
     top = (max(mean_imp.items(), key=lambda kv: kv[1])
            if mean_imp and any(mean_imp.values()) else None)
     # A per-competitor importance atom only earns its place when its driver
     # DIFFERS from the overall one; otherwise it restates the summary below.
-    for ii, k in enumerate(sorted(per_comp_top)):
+    # Rivals sharing that driver AND its rounded value collapse into one atom:
+    # four near-identical sentences differing only in a model name are exactly
+    # what a narrator shuffles names between.
+    imp_groups: Dict[Any, List[str]] = {}
+    for k in sorted(per_comp_top):
         feat, imp = per_comp_top[k]
         if top is not None and feat == top[0]:
             continue
+        imp_groups.setdefault((feat, _fmt(imp, 2)), []).append(k)
+    for ii, (feat, shown) in enumerate(sorted(imp_groups,
+                                              key=lambda kv: (kv[0], kv[1]))):
+        ks = sorted(imp_groups[(feat, shown)])
+        against = _oxford(ks)
+        each = "" if len(ks) == 1 else " in each case"
         evidence.append(make_atom(
-            f"ob.vs.{k}.importance", "feature_importance", k,
-            {"feature": feat, "importance": _val(imp, 3)},
-            f"Against {k}, the property that best separates those points is "
-            f"{_OFFBY_NOUNS.get(feat, feat)} (importance {_fmt(imp, 2)}).",
+            f"ob.vs.{ks[0]}.importance", "feature_importance",
+            ks[0] if len(ks) == 1 else "competitors",
+            {"feature": feat, "importance": float(shown), "competitors": ks},
+            f"Against {against}, the property that best separates those points "
+            f"is {_OFFBY_NOUNS.get(feat, feat)} (importance {shown}{each}).",
             order=300 + ii))
 
     if top is not None:

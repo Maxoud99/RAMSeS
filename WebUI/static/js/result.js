@@ -95,27 +95,60 @@ function infoDisclosure(info) {
     el("div", { class: "info-body" }, proseNode(info, "")));
 }
 
+/* What the extended view adds, per stage — the reader should know what a click
+ * buys before spending it. */
+const EXTENDED_LABEL = {
+  ga_selection: "Read the full explanation, including the detectors left out",
+  monte_carlo: "Read the full explanation, including the winning noise ranges",
+  off_by_threshold: "Read the full explanation, including property importances",
+};
+
 function narrativeDisclosure(stage) {
-  // summary_is_full === true today: same markup, opened, relabelled. When a
-  // real summariser lands, only these two lines change behaviour.
+  // When the summary IS the whole narrative the same markup renders open and
+  // relabelled, so a stage moving in or out of summarisation changes only the
+  // payload.
   const isFull = stage.summary_is_full;
   const details = el("details", { class: "narrative" });
   if (isFull) details.setAttribute("open", "");
   details.append(
-    el("summary", { text: isFull ? "Full text" : "Read the full explanation" }),
+    el("summary", { text: isFull ? "Full text"
+      : (EXTENDED_LABEL[stage.key] || "Read the full explanation") }),
     proseNode(stage.full));
   return details;
+}
+
+/* A deterministic ranking rendered from the IR, for stages whose answer is an
+ * order rather than a story. Detector and source names get the mono face so a
+ * column of them lines up. */
+function summaryTable(spec) {
+  const head = el("tr", {}, spec.columns.map((c, i) =>
+    el("th", { class: spec.align[i] === "num" ? "num" : "" }, c)));
+  const body = spec.rows.map((row) => el("tr", {}, row.map((cell, i) => {
+    const kind = spec.align[i];
+    return el("td", {
+      class: kind === "num" ? "num" : kind === "name" ? "detector" : "",
+      text: cell === null || cell === undefined ? "—" : String(cell),
+    });
+  })));
+  return el("div", { class: "table-scroll" },
+    el("table", { class: "summary-table" },
+      el("thead", {}, head), el("tbody", {}, body)));
 }
 
 function regimeSection(stage) {
   if (!stage.regimes || !stage.regimes.length) return null;
   const rows = stage.regimes.map((regime) => el("div", { class: "regime" },
-    el("div", {}, el("p", { class: "prose", text: regime.text })),
+    // The narrated sentence when the model wrote one; the IR's own text is the
+    // fallback so a regime is never blank.
+    el("div", {}, el("p", { class: "prose", text: regime.narrated || regime.text })),
     regime.plot
       ? figureNode({ src: regime.plot, title: `Regime ${regime.index}`,
                      caption: `Windows ${regime.start}–${regime.end}, led by ${regime.leader}.` })
       : el("p", { class: "muted small", text: "No plot for this regime." })));
-  return el("details", { class: "no-print" },
+  // Printable: this disclosure is the only place the per-regime prose appears
+  // now that the stage has no full-text disclosure, and the print stylesheet
+  // forces every <details> open.
+  return el("details", {},
     el("summary", { text: `Each regime with its channel attribution (${stage.regimes.length})` }),
     el("div", { class: "stack" }, rows));
 }
@@ -133,8 +166,14 @@ function stageCard(stage, payload) {
   const body = el("div", { class: "stack" });
   body.append(infoDisclosure(stage.info));
   body.append(proseNode(stage.summary));
-  if (!stage.summary_is_full) body.append(narrativeDisclosure(stage));
-  else if (stage.full && stage.full !== stage.summary) body.append(narrativeDisclosure(stage));
+  if (stage.summary_table) body.append(summaryTable(stage.summary_table));
+  // `extended_in` means another section of this card already shows what the
+  // summary held back — Thompson's regime walk, beside its per-regime plots —
+  // so a full-text disclosure here would just repeat it without them.
+  if (!stage.extended_in) {
+    if (!stage.summary_is_full) body.append(narrativeDisclosure(stage));
+    else if (stage.full && stage.full !== stage.summary) body.append(narrativeDisclosure(stage));
+  }
 
   const group = (payload.plots || {})[stage.plot_group] || {};
   if (group.headline && group.headline.length) {

@@ -335,6 +335,14 @@ table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); }
 th, td { text-align: left; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); }
 th { font-weight: 600; color: var(--text-muted); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .04em; }
 td.num, th.num { text-align: right; font-family: var(--font-mono); }
+td.detector { font-family: var(--font-detector); letter-spacing: -0.02em; }
+
+/* Wide tables scroll inside their own box; the page body never scrolls
+ * sideways. */
+.table-scroll { overflow-x: auto; max-width: 100%; }
+.summary-table { max-width: 44rem; }
+.summary-table tbody tr:last-child td { border-bottom: none; }
+.summary-table tbody tr:hover { background: var(--surface-sunken); }
 
 /* ── Run view ─────────────────────────────────────────────────────────────── */
 

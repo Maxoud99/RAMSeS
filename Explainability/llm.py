@@ -106,7 +106,7 @@ SYSTEM_PROMPT = (
     "into clear, plain-language prose for a reader who understands anomaly "
     "detection but not this framework's internals.\n"
     "Rules — follow every one strictly:\n"
-    "1. Use ONLY the numbered fact sentences given to you. Do not add facts, "
+    "1. Use ONLY the fact sentences given to you. Do not add facts, "
     "numbers, names, comparisons, or causes of your own.\n"
     "2. Copy every number and every model/detector name EXACTLY as written in "
     "the facts. Never re-round, convert, or estimate. A qualifier such as "
@@ -125,7 +125,16 @@ SYSTEM_PROMPT = (
     "-4', 'CBLOF_1-4', and 'LOFs 2 and 3' are all forbidden — write CBLOF_1, "
     "CBLOF_2, CBLOF_3, CBLOF_4. Likewise never merge numbers belonging to "
     "different detectors into a range such as 'from -0.0124 to -0.0243'; "
-    "state each value next to the detector it belongs to."
+    "state each value next to the detector it belongs to.\n"
+    "8. Write about the run, never about the facts as objects. Never refer to "
+    "them by position or label — 'fact 2', 'the third fact', 'as stated "
+    "above', 'the facts show' are all forbidden. State what happened.\n"
+    "9. Do not end with a conclusion, verdict, or assessment of your own. No "
+    "sentence may judge the result as balanced, optimal, sensible, effective "
+    "or otherwise, and none may explain why the outcome is reasonable. Stop "
+    "when the facts are conveyed.\n"
+    "10. When a fact names several detectors, name every one of them. Dropping "
+    "one from a list changes what the fact says."
 )
 
 
@@ -141,14 +150,39 @@ def _output_lines(output: Dict[str, Any]) -> List[str]:
     return [f"- {k}: {_render_value(v)}" for k, v in sorted(output.items())]
 
 
-def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220) -> tuple:
-    """Word budget for the WHOLE narrative, scaled with atom count so the floor
-    matches how much there is to say: dense stages (many detectors/rules) get
-    more room instead of triaging required facts out of a fixed paragraph, and
-    sparse stages (e.g. the 2-source final aggregation — a couple of facts) get
-    a low floor instead of being padded to 120 words of filler. The sparse floor
-    still has to clear the two fact sentences PLUS the woven-in caveat (the
-    2-source note alone is ~35 words), or the model triages the caveat out."""
+def _content_words(ir_doc: Dict[str, Any]) -> int:
+    """How many words of material the narrative actually has to convey."""
+    parts = [str(a.get("text", "")) for a in ir_doc.get("evidence", [])]
+    parts += [str(c.get("text", "")) for c in ir_doc.get("caveats", [])]
+    return sum(len(p.split()) for p in parts)
+
+
+# The floor is deliberately BELOW the content length: the narrative restates the
+# facts in connected prose, which compresses (shared subjects, pronouns) at least
+# as much as connectives add.
+_BUDGET_FLOOR_RATIO = 0.9
+_BUDGET_CEILING_RATIO = 2.2
+_BUDGET_MIN_FLOOR = 40
+
+
+def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220,
+                 content_words: Optional[int] = None) -> tuple:
+    """Word budget for the WHOLE narrative, scaled to how much there is to say.
+
+    Driven by the atoms' CONTENT LENGTH rather than their count. Counting atoms
+    is a poor proxy: consolidating several near-identical atoms into one (which
+    is what stops a narrator shuffling names between them) cuts the count
+    without cutting the material, and the old count-based floor then demanded
+    more words than the facts contained. A 4-atom ga_selection carrying 74 words
+    of facts was asked for at least 120 — so ~46 words had to be invented, and
+    they arrived as an unsupported concluding sentence and "(fact 2)" citations
+    of the prompt's own numbering.
+
+    Falls back to the count-based curve when the caller has no document.
+    """
+    if content_words:
+        floor = max(_BUDGET_MIN_FLOOR, int(content_words * _BUDGET_FLOOR_RATIO))
+        return floor, min(400, max(floor + 40, int(content_words * _BUDGET_CEILING_RATIO)))
     if n_atoms <= 3:
         return 65, 120
     return lo, min(400, hi + 8 * max(0, n_atoms - 12))
@@ -183,10 +217,14 @@ def _fact_lines(ir_doc: Dict[str, Any]) -> List[str]:
         idx, atom = pair
         o = atom.get("order")
         return (float(o) if o is not None else float("inf"), idx)
+    # Bulleted, never numbered. Nothing references the numbers — they were pure
+    # decoration — but they handed the narrator a citation handle, and it used
+    # it: "These detectors were selected for their high utility (fact 2). Fact 3
+    # reveals that…". With no numbers there is nothing to cite.
     lines = []
-    for n, (_, atom) in enumerate(sorted(enumerate(evidence), key=_key), 1):
+    for _, atom in sorted(enumerate(evidence), key=_key):
         marker = "[REQUIRED] " if atom.get("id") in required else ""
-        lines.append(f"{n}. {marker}{atom.get('text', '')}")
+        lines.append(f"- {marker}{atom.get('text', '')}")
     return lines
 
 
@@ -207,21 +245,28 @@ def _caveat_lines(ir_doc: Dict[str, Any]) -> List[str]:
 _STAGE_TASK_HINTS: Dict[str, str] = {
     "rank_aggregation_robust": (
         " Describe each source ranking in the order given; for each one, state "
-        "its influence rank, its agreement rank, and its pattern. A rank is a "
-        "position — rank 1 is best — so never restate a rank as 'high' or 'low' "
-        "influence or agreement; give the rank number itself. The 'shaped the "
-        "consensus Nth most' phrase is the source's overall standing — never "
-        "attach that ordinal to influence or agreement, which have their own "
-        "separate ranks. NEVER merge two sources into one statement or compare "
-        "ranks of one source against another."
+        "its overall standing rank, its influence rank, its agreement rank, and "
+        "its pattern. Each source has THREE separate ranks and every one of them "
+        "is written in its fact — copy all three from that source's own fact and "
+        "never compute, guess or renumber any of them. A rank is a position — "
+        "rank 1 is best — so never restate a rank as 'high' or 'low' influence "
+        "or agreement; give the rank number itself. 'Shaped the consensus Nth "
+        "most' reports the overall standing rank given in brackets, never the "
+        "influence or agreement rank. NEVER merge two sources into one statement "
+        "or compare ranks of one source against another."
     ),
     "ga_combination": (
         " Describe each detector in the order given; for each one, state its "
-        "rank on absolute SHAP and PFI (rank 1 is strongest). "
+        "overall weight rank and its rank on absolute SHAP and PFI (rank 1 is "
+        "strongest). Each detector has THREE separate ranks and every one of "
+        "them is written in its fact — copy all three from that detector's own "
+        "fact and never compute, guess or renumber any of them. In particular "
+        "the overall weight rank is the number given in brackets after 'overall "
+        "weight rank'; it is not the detector's place in this paragraph and not "
+        "either method rank. Where a fact says a rank is a tie, say it is tied "
+        "rather than giving that detector sole possession of the place. "
         "Then give the sign summary, listing which detectors signed positive "
-        "and which signed negative. The 'carries the Nth-most weight' phrase is "
-        "the detector's overall standing in the ensemble — never attach that "
-        "ordinal to a method rank. These are detectors in the ensemble, not "
+        "and which signed negative. These are detectors in the ensemble, not "
         "ranking sources. NEVER merge two detectors into one statement or "
         "compare one detector against another."
     ),
@@ -267,14 +312,19 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
     ),
     "off_by_threshold": (
         " Open with one short sentence naming the highest-ranked model, then "
-        "the surrogate rules, then the exclusive-win counts and the importance "
-        "figures. Give each rule as its OWN separate sentence, listing every "
-        "condition that rule states and naming exactly the models that rule "
-        "lists — never merge two rules together, and never attach one rule's "
-        "conditions to another rule's models. State each rule's conditions "
-        "exactly as they are worded in the facts — never rewrite a condition "
-        "as a bare variable name with a numeric comparison such as "
-        "'is_anomaly <= 0.5'. Write every model name in full. Use plain prose "
+        "give each fact about the models it beat as its OWN separate sentence, "
+        "then the importance figures. The rival models named in a sentence must "
+        "be EXACTLY the models that fact lists — copy that list of names from "
+        "the fact, never substitute a model from another fact, and never swap "
+        "one model family for another. Repeat the highest-ranked model's name "
+        "in every sentence instead of writing 'it'. Keep each fact's counts, "
+        "conditions and models together — never merge two facts, and never "
+        "attach one fact's conditions or counts to another fact's models. State "
+        "each condition exactly as it is worded in the facts — never rewrite a "
+        "condition as a bare variable name with a numeric comparison such as "
+        "'is_anomaly <= 0.5'. If a fact says the highest-ranked model never "
+        "exclusively beat some models, say so plainly and do not name those "
+        "models anywhere else. Write every model name in full. Use plain prose "
         "only: no LaTeX, no math notation, no backslashes or escaped "
         "parentheses around numbers."
     ),
@@ -288,7 +338,7 @@ def _stage_task_hint(stage: Any) -> str:
 def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
     n_atoms = len(ir_doc.get("evidence", []))
     lo, hi = (_stage_word_budget(ir_doc.get("stage", ""), n_atoms)
-              or _word_budget(n_atoms))
+              or _word_budget(n_atoms, content_words=_content_words(ir_doc)))
     question = ir_doc.get("question")
     lines: List[str] = []
     lines.append(f"STAGE: {ir_doc.get('stage')}")
@@ -446,12 +496,21 @@ def _violation_count(metrics: Dict[str, Any]) -> int:
     return (len(metrics.get("unsupported_numbers", []))
             + len(metrics.get("unsupported_entities", []))
             + len(metrics.get("misattributed_numbers", []))
+            # A swapped rival set and a wrong utility/stability profile are both
+            # false statements, not style notes. Left out of this count they were
+            # measured and then ignored: repair never ran, so the one place the
+            # model is told what it specifically got wrong stayed silent.
+            + len(metrics.get("swapped_rivals", []))
+            + len(metrics.get("attribution_warnings", []))
             + len(metrics.get("missing_required_ids", [])))
+
+
+_PROFILE_WORD = {"H": "high", "L": "low"}
 
 
 def _violation_lines(metrics: Dict[str, Any], ir_doc: Dict[str, Any]) -> List[str]:
     """Human-readable repair feedback for every hard violation the verifier
-    found (attribution warnings are diagnostic-only and not repaired)."""
+    found, each naming the exact fact to go back to."""
     lines: List[str] = []
     for tok in metrics.get("unsupported_numbers", []):
         lines.append(f"The number '{tok}' does not appear in the facts. Remove "
@@ -467,21 +526,59 @@ def _violation_lines(metrics: Dict[str, Any], ir_doc: Dict[str, Any]) -> List[st
                      f"them. Re-check the facts and attach it to the right "
                      f"detector.")
     atoms_by_id = {a.get("id"): a for a in ir_doc.get("evidence", [])}
+    for swap in metrics.get("swapped_rivals", []):
+        atom = atoms_by_id.get(swap.get("atom_id"))
+        expected = ", ".join(n.upper() for n in swap.get("expected", []))
+        wrong = ", ".join(n.upper() for n in swap.get("intruded", []))
+        detail = (f" You named {wrong}, which this fact does not mention."
+                  if wrong else "")
+        lines.append(f"This sentence names the wrong models: "
+                     f"\"{swap.get('sentence', '')}\"{detail} The fact it comes "
+                     f"from is about exactly {expected} — "
+                     f"\"{(atom or {}).get('text', '')}\". Use those names and "
+                     f"no others, and do not take model names from any other fact.")
+    for warn in metrics.get("attribution_warnings", []):
+        aspect = warn.get("aspect", "")
+        actual = _PROFILE_WORD.get(warn.get("actual", ""), warn.get("actual", ""))
+        claimed = ", ".join(_PROFILE_WORD.get(c, c) for c in warn.get("claimed", []))
+        if warn.get("contradictory"):
+            lines.append(f"This sentence calls {str(warn.get('subject', '')).upper()}'s "
+                         f"{aspect} both {claimed}: "
+                         f"\"{warn.get('sentence', '')}\". Its {aspect} is "
+                         f"{actual} — say that once and drop the other claim. "
+                         f"Do not add a reason for the outcome.")
+            continue
+        lines.append(f"{str(warn.get('subject', '')).upper()} is described with "
+                     f"{claimed} {aspect} in this sentence: "
+                     f"\"{warn.get('sentence', '')}\" — but the facts say its "
+                     f"{aspect} is {actual}. Restate it with the wording the "
+                     f"facts use, and do not group it with detectors that have a "
+                     f"different profile.")
     for rid in metrics.get("missing_required_ids", []):
         atom = atoms_by_id.get(rid)
         if atom is not None:
-            lines.append(f"This required fact was not conveyed: "
+            lines.append(f"This required fact was not conveyed — every model "
+                         f"name in it must appear in your paragraph: "
                          f"\"{atom.get('text', '')}\"")
     return lines
 
 
 def _repair_prompt(base_prompt: str, draft: str, problems: List[str]) -> str:
+    # Repair is where invention spikes: told a statement is wrong, the model
+    # reaches for justifying language and writes a cause the facts never gave
+    # ("left out due to its lower utility compared to other factors"). Such a
+    # sentence carries no number and no new name, so no mechanical check can
+    # see it — the constraint has to be restated at the point of failure.
     return (base_prompt
             + "\n\nYOUR PREVIOUS DRAFT:\n" + draft
             + "\n\nPROBLEMS DETECTED IN THE DRAFT — fix ALL of them:\n"
             + "\n".join(f"- {p}" for p in problems)
             + "\n\nRewrite the paragraph, fixing every problem above while "
-              "still following all the rules and the original task.")
+              "still following all the rules and the original task. Correct "
+              "the wording only: do NOT add a reason, cause or justification "
+              "for anything, and do not explain why a result came out the way "
+              "it did — the facts say what happened, not why. Keep it to ONE "
+              "paragraph.")
 
 
 # ── Entity-level orchestration ───────────────────────────────────────────────

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from WebUI import paths
-from WebUI.summarize import summarize
+from WebUI.summarize import attribute_sentences, summarize
 
 # ── The three-vocabulary map ────────────────────────────────────────────────
 #
@@ -224,6 +224,32 @@ def _regimes_from_ir(ir_doc: dict) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda r: r["index"])
 
 
+def _attach_narrated_regimes(regimes: List[Dict[str, Any]], narrative: str,
+                             ir_doc: dict) -> None:
+    """Give each regime the sentence the model wrote about it.
+
+    The per-regime disclosure used to show the IR's own atom text — correct but
+    flat, and a second rendering of facts the narrative already covers. The
+    narrated sentences are pulled out of the same paragraph the summary drops,
+    so nothing is generated twice and nothing is lost by hiding them from the
+    default view. `text` stays as the fallback when a regime's sentence cannot
+    be located.
+    """
+    by_index: Dict[int, str] = {}
+    for sentence, atom in attribute_sentences(narrative, ir_doc):
+        if not atom or atom.get("type") != "regime":
+            continue
+        m = _REGIME_RE.match(str(atom.get("id", "")))
+        if m:
+            idx = int(m.group(1))
+            # A regime can span two sentences; keep them in narrative order.
+            by_index[idx] = (by_index.get(idx, "") + " " + sentence.strip()).strip()
+    for regime in regimes:
+        narrated = by_index.get(regime.get("index"))
+        if narrated:
+            regime["narrated"] = narrated
+
+
 def _headline_pick(output: Dict[str, Any]) -> Optional[str]:
     """The one detector a stage put first, whatever the stage calls that key."""
     for key in ("top_pick", "winner", "top_pick_f1"):
@@ -270,7 +296,7 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
         if ir_doc is None and raw is None:
             continue
         info, narrative = split_info(raw or "")
-        summary = summarize(narrative, stage=stage["key"])
+        summary = summarize(narrative, stage=stage["key"], ir_doc=ir_doc)
         output = (ir_doc or {}).get("output") or {}
         entry: Dict[str, Any] = {
             "key": stage["key"],
@@ -285,6 +311,8 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             "summary": summary["summary"],
             "summary_is_full": summary["is_full"],
             "summary_mode": summary["mode"],
+            "summary_table": summary.get("table"),
+            "extended_in": summary.get("extended_in"),
             "full": narrative,
             "words": len(narrative.split()) if narrative else 0,
             "info": info,
@@ -297,6 +325,7 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
         }
         if stage["key"] == "thompson_sampling" and ir_doc:
             entry["regimes"] = _regimes_from_ir(ir_doc)
+            _attach_narrated_regimes(entry["regimes"], narrative, ir_doc)
         stages_out.append(entry)
 
     # Stages the global IR knows about but that produced no narrative — GAN

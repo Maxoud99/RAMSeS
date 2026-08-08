@@ -303,6 +303,282 @@ class TestVerifierAttribution(unittest.TestCase):
                          ["0.104"])
 
 
+def _rivals_ir():
+    """An off-by-shaped IR: a winner, the rivals it beat, and rivals it never
+    beat. The two sets are what a family-substituting narrator confuses."""
+    return {
+        "ir_version": "1.0", "stage": "off_by_threshold", "dataset": "DS",
+        "entity": "e1",
+        "output": {"winner": "CBLOF_4", "n_injected_points": 236},
+        "evidence": [
+            {"id": "ob.output.winner", "type": "stage_output", "subject": "CBLOF_4",
+             "value": "CBLOF_4",
+             "text": "CBLOF_4 was the highest-ranked model of the stage."},
+            {"id": "ob.edge.0", "type": "exclusive_wins", "subject": "CBLOF_4",
+             "value": {"count": 90, "rate": 0.3814,
+                       "competitors": ["NN_2", "NN_3"]},
+             "text": "CBLOF_4 correctly handles 90 injected points (38.14%) "
+                     "apiece that NN_2 and NN_3 each miss."},
+            {"id": "ob.edge.1", "type": "exclusive_wins", "subject": "CBLOF_4",
+             "value": {"count": 88, "rate": 0.3729, "competitors": ["NN_1"]},
+             "text": "CBLOF_4 correctly handles 88 injected points (37.29%) "
+                     "that NN_1 misses."},
+            {"id": "ob.degenerate", "type": "degenerate_comparison",
+             "subject": "CBLOF_4",
+             "value": {"competitors": ["CBLOF_1", "CBLOF_2", "CBLOF_3"]},
+             "text": "CBLOF_4 never exclusively beat CBLOF_1, CBLOF_2, and "
+                     "CBLOF_3."},
+        ],
+        "caveats": [], "required_atom_ids": ["ob.edge.0", "ob.edge.1"],
+        "confidence": {},
+    }
+
+
+class TestRepairSeesEveryViolation(unittest.TestCase):
+    """Repair is the one place the model is told what it specifically got
+    wrong. A finding the verifier measures but `_violation_count` ignores is a
+    finding that never reaches it: the swapped rival sets and wrong
+    utility/stability profiles were both scored and then silently dropped."""
+
+    def test_swapped_rivals_and_profile_claims_are_repairable(self):
+        metrics = {
+            "unsupported_numbers": [], "unsupported_entities": [],
+            "misattributed_numbers": [], "missing_required_ids": [],
+            "swapped_rivals": [
+                {"atom_id": "ob.edge.0", "expected": ["nn_2", "nn_3"],
+                 "found": ["cblof_2"], "intruded": ["cblof_2"],
+                 "dropped": ["nn_2", "nn_3"],
+                 "sentence": "CBLOF_4 beat CBLOF_2 on 90 points."}],
+            "attribution_warnings": [
+                {"subject": "lof_3", "aspect": "utility", "claimed": ["L"],
+                 "actual": "H", "sentence": "LOF_3 had low utility."}],
+        }
+        self.assertEqual(llm._violation_count(metrics), 2)
+
+        ir_doc = {"evidence": [
+            {"id": "ob.edge.0", "type": "exclusive_wins", "subject": "CBLOF_4",
+             "value": {"competitors": ["NN_2", "NN_3"]},
+             "text": "CBLOF_4 correctly handles 90 points that NN_2 and NN_3 miss."}]}
+        lines = llm._violation_lines(metrics, ir_doc)
+        self.assertEqual(len(lines), 2)
+        joined = " ".join(lines)
+        # Each message names the wrong thing AND the fact to go back to.
+        self.assertIn("CBLOF_2", joined)
+        self.assertIn("NN_2, NN_3", joined)
+        self.assertIn("LOF_3", joined)
+        # The H/L codes are spelled out — a bare letter means nothing to the model.
+        self.assertIn("its utility is high", joined)
+        self.assertNotIn("'H'", joined)
+
+    def test_a_clean_narrative_produces_no_repair(self):
+        clean = {"unsupported_numbers": [], "unsupported_entities": [],
+                 "misattributed_numbers": [], "missing_required_ids": [],
+                 "swapped_rivals": [], "attribution_warnings": []}
+        self.assertEqual(llm._violation_count(clean), 0)
+        self.assertEqual(llm._violation_lines(clean, {"evidence": []}), [])
+
+
+class TestVerifierCoverageIsConjunctive(unittest.TestCase):
+    """Every name a required atom uses must appear — `any()` hid two classes.
+
+    A source atom's `value` carries a `top_pick` (a detector) and a `pattern`
+    (an enum). Harvesting those as coverage candidates and accepting any ONE
+    meant a narrative that never mentioned GAN_PR_AUC still "conveyed" its
+    atom, because LOF_1 and redundant_agreer appear elsewhere in the text.
+    """
+
+    def _source_ir(self):
+        return {
+            "ir_version": "1.0", "stage": "rank_aggregation_robust",
+            "dataset": "DS", "entity": "e1", "output": {},
+            "evidence": [
+                {"id": "ra.source.GAN_PR_AUC.role", "type": "source_role",
+                 "subject": "GAN_PR_AUC",
+                 "value": {"influence_rank": 5, "agreement_rank": 2,
+                           "borda_rank": 2, "pattern": "redundant_agreer",
+                           "top_pick": "LOF_1"},
+                 "text": "GAN_PR_AUC shaped the consensus second most (overall "
+                         "standing rank 2 of 6), ranking 5 for influence and 2 "
+                         "for agreement, a redundant_agreer pattern."},
+            ],
+            "caveats": [], "required_atom_ids": ["ra.source.GAN_PR_AUC.role"],
+            "confidence": {},
+        }
+
+    def test_value_names_cannot_stand_in_for_the_subject(self):
+        narrative = ("LOF_1 leads the consensus. One source was a "
+                     "redundant_agreer, ranking 2 for agreement.")
+        v = verifier.verify_narrative(narrative, self._source_ir())
+        self.assertEqual(v["missing_required_ids"], ["ra.source.GAN_PR_AUC.role"])
+        self.assertEqual(v["omission_rate"], 1.0)
+
+    def test_naming_the_subject_conveys_it(self):
+        narrative = ("GAN_PR_AUC shaped the consensus second most, ranking 5 "
+                     "for influence and 2 for agreement.")
+        v = verifier.verify_narrative(narrative, self._source_ir())
+        self.assertEqual(v["missing_required_ids"], [])
+
+    def test_every_member_of_a_named_group_is_required(self):
+        doc = {
+            "ir_version": "1.0", "stage": "ga_selection", "dataset": "DS",
+            "entity": "e1", "output": {},
+            "evidence": [
+                {"id": "g.plain", "type": "excluded_group", "subject": "plain",
+                 "value": {"detectors": ["NN_2", "CBLOF_4", "CBLOF_3", "CBLOF_1"]},
+                 "text": "NN_2, CBLOF_4, CBLOF_3, and CBLOF_1 each had low "
+                         "utility and low stability, and were left out."},
+            ],
+            "caveats": [], "required_atom_ids": ["g.plain"], "confidence": {},
+        }
+        # The atom carries no numbers, so the number gate never ran and one
+        # name out of four used to prove all four.
+        dropped = verifier.verify_narrative(
+            "CBLOF_4, CBLOF_3, and CBLOF_1 were excluded for low utility and "
+            "low stability.", doc)
+        self.assertEqual(dropped["missing_required_ids"], ["g.plain"])
+        complete = verifier.verify_narrative(
+            "NN_2, CBLOF_4, CBLOF_3, and CBLOF_1 were excluded for low utility "
+            "and low stability.", doc)
+        self.assertEqual(complete["missing_required_ids"], [])
+
+    def test_bucket_label_subjects_are_not_required_words(self):
+        """"sources", "plain", "both" are prompt-internal labels; a narrative
+        has no reason to repeat them, so only identifier-shaped subjects count."""
+        doc = {
+            "ir_version": "1.0", "stage": "s", "dataset": "DS", "entity": "e1",
+            "output": {},
+            "evidence": [
+                {"id": "c.sources", "type": "stage_context", "subject": "sources",
+                 "value": {"n_sources": 2},
+                 "text": "The 2 sources aggregated into this consensus are "
+                         "rankings."},
+            ],
+            "caveats": [], "required_atom_ids": ["c.sources"], "confidence": {},
+        }
+        v = verifier.verify_narrative("Two source rankings were aggregated.", doc)
+        self.assertEqual(v["missing_required_ids"], [])
+
+
+class TestVerifierProfileClaims(unittest.TestCase):
+    """Comparative and shared-adjective forms of a utility/stability claim."""
+
+    def test_comparative_stability_is_read(self):
+        # "lower stability" is the same claim as "low stability"; reading only
+        # the plain form let a wrong profile through unnoticed.
+        v = verifier.verify_narrative(
+            "NN_3 had high utility but lower stability.", _archetype_ir())
+        stab = [w for w in v["attribution_warnings"] if w["aspect"] == "stability"]
+        self.assertEqual(len(stab), 1)
+        self.assertEqual(stab[0]["subject"], "nn_3")
+        self.assertEqual(stab[0]["actual"], "H")
+
+    def test_shared_adjective_is_read(self):
+        # In "low utility and stability" the second noun inherits the first's
+        # adjective, so the stability claim has no adjective of its own.
+        v = verifier.verify_narrative(
+            "NN_3 was left out due to its low utility and stability.",
+            _archetype_ir())
+        aspects = sorted(w["aspect"] for w in v["attribution_warnings"])
+        self.assertEqual(aspects, ["stability", "utility"])
+
+    def test_self_contradictory_sentence_is_caught(self):
+        # Both levels claimed for one subject: the true value is in the set, so
+        # the plain membership check passes while the sentence contradicts
+        # itself — and the added half is invented, carrying no number or name.
+        v = verifier.verify_narrative(
+            "NN_3 had high utility and high stability but was still left out "
+            "due to its low utility.", _archetype_ir())
+        util = [w for w in v["attribution_warnings"] if w["aspect"] == "utility"]
+        self.assertEqual(len(util), 1)
+        self.assertTrue(util[0]["contradictory"])
+        self.assertEqual(util[0]["claimed"], ["H", "L"])
+
+    def test_contrast_sentence_still_does_not_warn(self):
+        v = verifier.verify_narrative(
+            "LOF_1 shows low utility and high stability while NN_3 shows high "
+            "utility and high stability.", _archetype_ir())
+        self.assertEqual(v["attribution_warnings"], [])
+
+
+class TestVerifierRivalSets(unittest.TestCase):
+    """Rival-set attribution (verifier v3).
+
+    The failure this exists for: a narrator replaced every NN_* with the
+    CBLOF_* of the same index. Those names are all in the IR (they appear in
+    the degenerate atom), so the entity check passed; the rivals are not the
+    atom's subject, so the sentence-scoped number check skipped them; and
+    `_atom_covered` was satisfied by the winner's name plus the count. Both
+    headline rates read 0.000 on a narrative asserting the exact negation of
+    the run's findings.
+    """
+
+    def test_family_swap_is_caught(self):
+        narrative = (
+            "CBLOF_4 was the highest-ranked model of the stage. It uniquely "
+            "handled 90 points (38.14%) that CBLOF_2 and CBLOF_3 each missed, "
+            "and correctly identified 88 points (37.29%) that CBLOF_1 missed.")
+        v = verifier.verify_narrative(narrative, _rivals_ir())
+        self.assertTrue(v["swapped_rivals"])
+        by_atom = {p["atom_id"]: p for p in v["swapped_rivals"]}
+        self.assertIn("ob.edge.0", by_atom)
+        self.assertEqual(by_atom["ob.edge.0"]["dropped"], ["nn_2", "nn_3"])
+        self.assertIn("cblof_2", by_atom["ob.edge.0"]["intruded"])
+        self.assertGreater(v["hallucination_rate"], 0.0)
+
+    def test_correct_rivals_pass(self):
+        narrative = (
+            "CBLOF_4 was the highest-ranked model of the stage. CBLOF_4 "
+            "correctly handles 90 injected points (38.14%) apiece that NN_2 "
+            "and NN_3 each miss. CBLOF_4 correctly handles 88 injected points "
+            "(37.29%) that NN_1 misses. CBLOF_4 never exclusively beat "
+            "CBLOF_1, CBLOF_2, and CBLOF_3.")
+        v = verifier.verify_narrative(narrative, _rivals_ir())
+        self.assertEqual(v["swapped_rivals"], [])
+        self.assertEqual(v["hallucination_rate"], 0.0)
+
+    def test_a_dropped_rival_is_caught(self):
+        narrative = ("CBLOF_4 correctly handles 90 injected points (38.14%) "
+                     "that NN_2 misses.")
+        v = verifier.verify_narrative(narrative, _rivals_ir())
+        self.assertEqual([p["dropped"] for p in v["swapped_rivals"]], [["nn_3"]])
+
+    def test_unmentioned_atom_is_an_omission_not_a_swap(self):
+        # Saying nothing about an atom is already measured by omission_rate;
+        # this check must not double-count it as a swap.
+        v = verifier.verify_narrative("CBLOF_4 was the highest-ranked model.",
+                                      _rivals_ir())
+        self.assertEqual(v["swapped_rivals"], [])
+        self.assertEqual(v["omission_rate"], 1.0)
+
+    def test_wrong_names_counted_once_per_sentence(self):
+        # One sentence carrying both atoms' numbers must not have its wrong
+        # names counted twice, once per anchoring atom.
+        narrative = ("CBLOF_4 handled 90 points (38.14%) that CBLOF_2 missed "
+                     "and 88 points (37.29%) that CBLOF_2 missed.")
+        v = verifier.verify_narrative(narrative, _rivals_ir())
+        self.assertGreaterEqual(len(v["swapped_rivals"]), 1)
+        # cblof_2 intruded + nn_1/nn_2/nn_3 dropped = 4 distinct wrong names.
+        self.assertEqual(v["n_swapped_rival_names"], 4)
+
+    def test_shared_numbers_do_not_anchor(self):
+        # Two rival-set atoms with the same count cannot be told apart by it,
+        # so neither sentence can be attributed and neither is judged.
+        doc = _rivals_ir()
+        doc["evidence"][2]["value"] = {"count": 90, "rate": 0.3814,
+                                       "competitors": ["NN_1"]}
+        doc["evidence"][2]["text"] = ("CBLOF_4 correctly handles 90 injected "
+                                      "points (38.14%) that NN_1 misses.")
+        v = verifier.verify_narrative(
+            "CBLOF_4 handled 90 points (38.14%) that CBLOF_1 missed.", doc)
+        self.assertEqual(v["swapped_rivals"], [])
+
+    def test_ir_without_rival_sets_is_unaffected(self):
+        v = verifier.verify_narrative("LOF_1 achieves a score of 0.287.",
+                                      _tiny_ir())
+        self.assertEqual(v["swapped_rivals"], [])
+        self.assertEqual(v["hallucination_rate"], 0.0)
+
+
 class TestPrompts(unittest.TestCase):
 
     def test_stage_prompt_contains_all_atoms_and_markers(self):
@@ -321,7 +597,9 @@ class TestPrompts(unittest.TestCase):
         for cav in doc["caveats"]:
             self.assertIn(cav["text"], prompt)
         self.assertIn("[CAVEAT]", prompt)
-        self.assertIn("120-220 words", prompt)
+        lo, hi = llm._word_budget(len(doc["evidence"]),
+                                  content_words=llm._content_words(doc))
+        self.assertIn(f"{lo}-{hi} words", prompt)
 
     def test_global_prompt_is_fact_based(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,30 +635,47 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("QUESTION THIS STAGE ANSWERS: Why did LOF_1 rank first?", prompt)
         self.assertIn("answers the question above, leading with the answer", prompt)
 
-    def test_stage_prompt_budget_scales_with_atom_count(self):
-        # Sparse stage (tiny IR, 2 atoms) → low floor, no 120-word padding.
-        doc = _tiny_ir()
-        self.assertEqual(llm._word_budget(len(doc["evidence"])), (65, 120))
-        self.assertIn("65-120 words", llm.build_stage_prompt(doc))
-        # Mid-size stage → the default 120-220.
-        mid = dict(doc)
-        mid["evidence"] = [
-            {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
-             "text": f"Fact number {i}."} for i in range(7)
-        ]
-        self.assertIn("120-220 words", llm.build_stage_prompt(mid))
-        # Dense stage → ceiling scales above 220.
-        dense = dict(doc)
-        dense["evidence"] = [
-            {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
-             "text": f"Fact number {i}."} for i in range(30)
-        ]
-        prompt = llm.build_stage_prompt(dense)
-        lo, hi = llm._word_budget(30)
-        self.assertGreater(hi, 220)
-        self.assertIn(f"{lo}-{hi} words", prompt)
+    def test_word_budget_follows_content_length_not_atom_count(self):
+        """The floor must never exceed the material available.
 
-    def test_fact_lines_follow_presentation_order(self):
+        A 4-atom ga_selection carrying 74 words of facts was asked for at least
+        120 words, so ~46 had to be invented — and they arrived as an
+        unsupported concluding sentence. Consolidating near-identical atoms
+        (which is what stops a narrator shuffling names between them) cuts the
+        atom count without cutting the material, so the count is the wrong
+        driver."""
+        doc = _tiny_ir()
+        doc["evidence"] = [
+            {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
+             "text": "word " * 20} for i in range(4)
+        ]
+        doc["caveats"] = []
+        content = llm._content_words(doc)
+        self.assertEqual(content, 80)
+        lo, hi = llm._word_budget(4, content_words=content)
+        self.assertLess(lo, content)          # never demand more than exists
+        self.assertGreater(hi, content)       # but leave room for connectives
+        self.assertIn(f"{lo}-{hi} words", llm.build_stage_prompt(doc))
+
+        # Half the atoms, same material → essentially the same budget. Under the
+        # old count-based curve this pair straddled the 120-word cliff.
+        merged = dict(doc)
+        merged["evidence"] = [
+            {"id": f"toy.b{i}", "type": "t", "subject": "LOF_1", "value": i,
+             "text": "word " * 40} for i in range(2)
+        ]
+        self.assertEqual(llm._word_budget(2, content_words=llm._content_words(merged)),
+                         (lo, hi))
+
+    def test_word_budget_falls_back_to_atom_count(self):
+        self.assertEqual(llm._word_budget(2), (65, 120))
+        self.assertEqual(llm._word_budget(7), (120, 220))
+        self.assertGreater(llm._word_budget(30)[1], 220)
+
+    def test_fact_lines_are_bulleted_never_numbered(self):
+        """Numbering the facts handed the narrator a citation handle, and it
+        used it: 'These detectors were selected … (fact 2). Fact 3 reveals …'.
+        Nothing references the numbers, so there is nothing to lose."""
         doc = _tiny_ir()
         doc["evidence"] = [
             {"id": "z.second", "type": "t", "subject": "LOF_1", "value": None,
@@ -392,8 +687,9 @@ class TestPrompts(unittest.TestCase):
         ]
         doc["required_atom_ids"] = []
         lines = llm._fact_lines(doc)
-        self.assertEqual(lines, ["1. First fact.", "2. Second fact.",
-                                 "3. Unordered fact."])
+        self.assertEqual(lines, ["- First fact.", "- Second fact.",
+                                 "- Unordered fact."])
+        self.assertNotIn("1.", llm.build_stage_prompt(doc))
 
 
 class TestClient(unittest.TestCase):

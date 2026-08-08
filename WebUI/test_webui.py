@@ -124,9 +124,26 @@ class ArtifactTreeCase(unittest.TestCase):
 
         # Rank aggregation carries an iteration suffix.
         _write(self.ir_dir / "ir_rank_aggregation_robust_0.json",
-               _ir("rank_aggregation_robust", output={"top_pick": "LOF_1"}))
+               _ir("rank_aggregation_robust", output={"top_pick": "LOF_1"},
+                   evidence=[
+                       {"id": "ra_robust.output.top", "type": "stage_output",
+                        "subject": "LOF_1", "value": "LOF_1",
+                        "text": "Its first-ranked detector is LOF_1."},
+                       {"id": "ra_robust.source.GAN_F1.role", "type": "source_role",
+                        "subject": "GAN_F1",
+                        "value": {"influence_rank": 1, "agreement_rank": 1,
+                                  "borda_rank": 1, "pattern": "consistent"},
+                        "text": "GAN_F1 shaped the consensus most."},
+                       {"id": "ra_robust.source.GAN_PR_AUC.role", "type": "source_role",
+                        "subject": "GAN_PR_AUC",
+                        "value": {"influence_rank": 5, "agreement_rank": 2,
+                                  "borda_rank": 2, "pattern": "redundant_agreer"},
+                        "text": "GAN_PR_AUC shaped the consensus second most."},
+                   ]))
         _write(self.nl_dir / "nl_rank_aggregation_robust_0.txt",
-               _nl("Influence compares rankings.", "GAN_F1 shaped the consensus most."))
+               _nl("Influence compares rankings.",
+                   "Its first-ranked detector is LOF_1. GAN_F1 shaped the "
+                   "consensus most. GAN_PR_AUC shaped the consensus second most."))
 
         _write(self.ir_dir / "ir_global_iter0.json", {
             "ir_version": "1.0", "stage": "global", "dataset": self.DATASET,
@@ -348,11 +365,19 @@ class TestComprehensiveReport(ArtifactTreeCase):
 
 class TestSummarizeSeam(ArtifactTreeCase):
 
-    def test_today_the_summary_is_the_full_text(self):
+    def test_unconfigured_stage_keeps_the_whole_narrative(self):
         out = summarize.summarize("Some narrative.")
         self.assertEqual(out["summary"], "Some narrative.")
         self.assertTrue(out["is_full"])
         self.assertEqual(out["mode"], "full")
+
+    def test_rank_aggregation_final_is_left_whole(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        final = next((s for s in p["stages"]
+                      if s["key"] == "rank_aggregation_final"), None)
+        if final and final["full"]:
+            self.assertTrue(final["summary_is_full"])
+            self.assertEqual(final["summary"], final["full"])
 
     def test_payload_never_has_an_empty_summary_for_a_non_empty_narrative(self):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
@@ -366,7 +391,7 @@ class TestSummarizeSeam(ArtifactTreeCase):
         offer an expand."""
         original = artifacts.summarize
         try:
-            artifacts.summarize = lambda text, stage=None: {
+            artifacts.summarize = lambda text, stage=None, ir_doc=None: {
                 "summary": text.split(".")[0] + ".", "is_full": False, "mode": "stub"}
             p = artifacts.build_payload(self.DATASET, self.ENTITY)
             ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
@@ -377,22 +402,252 @@ class TestSummarizeSeam(ArtifactTreeCase):
         finally:
             artifacts.summarize = original
 
-    def test_first_paragraph_mode_is_a_working_second_implementation(self):
-        saved = summarize.SUMMARY_MODE
+    def test_a_summariser_failure_degrades_to_the_full_text(self):
+        """A broken summariser must never blank a stage card."""
+        original = summarize._TABLE_BUILDERS["ga_combination"]
         try:
-            summarize.SUMMARY_MODE = "first_paragraph"
-            out = summarize.summarize("Head para.\n\nTail para.")
-            self.assertEqual(out["summary"], "Head para.")
-            self.assertFalse(out["is_full"])
-            single = summarize.summarize("Only one para.")
-            self.assertTrue(single["is_full"])
+            def boom(_):
+                raise RuntimeError("nope")
+            summarize._TABLE_BUILDERS["ga_combination"] = boom
+            out = summarize.summarize("A narrative.", stage="ga_combination",
+                                      ir_doc={"evidence": []})
+            self.assertEqual(out["summary"], "A narrative.")
+            self.assertTrue(out["is_full"])
         finally:
-            summarize.SUMMARY_MODE = saved
+            summarize._TABLE_BUILDERS["ga_combination"] = original
 
     def test_glossary_is_never_summarised(self):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
         ts = next(s for s in p["stages"] if s["key"] == "thompson_sampling")
         self.assertNotIn("Expected reward is", ts["summary"])
+
+
+def _stage_ir(stage, atoms, output=None):
+    return {"ir_version": "1.0", "stage": stage, "dataset": "DS", "entity": "e1",
+            "output": output or {}, "evidence": atoms, "caveats": [],
+            "required_atom_ids": [], "confidence": {}}
+
+
+class TestSummaryDropsAtomClasses(unittest.TestCase):
+    """The default view is the narrative minus one class of fact. Sentences are
+    attributed to atoms by shared names and numbers — nothing is paraphrased,
+    so every sentence shown is one the verifier already scored."""
+
+    def test_ga_selection_moves_exclusions_to_the_extended_view(self):
+        ir_doc = _stage_ir("ga_selection", [
+            {"id": "o", "type": "stage_output", "subject": "best_ensemble",
+             "value": ["LOF_1", "NN_1"],
+             "text": "The genetic algorithm selected the ensemble {LOF_1, NN_1}."},
+            {"id": "b", "type": "member_reason", "subject": "both",
+             "value": {"detectors": ["LOF_1"]},
+             "text": "LOF_1 was chosen for both high utility and high stability."},
+            {"id": "x", "type": "excluded_group", "subject": "plain",
+             "value": {"detectors": ["CBLOF_3"]},
+             "text": "CBLOF_3 had low utility and low stability, and was left out."},
+        ])
+        narrative = ("The genetic algorithm selected the ensemble of LOF_1 and "
+                     "NN_1. LOF_1 was chosen for both high utility and high "
+                     "stability. CBLOF_3 was left out for low utility.")
+        out = summarize.summarize(narrative, stage="ga_selection", ir_doc=ir_doc)
+        self.assertFalse(out["is_full"])
+        self.assertIn("LOF_1 was chosen", out["summary"])
+        self.assertNotIn("CBLOF_3", out["summary"])
+
+    def test_monte_carlo_moves_win_regions_to_the_extended_view(self):
+        ir_doc = _stage_ir("monte_carlo", [
+            {"id": "t", "type": "stage_output", "subject": "LOF_1", "value": {},
+             "text": "In the production test, LOF_1 ranked first by F1."},
+            {"id": "w", "type": "win_region", "subject": "NN_3", "value": {},
+             "text": "NN_3 won by F1 at noise levels 0.042 and 0.158."},
+            {"id": "r", "type": "surrogate_win_rates", "subject": "rates",
+             "value": {}, "text": "Across the sweep LOF_1 led with 39.0%."},
+        ])
+        narrative = ("In the production test, LOF_1 ranked first by F1. NN_3 "
+                     "won by F1 at noise levels 0.042 and 0.158. Across the "
+                     "sweep LOF_1 led with 39.0%.")
+        out = summarize.summarize(narrative, stage="monte_carlo", ir_doc=ir_doc)
+        self.assertNotIn("0.042", out["summary"])
+        self.assertIn("39.0%", out["summary"])
+
+    def test_off_by_moves_both_importance_families(self):
+        ir_doc = _stage_ir("off_by_threshold", [
+            {"id": "w", "type": "stage_output", "subject": "LOF_1", "value": {},
+             "text": "LOF_1 was the highest-ranked model of the stage."},
+            {"id": "v", "type": "feature_importance", "subject": "NN_3",
+             "value": {}, "text": "Against NN_3, the property that best "
+                                  "separates those points is position (importance 0.71)."},
+            {"id": "s", "type": "summary", "subject": "position", "value": {},
+             "text": "Across all competitors, LOF_1's edge is best explained "
+                     "by position (mean importance 0.87)."},
+        ])
+        narrative = ("LOF_1 was the highest-ranked model of the stage. Against "
+                     "NN_3, the best separator is position (importance 0.71). "
+                     "Across all competitors, LOF_1's edge is best explained by "
+                     "position (mean importance 0.87).")
+        out = summarize.summarize(narrative, stage="off_by_threshold", ir_doc=ir_doc)
+        self.assertNotIn("0.71", out["summary"])
+        self.assertNotIn("0.87", out["summary"])
+        self.assertIn("highest-ranked", out["summary"])
+
+    def test_an_unattributable_sentence_is_kept(self):
+        """Dropping happens only on positive evidence: a sentence that matches
+        no atom is shown rather than silently lost."""
+        ir_doc = _stage_ir("monte_carlo", [
+            {"id": "w", "type": "win_region", "subject": "NN_3", "value": {},
+             "text": "NN_3 won by F1 at noise levels 0.042."},
+        ])
+        out = summarize.summarize(
+            "Something the verifier never saw. NN_3 won at 0.042.",
+            stage="monte_carlo", ir_doc=ir_doc)
+        self.assertIn("Something the verifier never saw.", out["summary"])
+        self.assertNotIn("0.042", out["summary"])
+
+
+class TestThompsonRegimeHandling(unittest.TestCase):
+
+    def _ir(self):
+        atoms = [
+            {"id": "ts.output.top", "type": "stage_output", "subject": "NN_1",
+             "value": {}, "text": "Thompson Sampling ranked NN_1 first."},
+            {"id": "ts.regimes.summary", "type": "regime_summary",
+             "subject": "regimes", "value": {},
+             "text": "The 173 windows split into 2 regimes led by 2 detectors."},
+            {"id": "ts.winner.channels", "type": "winner_channels",
+             "subject": "NN_1", "value": {},
+             "text": "Across the regimes NN_1 led, channel 7 contributed most."},
+        ]
+        for i, (lead, a, b) in enumerate(((("NN_3"), 0, 4), ("NN_1", 5, 18))):
+            atoms.append({"id": f"ts.regime.{i}", "type": "regime", "subject": lead,
+                          "value": {"start": a, "end": b, "leader": lead},
+                          "text": f"Regime {i} (windows {a} to {b}) was led by {lead}."})
+        return _stage_ir("thompson_sampling", atoms)
+
+    NARRATIVE = (
+        "Thompson Sampling ranked NN_1 first. The run was divided into 2 "
+        "regimes led by 2 detectors. Regime 0 (windows 0 to 4) was led by "
+        "NN_3, with channel 7 raising its reward. Regime 1 (windows 5 to 18) "
+        "was led by NN_1. Across the regimes NN_1 led, channel 7 contributed "
+        "most.")
+
+    def test_regime_walk_leaves_the_default_view(self):
+        out = summarize.summarize(self.NARRATIVE, stage="thompson_sampling",
+                                  ir_doc=self._ir())
+        self.assertNotIn("Regime 0", out["summary"])
+        self.assertNotIn("Regime 1", out["summary"])
+
+    def test_the_regime_disclosure_is_the_only_extended_view(self):
+        """The regime sentences belong beside their SHAP plots, not in a second
+        full-text disclosure that would repeat them without the plots."""
+        out = summarize.summarize(self.NARRATIVE, stage="thompson_sampling",
+                                  ir_doc=self._ir())
+        self.assertEqual(out["extended_in"], "regimes")
+        # Every other summarised stage still offers its own full text.
+        other = summarize.summarize(
+            "LOF_1 was first. Against NN_3 the separator is position (0.71).",
+            stage="off_by_threshold",
+            ir_doc=_stage_ir("off_by_threshold", [
+                {"id": "w", "type": "stage_output", "subject": "LOF_1",
+                 "value": {}, "text": "LOF_1 was first."},
+                {"id": "v", "type": "feature_importance", "subject": "NN_3",
+                 "value": {}, "text": "Against NN_3 the separator is position (0.71)."},
+            ]))
+        self.assertIsNone(other.get("extended_in"))
+
+    def test_roll_up_sentences_survive_the_regime_walk(self):
+        """These lost ties against regime atoms and vanished with them: both
+        share one detector name and one channel number with some regime. A
+        regime is identified by its index or not at all."""
+        out = summarize.summarize(self.NARRATIVE, stage="thompson_sampling",
+                                  ir_doc=self._ir())
+        self.assertIn("divided into 2 regimes", out["summary"])
+        self.assertIn("Across the regimes NN_1 led", out["summary"])
+        self.assertIn("ranked NN_1 first", out["summary"])
+
+    def test_each_regime_carries_its_narrated_sentence(self):
+        regimes = artifacts._regimes_from_ir(self._ir())
+        artifacts._attach_narrated_regimes(regimes, self.NARRATIVE, self._ir())
+        self.assertEqual(regimes[0]["narrated"],
+                         "Regime 0 (windows 0 to 4) was led by NN_3, with "
+                         "channel 7 raising its reward.")
+        self.assertIn("Regime 1", regimes[1]["narrated"])
+        # The deterministic text stays as the fallback.
+        self.assertTrue(regimes[0]["text"])
+
+    def test_regimes_without_a_narrated_sentence_fall_back(self):
+        regimes = artifacts._regimes_from_ir(self._ir())
+        artifacts._attach_narrated_regimes(regimes, "Nothing about regimes here.",
+                                           self._ir())
+        self.assertNotIn("narrated", regimes[0])
+
+
+class TestSummaryTables(unittest.TestCase):
+    """Stages whose answer is a ranking get a deterministic table from the IR —
+    never parsed out of the rendered *_explainability_*.txt reports, which are
+    a display format that no test would catch changing."""
+
+    def test_ga_combination_table_omits_raw_markov_values(self):
+        ir_doc = _stage_ir("ga_combination", [
+            {"id": "s", "type": "stage_output", "subject": "best_ensemble",
+             "value": {}, "text": "The combination step selected 2 detectors."},
+            {"id": "d1", "type": "detector_role", "subject": "LOF_1",
+             "value": {"final_rank": 1, "final_rank_tied": False,
+                       "markov_score": 0.1835, "mean_abs_shap_rank": 2,
+                       "pfi_rank": 1, "signed_direction": "positive"},
+             "text": "LOF_1 carries the most weight."},
+            {"id": "d2", "type": "detector_role", "subject": "NN_3",
+             "value": {"final_rank": 2, "final_rank_tied": True,
+                       "markov_score": 0.0777, "mean_abs_shap_rank": 1,
+                       "pfi_rank": 2, "signed_direction": "negative"},
+             "text": "NN_3 carries the second-most weight."},
+        ])
+        out = summarize.summarize("The combination step selected 2 detectors. "
+                                  "LOF_1 carries the most weight.",
+                                  stage="ga_combination", ir_doc=ir_doc)
+        self.assertEqual(out["mode"], "table")
+        table = out["table"]
+        self.assertEqual(table["columns"],
+                         ["Weight rank", "Detector", "|SHAP| rank", "PFI rank", "Sign"])
+        self.assertEqual(table["rows"][0], [1, "LOF_1", 2, 1, "positive"])
+        self.assertEqual(table["rows"][1], ["2 (tie)", "NN_3", 1, 2, "negative"])
+        # The raw stationary-distribution values never reach the page: their
+        # ties are decided at the 16th decimal.
+        self.assertNotIn("0.1835", json.dumps(table))
+
+    def test_rank_aggregation_table_carries_all_three_ranks(self):
+        ir_doc = _stage_ir("rank_aggregation_robust", [
+            {"id": "t", "type": "stage_output", "subject": "LOF_1", "value": {},
+             "text": "Its first-ranked detector is LOF_1."},
+            {"id": "s1", "type": "source_role", "subject": "GAN_F1",
+             "value": {"influence_rank": 1, "agreement_rank": 1,
+                       "borda_rank": 1, "pattern": "consistent"},
+             "text": "GAN_F1 shaped the consensus most."},
+            {"id": "s2", "type": "source_role", "subject": "GAN_PR_AUC",
+             "value": {"influence_rank": 5, "agreement_rank": 2,
+                       "borda_rank": 2, "pattern": "redundant_agreer"},
+             "text": "GAN_PR_AUC shaped the consensus second most."},
+        ])
+        out = summarize.summarize("Its first-ranked detector is LOF_1. GAN_F1 "
+                                  "shaped the consensus most.",
+                                  stage="rank_aggregation_robust", ir_doc=ir_doc)
+        table = out["table"]
+        self.assertEqual(table["columns"], ["Overall standing", "Source",
+                                            "Influence", "Agreement", "Pattern"])
+        self.assertEqual(table["rows"][0], [1, "GAN_F1", 1, 1, "consistent"])
+        self.assertEqual(table["rows"][1], [2, "GAN_PR_AUC", 5, 2, "redundant agreer"])
+        # The lead is the narrative's own stage-output sentence, not invented copy.
+        self.assertEqual(out["summary"], "Its first-ranked detector is LOF_1.")
+
+class TestSummaryTableThroughThePayload(ArtifactTreeCase):
+
+    def test_table_reaches_the_payload_with_the_full_text_behind_it(self):
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        ra = next(s for s in p["stages"] if s["key"] == "rank_aggregation_robust")
+        self.assertEqual(ra["summary_mode"], "table")
+        self.assertFalse(ra["summary_is_full"])
+        self.assertEqual([r[1] for r in ra["summary_table"]["rows"]],
+                         ["GAN_F1", "GAN_PR_AUC"])
+        # The narrative stays available for the disclosure.
+        self.assertIn("GAN_PR_AUC shaped the consensus second most", ra["full"])
 
 
 # ── catalog ──────────────────────────────────────────────────────────────────

@@ -199,10 +199,13 @@ class TestCore(unittest.TestCase):
 class TestTreeToRules(unittest.TestCase):
 
     def test_1d_intervals(self):
-        import importlib
-        if importlib.util.find_spec("sklearn") is None:
+        # try/except, not find_spec: another test module in the same run may
+        # already have partially imported sklearn, leaving sklearn.__spec__ None,
+        # and find_spec then raises ValueError instead of answering the question.
+        try:
+            from sklearn.tree import DecisionTreeClassifier
+        except ImportError:
             self.skipTest("scikit-learn not installed")
-        from sklearn.tree import DecisionTreeClassifier
         X = np.array([[0.0], [0.05], [0.1], [0.3], [0.35], [0.4]])
         y = np.array(["A", "A", "A", "B", "B", "B"])
         clf = DecisionTreeClassifier(max_depth=2, random_state=0).fit(X, y)
@@ -362,9 +365,12 @@ class TestBuilders(unittest.TestCase):
             "A was chosen for both high utility and high stability.")
         self.assertIn("B was low on both utility and stability",
                       by_id["ga_sel.included.marginal"]["text"])
+        # The profile LEADS the sentence. Three excluded atoms in a row all
+        # opened "X was left out …" and differed only in the high/low tail, so a
+        # narrator merged them and handed one detector another's profile.
         self.assertEqual(
             by_id["ga_sel.excluded.C"]["text"],
-            "C was left out even though it had high utility but low stability.")
+            "C had high utility and low stability, but was still left out.")
         # Utility/stability numbers stay in `value`, never in the prose.
         self.assertEqual(
             by_id["ga_sel.included.both"]["value"]["per_detector"]["A"],
@@ -398,14 +404,69 @@ class TestBuilders(unittest.TestCase):
         self.assertEqual(by_id["ga_sel.included.utility"]["value"]["detectors"], ["Mu"])
         self.assertEqual(by_id["ga_sel.included.stability"]["value"]["detectors"], ["Ms"])
         self.assertEqual(by_id["ga_sel.included.marginal"]["value"]["detectors"], ["Mm"])
-        # Mn: low profile but lofo>0 → individual "needed" callout, with number.
-        self.assertIn("Removing Mn lowers the ensemble's fitness by 0.0300",
-                      by_id["ga_sel.needed.Mn"]["text"])
+        # Mn: low profile but lofo>0 → "needed" callout, with number. The low/low
+        # finding LEADS the sentence rather than sitting in a `despite` clause:
+        # backgrounded that way, narrators restated it as high/high.
+        needed = by_id["ga_sel.needed.Mn"]
+        self.assertEqual(
+            needed["text"],
+            "Mn has low utility and low stability, yet removing it lowers the "
+            "ensemble's fitness by 0.0300, which is why it was kept.")
+        # The profile is machine-checkable, so the verifier's attribution channel
+        # catches an inversion even though the code never reaches the prose.
+        self.assertEqual(needed["value"]["archetype"], "LL")
+        self.assertEqual(by_id["ga_sel.included.both"]["value"]["archetype"], "HH")
+        self.assertEqual(by_id["ga_sel.included.utility"]["value"]["archetype"], "HL")
+        self.assertEqual(by_id["ga_sel.included.stability"]["value"]["archetype"], "LH")
         # Excluded: high-utility anomaly individual; the rest grouped by profile.
-        self.assertIn("high utility but low stability", by_id["ga_sel.excluded.Xh"]["text"])
+        self.assertEqual(by_id["ga_sel.excluded.Xh"]["text"],
+                         "Xh had high utility and low stability, but was still left out.")
         self.assertEqual(by_id["ga_sel.excluded.stable"]["value"]["detectors"], ["Xs"])
         self.assertEqual(by_id["ga_sel.excluded.plain"]["value"]["detectors"], ["Xp"])
+        # Excluded groups lead with the profile too, for the same reason.
+        self.assertEqual(by_id["ga_sel.excluded.plain"]["text"],
+                         "Xp had low utility and low stability, and was left out.")
         self.assertEqual(by_id["ga_sel.excluded.nodata"]["value"]["detectors"], ["Xn"])
+
+    def test_competition_rank_tolerates_float_noise(self):
+        """Markov scores that are mathematically tied come back from
+        np.linalg.eig a few ulp apart. An exact `!=` promoted that wobble into a
+        real rank difference, so which detector 'carries the most weight' was
+        decided by the eigen-solver rather than by the data."""
+        scores = {"A": 0.18347554726124723,      # one ulp above the other two
+                  "B": 0.18347554726124712,
+                  "C": 0.18347554726124712,
+                  "D": 0.17937750940504008}
+        ranks = ir._competition_rank(scores, ["A", "B", "C", "D"])
+        self.assertEqual(ranks, {"A": 1, "B": 1, "C": 1, "D": 4})
+        # A genuine gap still separates, and competition ranking still skips.
+        self.assertEqual(
+            ir._competition_rank({"A": 0.5, "B": 0.3, "C": 0.3, "D": 0.1},
+                                 ["A", "B", "C", "D"]),
+            {"A": 1, "B": 2, "C": 2, "D": 4})
+        # Ties are measured against the running block, not the previous item,
+        # so a chain of small steps cannot collapse into one rank.
+        drift = {"A": 1.0, "B": 1.0 - 6e-10, "C": 1.0 - 1.2e-9}
+        self.assertEqual(ir._competition_rank(drift, ["A", "B", "C"]),
+                         {"A": 1, "B": 1, "C": 3})
+
+    def test_ga_combination_reports_a_tied_lead_as_tied(self):
+        result = _ga_combination_result()
+        # A and B mathematically tied, one ulp apart as the solver returns them.
+        result["markov_scores"] = {"A": 0.5, "B": 0.5 - 1.1e-16, "C": 0.2}
+        doc = ir.build_ga_combination_ir("DS", "e1", result)
+        by_id = {a["id"]: a for a in doc["evidence"]}
+        a = by_id["ga_comb.detector.A.role"]
+        b = by_id["ga_comb.detector.B.role"]
+        self.assertEqual(a["value"]["final_rank"], 1)
+        self.assertEqual(b["value"]["final_rank"], 1)
+        self.assertTrue(a["value"]["final_rank_tied"])
+        self.assertIn("(overall weight rank 1 of 3, a tie)", a["text"])
+        self.assertIn("(overall weight rank 1 of 3, a tie)", b["text"])
+        # `top_pick` is the first of an arbitrary order, so the tied set is
+        # recorded rather than presenting it as a sole winner.
+        self.assertEqual(doc["output"]["top_pick_tied_with"], ["B"])
+        self.assertFalse(by_id["ga_comb.detector.C.role"]["value"]["final_rank_tied"])
 
     def test_ga_combination_no_matrix(self):
         doc = ir.build_ga_combination_ir("DS", "e1", _ga_combination_result())
@@ -427,21 +488,25 @@ class TestBuilders(unittest.TestCase):
         # Only the two MAGNITUDE measures are quoted: signed SHAP no longer
         # feeds the aggregation, so citing its rank here would imply a
         # contribution to the weight that it does not make.
+        # The overall weight rank carries its own LABEL and its own NUMBER: as a
+        # bare ordinal it was the only quantity in the sentence without a digit,
+        # sitting beside two digit method ranks, and narrators re-derived it from
+        # whichever digit was nearest.
         a = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.A.role")
         self.assertEqual(
             a["text"],
-            "A carries the most weight in the ensemble, ranking 1 on absolute "
-            "SHAP and PFI.")
+            "A carries the most weight in the ensemble (overall weight rank 1 of "
+            "3), ranking 1 on absolute SHAP and PFI.")
         b = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.B.role")
         self.assertEqual(
             b["text"],
-            "B carries the second-most weight in the ensemble, ranking 2 on "
-            "absolute SHAP and 3 on PFI.")
+            "B carries the second-most weight in the ensemble (overall weight "
+            "rank 2 of 3), ranking 2 on absolute SHAP and 3 on PFI.")
         c = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.C.role")
         self.assertEqual(
             c["text"],
-            "C carries the third-most weight in the ensemble, ranking 3 on "
-            "absolute SHAP and 2 on PFI.")
+            "C carries the third-most weight in the ensemble (overall weight "
+            "rank 3 of 3), ranking 3 on absolute SHAP and 2 on PFI.")
         prose = " ".join(x["text"] for x in doc["evidence"])
         self.assertNotIn("signed SHAP", prose)
         # ...but the signed value and its rank stay machine-readable.
@@ -540,9 +605,10 @@ class TestBuilders(unittest.TestCase):
         self.assertLess(atoms["ra_robust.source.S2.role"]["order"],
                         atoms["ra_robust.source.S1.role"]["order"])
         # S2 is Borda #1 → "shaped ... most"; S1 is Borda #2 → "second most".
-        self.assertIn("shaped the robustness consensus most,",
+        self.assertIn("shaped the robustness consensus most (overall standing rank 1 of 2),",
                       atoms["ra_robust.source.S2.role"]["text"])
-        self.assertIn("shaped the robustness consensus second most,",
+        self.assertIn("shaped the robustness consensus second most "
+                      "(overall standing rank 2 of 2),",
                       atoms["ra_robust.source.S1.role"]["text"])
         # Both component ranks are stated for each source (never inferred).
         self.assertIn("ranking 1 for influence and 2 for agreement",
@@ -567,7 +633,7 @@ class TestBuilders(unittest.TestCase):
             ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
         lead = next(a for a in doc["evidence"]
                     if a["id"] == "ra_robust.source.S1.role")
-        self.assertIn("shaped the robustness consensus most,", lead["text"])
+        self.assertIn("shaped the robustness consensus most (overall standing rank 1 of 2),", lead["text"])
         self.assertIn("ranking 1 for influence and 1 for agreement", lead["text"])
 
     def test_monte_carlo_lean(self):
@@ -638,9 +704,18 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("ob.degenerate", ids)
         self.assertNotIn("ob.vs.C.degenerate", ids)
         deg = next(a for a in ok["evidence"] if a["id"] == "ob.degenerate")
-        self.assertEqual(deg["text"], "A never exclusively beat C.")
+        self.assertEqual(
+            deg["text"],
+            "A never exclusively beat C, so it does not appear above.")
+        # REQUIRED, and stated LAST: it is the only place these names appear as a
+        # group, and next to the win atoms it became a ready-made set for a
+        # narrator to lift into them while dropping the negation it carried.
+        self.assertIn("ob.degenerate", ok["required_atom_ids"])
+        self.assertGreater(deg["order"],
+                           max(a["order"] for a in ok["evidence"]
+                               if a["id"] != "ob.degenerate"))
 
-    def test_off_by_wins_grouped_by_identical_counts(self):
+    def test_off_by_edges_grouped_by_identical_counts(self):
         # Distinct win counts → one atom each, ordered best-first and all
         # required (grouping keeps the atom count low enough to require them).
         result = _off_by_result(n_wins=10)
@@ -651,15 +726,15 @@ class TestBuilders(unittest.TestCase):
         doc = ir.build_off_by_ir("DS", "e1", result, ["A", "B"])
         _check_envelope(self, doc, "off_by_threshold")
         req = set(doc["required_atom_ids"])
-        for wid in ("ob.wins.0", "ob.wins.1", "ob.wins.2", "ob.wins.3"):
+        for wid in ("ob.edge.0", "ob.edge.1", "ob.edge.2", "ob.edge.3"):
             self.assertIn(wid, req)
         wins = {a["id"]: a for a in doc["evidence"] if a["type"] == "exclusive_wins"}
-        self.assertEqual(wins["ob.wins.0"]["value"]["competitors"], ["B"])  # 10
-        self.assertEqual(wins["ob.wins.3"]["value"]["competitors"], ["F"])  # 1
-        self.assertIn("10 injected points", wins["ob.wins.0"]["text"])
-        self.assertIn("1 injected point ", wins["ob.wins.3"]["text"])  # singular
+        self.assertEqual(wins["ob.edge.0"]["value"]["competitors"], ["B"])  # 10
+        self.assertEqual(wins["ob.edge.3"]["value"]["competitors"], ["F"])  # 1
+        self.assertIn("10 injected points", wins["ob.edge.0"]["text"])
+        self.assertIn("1 injected point ", wins["ob.edge.3"]["text"])  # singular
 
-    def test_off_by_wins_merge_when_counts_identical(self):
+    def test_off_by_edges_merge_when_counts_identical(self):
         # Rivals sharing the same (count, rate) collapse into ONE atom naming
         # both — the repetition that pushes the narrator into compressing names.
         result = _off_by_result(n_wins=1)
@@ -673,10 +748,13 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("apiece that B, D, and E each miss", wins[0]["text"])
 
     def test_off_by_rules_deduplicated_across_competitors(self):
-        import importlib
-        if importlib.util.find_spec("sklearn") is None:
+        # try/except, not find_spec: another test module in the same run may
+        # already have partially imported sklearn, leaving sklearn.__spec__ None,
+        # and find_spec then raises ValueError instead of answering the question.
+        try:
+            from sklearn.tree import DecisionTreeClassifier
+        except ImportError:
             self.skipTest("scikit-learn not installed")
-        from sklearn.tree import DecisionTreeClassifier
         X = np.array([[0.01, 0.2], [0.02, 0.3], [0.04, 0.2], [0.05, 0.3]])
         y = np.array([1, 1, 0, 0])
         clf1 = DecisionTreeClassifier(max_depth=2, random_state=0).fit(X, y)
@@ -686,15 +764,22 @@ class TestBuilders(unittest.TestCase):
         pc["B"] = dict(pc["B"], clf=clf1)
         pc["D"] = dict(pc["B"], clf=clf2)
         doc = ir.build_off_by_ir("DS", "e1", result, ["A", "B"])
-        rules = [a for a in doc["evidence"] if a["type"] == "surrogate_rule"]
-        # Identical rule fitted for B and D → ONE merged atom naming both.
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0]["value"]["competitors"], ["B", "D"])
+        edges = [a for a in doc["evidence"] if a["type"] == "exclusive_wins"]
+        # B and D share both the rule and the win count → ONE atom naming both.
+        # Rule and count live in the SAME atom: as two families they expressed
+        # the same rivals twice, in two groupings and two orders, which is what
+        # let a narrator carry one group's names into the other's sentence.
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["value"]["competitors"], ["B", "D"])
         # Competitors read as a full oxford list and the condition is prose,
         # never a raw "feature op threshold" comparison.
-        self.assertIn("uniquely beats B and D when ", rules[0]["text"])
-        self.assertIn("the distance from the boundary is at most", rules[0]["text"])
-        self.assertNotIn("boundary_distance <=", rules[0]["text"])
+        self.assertIn("apiece that B and D each miss", edges[0]["text"])
+        self.assertIn("uniquely beating them when ", edges[0]["text"])
+        self.assertIn("the distance from the boundary is at most", edges[0]["text"])
+        self.assertNotIn("boundary_distance <=", edges[0]["text"])
+        # No separate rule atom family survives to be cross-contaminated.
+        self.assertEqual(
+            [a for a in doc["evidence"] if a["type"] == "surrogate_rule"], [])
 
     def test_mc_winner_surrogate_rules_not_emitted_but_fidelity_kept(self):
         # The winner-surrogate tree restates the win regions in fitted form, so

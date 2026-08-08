@@ -1989,19 +1989,32 @@ def markov_aggregate_importances(
     return scores, final_ranking
 
 
+# Points closer than this are one tie. When the points are Markov scores from
+# markov_aggregate_importances, exact ties are the norm — only two measures feed
+# the chain, so C[j,i] - C[i,j] takes three values — and np.linalg.eig returns
+# those ties a few ulp apart. An exact `!=` promoted a 1.1e-16 eigenvector
+# wobble into a real rank difference, letting the solver rather than the data
+# decide which feature led.
+_RANK_TIE_ATOL = 1e-9
+
+
 def _competition_ranks(points: Dict[str, float], order: List[str]) -> Dict[str, int]:
     """
     Standard competition ranking ("1224"): features with equal points share the
     smallest rank in their group (so two features tied for 2nd are both rank 2 and
     the next is rank 4). `order` must be the points-descending feature order.
+    Equality is within `_RANK_TIE_ATOL`, compared against the running block's
+    points rather than the previous feature so a drift of near-equal values
+    cannot chain a long run into one rank.
     """
     ranks: Dict[str, int] = {}
-    prev_pts = None
+    block_pts = None
     rank = 0
     for i, f in enumerate(order):
-        if prev_pts is None or points[f] != prev_pts:
+        pts = points[f]
+        if block_pts is None or abs(float(pts) - float(block_pts)) > _RANK_TIE_ATOL:
             rank = i + 1
-            prev_pts = points[f]
+            block_pts = pts
         ranks[f] = rank
     return ranks
 

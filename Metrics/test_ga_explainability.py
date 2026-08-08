@@ -381,6 +381,32 @@ class TestCombination(unittest.TestCase):
         self.assertEqual(ranks["D"], 4)            # skips 3 (competition style)
         self.assertEqual(ranks["E"], 4)
 
+    def test_competition_ranks_tolerate_eigenvector_noise(self):
+        """Markov scores that are mathematically tied come back from
+        np.linalg.eig a few ulp apart — only two measures feed the chain, so
+        exact ties are the norm. An exact `!=` turned that wobble into a real
+        rank difference in the report table."""
+        points = {"A": 0.18347554726124723,       # one ulp above the other two
+                  "B": 0.18347554726124712,
+                  "C": 0.18347554726124712,
+                  "D": 0.17937750940504008}
+        ranks = _competition_ranks(points, ["A", "B", "C", "D"])
+        self.assertEqual(ranks, {"A": 1, "B": 1, "C": 1, "D": 4})
+
+    def test_markov_aggregation_ties_are_exact_not_ordered(self):
+        """The three-way tie this came from: with two measures each pair splits
+        1-1, so the stationary distribution is equal for all three and only
+        float noise separates them."""
+        feats = ["X", "Y", "Z"]
+        a = {"X": -3.0, "Y": -2.0, "Z": -1.0}     # ranks X<Y<Z
+        b = {"X": -1.0, "Y": -2.0, "Z": -3.0}     # exactly reversed
+        scores, ranking = markov_aggregate_importances(
+            {"SHAP_abs": a, "PFI": b}, feats)
+        spread = max(scores.values()) - min(scores.values())
+        self.assertLess(spread, 1e-9)
+        # Whatever arbitrary order `ranking` came back in, all three share rank 1.
+        self.assertEqual(set(_competition_ranks(scores, ranking).values()), {1})
+
     def test_fitness_function_returns_meta_model(self):
         # Step 0: fitness_function appends the trained meta-model as a 6th element,
         # while the first five indices stay unchanged (callers index [0..4]).
