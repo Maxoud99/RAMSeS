@@ -123,23 +123,22 @@ SYSTEM_PROMPT = (
     "5. If a value reads 'not_available', either omit it or say the data is "
     "not available — never fill it in.\n"
     "6. Write ONE coherent paragraph of plain prose. No headings, lists, "
-    "tables, or markdown.\n"
-    "7. Write every detector name in full each time it appears. Never "
-    "compress names into ranges, plurals, or shared prefixes: 'CBLOF_1 to "
-    "-4', 'CBLOF_1-4', and 'LOFs 2 and 3' are all forbidden — write CBLOF_1, "
-    "CBLOF_2, CBLOF_3, CBLOF_4. Likewise never merge numbers belonging to "
-    "different detectors into a range such as 'from -0.0124 to -0.0243'; "
-    "state each value next to the detector it belongs to.\n"
-    "8. Write about the run, never about the facts as objects. Never refer to "
-    "them by position or label — 'fact 2', 'the third fact', 'as stated "
-    "above', 'the facts show' are all forbidden. State what happened.\n"
-    "9. Do not end with a conclusion, verdict, or assessment of your own. No "
-    "sentence may judge the result as balanced, optimal, sensible, effective "
-    "or otherwise, and none may explain why the outcome is reasonable. Stop "
-    "when the facts are conveyed.\n"
-    "10. When a fact names several detectors, name every one of them. Dropping "
-    "one from a list changes what the fact says."
+    "tables, or markdown."
 )
+# Four further rules were dropped when the narrator moved from qwen2.5:7b to
+# 14b. Measured on SKAB/7 across five stages, removing them changed no metric:
+#   - name compression ('CBLOF_1 to -4') was a 7b artifact; 14b writes the
+#     names out unprompted.
+#   - 'never cite fact 2' patched a hole that no longer exists: the facts are
+#     bulleted rather than numbered, so there is nothing to cite.
+#   - 'no invented conclusions' addressed padding forced by a word-budget floor
+#     that demanded more words than the facts contained; the budget now scales
+#     with content length.
+#   - 'name every detector in a list' is enforced by the verifier's conjunctive
+#     coverage check and repaired by the repair loop.
+# Rules 1-5 are the contract the verifier measures and are not a model-size
+# question; rule 6 is format. If the narrator is ever downgraded, restore the
+# four from git history before trusting the output.
 
 
 def _render_value(v: Any) -> str:
@@ -199,6 +198,10 @@ _STAGE_WORD_BUDGETS: Dict[str, tuple] = {
     # Thompson narrates every regime individually; ~20 words each plus the
     # lead, regime summary, winner channel and state line.
     "thompson_sampling": (20, 40, 700),
+    # The ranking sibling narrates regimes too, but plain run-length encoding of
+    # the ||mu||^2 leader yields a handful of them rather than a dozen, so it
+    # needs a lower ceiling than the stage above.
+    "thompson_ranking": (20, 40, 500),
 }
 
 
@@ -247,92 +250,93 @@ def _caveat_lines(ir_doc: Dict[str, Any]) -> List[str]:
 # per-IR field. Keyed by exact stage name; add other stages here as their
 # narratives need shaping.
 _STAGE_TASK_HINTS: Dict[str, str] = {
+    # The opening sentence is load-bearing: without it the narrator went
+    # straight into the per-source walk and dropped both the consensus winner
+    # and the source list (omission 0.000 -> 0.250). One positive instruction
+    # replaced three defensive ones and scored better.
     "rank_aggregation_robust": (
-        " Describe each source ranking in the order given; for each one, state "
-        "its overall standing rank, its influence rank, its agreement rank, and "
-        "its pattern. Each source has THREE separate ranks and every one of them "
-        "is written in its fact — copy all three from that source's own fact and "
-        "never compute, guess or renumber any of them. A rank is a position — "
-        "rank 1 is best — so never restate a rank as 'high' or 'low' influence "
-        "or agreement; give the rank number itself. 'Shaped the consensus Nth "
-        "most' reports the overall standing rank given in brackets, never the "
-        "influence or agreement rank. NEVER merge two sources into one statement "
-        "or compare ranks of one source against another."
+        " Open by naming the consensus's own top-ranked detector and the source "
+        "rankings being aggregated. Then describe each source in the order "
+        "given; for each one, state its overall standing rank, its influence "
+        "rank, its agreement rank, and its pattern. A rank is a position — rank "
+        "1 is best — so give the rank number itself rather than calling it high "
+        "or low."
     ),
     "ga_combination": (
         " Describe each detector in the order given; for each one, state its "
         "overall weight rank and its rank on absolute SHAP and PFI (rank 1 is "
-        "strongest). Each detector has THREE separate ranks and every one of "
-        "them is written in its fact — copy all three from that detector's own "
-        "fact and never compute, guess or renumber any of them. In particular "
-        "the overall weight rank is the number given in brackets after 'overall "
-        "weight rank'; it is not the detector's place in this paragraph and not "
-        "either method rank. Where a fact says a rank is a tie, say it is tied "
-        "rather than giving that detector sole possession of the place. "
-        "Then give the sign summary, listing which detectors signed positive "
-        "and which signed negative. These are detectors in the ensemble, not "
-        "ranking sources. NEVER merge two detectors into one statement or "
-        "compare one detector against another."
+        "strongest). Where a fact says a rank is a tie, say it is tied. Finish "
+        "with the sign summary, listing which detectors signed positive and "
+        "which signed negative."
     ),
     "ga_selection": (
         " Open by naming the chosen ensemble. Then explain why the chosen "
-        "detectors were kept, following the facts in order — keep the detectors "
-        "grouped exactly as the facts group them and never move a detector into "
-        "a group it is not listed in. Then explain why the rest were left out. "
-        "Describe each detector only with the high/low utility and stability "
-        "wording the facts use; do not invent two-letter archetype codes. Write "
-        "every detector name in full, do not merge two groups, and use plain "
-        "prose with no math notation."
+        "detectors were kept, following the facts in order and keeping the "
+        "detectors grouped exactly as the facts group them. Then explain why "
+        "the rest were left out, using the high/low utility and stability "
+        "wording the facts use."
     ),
+    # Direction is the whole risk here. A detector's channel shares are sums of
+    # squares, so every one is positive and none can "drag the score down" —
+    # but that is exactly the sentence a narrator reaches for when a share is
+    # small, and the verifier cannot see it: the number and the channel name are
+    # both correct. Only the comparison against the named rival has a sign, so
+    # the hint puts direction language where it belongs and nowhere else.
+    "thompson_ranking": (
+        " Open with the winner and its score, then the channels its score is "
+        "built from. Describe those channels only as larger or smaller shares "
+        "of that detector's own score — a small share means a channel "
+        "contributed little, never that it lowered the score or worked against "
+        "the detector. Only when comparing the winner with the named runner-up "
+        "may you say a channel favoured one over the other, and there keep the "
+        "direction exactly as the fact states it. Then give the selection "
+        "counts, then how leadership divided into regimes, then EVERY regime "
+        "its own sentence in the order listed, each naming its window range, "
+        "its leader and its channels. Name that leader outright — never "
+        "describe it by reference to the previous regime. Do not add a sentence "
+        "interpreting what any of this implies."
+    ),
+    # The regime-shape instruction is the one clause here that earns its length:
+    # a narrator that describes a regime by reference to the previous one writes
+    # false continuity ("NN_3 continued as leader" when the previous regime was
+    # led by NN_2), and no metric can see it — the names and numbers are all
+    # correct. A positive template held where a shorter ban leaked.
     "thompson_sampling": (
         " Open with the winner and its margin, then how the run divided into "
         "regimes. Then give EVERY regime its own sentence, in the order listed, "
         "keeping each regime's window range, its leader and its channels "
-        "together — never merge two regimes and never carry one regime's "
-        "channels over to another. State each regime on its own terms: never "
-        "say a regime followed suit, continued, repeated or matched another, "
-        "and never write 'also led by' — consecutive regimes have different "
-        "leaders. Finish with the winner's overall channel and "
-        "the selection-state percentages. Do not list the windows where the "
-        "leader changed; the regime ranges already cover them. Write every "
-        "detector and channel name in full, and use plain prose with no math "
-        "notation."
+        "together. Write every regime sentence in the same shape: the regime "
+        "and its window range, then the detector that led it, then its "
+        "channels. Name that detector outright — never describe it by reference "
+        "to the previous regime. Finish with the winner's overall channel and "
+        "the selection-state percentages."
     ),
     "monte_carlo": (
         " Open with one sentence restating the production-test result exactly "
         "as the fact gives it — use the word 'first' — naming the top detector "
         "for each metric. The F1 and PR-AUC leaders are not always the same "
-        "detector: if the fact names two different ones, keep them separate and "
-        "never merge them into a single winner. That opening is about the "
-        "production test, not the sweep, so do not describe it as being most "
-        "robust across noise levels. Then say that "
-        "different detectors won at different noise levels and give each "
-        "detector's winning noise ranges in the order listed, one detector per "
-        "statement. Finish with the win percentages. Copy each noise range as "
-        "it is written ('from 0.000 to 0.042') — never turn a range into a "
-        "hyphenated pair, and never list individual points where the leader "
-        "changes. Write every detector name in full and do not merge two "
-        "detectors. Use plain prose only: no LaTeX and no math notation."
+        "detector: if the fact names two different ones, keep them separate. "
+        "Then give each detector's winning noise ranges in the order listed, "
+        "one detector per statement. Finish with the win percentages. Copy each "
+        "noise range as it is written ('from 0.000 to 0.042') — never turn a "
+        "range into a hyphenated pair."
     ),
     "off_by_threshold": (
         " Open with one short sentence naming the highest-ranked model, then "
         "give each fact about the models it beat as its OWN separate sentence, "
         "then the importance figures. The rival models named in a sentence must "
-        "be EXACTLY the models that fact lists — copy that list of names from "
-        "the fact, never substitute a model from another fact, and never swap "
-        "one model family for another. Repeat the highest-ranked model's name "
-        "in every sentence instead of writing 'it'. Keep each fact's counts, "
-        "conditions and models together — never merge two facts, and never "
-        "attach one fact's conditions or counts to another fact's models. State "
-        "each condition exactly as it is worded in the facts — never rewrite a "
-        "condition as a bare variable name with a numeric comparison such as "
-        "'is_anomaly <= 0.5'. If a fact says the highest-ranked model never "
-        "exclusively beat some models, say so plainly and do not name those "
-        "models anywhere else. Write every model name in full. Use plain prose "
-        "only: no LaTeX, no math notation, no backslashes or escaped "
-        "parentheses around numbers."
+        "be EXACTLY the models that fact lists. State each condition exactly as "
+        "it is worded in the facts. If a fact says the highest-ranked model "
+        "never exclusively beat some models, state that too."
     ),
 }
+# The hyphenated-range ban in monte_carlo and the degenerate clause in
+# off_by_threshold are NOT model-capability patches and must survive any future
+# trim. The first exists because the verifier's number extraction is sign-aware,
+# so "0.000-0.042" reads as the negative number -0.042 and is flagged
+# unsupported. The second was measured load-bearing: dropping it lost
+# ob.degenerate (omission 0.000 -> 0.200), and that atom is the negation that
+# makes a swapped rival set self-contradictory.
 
 
 def _stage_task_hint(stage: Any) -> str:
@@ -426,7 +430,11 @@ GLOBAL_MODES = ("concat", "llm")
 # The merged document follows the pipeline's order so it reads as the run ran,
 # rather than the alphabetical order the IR files happen to load in.
 _GLOBAL_STAGE_ORDER = (
-    "ga_selection", "ga_combination", "thompson_sampling",
+    "ga_selection", "ga_combination",
+    # The ranking criterion first: it explains the ordering the pipeline goes on
+    # to consume, and the selection dynamics then account for how the run got
+    # there. WebUI.artifacts.STAGES must stay in this order.
+    "thompson_ranking", "thompson_sampling",
     "monte_carlo", "off_by_threshold",
     "rank_aggregation_robust", "rank_aggregation_final",
 )
@@ -434,7 +442,11 @@ _GLOBAL_STAGE_ORDER = (
 _GLOBAL_STAGE_TITLES = {
     "ga_selection": "Ensemble selection (genetic algorithm)",
     "ga_combination": "Ensemble weighting (meta-learner)",
-    "thompson_sampling": "Single-model selection (Thompson Sampling)",
+    # Two stages explain one algorithm, so neither may claim the plain name:
+    # these titles say which question each answers. Duplicated verbatim in
+    # WebUI.artifacts.STAGES.
+    "thompson_ranking": "Thompson Sampling: ranking criterion",
+    "thompson_sampling": "Thompson Sampling: selection dynamics",
     "monte_carlo": "Robustness: Monte Carlo noise sweep",
     "off_by_threshold": "Sensitivity: off-by-threshold test",
     "rank_aggregation_robust": "Robustness consensus",
@@ -590,6 +602,7 @@ def _repair_prompt(base_prompt: str, draft: str, problems: List[str]) -> str:
 def _stage_file_map(iteration: int) -> Dict[str, str]:
     return {
         "thompson_sampling": "ir_thompson",
+        "thompson_ranking": "ir_thompson_ranking",
         "ga_selection": "ir_ga_selection",
         "ga_combination": "ir_ga_combination",
         "rank_aggregation_robust": f"ir_rank_aggregation_robust_{iteration}",

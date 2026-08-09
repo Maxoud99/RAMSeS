@@ -46,6 +46,9 @@ from Thompson_Sampling import (
     compute_shap_values,
     aggregate_shap_per_channel,
     reconstruct_regime_segments,
+    aggregate_squared_per_channel,
+    rank_gap_decomposition,
+    leadership_regimes,
 )
 
 
@@ -579,6 +582,126 @@ class TestReconstructRegimeSegments(unittest.TestCase):
         for earlier, later in zip(segs, segs[1:]):
             self.assertEqual(earlier[1] + 1, later[0])
         self.assertEqual(sum(d for _, _, _, d in segs), T)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 12.  Ranking criterion ||mu_k||^2 — decomposition
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestRankingDecomposition(unittest.TestCase):
+    """The ranking stage's whole claim is that these two splits are EXACT: the
+    shares account for all of a detector's score, the gap terms for all of its
+    margin. If either stopped summing, the explanation would be quietly wrong
+    while still looking plausible."""
+
+    def test_per_channel_squares_sum_to_the_score(self):
+        mu = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        per_channel = aggregate_squared_per_channel(mu, n_channels=3)
+        # channel c owns a contiguous block: [1,2], [3,4], [5,6].
+        np.testing.assert_array_almost_equal(per_channel, [5.0, 25.0, 61.0])
+        self.assertAlmostEqual(float(per_channel.sum()), float(np.dot(mu, mu)))
+
+    def test_contributions_are_never_negative(self):
+        rng = np.random.default_rng(3)
+        mu = rng.normal(size=(60, 1))          # column vector, as means are stored
+        per_channel = aggregate_squared_per_channel(mu, n_channels=6)
+        self.assertTrue((per_channel >= 0).all())
+        self.assertAlmostEqual(float(per_channel.sum()),
+                               float(np.dot(mu.flatten(), mu.flatten())))
+
+    def test_uneven_division_drops_the_tail_like_the_shap_helper(self):
+        mu = np.array([1.0, 2.0, 3.0, 4.0, 5.0])       # 5 // 2 = 2 per channel
+        np.testing.assert_array_almost_equal(
+            aggregate_squared_per_channel(mu, n_channels=2), [5.0, 25.0])
+
+    def test_degenerate_channel_counts(self):
+        mu = np.array([1.0, 2.0])
+        self.assertEqual(aggregate_squared_per_channel(mu, 0).size, 0)
+        # More channels than features: window_size floors to 0.
+        np.testing.assert_array_almost_equal(
+            aggregate_squared_per_channel(mu, 4), np.zeros(4))
+
+    def test_gap_sums_to_the_score_difference(self):
+        rng = np.random.default_rng(11)
+        a, b = rng.normal(size=48), rng.normal(size=48)
+        gap = rank_gap_decomposition(a, b, n_channels=8)
+        expected = float(np.dot(a, a)) - float(np.dot(b, b))
+        self.assertAlmostEqual(float(gap.sum()), expected)
+
+    def test_gap_is_antisymmetric_and_zero_against_itself(self):
+        rng = np.random.default_rng(12)
+        a, b = rng.normal(size=24), rng.normal(size=24)
+        np.testing.assert_array_almost_equal(
+            rank_gap_decomposition(a, b, 4), -rank_gap_decomposition(b, a, 4))
+        np.testing.assert_array_almost_equal(
+            rank_gap_decomposition(a, a, 4), np.zeros(4))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 13.  Ranking criterion — leadership regimes
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestLeadershipRegimes(unittest.TestCase):
+
+    @staticmethod
+    def _history(rows):
+        """[{model: ||mu||^2}] -> the means_history shape the segmenter reads."""
+        return [{m: np.array([np.sqrt(v)]) for m, v in row.items()} for row in rows]
+
+    def test_run_length_encodes_the_argmax_without_merging(self):
+        """Pure RLE, no minimum length: a one-window lead is a regime. This is
+        the deliberate simplification over detect_regime_shifts, and it is what
+        produces short regimes wherever two detectors are near-tied."""
+        hist = self._history([{"A": 1.0, "B": 0.0}] * 10
+                            + [{"A": 1.0, "B": 2.0}] * 3
+                            + [{"A": 5.0, "B": 2.0}])
+        segments, warmup = leadership_regimes(hist, warmup=10)
+        self.assertEqual(warmup, 10)
+        self.assertEqual(segments, [(10, 12, "B", 3), (13, 13, "A", 1)])
+
+    def test_warmup_windows_are_excluded(self):
+        """Until every arm has been sampled most scores are exactly zero, so
+        leadership there reflects sampling order, not merit."""
+        hist = self._history([{"A": 0.0, "B": 1.0}] * 10
+                            + [{"A": 3.0, "B": 1.0}] * 10)
+        segments, _ = leadership_regimes(hist, warmup=10)
+        self.assertEqual(segments, [(10, 19, "A", 10)])
+        # Window indices stay on the original timeline, so they still line up
+        # with the plots and the per-window artefacts.
+        self.assertEqual(segments[0][0], 10)
+
+    def test_short_runs_collapse_the_warmup_rather_than_returning_nothing(self):
+        hist = self._history([{"A": 1.0, "B": 0.0}] * 5)
+        segments, warmup = leadership_regimes(hist, warmup=10)
+        self.assertEqual(warmup, 0)
+        self.assertEqual(segments, [(0, 4, "A", 5)])
+
+    def test_exact_ties_never_manufacture_a_boundary(self):
+        """All-zero scores are the normal early state; argmax over them must be
+        stable or every window would look like a regime change."""
+        hist = self._history([{"A": 0.0, "B": 0.0, "C": 0.0}] * 20)
+        segments, _ = leadership_regimes(hist, warmup=10)
+        self.assertEqual(len(segments), 1)
+
+    def test_a_tie_at_the_top_keeps_the_incumbent(self):
+        hist = self._history([{"A": 2.0, "B": 1.0}] * 12
+                            + [{"A": 2.0, "B": 2.0}] * 4)
+        segments, _ = leadership_regimes(hist, warmup=10)
+        self.assertEqual([s[2] for s in segments], ["A"])
+
+    def test_non_finite_scores_never_lead(self):
+        """A failed window leaves NaN behind; it must not hand that detector
+        the lead, and it must not split the surrounding regime in two."""
+        hist = self._history([{"A": 1.0, "B": 0.5}] * 11
+                            + [{"A": float("nan"), "B": 0.5}]
+                            + [{"A": 1.0, "B": 0.5}] * 3)
+        segments, _ = leadership_regimes(hist, warmup=10)
+        self.assertEqual([(s[2]) for s in segments], ["A", "B", "A"])
+        # The NaN window goes to B (the only finite score), one window wide.
+        self.assertEqual(segments[1], (11, 11, "B", 1))
+
+    def test_empty_history(self):
+        self.assertEqual(leadership_regimes([], warmup=10), ([], 0))
 
 
 # ════════════════════════════════════════════════════════════════════════════

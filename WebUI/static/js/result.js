@@ -11,7 +11,8 @@
  * only the payload.
  */
 
-import { $, $$, el, getJSON, pct, proseNode, familyClass, timeAgo, postJSON } from "./dom.js";
+import { $, $$, el, getJSON, pct, proseNode, familyClass, timeAgo, postJSON,
+         makeSortable } from "./dom.js";
 import { openLightbox, attachLightbox } from "./gallery.js";
 
 const root = $("#result-root");
@@ -101,6 +102,7 @@ const EXTENDED_LABEL = {
   ga_selection: "Read the full explanation, including the detectors left out",
   monte_carlo: "Read the full explanation, including the winning noise ranges",
   off_by_threshold: "Read the full explanation, including property importances",
+  thompson_ranking: "Read the full explanation, including how leadership changed hands",
 };
 
 function narrativeDisclosure(stage) {
@@ -123,16 +125,37 @@ function narrativeDisclosure(stage) {
 function summaryTable(spec) {
   const head = el("tr", {}, spec.columns.map((c, i) =>
     el("th", { class: spec.align[i] === "num" ? "num" : "" }, c)));
-  const body = spec.rows.map((row) => el("tr", {}, row.map((cell, i) => {
-    const kind = spec.align[i];
-    return el("td", {
-      class: kind === "num" ? "num" : kind === "name" ? "detector" : "",
-      text: cell === null || cell === undefined ? "—" : String(cell),
-    });
-  })));
-  return el("div", { class: "table-scroll" },
-    el("table", { class: "summary-table" },
-      el("thead", {}, head), el("tbody", {}, body)));
+  // `collapse_after` hides the tail rather than dropping it: a decomposition
+  // whose parts sum to the whole is only honest if every part is reachable, so
+  // the rows are all in the DOM (and so all printed) with the overflow folded.
+  const fold = spec.collapse_after || 0;
+  const body = spec.rows.map((row, r) => el("tr",
+    { class: fold && r >= fold ? "extra" : "" }, row.map((cell, i) => {
+      const kind = spec.align[i];
+      return el("td", {
+        class: kind === "num" ? "num" : kind === "name" ? "detector" : "",
+        text: cell === null || cell === undefined ? "—" : String(cell),
+      });
+    })));
+  const table = el("table", { class: "summary-table" },
+    el("thead", {}, head), el("tbody", {}, body));
+  // The fold is declared on the element so sorting can re-apply it: hiding a
+  // fixed set of rows would survive a re-order and hide the wrong ones.
+  if (fold) table.dataset.collapseAfter = String(fold);
+  makeSortable(table);
+  const wrap = el("div", { class: "table-scroll" }, table);
+  if (!fold || spec.rows.length <= fold) return wrap;
+
+  const hidden = spec.rows.length - fold;
+  const button = el("button", { class: "link-button",
+    text: `Show all ${spec.rows.length} rows (${hidden} more)` });
+  button.addEventListener("click", () => {
+    const shown = table.classList.toggle("expanded");
+    button.textContent = shown
+      ? `Show top ${fold} only`
+      : `Show all ${spec.rows.length} rows (${hidden} more)`;
+  });
+  return el("div", {}, wrap, button);
 }
 
 function regimeSection(stage) {
@@ -142,8 +165,12 @@ function regimeSection(stage) {
     // fallback so a regime is never blank.
     el("div", {}, el("p", { class: "prose", text: regime.narrated || regime.text })),
     regime.plot
+      // The caption comes from the server when it has one: the two Thompson
+      // stages plot different quantities over the same window range, so a
+      // generic "windows X–Y" here would under-describe both.
       ? figureNode({ src: regime.plot, title: `Regime ${regime.index}`,
-                     caption: `Windows ${regime.start}–${regime.end}, led by ${regime.leader}.` })
+                     caption: regime.plot_caption
+                       || `Windows ${regime.start}–${regime.end}, led by ${regime.leader}.` })
       : el("p", { class: "muted small", text: "No plot for this regime." })));
   // Printable: this disclosure is the only place the per-regime prose appears
   // now that the stage has no full-text disclosure, and the print stylesheet
@@ -289,15 +316,16 @@ function appendix(payload) {
       el("td", { class: "num", text: pct(f.omission_rate) }),
       el("td", { class: "num", text: f.n_claims ?? "—" }));
   });
+  const table = makeSortable(el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { text: "Stage" }), el("th", { class: "num", text: "Words" }),
+      el("th", { class: "num", text: "Unsupported" }), el("th", { class: "num", text: "Omitted" }),
+      el("th", { class: "num", text: "Claims" }))),
+    el("tbody", {}, rows)));
   return el("details", { class: "card" },
     el("summary", { text: "Appendix: faithfulness and provenance" }),
     el("div", { class: "stack" },
-      el("table", {},
-        el("thead", {}, el("tr", {},
-          el("th", { text: "Stage" }), el("th", { class: "num", text: "Words" }),
-          el("th", { class: "num", text: "Unsupported" }), el("th", { class: "num", text: "Omitted" }),
-          el("th", { class: "num", text: "Claims" }))),
-        el("tbody", {}, rows)),
+      table,
       el("p", { class: "small muted", text:
         `Explanations read from myresults/explanations_nl/${payload.dataset}/${payload.entity}/` +
         (payload.iteration !== null && payload.iteration !== undefined

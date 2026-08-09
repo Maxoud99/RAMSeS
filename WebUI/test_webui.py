@@ -10,6 +10,7 @@ starts the pipeline or the LLM.
 import json
 import os
 import pickle
+import re
 import sys
 import tempfile
 import time
@@ -115,6 +116,37 @@ class ArtifactTreeCase(unittest.TestCase):
                _nl("Expected reward is the weights applied to the window.",
                    "Thompson Sampling ranked NN_1 first."))
 
+        # The ranking-criterion sibling: same tree, own files, own atom prefix.
+        _write(self.ir_dir / "ir_thompson_ranking.json", _ir(
+            "thompson_ranking",
+            output={"top_pick": "NN_1", "n_regimes": 1, "n_windows": 173,
+                    "n_channels": 8, "warmup_windows": 10},
+            evidence=[
+                {"id": "tsr.output.top", "type": "stage_output", "subject": "NN_1",
+                 "value": {"top": "NN_1", "score": 0.559322, "runner_up": "NN_2",
+                           "margin": 0.00041},
+                 "text": "Ranked by the size of its learned weights, NN_1 scored "
+                         "0.559322, ahead of NN_2 by 0.000410."},
+                {"id": "tsr.winner.channels", "type": "winner_channels",
+                 "subject": "NN_1",
+                 "value": {"channel": 3, "total": 0.559322,
+                           "per_channel": [[3, 0.229], [0, 0.101]]},
+                 "text": "NN_1's score is built mostly from channel 3 (41.0%)."},
+                {"id": "tsr.gap.runner_up", "type": "rank_gap", "subject": "NN_1",
+                 "value": {"rivals": ["NN_2"], "runner_up": "NN_2",
+                           "per_channel": [[3, 0.091], [0, -0.058]]},
+                 "text": "NN_1's lead over NN_2 came mostly from channel 3."},
+                {"id": "tsr.regime.0", "type": "regime", "subject": "NN_2",
+                 "value": {"start": 10, "end": 71, "duration": 62, "leader": "NN_2"},
+                 "text": "Regime 0 (windows 10 to 71, 62 windows) was led by NN_2."},
+            ]))
+        _write(self.nl_dir / "nl_thompson_ranking.txt",
+               _nl("The ranking score is the sum of every squared weight.",
+                   "Ranked by the size of its learned weights, NN_1 scored "
+                   "0.559322, ahead of NN_2 by 0.000410. NN_1's score is built "
+                   "mostly from channel 3 (41.0%). Regime 0 (windows 10 to 71, "
+                   "62 windows) was led by NN_2."))
+
         _write(self.ir_dir / "ir_monte_carlo.json", _ir(
             "monte_carlo", output={"top_pick_f1": "LOF_1", "top_pick_pr": "LOF_1"},
             caveats=[{"id": "mc.c", "type": "caveat", "subject": "x", "value": None,
@@ -153,6 +185,7 @@ class ArtifactTreeCase(unittest.TestCase):
             "stage_agreement": {"thompson": {"top_pick": "NN_1",
                                              "agrees_with_final_single": False}},
             "stages": {"thompson_sampling": {"status": "ok"},
+                       "thompson_ranking": {"status": "ok"},
                        "monte_carlo": {"status": "ok"},
                        "gan": {"status": "not_available",
                                "note": "no explainability layer implemented for the GAN test"}},
@@ -224,9 +257,46 @@ class TestBuildPayload(ArtifactTreeCase):
 
     def test_assembles_stages_in_pipeline_order(self):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        # The ranking criterion precedes the selection dynamics: it explains the
+        # ordering the rest of the pipeline consumes.
         self.assertEqual([s["key"] for s in p["stages"]],
-                         ["thompson_sampling", "monte_carlo", "rank_aggregation_robust"])
-        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 6])
+                         ["thompson_ranking", "thompson_sampling", "monte_carlo",
+                          "rank_aggregation_robust"])
+        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 5, 7])
+
+    def test_stage_order_matches_the_narrator(self):
+        """The merged .txt and the page must present the stages in one order.
+
+        artifacts.STAGES and llm._GLOBAL_STAGE_ORDER are independent copies, and
+        a divergence would give the global document section headings in a
+        different sequence from the cards on the page.
+        """
+        llm_path = Path(__file__).resolve().parent.parent / "Explainability" / "llm.py"
+        source = llm_path.read_text(encoding="utf-8")
+        order = re.search(r"_GLOBAL_STAGE_ORDER = \((.*?)\)", source, re.S).group(1)
+        narrator = re.findall(r'"([a-z_]+)"', order)
+        self.assertEqual([s["key"] for s in artifacts.STAGES], narrator)
+
+    def test_stage_titles_match_the_narrator(self):
+        """Same reason: the titles are duplicated verbatim in llm.py."""
+        llm_path = Path(__file__).resolve().parent.parent / "Explainability" / "llm.py"
+        source = llm_path.read_text(encoding="utf-8")
+        block = re.search(r"_GLOBAL_STAGE_TITLES = \{(.*?)\n\}", source, re.S).group(1)
+        titles = dict(re.findall(r'"([a-z_]+)": "([^"]+)"', block))
+        for stage in artifacts.STAGES:
+            self.assertEqual(titles.get(stage["key"]), stage["title"], stage["key"])
+
+    def test_the_payload_serves_the_trimmed_body_but_counts_the_real_one(self):
+        """`full` is what the disclosure renders; `words` and the download stay
+        on the narrative as written, which is the verbatim record."""
+        p = artifacts.build_payload("SKAB", "7")
+        s = next(x for x in p["stages"] if x["key"] == "thompson_ranking")
+        self.assertNotIn("Regime 0", s["full"])
+        self.assertIn("Ranked by the size of its learned weights", s["full"])
+        self.assertGreater(s["words"], len(s["full"].split()))
+        # And the regimes still carry their own narrated sentences.
+        self.assertTrue(any("Regime 0" in (r.get("narrated") or r["text"])
+                            for r in s["regimes"]))
 
     def test_case_insensitive_dataset_and_entity(self):
         # The pipeline writes the dataset string verbatim, so `skab` and `SKAB`
@@ -322,7 +392,8 @@ class TestBuildPayload(ArtifactTreeCase):
         self.assertEqual(artifacts.known_entities(), [("SKAB", "7")])
         s = artifacts.entity_summary(self.DATASET, self.ENTITY)
         self.assertEqual(s["framework_choice"], "ensemble")
-        self.assertEqual(s["n_stages"], 2)
+        # Both Thompson stages plus Monte Carlo; GAN is not_available.
+        self.assertEqual(s["n_stages"], 3)
         self.assertEqual(s["hallucination_rate"], 0.0)
 
 
@@ -503,6 +574,92 @@ class TestSummaryDropsAtomClasses(unittest.TestCase):
         self.assertNotIn("0.042", out["summary"])
 
 
+class TestCaveatsStayInTheExtendedView(unittest.TestCase):
+    """Caveats qualify a result rather than stating it, so they belong with the
+    detail behind the click. They are matched lexically, not by the name/number
+    scorer: most carry neither a detector name nor a number, so that scorer
+    cannot see them at all."""
+
+    CAVEAT = ("Correctness is judged on thresholded predictions (the F1 side); "
+              "PR-AUC has no per-point notion of correct or incorrect.")
+
+    def _ir(self, stage):
+        return {"ir_version": "1.0", "stage": stage, "dataset": "DS",
+                "entity": "e1", "output": {},
+                "evidence": [
+                    {"id": "w", "type": "stage_output", "subject": "LOF_1",
+                     "value": {}, "text": "LOF_1 was the highest-ranked model."},
+                    {"id": "v", "type": "feature_importance", "subject": "NN_3",
+                     "value": {}, "text": "Against NN_3 the separator is position "
+                                          "(importance 0.71)."},
+                ],
+                "caveats": [{"id": "c", "type": "caveat", "subject": "scope",
+                             "value": None, "text": self.CAVEAT}],
+                "required_atom_ids": [], "confidence": {}}
+
+    NARRATIVE = ("LOF_1 was the highest-ranked model. Against NN_3 the separator "
+                 "is position (importance 0.71). Note that correctness is judged "
+                 "on thresholded predictions (the F1 side), and PR-AUC has no "
+                 "per-point notion of correct or incorrect.")
+
+    def test_caveat_leaves_the_default_view(self):
+        out = summarize.summarize(self.NARRATIVE, stage="off_by_threshold",
+                                  ir_doc=self._ir("off_by_threshold"))
+        self.assertNotIn("thresholded predictions", out["summary"])
+        self.assertIn("highest-ranked model", out["summary"])
+
+    def test_thompson_keeps_its_caveats(self):
+        """Deliberately exempt — its caveats belong in the default view."""
+        ir_doc = self._ir("thompson_sampling")
+        ir_doc["evidence"][1] = {"id": "r0", "type": "regime", "subject": "NN_3",
+                                 "value": {}, "text": "Regime 0 was led by NN_3."}
+        narrative = ("LOF_1 was the highest-ranked model. Regime 0 was led by "
+                     "NN_3. Note that correctness is judged on thresholded "
+                     "predictions (the F1 side), and PR-AUC has no per-point "
+                     "notion of correct or incorrect.")
+        out = summarize.summarize(narrative, stage="thompson_sampling", ir_doc=ir_doc)
+        self.assertIn("thresholded predictions", out["summary"])
+        self.assertNotIn("Regime 0", out["summary"])
+
+    def test_a_table_lead_is_never_a_caveat(self):
+        ir_doc = {"ir_version": "1.0", "stage": "rank_aggregation_robust",
+                  "dataset": "DS", "entity": "e1", "output": {},
+                  "evidence": [
+                      {"id": "s1", "type": "source_role", "subject": "GAN_F1",
+                       "value": {"influence_rank": 1, "agreement_rank": 1,
+                                 "borda_rank": 1, "pattern": "consistent"},
+                       "text": "GAN_F1 shaped the consensus most."}],
+                  "caveats": [{"id": "c", "type": "caveat", "subject": "agg",
+                               "value": None,
+                               "text": "The consensus ranking is produced by "
+                                       "Markov-chain rank aggregation over the "
+                                       "source rankings."}],
+                  "required_atom_ids": [], "confidence": {}}
+        # No stage_output sentence, so the lead falls back — and must skip the
+        # caveat rather than introduce the table with its own limitation.
+        narrative = ("The consensus ranking is produced by Markov-chain rank "
+                     "aggregation over the source rankings. GAN_F1 shaped the "
+                     "consensus most.")
+        out = summarize.summarize(narrative, stage="rank_aggregation_robust",
+                                  ir_doc=ir_doc)
+        self.assertEqual(out["summary"], "GAN_F1 shaped the consensus most.")
+
+    def test_sharing_vocabulary_is_not_a_caveat(self):
+        """An evidence sentence that happens to reuse a caveat's words must
+        survive; the bar is deliberately high."""
+        ir_doc = self._ir("off_by_threshold")
+        hits = summarize.caveat_sentences(
+            "LOF_1 was judged correct on 4 points.", ir_doc)
+        self.assertEqual(hits, [])
+
+    def test_final_consensus_keeps_everything(self):
+        # No entry in _STAGE_SUMMARY at all, so nothing is held back.
+        out = summarize.summarize(self.NARRATIVE, stage="rank_aggregation_final",
+                                  ir_doc=self._ir("rank_aggregation_final"))
+        self.assertTrue(out["is_full"])
+        self.assertIn("thresholded predictions", out["summary"])
+
+
 class TestThompsonRegimeHandling(unittest.TestCase):
 
     def _ir(self):
@@ -578,6 +735,129 @@ class TestThompsonRegimeHandling(unittest.TestCase):
         artifacts._attach_narrated_regimes(regimes, "Nothing about regimes here.",
                                            self._ir())
         self.assertNotIn("narrated", regimes[0])
+
+
+class TestThompsonRankingStage(unittest.TestCase):
+    """The ||mu||^2 sibling. It reuses the regime machinery rather than forking
+    it, so these tests pin that the shared path really is shared."""
+
+    def _ir(self):
+        atoms = [
+            {"id": "tsr.output.top", "type": "stage_output", "subject": "NN_1",
+             "value": {"top": "NN_1", "score": 0.559322, "runner_up": "NN_2",
+                       "margin": 0.00041},
+             "text": "Ranked by the size of its learned weights, NN_1 scored "
+                     "0.559322, ahead of NN_2 by 0.000410."},
+            {"id": "tsr.winner.channels", "type": "winner_channels",
+             "subject": "NN_1",
+             "value": {"channel": 3, "total": 0.5,
+                       "per_channel": [[3, 0.25], [0, 0.15], [7, 0.10]]},
+             "text": "NN_1's score is built mostly from channel 3 (50.0%)."},
+            {"id": "tsr.gap.runner_up", "type": "rank_gap", "subject": "NN_1",
+             "value": {"rivals": ["NN_2"], "runner_up": "NN_2",
+                       "per_channel": [[3, 0.091], [0, -0.058]]},
+             "text": "NN_1's lead over NN_2 came mostly from channel 3 (0.091)."},
+            {"id": "tsr.support", "type": "support", "subject": "NN_1",
+             "value": {"winner_selections": 23, "runner_up": "NN_2"},
+             "text": "NN_1 was selected in 23 of the 173 windows, against 30 "
+                     "for NN_2."},
+            {"id": "tsr.regimes.summary", "type": "regime_summary",
+             "subject": "regimes", "value": {},
+             "text": "Leadership splits into 2 regimes led by 2 detectors."},
+        ]
+        for i, (lead, a, b) in enumerate((("NN_2", 10, 71), ("NN_1", 72, 172))):
+            atoms.append({"id": f"tsr.regime.{i}", "type": "regime", "subject": lead,
+                          "value": {"start": a, "end": b, "leader": lead},
+                          "text": f"Regime {i} (windows {a} to {b}) was led by {lead}."})
+        return _stage_ir("thompson_ranking", atoms)
+
+    NARRATIVE = (
+        "Ranked by the size of its learned weights, NN_1 scored 0.559322, ahead "
+        "of NN_2 by 0.000410. NN_1's score is built mostly from channel 3 "
+        "(50.0%). NN_1's lead over NN_2 came mostly from channel 3 (0.091). "
+        "NN_1 was selected in 23 of the 173 windows, against 30 for NN_2. "
+        "Leadership splits into 2 regimes led by 2 detectors. Regime 0 (windows "
+        "10 to 71) was led by NN_2. Regime 1 (windows 72 to 172) was led by NN_1.")
+
+    def test_summary_stops_after_the_answer(self):
+        """The default view answers the question — winner, the channels its
+        score is built from, which channels decided the margin — and stops.
+        The selection counts, the regime walk and the limitations are all
+        supporting detail behind the click."""
+        out = summarize.summarize(self.NARRATIVE, stage="thompson_ranking",
+                                  ir_doc=self._ir())
+        self.assertIn("built mostly from channel 3", out["summary"])
+        self.assertIn("lead over NN_2", out["summary"])
+        for held_back in ("Regime 0", "Regime 1", "Leadership splits",
+                          "was selected in"):
+            self.assertNotIn(held_back, out["summary"])
+        # Unlike its sibling this stage keeps a full-text disclosure, which is
+        # what makes dropping the caveats safe.
+        self.assertIsNone(out.get("extended_in"))
+        self.assertFalse(out["is_full"])
+
+    def test_the_regime_walk_appears_beside_its_plots_and_nowhere_else(self):
+        """The regime sentences are held back from the summary AND from the
+        full-text view: they belong next to their own per-regime figures, and a
+        card that also lists them under "read the full explanation" is showing
+        the same eleven sentences twice, the second time without the plots."""
+        out = summarize.summarize(self.NARRATIVE, stage="thompson_ranking",
+                                  ir_doc=self._ir())
+        extended = out["extended"]
+        self.assertNotIn("Regime 0", extended)
+        self.assertNotIn("Regime 1", extended)
+        # Everything else the summary held back is exactly what the click buys.
+        self.assertIn("Leadership splits", extended)
+        self.assertIn("was selected in", extended)
+
+
+    def test_a_drop_stage_can_also_carry_a_table(self):
+        """The channel split is the stage's headline answer and 38 channels on
+        SMD do not read as prose, so this stage holds sentences back AND
+        tabulates — a combination no other stage used before."""
+        out = summarize.summarize(self.NARRATIVE, stage="thompson_ranking",
+                                  ir_doc=self._ir())
+        table = out["table"]
+        self.assertEqual(table["columns"],
+                         ["Channel", "Share", "Contribution", "vs NN_2"])
+        self.assertEqual([r[0] for r in table["rows"]],
+                         ["channel 3", "channel 0", "channel 7"])
+        self.assertEqual(table["collapse_after"], 5)
+        self.assertEqual(table["rows"][0][1], "50.0%")
+        self.assertEqual(table["rows"][0][3], "+0.091000")
+        # A channel the gap atom does not mention renders as a blank, not a zero:
+        # "no delta recorded" and "the two are level" are different claims.
+        self.assertIsNone(table["rows"][2][3])
+
+    def test_the_table_keeps_every_channel_and_folds_the_tail(self):
+        """The shares only mean anything because they sum to the whole score,
+        so no channel may be dropped however many there are — SMD carries 38.
+        The default view shows five; the rest are folded, not discarded."""
+        ir_doc = self._ir()
+        atom = next(a for a in ir_doc["evidence"] if a["type"] == "winner_channels")
+        atom["value"]["per_channel"] = [[c, 1.0] for c in range(1000)]
+        table = summarize._ts_ranking_table(ir_doc)
+        self.assertEqual(len(table["rows"]), 1000)
+        self.assertEqual(table["collapse_after"], 5)
+
+    def test_regime_atoms_are_found_despite_the_different_prefix(self):
+        """One regex serves `ts.regime.N` and `tsr.regime.N`; a prefix-anchored
+        one would silently find nothing here and every regime would vanish."""
+        regimes = artifacts._regimes_from_ir(self._ir())
+        self.assertEqual([r["index"] for r in regimes], [0, 1])
+        artifacts._attach_narrated_regimes(regimes, self.NARRATIVE, self._ir())
+        self.assertIn("was led by NN_2", regimes[0]["narrated"])
+        self.assertIn("was led by NN_1", regimes[1]["narrated"])
+
+    def test_a_stage_only_drops_caveats_when_it_has_a_full_text_view(self):
+        """`extended_in` suppresses the full-text disclosure, so dropping the
+        caveats there would delete them from the page with no error. This stage
+        has the disclosure and does drop them; its sibling has neither."""
+        self.assertTrue(
+            summarize._STAGE_SUMMARY["thompson_ranking"]["drop_caveats"])
+        for key, spec in summarize._STAGE_SUMMARY.items():
+            if spec.get("extended_in"):
+                self.assertFalse(spec.get("drop_caveats"), key)
 
 
 class TestSummaryTables(unittest.TestCase):
@@ -820,6 +1100,53 @@ class TestPlots(unittest.TestCase):
         self.assertEqual(sorted(r), [0, 13])
         self.assertIn("Windows 147\u2013172, led by NN_2", r[13]["caption"])
 
+    def test_each_thompson_stage_gets_its_own_regime_directory(self):
+        """Both stages mint the same filename shape into one tree, so the only
+        thing separating their regimes is the subdirectory the caller names.
+        Crossing them would put expected-reward plots beside ||mu||^2 prose."""
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        self._touch("Thomposon/SKAB/7/shap_per_regime_50/regime_00_w0-4_NN_3.png")
+        self._touch("Thomposon/SKAB/7/ranking_per_regime_50/regime_00_w10-71_NN_2.png")
+        self._touch("Thomposon/SKAB/7/ranking_per_regime_50/regime_01_w72-172_NN_1.png")
+        shap = self.plots.regime_plots("SKAB", "7")
+        ranking = self.plots.regime_plots("SKAB", "7", "ranking_per_regime")
+        self.assertEqual(sorted(shap), [0])
+        self.assertEqual(sorted(ranking), [0, 1])
+        self.assertIn("led by NN_3", shap[0]["caption"])
+        self.assertIn("led by NN_2", ranking[0]["caption"])
+
+    def test_ranking_builder_reads_only_its_own_prefix(self):
+        """Both Thompson stages share TREE_THOMPSON and are separated purely by
+        the `ranking_` filename prefix, exactly as the two GA stages are."""
+        for name in ("expected_rewards_50", "expected_rewards_smoothed_50",
+                     "selection_states_50", "ranking_final_50", "ranking_gap_50",
+                     "ranking_criterion_50", "ranking_channels_50",
+                     "ranking_channels_all_50"):
+            self._touch(f"Thomposon/SKAB/7/{name}.png")
+        ranking, _ = self.plots._ts_ranking("SKAB", "7")
+        names = [f.get("name") for f in ranking if "name" in f]
+        self.assertNotIn("expected_rewards_50.png", names)
+        self.assertIn("ranking_final_50.png", names)
+        self.assertIn("ranking_gap_50.png", names)
+        # The all-vs-top-3 toggle is a variant group, not two separate figures.
+        variants = [f for f in ranking if "variants" in f]
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(len(variants[0]["variants"]), 2)
+
+        thompson, _ = self.plots._thompson("SKAB", "7")
+        self.assertNotIn("ranking_final_50.png",
+                         [f.get("name") for f in thompson if "name" in f])
+
+    def test_plot_groups_do_not_prefix_collide(self):
+        """result.js attaches lazy galleries with id.startsWith(plot_group), so
+        one group being a prefix of another makes a card claim the other's
+        galleries. `thompson` vs `ts_ranking` is the pair at risk."""
+        groups = [s["plot_group"] for s in artifacts.STAGES]
+        for a in groups:
+            for b in groups:
+                if a != b:
+                    self.assertFalse(a.startswith(b), f"{a} starts with {b}")
+
     def test_monte_carlo_defaults_to_the_plain_variant(self):
         for suffix in ("F1_plain", "F1", "PRAUC_plain"):
             self._touch(f"robustness/MonteCarlo/SKAB/7/SKAB_7_MonteCarlo_noise_curves_{suffix}.png")
@@ -854,6 +1181,53 @@ class TestPlots(unittest.TestCase):
         for bad in ("thompson/../../etc", "thompson/.hidden", "other/x", ""):
             self.assertEqual(
                 self.plots.gallery_page("SKAB", "7", bad)["items"], [])
+
+    def test_each_thompson_stage_owns_its_per_window_gallery(self):
+        """Both stages write per-window frames into the one Thompson tree, so
+        the gallery id carries the plot_group. result.js attaches a descriptor
+        with id.startsWith(plot_group), which is why these two group names must
+        not prefix one another."""
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        for i in range(30):
+            self._touch(f"Thomposon/SKAB/7/shap_per_window_50/window_{i:03d}.png")
+            self._touch(f"Thomposon/SKAB/7/ranking_per_window_50/window_{i:03d}.png")
+        ids = [d["id"] for d in self.plots.gallery_descriptors("SKAB", "7")]
+        self.assertIn("thompson/shap_per_window_50", ids)
+        self.assertIn("ts_ranking/ranking_per_window_50", ids)
+        for gid in ids:
+            group = gid.split("/")[0]
+            other = "ts_ranking" if group == "thompson" else "thompson"
+            self.assertFalse(gid.startswith(other), gid)
+        # The ranking group used to be rejected outright by a hardcoded gate.
+        page = self.plots.gallery_page("SKAB", "7", "ts_ranking/ranking_per_window_50")
+        self.assertEqual(page["total"], 30)
+
+    def test_per_regime_captions_say_which_quantity_they_show(self):
+        """The two stages' per-regime figures cover the same window range but
+        show different things — an averaged attribution vs a single cumulative
+        snapshot — so "windows 10–62" alone under-describes both."""
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        self._touch("Thomposon/SKAB/7/shap_per_regime_50/regime_00_w0-4_NN_3.png")
+        self._touch("Thomposon/SKAB/7/ranking_per_regime_50/regime_00_w10-62_NN_3.png")
+        shap = self.plots.regime_plots("SKAB", "7")[0]["caption"]
+        ranking = self.plots.regime_plots("SKAB", "7", "ranking_per_regime")[0]["caption"]
+        self.assertIn("averaged over the regime", shap)
+        self.assertIn("last window of the regime", ranking)
+        self.assertIn("cumulative", ranking)
+
+    def test_channel_plot_captions_state_the_selection_rule(self):
+        """These figures plot a subset — 9 channels on SKAB, 38 on SMD — and the
+        bars cannot say whether a missing channel was small or just not picked."""
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        for name in ("shap_average_top3_50", "shap_comparison_50",
+                     "ranking_channels_50"):
+            self._touch(f"Thomposon/SKAB/7/{name}.png")
+        captions = []
+        for builder in (self.plots._thompson, self.plots._ts_ranking):
+            headline, gallery = builder("SKAB", "7")
+            captions += [f.get("caption", "") for f in headline + gallery]
+        stating = [c for c in captions if "not necessarily zero" in c]
+        self.assertGreaterEqual(len(stating), 3, captions)
 
     def test_missing_directories_yield_empty_manifest_not_an_error(self):
         m = self.plots.manifest("NOPE", "999")
@@ -1271,6 +1645,22 @@ class TestRoutes(ArtifactTreeCase):
     def tearDown(self):
         self.jobs.reset_manager()
         super().tearDown()
+
+    def test_css_and_js_are_cache_busted_by_mtime(self):
+        """The server runs with use_reloader=False, so a frontend edit needs a
+        restart — and without a stamp the browser then keeps the old file, which
+        presents as the new feature simply not being there."""
+        html = self.client.get("/result/SKAB/7").get_data(as_text=True)
+        self.assertRegex(html, r'href="/static/css/ramses\.css\?v=\d+"')
+        self.assertRegex(html, r'src="/static/js/result\.js\?v=\d+"')
+
+    def test_dom_js_is_loaded_exactly_once_per_page(self):
+        """Every entry script imports "./dom.js". A second, stamped <script> tag
+        for it would be a different URL, so the module would evaluate twice and
+        bind the theme toggle twice — one click, two theme changes."""
+        for path in ("/", "/result/SKAB/7", "/report/SKAB/7"):
+            html = self.client.get(path).get_data(as_text=True)
+            self.assertEqual(html.count("js/dom.js"), 0, path)
 
     def test_pages_render(self):
         self.assertEqual(self.client.get("/").status_code, 200)

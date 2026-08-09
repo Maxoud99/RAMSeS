@@ -318,6 +318,63 @@ def aggregate_shap_per_channel(shap_values: np.ndarray, n_channels: int) -> np.n
     return shap_values[: n_channels * window_size].reshape(n_channels, window_size).sum(axis=1)
 
 
+def aggregate_squared_per_channel(mean: np.ndarray, n_channels: int) -> np.ndarray:
+    """
+    Split the ranking score ||mu||^2 into one contribution per channel.
+
+    The ranking criterion is mu^T mu = sum_i mu_i^2, and the flattened feature
+    vector lays channels out in contiguous blocks of window_size timesteps (the
+    same layout aggregate_shap_per_channel assumes), so channel c contributes
+
+        contrib(c) = sum_{i in block c} mu_i^2
+
+    and sum_c contrib(c) == ||mu||^2 exactly. Unlike a SHAP attribution this is
+    a sum of squares, so **every contribution is non-negative**: it says how a
+    detector's score is divided among channels, never which channels pushed it
+    down. Only a comparison between two detectors (rank_gap_decomposition) is
+    signed.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The posterior mean mu_k. May be 1-D (d,) or column (d, 1).
+    n_channels : int
+        Number of sensor channels.
+
+    Returns
+    -------
+    np.ndarray
+        Per-channel contributions to ||mu||^2, shape (n_channels,), all >= 0.
+    """
+    if n_channels <= 0:
+        return np.zeros(0)
+    mu = mean.flatten()
+    window_size = mu.size // n_channels
+    if window_size == 0:
+        return np.zeros(n_channels)
+    block = mu[: n_channels * window_size].reshape(n_channels, window_size)
+    return np.square(block).sum(axis=1)
+
+
+def rank_gap_decomposition(mean_a: np.ndarray, mean_b: np.ndarray,
+                           n_channels: int) -> np.ndarray:
+    """
+    Split the ranking gap ||mu_a||^2 - ||mu_b||^2 into one term per channel.
+
+    This is the signed counterpart of aggregate_squared_per_channel: it sums to
+    the margin exactly, and a negative entry means that channel was worked in
+    B's favour, i.e. it cost A part of its lead. This — not the per-detector
+    split — is what answers "which channels put A ahead of B".
+
+    Returns
+    -------
+    np.ndarray
+        Per-channel signed contributions to the gap, shape (n_channels,).
+    """
+    return (aggregate_squared_per_channel(mean_a, n_channels)
+            - aggregate_squared_per_channel(mean_b, n_channels))
+
+
 def detect_regime_shifts(
     expected_rewards_history: Dict[str, List[float]],
     smoothing_window: int = 5,
@@ -450,6 +507,84 @@ def reconstruct_regime_segments(
         models_seq = [regime_shifts[0]['from_model']] + [s['to_model'] for s in regime_shifts]
         return [(rs, re - 1, rm, re - rs) for rm, rs, re in zip(models_seq, starts, ends)]
     return [(0, T - 1, fallback_model, T)]
+
+
+def leadership_regimes(
+    means_history: List[Dict[str, np.ndarray]],
+    warmup: int = 10,
+) -> Tuple[List[Tuple[int, int, str, int]], int]:
+    """
+    Segment the run by whichever detector leads on the ranking score ||mu||^2.
+
+    Deliberately simpler than detect_regime_shifts(), which smooths expected
+    rewards and imposes a minimum length: here a regime is just a maximal run of
+    consecutive windows with the same argmax_k ||mu_k||^2 — no smoothing, no
+    minimum length. ||mu||^2 leadership is far stickier than expected-reward
+    leadership (it only moves in the windows where that arm was selected), so
+    plain run-length encoding already yields a handful of regimes rather than
+    one per handful of windows.
+
+    The first `warmup` windows are excluded: until every arm has been sampled at
+    least once most scores are still exactly zero, so leadership there is an
+    artefact of sampling order rather than a finding. The warm-up collapses to 0
+    on runs too short to spare it, and the value actually used is returned so
+    the explanation can state it instead of asserting a constant.
+
+    Reads the PRE-update means, keeping this stage on the single vintage the fit
+    loop snapshots (see _pre_means_hist) — every quantity here describes the
+    same moment. The post-update norms in _l2_norm_hist are the alternative.
+
+    Ties are resolved in favour of the incumbent leader, so an exact tie (all
+    scores zero, in practice) never manufactures a boundary; with no incumbent
+    the first name in sorted order wins, which keeps the result deterministic.
+
+    Parameters
+    ----------
+    means_history : List[Dict[str, np.ndarray]]
+        Per-window posterior means, one dict of {model: mu} per window.
+    warmup : int
+        Number of leading windows to exclude.
+
+    Returns
+    -------
+    Tuple[List[Tuple[int, int, str, int]], int]
+        (segments, warmup_used), segments as (start, end_inclusive, leader,
+        duration) with window indices on the original, un-trimmed timeline.
+    """
+    T = len(means_history)
+    if T <= 0:
+        return [], 0
+    warmup_used = warmup if (warmup > 0 and T > warmup + 2) else 0
+
+    segments: List[Tuple[int, int, str, int]] = []
+    leader: Optional[str] = None
+    start = warmup_used
+    for t in range(warmup_used, T):
+        scores = {m: float(np.dot(mu.flatten(), mu.flatten()))
+                  for m, mu in means_history[t].items()}
+        finite = {m: s for m, s in scores.items() if np.isfinite(s)}
+        if not finite:
+            # Every score unusable; carry the incumbent rather than inventing a
+            # boundary out of a failed window.
+            if leader is None:
+                continue
+            current = leader
+        else:
+            best = max(finite.values())
+            if leader is not None and np.isclose(finite.get(leader, -np.inf), best):
+                current = leader
+            else:
+                current = min(m for m, s in finite.items() if np.isclose(s, best))
+
+        if leader is None:
+            leader, start = current, t
+        elif current != leader:
+            segments.append((start, t - 1, leader, t - start))
+            leader, start = current, t
+
+    if leader is not None:
+        segments.append((start, T - 1, leader, T - start))
+    return segments, warmup_used
 
 
 def fit_linear_thompson_sampling(dataset,
@@ -981,11 +1116,25 @@ def _render_shap_comparison(
     top_n_channels: int,
     title: str,
     save_path: str,
+    ylabel: str = 'Per-channel SHAP contribution',
+    n_channels_total: Optional[int] = None,
+    note: Optional[str] = None,
 ) -> None:
     """
-    Shared grouped-bar renderer for SHAP comparison plots. Channels shown are the
-    union of each model's top_n_channels by |per-channel SHAP|. One bar per model
-    per channel; legend placed outside the plot area.
+    Shared grouped-bar renderer for per-channel comparison plots. Channels shown
+    are the union of each model's top_n_channels by |per-channel value|. One bar
+    per model per channel; legend placed outside the plot area.
+
+    `ylabel` names the quantity: the SHAP stage leaves the default, the ranking
+    stage passes the ||mu||^2 wording. Everything else about the two is identical,
+    so they share this renderer rather than a near-copy of it.
+
+    A footnote stating the channel-selection rule is added automatically, and
+    `note` is prepended to it. Every one of these figures shows a SUBSET of the
+    channels — datasets here carry 9 to 38 — and a reader cannot tell from the
+    bars alone whether an absent channel was small or simply not plotted. The
+    rule is generated here rather than written out at each call site so it can
+    never drift from the selection the code just performed.
     """
     plt.rcParams.update({
         "font.family": "serif",
@@ -1019,10 +1168,20 @@ def _render_shap_comparison(
     ax.set_xticks(x_base + bar_width * (n_models - 1) / 2)
     ax.set_xticklabels([f"ch{c}" for c in channels], rotation=45, ha='right')
     ax.set_xlabel('Channel')
-    ax.set_ylabel('Per-channel SHAP contribution')
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, axis='y', linestyle='--', linewidth=0.5, alpha=0.6)
     ax.legend(loc='upper left', frameon=False, bbox_to_anchor=(1.01, 1), borderaxespad=0)
+
+    scope = (f"{len(channels)} of {n_channels_total}" if n_channels_total
+             else f"{len(channels)}")
+    rule = (f"Channels shown ({scope}): the union over the plotted detectors of "
+            f"each one's {top_n_channels} largest |values|. A channel absent "
+            f"here was outside every plotted detector's top {top_n_channels}, "
+            f"not necessarily zero.")
+    ax.text(0.0, -0.17, ((note + "  ") if note else "") + rule,
+            transform=ax.transAxes, fontsize=7.5, color='dimgrey',
+            va='top', ha='left', wrap=True)
 
     plt.tight_layout(pad=1.2)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1106,7 +1265,7 @@ def plot_shap_comparison(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 8,
+    top_n_channels: int = 9,
     all_models: bool = False,
 ) -> None:
     """
@@ -1140,6 +1299,7 @@ def plot_shap_comparison(
         per_channel, sel_models, top_n_channels,
         title=title,
         save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_comparison{suffix}_{iterations}.png',
+        n_channels_total=n_channels,
     )
 
 
@@ -1150,7 +1310,7 @@ def plot_shap_per_window(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 8,
+    top_n_channels: int = 9,
     all_models: bool = False,
     sample_stride: Optional[int] = None,
 ) -> None:
@@ -1200,6 +1360,7 @@ def plot_shap_per_window(
             per_channel, sel_models, top_n_channels,
             title=title,
             save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            n_channels_total=n_channels,
         )
 
 
@@ -1211,7 +1372,7 @@ def plot_shap_per_regime(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 8,
+    top_n_channels: int = 9,
     all_models: bool = False,
 ) -> None:
     """
@@ -1261,6 +1422,8 @@ def plot_shap_per_regime(
             per_channel, sel_models, top_n_channels,
             title=title,
             save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
+            n_channels_total=n_channels,
+            note=(f'SHAP averaged over the {end - start + 1} windows of this regime.'),
         )
 
 
@@ -1271,7 +1434,7 @@ def plot_shap_average_all(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 8,
+    top_n_channels: int = 9,
     all_models: bool = True,
 ) -> None:
     """
@@ -1312,6 +1475,7 @@ def plot_shap_average_all(
         per_channel, sel_models, top_n_channels,
         title=title,
         save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_average_{suffix}_{iterations}.png',
+        n_channels_total=n_channels,
     )
 
 
@@ -1625,6 +1789,466 @@ def explain_thompson_sampling(
         logger.error(f"Thompson IR emission failed (non-fatal): {e}")
 
 
+# ── Ranking-criterion explainability (||mu_k||^2) ────────────────────────────
+#
+# The stage above explains mu^T x — the expected reward that drives per-window
+# selection. Everything below explains the quantity the detectors are actually
+# ranked by, mu^T mu, which is context-free and therefore decomposes over
+# channels on its own, with no baseline and no SHAP.
+
+def _norm_scores_at(means_at: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """||mu||^2 for every detector at one window."""
+    return {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means_at.items()}
+
+
+def _channel_pairs(values: np.ndarray, top_n: Optional[int] = None,
+                   by_magnitude: bool = False) -> List[Tuple[int, float]]:
+    """[(channel_index, value)] sorted for presentation, optionally truncated."""
+    pairs = [(int(c), float(v)) for c, v in enumerate(values)]
+    pairs.sort(key=lambda cv: -abs(cv[1]) if by_magnitude else -cv[1])
+    return pairs[:top_n] if top_n else pairs
+
+
+def _regime_ranking_facts(means_history: List[Dict[str, np.ndarray]],
+                          segments: List[Tuple[int, int, str, int]],
+                          n_channels: int,
+                          top_n_channels: int = 3) -> List[Dict[str, Any]]:
+    """
+    Per-regime facts, read at the regime's LAST window — the state the leader
+    had accumulated by the time it handed over, which is what its lead over that
+    regime's runner-up rests on.
+
+    The single source for both the report/IR and the per-regime plots, so the
+    prose and the figure beside it can never disagree.
+    """
+    facts: List[Dict[str, Any]] = []
+    for i, (start, end, leader, duration) in enumerate(segments):
+        if end >= len(means_history):
+            continue
+        at = means_history[end]
+        scores = _norm_scores_at(at)
+        rivals = sorted(((s, m) for m, s in scores.items() if m != leader), reverse=True)
+        runner = rivals[0][1] if rivals else None
+
+        top_channels = _channel_pairs(
+            aggregate_squared_per_channel(at[leader], n_channels), top_n_channels)
+        gap_channels = []
+        if runner is not None:
+            gap_channels = _channel_pairs(
+                rank_gap_decomposition(at[leader], at[runner], n_channels),
+                top_n_channels, by_magnitude=True)
+
+        facts.append({
+            "index": i, "start": int(start), "end": int(end),
+            "duration": int(duration), "leader": leader, "runner_up": runner,
+            "top_channels": top_channels, "gap_channels": gap_channels,
+            "score": scores.get(leader),
+            "runner_score": scores.get(runner) if runner else None,
+        })
+    return facts
+
+
+def plot_ranking_criterion(means_history: List[Dict[str, np.ndarray]],
+                           segments: List[Tuple[int, int, str, int]],
+                           warmup: int, dataset: str, entity: str,
+                           iterations: int) -> None:
+    """
+    ||mu_k||^2 for every detector across the run, with the leadership regimes
+    shaded and the excluded warm-up greyed out.
+
+    The sibling of plot_expected_rewards, on the axis the ranking actually uses:
+    where that plot shows a detector's chance of being picked next, this one
+    shows the quantity it is finally ranked by. Unsmoothed on purpose — regimes
+    here are read off the raw series, so a smoothed curve would show boundaries
+    the segmentation did not use.
+    """
+    if not means_history:
+        return
+    plt.rcParams.update({
+        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
+        "legend.fontsize": 9, "xtick.labelsize": 10, "ytick.labelsize": 10,
+    })
+    model_names = sorted(means_history[0].keys())
+    T = len(means_history)
+    series = {m: [float(np.dot(h[m].flatten(), h[m].flatten())) for h in means_history]
+              for m in model_names}
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colour_map = {m: plt.cm.tab20(i / max(len(model_names), 1))
+                  for i, m in enumerate(model_names)}
+    for m in model_names:
+        ax.plot(range(T), series[m], label=m, linewidth=1.4, color=colour_map[m])
+
+    # Fix the ceiling before annotating: every axvspan below would otherwise
+    # move it, and the labels would drift off the top of the axes.
+    ymax = ax.get_ylim()[1]
+    ax.set_ylim(ax.get_ylim()[0], ymax * 1.12)
+    ymax = ax.get_ylim()[1]
+
+    if warmup > 0:
+        ax.axvspan(-0.5, warmup - 0.5, color='grey', alpha=0.18, zorder=0)
+        ax.text(max(warmup / 2.0 - 0.5, 0.0), ymax * 0.5, 'warm-up',
+                ha='center', va='center', rotation=90, fontsize=8,
+                color='dimgrey')
+    for i, (start, end, leader, _duration) in enumerate(segments):
+        if i:
+            ax.axvline(start - 0.5, color='black', linestyle='--', linewidth=0.7,
+                       alpha=0.5)
+        ax.axvspan(start - 0.5, end + 0.5, color=colour_map.get(leader, 'grey'),
+                   alpha=0.10, zorder=0)
+        # Alternate the label height so neighbouring short regimes — which pure
+        # run-length encoding does produce wherever two detectors are near-tied —
+        # do not print on top of each other.
+        ax.text((start + end) / 2.0, ymax * (0.99 if i % 2 == 0 else 0.90),
+                f'R{i} {leader}', ha='center', va='top', fontsize=7,
+                rotation=90, color='black', alpha=0.75)
+
+    ax.set_xlabel('Window')
+    ax.set_ylabel(r'Ranking score  $\|\mu_k\|^2$')
+    ax.set_title('Ranking score over the run, shaded by leadership regime')
+    ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+    ax.legend(loc='upper left', frameon=False, bbox_to_anchor=(1.01, 1),
+              borderaxespad=0)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(os.path.join(directory, f'ranking_criterion_{iterations}.png'),
+                format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_ranking_final(means: Dict[str, np.ndarray],
+                       list_of_chosen_models: List[str],
+                       dataset: str, entity: str, iterations: int) -> None:
+    """
+    The final ranking as a bar chart, each bar annotated with how many windows
+    that detector was actually selected in.
+
+    The selection count is on the plot because it is the ranking's main
+    confound: mu only moves in the windows where its arm was pulled, so a low
+    bar on two selections means "barely tried", not "tried and found wanting".
+    """
+    if not means:
+        return
+    plt.rcParams.update({
+        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
+        "xtick.labelsize": 10, "ytick.labelsize": 10,
+    })
+    counts: Dict[str, int] = {}
+    for m in list_of_chosen_models or []:
+        counts[m] = counts.get(m, 0) + 1
+
+    ranking = sorted(((float(np.dot(mu.flatten(), mu.flatten())), m)
+                      for m, mu in means.items()), reverse=True)
+    labels = [m for _s, m in ranking][::-1]
+    values = [s for s, _m in ranking][::-1]
+
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.45 * len(labels) + 1.5)))
+    colours = ['#3B5BDB' if i == len(labels) - 1 else '#AAB2C8'
+               for i in range(len(labels))]
+    bars = ax.barh(labels, values, color=colours)
+    span = max(values) if values else 1.0
+    for bar, name in zip(bars, labels):
+        ax.text(bar.get_width() + span * 0.01, bar.get_y() + bar.get_height() / 2,
+                f'{bar.get_width():.6f}  ({counts.get(name, 0)} selections)',
+                va='center', fontsize=8)
+
+    ax.set_xlim(0, span * 1.35 if span else 1.0)
+    ax.set_xlabel(r'Ranking score  $\|\mu_k\|^2$')
+    ax.set_title('Final ranking, with the number of windows each detector was tried')
+    ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(os.path.join(directory, f'ranking_final_{iterations}.png'),
+                format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_ranking_channels(means: Dict[str, np.ndarray], n_channels: int,
+                          dataset: str, entity: str, iterations: int,
+                          top_k_models: int = 3, top_n_channels: int = 9,
+                          all_models: bool = False) -> None:
+    """Per-channel split of the final ||mu||^2, top-k detectors or all of them."""
+    if not means or n_channels <= 0:
+        return
+    models = (_top_k_models_by_norm(means, len(means)) if all_models
+              else _top_k_models_by_norm(means, top_k_models))
+    per_channel = {m: aggregate_squared_per_channel(means[m], n_channels)
+                   for m in models}
+    suffix = '_all' if all_models else ''
+    scope = 'all models' if all_models else f'top {top_k_models} by score'
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    _render_shap_comparison(
+        per_channel, models, top_n_channels,
+        title=f'Where each detector\'s ranking score comes from ({scope})',
+        save_path=os.path.join(directory,
+                               f'ranking_channels{suffix}_{iterations}.png'),
+        ylabel=r'Contribution to $\|\mu_k\|^2$',
+        n_channels_total=n_channels,
+        note='Final weights, at the end of the run.',
+    )
+
+
+def plot_ranking_gap(means: Dict[str, np.ndarray], n_channels: int,
+                     dataset: str, entity: str, iterations: int,
+                     top_n_channels: int = 12) -> None:
+    """
+    The winner's margin over the runner-up, split per channel and signed.
+
+    This is the plot that answers the ranking question directly: the bars sum
+    exactly to the gap between the two scores, so a green bar is a channel that
+    put the winner ahead and a red one is a channel the runner-up won.
+    """
+    if not means or n_channels <= 0 or len(means) < 2:
+        return
+    order = _top_k_models_by_norm(means, 2)
+    winner, runner = order[0], order[1]
+    gap = rank_gap_decomposition(means[winner], means[runner], n_channels)
+    pairs = _channel_pairs(gap, top_n_channels, by_magnitude=True)
+    if not pairs:
+        return
+    pairs = sorted(pairs, key=lambda cv: cv[1])
+
+    plt.rcParams.update({
+        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
+        "xtick.labelsize": 10, "ytick.labelsize": 10,
+    })
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.42 * len(pairs) + 1.5)))
+    ax.barh([f'ch{c}' for c, _v in pairs], [v for _c, v in pairs],
+            color=['#2F9E44' if v >= 0 else '#C92A2A' for _c, v in pairs])
+    ax.axvline(0, color='black', linewidth=0.7)
+    total = float(np.sum(gap))
+    ax.set_xlabel(r'Contribution to the gap in $\|\mu\|^2$')
+    ax.set_title(f'{winner} vs {runner}: where the {total:+.6f} margin came from\n'
+                 f'(green: {winner} ahead, red: {runner} ahead)')
+    ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(os.path.join(directory, f'ranking_gap_{iterations}.png'),
+                format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_ranking_per_window(means_history: List[Dict[str, np.ndarray]],
+                            n_channels: int, dataset: str, entity: str,
+                            iterations: int, top_k_models: int = 3,
+                            top_n_channels: int = 9, all_models: bool = False,
+                            sample_stride: Optional[int] = None) -> None:
+    """
+    One per-channel ranking-score plot per window, the sibling of
+    plot_shap_per_window.
+
+    Answers "what did the ranking score look like at window t" without the
+    ambiguity a per-regime figure carries: a regime spans many windows, and the
+    score is cumulative, so a single regime plot can only show one moment of it.
+    Here that moment is named on every frame.
+
+    all_models : bool
+        When False (default) each frame shows the top_k_models by ||mu||^2 AT
+        THAT WINDOW — the ranking as it stood then, not the final one — saved
+        under ranking_per_window_{iterations}/. When True every detector is
+        shown, under ranking_per_window_all_{iterations}/.
+    sample_stride : Optional[int]
+        When set (e.g. 10) only every stride-th window is plotted, saved under
+        ranking_per_window_every{stride}_{iterations}/.
+    """
+    if not means_history or n_channels <= 0:
+        return
+    base = "ranking_per_window_all" if all_models else "ranking_per_window"
+    if sample_stride and sample_stride > 1:
+        base = f"{base}_every{sample_stride}"
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    for t, at in enumerate(means_history):
+        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
+            continue
+        if all_models:
+            sel_models = _top_k_models_by_norm(at, len(at))
+            title = f'Ranking score by channel — window {t} (all detectors)'
+        else:
+            sel_models = _top_k_models_by_norm(at, top_k_models)
+            title = (f'Ranking score by channel — window {t} '
+                     f'(top {top_k_models} by score at this window)')
+        per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
+                       for m in sel_models}
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            ylabel=r'Contribution to $\|\mu_k\|^2$',
+            n_channels_total=n_channels,
+            note=(f'Weights as they stood at window {t}. The score is '
+                  f'cumulative, so these bars are the total accumulated up to '
+                  f'this window.'),
+        )
+
+
+def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
+                            segments: List[Tuple[int, int, str, int]],
+                            n_channels: int, dataset: str, entity: str,
+                            iterations: int, top_n_channels: int = 9) -> None:
+    """
+    One figure per leadership regime: the leader's per-channel score beside that
+    regime's runner-up, read at the regime's last window.
+
+    Filenames mirror shap_per_regime_{it}/ exactly — 0-based index, window range,
+    leader — so the same WebUI joiner pairs each figure with its own sentence.
+    """
+    if not means_history or not segments or n_channels <= 0:
+        return
+    directory = _fresh_plot_dir(
+        f'myresults/Thomposon/{dataset}/{entity}/ranking_per_regime_{iterations}/')
+    for fact in _regime_ranking_facts(means_history, segments, n_channels,
+                                      top_n_channels=n_channels):
+        end, leader, runner = fact["end"], fact["leader"], fact["runner_up"]
+        at = means_history[end]
+        models = [leader] + ([runner] if runner else [])
+        per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
+                       for m in models}
+        rng = f'{fact["start"]}-{end}'
+        _render_shap_comparison(
+            per_channel, models, top_n_channels,
+            title=(f'Ranking score by channel — regime {fact["index"]} '
+                   f'({leader}, windows {rng}), as at window {end}'),
+            save_path=os.path.join(
+                directory,
+                f'regime_{fact["index"]:02d}_w{rng}_{leader}.png'),
+            ylabel=r'Contribution to $\|\mu_k\|^2$',
+            n_channels_total=n_channels,
+            # Says plainly what a per-regime figure of a cumulative quantity can
+            # and cannot mean. Unlike the SHAP stage's per-regime plot, which
+            # averages a per-window attribution over the regime, this is a
+            # single snapshot: ||mu||^2 only moves when the arm is selected and
+            # never resets, so the bars carry everything the detector had
+            # accumulated by then, not what this regime contributed.
+            note=(f'Weights as they stood at window {end}, the last of this '
+                  f'regime. The score is cumulative, so this is the state '
+                  f'reached by the end of the regime, not the regime\'s own '
+                  f'contribution.'),
+        )
+
+
+def explain_thompson_ranking(
+    means: Dict[str, np.ndarray],
+    list_of_chosen_models: List[str],
+    shap_payload: Optional[Dict],
+    segments: List[Tuple[int, int, str, int]],
+    warmup_used: int,
+    dataset: str,
+    entity: str,
+    iterations: int,
+) -> None:
+    """
+    Write the ranking-criterion report and its IR.
+
+    Answers "why did Thompson Sampling rank the detectors as it did", which the
+    sibling stage does not: that one explains mu^T x, the per-window expected
+    reward, while the ranking is by mu^T mu. Both decompositions used here are
+    exact — the per-detector shares sum to that detector's score, and the
+    winner-minus-runner-up terms sum to the margin — so nothing is approximated
+    and there is no baseline to choose.
+    """
+    if not means:
+        return
+    payload = shap_payload or {}
+    n_channels = int(payload.get("n_channels") or 0)
+    means_history: List[Dict[str, np.ndarray]] = payload.get("means_history") or []
+    T = len(means_history)
+
+    final_scores = {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means.items()}
+    ranking = sorted(final_scores.items(), key=lambda kv: kv[1], reverse=True)
+    winner = ranking[0][0]
+    runner_up = ranking[1][0] if len(ranking) > 1 else None
+
+    winner_channels = (_channel_pairs(aggregate_squared_per_channel(means[winner], n_channels))
+                       if n_channels > 0 else [])
+    gap_channels = (_channel_pairs(
+        rank_gap_decomposition(means[winner], means[runner_up], n_channels),
+        by_magnitude=True) if (runner_up and n_channels > 0) else [])
+
+    counts: Dict[str, int] = {m: 0 for m in means}
+    for m in list_of_chosen_models or []:
+        counts[m] = counts.get(m, 0) + 1
+
+    regimes_data = _regime_ranking_facts(means_history, segments, n_channels)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    output_file = os.path.join(directory, f'ranking_explainability_{iterations}.txt')
+    with open(output_file, 'w') as f:
+        f.write("Thompson Sampling — ranking criterion ||mu_k||^2\n")
+        f.write("=" * 52 + "\n")
+        f.write(f"Dataset: {dataset}   Entity: {entity}   Windows: {T}   "
+                f"Channels: {n_channels}\n")
+
+        f.write("\n--- Final Ranking (by ||mu_k||^2) ---\n")
+        f.write(f"  {'Rank':>4}  {'Model':>12}  {'Score':>12}  {'Selections':>11}\n")
+        f.write("  " + "-" * 45 + "\n")
+        for rank, (m, score) in enumerate(ranking, 1):
+            f.write(f"  {rank:>4}  {m:>12}  {score:>12.6f}  {counts.get(m, 0):>11}\n")
+
+        f.write(f"\n--- Per-Channel Decomposition of {winner}'s Score ---\n")
+        f.write("  Contributions are sums of squared weights: non-negative, and they\n"
+                "  add up to the score exactly.\n")
+        total = sum(v for _c, v in winner_channels) or 1.0
+        for c, v in winner_channels[:20]:
+            f.write(f"  channel {c:>3}  {v:>12.6f}  ({100.0 * v / total:>5.1f}%)\n")
+        f.write(f"  {'total':>11}  {sum(v for _c, v in winner_channels):>12.6f}\n")
+
+        if runner_up:
+            f.write(f"\n--- {winner} vs {runner_up}: Gap Decomposition ---\n")
+            f.write("  Signed, and sums to the difference between the two scores.\n")
+            for c, v in gap_channels[:20]:
+                side = winner if v >= 0 else runner_up
+                f.write(f"  channel {c:>3}  {v:>+12.6f}  favours {side}\n")
+            f.write(f"  {'gap':>11}  {sum(v for _c, v in gap_channels):>+12.6f}\n")
+
+        f.write("\n--- Leadership Regimes ---\n")
+        f.write(f"  Warm-up windows excluded: {warmup_used}\n")
+        if not regimes_data:
+            f.write("  No regime could be formed.\n")
+        for r in regimes_data:
+            f.write(f"  Regime {r['index']:>2}  windows {r['start']:>4}-{r['end']:<4} "
+                    f"({r['duration']:>3} windows)  leader {r['leader']:>12}"
+                    f"  runner-up {str(r['runner_up']):>12}\n")
+
+        f.write("\n--- Per-Regime Channel Decomposition ---\n")
+        for r in regimes_data:
+            f.write(f"  Regime {r['index']} ({r['leader']}, windows "
+                    f"{r['start']}-{r['end']}):\n")
+            for c, v in r["top_channels"]:
+                f.write(f"      channel {c:>3}  {v:>12.6f}\n")
+            if r["runner_up"]:
+                f.write(f"    vs {r['runner_up']}:\n")
+                for c, v in r["gap_channels"]:
+                    f.write(f"      channel {c:>3}  {v:>+12.6f}\n")
+
+    print(f"Ranking explainability report saved to {output_file}")
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        ir_doc = _ir.build_thompson_ranking_ir(
+            dataset, entity, n_windows=T,
+            final_ranking=ranking,
+            winner_channels=winner_channels,
+            gap_channels=gap_channels,
+            selection_counts=counts,
+            regimes=regimes_data,
+            warmup_windows=warmup_used,
+            channel_names=payload.get("channel_names"),
+            n_channels=n_channels,
+        )
+        _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson_ranking")
+    except Exception as e:
+        logger.error(f"Thompson ranking IR emission failed (non-fatal): {e}")
+
+
 def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity, iterations, F1_Score_list_ind_curent,
                        PR_AUC_Score_list_ind_curent):
     data = test_data.entities[0].Y
@@ -1796,6 +2420,36 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
                                   regime_shifts, blip_windows, selection_states,
                                   shap_payload,
                                   dataset, entity, iterations)
+
+        # ── Ranking criterion (||mu_k||^2) — the sibling stage ──────────────
+        # Separate regimes from the ones above: leadership on the ranking score
+        # rather than on expected reward, by plain run-length encoding of the
+        # argmax. Segmented once here and handed to both the plots and the
+        # report so a figure can never disagree with the sentence beside it.
+        means_history = (shap_payload or {}).get("means_history") or []
+        n_channels_ranking = int((shap_payload or {}).get("n_channels") or 0)
+        regime_segments, warmup_used = leadership_regimes(means_history)
+        plot_ranking_criterion(means_history, regime_segments, warmup_used,
+                               dataset, entity, iterations)
+        plot_ranking_final(means, list_of_chosen_models, dataset, entity, iterations)
+        plot_ranking_channels(means, n_channels_ranking, dataset, entity, iterations)
+        plot_ranking_channels(means, n_channels_ranking, dataset, entity, iterations,
+                              all_models=True)
+        plot_ranking_gap(means, n_channels_ranking, dataset, entity, iterations)
+        plot_ranking_per_regime(means_history, regime_segments, n_channels_ranking,
+                                dataset, entity, iterations)
+        # Per-window frames, mirroring the SHAP stage's three sets: a regime is
+        # many windows and the score is cumulative, so the per-regime figure can
+        # only ever be one moment of it. These name the moment on every frame.
+        plot_ranking_per_window(means_history, n_channels_ranking,
+                                dataset, entity, iterations)
+        plot_ranking_per_window(means_history, n_channels_ranking,
+                                dataset, entity, iterations, all_models=True)
+        plot_ranking_per_window(means_history, n_channels_ranking,
+                                dataset, entity, iterations, sample_stride=10)
+        explain_thompson_ranking(means, list_of_chosen_models, shap_payload,
+                                 regime_segments, warmup_used,
+                                 dataset, entity, iterations)
 
     # evaulate over all current data and other data
 

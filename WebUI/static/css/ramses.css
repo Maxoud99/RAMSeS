@@ -344,6 +344,28 @@ td.detector { font-family: var(--font-detector); letter-spacing: -0.02em; }
 .summary-table tbody tr:last-child td { border-bottom: none; }
 .summary-table tbody tr:hover { background: var(--surface-sunken); }
 
+/* Sortable headers. The glyph is generated from aria-sort, so the visual state
+   and the state announced to a screen reader cannot drift apart. */
+th[aria-sort] { cursor: pointer; user-select: none; white-space: nowrap; }
+th[aria-sort]:hover { background: var(--surface-sunken); }
+th[aria-sort]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+th[aria-sort]::after { content: " ↕"; opacity: .3; font-size: .85em; }
+th[aria-sort="ascending"]::after { content: " ↑"; opacity: 1; }
+th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
+
+/* Folded overflow rows: present in the DOM, revealed by the toggle. A table
+   with 38 channels is a wall in the default view but must stay reachable —
+   and must print in full, like every other disclosure. */
+.summary-table tbody tr.extra { display: none; }
+.summary-table.expanded tbody tr.extra { display: table-row; }
+
+.link-button {
+  background: none; border: none; padding: 0; margin-top: var(--space-2);
+  font: inherit; font-size: 0.875rem; color: var(--accent);
+  cursor: pointer; text-decoration: underline; text-underline-offset: 2px;
+}
+.link-button:hover { color: var(--accent-strong, var(--accent)); }
+
 /* ── Run view ─────────────────────────────────────────────────────────────── */
 
 .run-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: var(--sp-5); align-items: start; }
@@ -446,6 +468,13 @@ td.detector { font-family: var(--font-detector); letter-spacing: -0.02em; }
   details > summary { display: none; }
   details, details.info { display: block !important; }
   details > *:not(summary) { display: block !important; }
+  /* Folded table rows print in full, for the same reason disclosures open. The
+     toggle itself is a <button>, already hidden above. */
+  .summary-table tbody tr.extra { display: table-row !important; }
+  /* The sort affordance is interactive; on paper it is noise. Whatever order
+     the reader left the table in is what prints. */
+  th[aria-sort] { cursor: auto; }
+  th[aria-sort]::after { content: "" !important; }
   .card { break-inside: avoid; border: 1px solid var(--border); box-shadow: none; }
   .stage-card { break-inside: avoid-page; page-break-inside: avoid; }
   figure { break-inside: avoid; }

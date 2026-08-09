@@ -7,6 +7,7 @@ test importorskips sklearn.
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -142,6 +143,27 @@ def _thompson_kwargs():
         blip_count=1,
         state_fractions={"random": 0.2, "exploitation": 0.6, "informed_exploration": 0.2},
         final_state="exploitation",
+    )
+
+
+def _thompson_ranking_kwargs():
+    return dict(
+        n_windows=40,
+        final_ranking=[("A", 1.5), ("B", 0.7), ("C", 0.2)],
+        # Sums to A's score of 1.5, as the real decomposition does exactly.
+        winner_channels=[(0, 0.9), (2, 0.4), (1, 0.2)],
+        # Sums to the 0.8 margin over B; the third entry is a channel B won.
+        gap_channels=[(0, 0.7), (2, 0.3), (1, -0.2)],
+        selection_counts={"A": 22, "B": 12, "C": 6},
+        regimes=[{"index": 0, "start": 10, "end": 24, "duration": 15,
+                  "leader": "B", "runner_up": "A",
+                  "top_channels": [(2, 0.3), (0, 0.1)],
+                  "gap_channels": [(2, 0.2)], "score": 0.4, "runner_score": 0.3},
+                 {"index": 1, "start": 25, "end": 39, "duration": 15,
+                  "leader": "A", "runner_up": "B",
+                  "top_channels": [(0, 0.9)], "gap_channels": [(0, 0.5)],
+                  "score": 1.5, "runner_score": 0.7}],
+        warmup_windows=10,
     )
 
 
@@ -331,6 +353,168 @@ class TestBuilders(unittest.TestCase):
         kwargs["final_ranking"] = [("NN_1", 1.5), ("LOF_2", 1.2), ("NN_3", 0.9)]
         mixed = ir.build_thompson_ir("DS", "e1", **kwargs)
         self.assertNotIn("ts.output.family", {a["id"] for a in mixed["evidence"]})
+
+    def test_thompson_ranking(self):
+        doc = ir.build_thompson_ranking_ir("DS", "e1", n_channels=4,
+                                           **_thompson_ranking_kwargs())
+        _check_envelope(self, doc, "thompson_ranking")
+        self.assertEqual(doc["output"]["top_pick"], "A")
+        self.assertEqual(doc["output"]["warmup_windows"], 10)
+        by_id = {a["id"]: a for a in doc["evidence"]}
+
+        # The lead states the criterion, not just the winner: this stage exists
+        # because the sibling's headline reports a ranking it never explains.
+        self.assertEqual(
+            by_id["tsr.output.top"]["text"],
+            "Ranked by the size of its learned weights, A scored 1.500000, "
+            "ahead of B by 0.800000.")
+
+        # Shares are percentages of the winner's own score, computed from the
+        # forwarded contributions rather than restated by the caller.
+        self.assertEqual(
+            by_id["tsr.winner.channels"]["text"],
+            "A's score is built mostly from channel 0 (60.0%), channel 2 "
+            "(26.7%), and channel 1 (13.3%).")
+        # No concentration atom: "the top 3 channels are N% of the score" is a
+        # restatement of the shares just given, and the narrator turned it into
+        # editorial ("indicating the remaining six contributed less
+        # significantly").
+        self.assertNotIn("tsr.winner.concentration", by_id)
+
+        # The gap is the only directional quantity, and it must name the rival.
+        # No raw values in the prose at all — the table and the gap plot carry
+        # them — and the losing channel's direction is stated in words. A signed
+        # "-0.200000" next to "in B's favour" had read as "bad for B" and
+        # inverted the claim in a real narration.
+        self.assertEqual(
+            by_id["tsr.gap.runner_up"]["text"],
+            "A's lead over B came mostly from channel 0 and channel 2, while "
+            "channel 1 favoured B the most.")
+        for atom_id in ("tsr.gap.runner_up", "tsr.winner.channels"):
+            self.assertNotIn("0.700000", by_id[atom_id]["text"])
+        self.assertEqual(by_id["tsr.gap.runner_up"]["value"]["per_channel"],
+                         [[0, 0.7], [2, 0.3], [1, -0.2]])
+        # `rivals` is a verifier._RIVAL_KEYS name, so the rival set gets checked
+        # against the narrated sentence for free.
+        self.assertEqual(by_id["tsr.gap.runner_up"]["value"]["rivals"], ["B"])
+
+        # Against the runner-up, not the least-tried detector: it is the
+        # comparison the ranking actually turns on, and it can cut against the
+        # winner. It is also the safer name — the runner-up is already in the
+        # lead sentence, whereas the least-tried one appeared nowhere else and
+        # got narrated as an outright wrong name (CBLOF_3 for LOF_3).
+        self.assertEqual(
+            by_id["tsr.support"]["text"],
+            "A was selected in 22 of the 40 windows, against 12 for B.")
+        self.assertEqual(by_id["tsr.support"]["value"]["runner_up"], "B")
+
+        # Each leader's regime count AND the windows it held: four short spells
+        # are not more of the run than one long one, so the count alone misleads.
+        self.assertEqual(
+            by_id["tsr.regimes.summary"]["text"],
+            "Leadership on this score changed hands over the run: it splits "
+            "into 2 regimes led by 2 different detectors: A led 1 regime, "
+            "spanning 15 windows and B led 1 regime, spanning 15 windows. "
+            "The first 10 windows are left out, because until every detector "
+            "has been tried its score is still zero.")
+        self.assertEqual(by_id["tsr.regimes.summary"]["value"]["windows_led"],
+                         {"A": 15, "B": 15})
+        # No runner-up in the regime sentence. Coverage is conjunctive, the
+        # narrator drops that clause, and the atom then passed only when the
+        # runner-up was named elsewhere by luck — so a run's faithfulness hung
+        # on which detector placed second. It stays in `value` and on the plot.
+        self.assertEqual(
+            by_id["tsr.regime.0"]["text"],
+            "Regime 0 (windows 10 to 24, 15 windows) was led by B. Channel 2 "
+            "and channel 0 supplied most of the score that kept it there.")
+        self.assertEqual(by_id["tsr.regime.0"]["value"]["runner_up"], "A")
+        for atom in doc["evidence"]:
+            if atom["type"] != "regime":
+                continue
+            runner = atom["value"]["runner_up"]
+            # The leader is named; the runner-up is not — that is the whole
+            # point, since every name in an atom's text becomes a coverage
+            # requirement the narrator has to satisfy.
+            self.assertRegex(atom["text"], rf"\b{atom['value']['leader']}\b")
+            self.assertNotRegex(atom["text"], rf"\b{runner}\b")
+
+        for rid in ("tsr.output.top", "tsr.winner.channels",
+                    "tsr.gap.runner_up",
+                    "tsr.support", "tsr.regimes.summary",
+                    "tsr.regime.0", "tsr.regime.1"):
+            self.assertIn(rid, doc["required_atom_ids"])
+
+        # Both method caveats always ride along: the non-negativity one is the
+        # single mistake the verifier cannot catch, and the exposure one is a
+        # real limit on what the ranking means.
+        caveats = {c["id"]: c["text"] for c in doc["caveats"]}
+        self.assertEqual(sorted(caveats),
+                         ["tsr.caveat.exposure", "tsr.caveat.nonnegative"])
+        self.assertIn("never be negative", caveats["tsr.caveat.nonnegative"])
+        self.assertIn("only move in windows where it was selected",
+                      caveats["tsr.caveat.exposure"])
+
+        self.assertIn("which channels drove each detector's ranking score up",
+                      doc["question"])
+        # The footer must say the two stages' regimes are different things.
+        self.assertIn("not the same regimes", doc["info_footer"])
+
+    def test_thompson_ranking_prose_never_gives_a_share_a_direction(self):
+        """A share is a sum of squares. "Channel 1 lowered the score" is the one
+        false sentence the verifier cannot see — its number and its channel name
+        are both correct — so the atoms must never model that phrasing."""
+        doc = ir.build_thompson_ranking_ir("DS", "e1", n_channels=4,
+                                           **_thompson_ranking_kwargs())
+        share_atoms = [a["text"] for a in doc["evidence"]
+                       if a["type"] in ("winner_channels", "regime")]
+        for text in share_atoms:
+            for direction in ("lowered", "reduced", "worked against",
+                              "dragged", "pushed it down", "negative"):
+                self.assertNotIn(direction, text.lower())
+        # The gap atom, and only the gap atom, may take a side — and it names
+        # the detector the channel went to, so direction cannot be inferred
+        # from a sign the narrator has to interpret.
+        gap = next(a for a in doc["evidence"] if a["type"] == "rank_gap")
+        self.assertIn("favoured B the most", gap["text"])
+
+    def test_thompson_ranking_degenerate_runs(self):
+        kwargs = _thompson_ranking_kwargs()
+        # A single regime must not claim leadership "changed hands", and a
+        # one-window regime must not read "1 windows".
+        kwargs["regimes"] = [{"index": 0, "start": 10, "end": 10, "duration": 1,
+                              "leader": "A", "runner_up": "B",
+                              "top_channels": [(0, 0.9)], "gap_channels": [],
+                              "score": 1.5, "runner_score": 0.7}]
+        doc = ir.build_thompson_ranking_ir("DS", "e1", n_channels=4, **kwargs)
+        by_id = {a["id"]: a for a in doc["evidence"]}
+        self.assertEqual(
+            by_id["tsr.regimes.summary"]["text"].split(".")[0],
+            "One detector held the highest score for the whole run: A, "
+            "across 1 windows")
+        self.assertIn("1 window)", by_id["tsr.regime.0"]["text"])
+        self.assertNotIn("1 windows", by_id["tsr.regime.0"]["text"])
+
+        # With one detector there is no runner-up, so the support sentence
+        # must not compare the winner against itself.
+        solo = _thompson_ranking_kwargs()
+        solo["final_ranking"] = [("A", 1.5)]
+        solo["selection_counts"] = {"A": 40}
+        solo["gap_channels"] = []
+        doc = ir.build_thompson_ranking_ir("DS", "e1", n_channels=4, **solo)
+        support = next(a for a in doc["evidence"] if a["id"] == "tsr.support")
+        self.assertEqual(support["text"], "A was selected in 40 of the 40 windows.")
+        self.assertNotIn("tsr.gap.runner_up", {a["id"] for a in doc["evidence"]})
+
+    def test_thompson_ranking_is_absent_from_cross_stage_agreement(self):
+        """Both Thompson stages report the same winner — they share rank_models
+        — so counting the new one would double-weight Thompson in the
+        consensus."""
+        self.assertIn("thompson_ranking", ir._STAGE_FILES)
+        with open(os.path.join(_THIS, "ir.py"), encoding="utf-8") as f:
+            source = f.read()
+        picks = re.search(r"stage_picks = \{(.*?)\n    \}", source, re.S)
+        self.assertIsNotNone(picks)
+        self.assertNotIn("thompson_ranking", picks.group(1))
 
     def test_ga_selection_no_archetype_codes_or_complementarity(self):
         doc = ir.build_ga_selection_ir("DS", "e1", _ga_selection_result())
@@ -562,7 +746,14 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("S2", ctx["text"])
         # Friendly consensus naming + question + glossary footer.
         self.assertIn("robustness consensus", robust["question"])
-        self.assertIn("influential_disagreer", robust["info_footer"])
+        # Prose spells the pattern out; the underscored form is an enum and
+        # stays in `value` for machine consumers, not in a human sentence.
+        self.assertIn("influential disagreer", robust["info_footer"])
+        self.assertNotIn("influential_disagreer", robust["info_footer"])
+        role = next(a for a in robust["evidence"]
+                    if a["id"] == "ra_robust.source.S1.role")
+        self.assertIn("an influential disagreer pattern", role["text"])
+        self.assertEqual(role["value"]["pattern"], "influential_disagreer")
 
         final = ir.build_rank_aggregation_ir(
             "DS", "e1", "final", 0, _rank_agg_result(True),
@@ -659,6 +850,12 @@ class TestBuilders(unittest.TestCase):
             "In the production Monte Carlo test, A ranked first by F1 score "
             "and B ranked first by PR-AUC.")
         self.assertIn("mc.surrogate.win_rates", doc["required_atom_ids"])
+        # All winners fit inside the top-K cut here, so there is no tail clause.
+        wr = next(a for a in doc["evidence"] if a["id"] == "mc.surrogate.win_rates")
+        self.assertEqual(
+            wr["text"],
+            "Across the noise sweep the trials were won by: A 60.0%, B 40.0%.")
+        self.assertEqual(wr["value"]["n_other"], 0)
         conf = doc["confidence"]
         self.assertEqual(conf["winner_surrogate_f1"]["grade"], "high")
         # Per-model cv R² is graded confidence data, number kept visible.
@@ -781,6 +978,35 @@ class TestBuilders(unittest.TestCase):
         self.assertEqual(
             [a for a in doc["evidence"] if a["type"] == "surrogate_rule"], [])
 
+    def test_mc_win_rates_account_for_the_detectors_the_cut_drops(self):
+        """The shares are of the same trials, so they sum to 100% across ALL
+        winners. Listing only the top few left a reader adding up 96% and
+        hunting for the bug, so the tail is stated rather than simply absent."""
+        result = _mc_result()
+        result["winner_f1"]["win_rates"] = {
+            "A": 0.39, "B": 0.20, "C": 0.13, "D": 0.12, "E": 0.12,   # top 5
+            "F": 0.03, "G": 0.01,                                    # cut
+        }
+        doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
+        wr = next(a for a in doc["evidence"] if a["id"] == "mc.surrogate.win_rates")
+        self.assertIn("the remaining 4.0% went to 2 further detectors", wr["text"])
+        self.assertEqual(wr["value"]["n_other"], 2)
+        self.assertEqual(wr["value"]["other_share"], 0.04)
+        # The cut detectors are still not named — that is what the cut is for.
+        self.assertNotIn("F", [m for m, _ in wr["value"]["listed"]])
+        # Listed shares plus the tail reach 100%.
+        self.assertAlmostEqual(
+            sum(r for _, r in wr["value"]["listed"]) + wr["value"]["other_share"],
+            1.0, places=6)
+
+    def test_mc_win_rates_singular_tail(self):
+        result = _mc_result()
+        result["winner_f1"]["win_rates"] = {
+            "A": 0.39, "B": 0.20, "C": 0.13, "D": 0.12, "E": 0.12, "F": 0.04}
+        doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
+        wr = next(a for a in doc["evidence"] if a["id"] == "mc.surrogate.win_rates")
+        self.assertIn("went to 1 further detector.", wr["text"])
+
     def test_mc_winner_surrogate_rules_not_emitted_but_fidelity_kept(self):
         # The winner-surrogate tree restates the win regions in fitted form, so
         # its rules are no longer evidence — but its held-out fidelity stays.
@@ -874,6 +1100,7 @@ class TestWriterAndAssembler(unittest.TestCase):
             ir.build_monte_carlo_ir("DS", "e1", _mc_result(), ["A"], ["A"]),
             ir.build_off_by_ir("DS", "e1", _off_by_result(), ["A", "B"]),
             ir.build_thompson_ir("DS", "e1", **_thompson_kwargs()),
+            ir.build_thompson_ranking_ir("DS", "e1", **_thompson_ranking_kwargs()),
             ir.build_rank_aggregation_ir("DS", "e1", "robust", 0,
                                          _rank_agg_result(), ["S1", "S2"],
                                          {"S1": "A", "S2": "B"}, ["A", "B"]),

@@ -621,8 +621,8 @@ class TestPrompts(unittest.TestCase):
         doc["stage"] = "rank_aggregation_robust"
         prompt = llm.build_stage_prompt(doc)
         self.assertIn("rank is a position", prompt)
-        self.assertIn("never restate a rank as 'high' or 'low'", prompt)
-        # Other stages get no hint.
+        self.assertIn("rather than calling it high or low", prompt)
+        # Other stages get their own hint, not this one.
         doc["stage"] = "monte_carlo"
         self.assertNotIn("rank is a position", llm.build_stage_prompt(doc))
 

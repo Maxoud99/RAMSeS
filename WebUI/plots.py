@@ -151,6 +151,16 @@ def _ga_combination(ds, ent):
     return headline, []
 
 
+# Every grouped-bar channel figure in both Thompson stages plots a subset —
+# entities here carry 9 to 38 channels — and the bars alone cannot tell a reader
+# whether a missing channel was small or simply not selected. The rule is stated
+# on the figures themselves too (Thompson_Sampling._render_shap_comparison);
+# this is the same sentence for the page.
+CHANNEL_RULE = ("Channels shown are the union over the plotted detectors of "
+                "each one's 9 largest values; a channel missing here was "
+                "outside every plotted detector's top 9, not necessarily zero.")
+
+
 def _thompson(ds, ent):
     d = _dir_for(TREE_THOMPSON, ds, ent)
     it = _iteration_tag(d)
@@ -171,23 +181,68 @@ def _thompson(ds, ent):
                         ["Top 3 detectors", "All detectors"])
         if avg:
             headline.append({"title": "Mean channel contribution across all windows",
-                             "caption": "Which channels carried each detector's expected reward.",
+                             "caption": "Which channels carried each detector's expected "
+                                        "reward. " + CHANNEL_RULE,
                              "variants": avg, "default": 0})
-        for pattern, title in ((f"history_plot_{it}.png", "Posterior history"),
-                               (f"shap_per_model_{it}.png", "Per-model channel attribution"),
-                               (f"shap_comparison_{it}.png", "Channel comparison (top 3)"),
-                               (f"shap_comparison_all_{it}.png", "Channel comparison (all)")):
+        for pattern, title, caption in (
+            (f"history_plot_{it}.png", "Posterior history", ""),
+            (f"shap_per_model_{it}.png", "Per-model channel attribution",
+             "One panel per detector, each showing its own 10 largest "
+             "contributions; a detector's other channels are not drawn."),
+            (f"shap_comparison_{it}.png", "Channel comparison (top 3)", CHANNEL_RULE),
+            (f"shap_comparison_all_{it}.png", "Channel comparison (all)", CHANNEL_RULE),
+        ):
             for path in _ls(d, pattern):
-                gallery.append(_fig(path, title))
+                gallery.append(_fig(path, title, caption))
     return headline, gallery
 
 
-def regime_plots(ds, ent) -> Dict[int, Dict[str, Any]]:
-    """Per-regime SHAP images keyed by regime index.
+def _ts_ranking(ds, ent):
+    """The ranking-criterion stage.
+
+    Shares TREE_THOMPSON with `_thompson` and is separated purely by the
+    `ranking_` filename prefix — the same way `_ga_combination` is separated
+    from `_ga_selection` inside one GA directory. `_iteration_tag` still reads
+    `expected_rewards_*.png`, which is written by the sibling stage into this
+    same directory.
+    """
+    d = _dir_for(TREE_THOMPSON, ds, ent)
+    it = _iteration_tag(d)
+    headline, gallery = [], []
+    if not it:
+        return headline, gallery
+    for pattern, title, caption in (
+        (f"ranking_final_{it}.png", "Final ranking",
+         "The score each detector was ranked by, with how many windows it was tried in."),
+        (f"ranking_gap_{it}.png", "What decided the top spot",
+         "The winner's margin over the runner-up, split channel by channel; "
+         "these bars sum to the margin exactly."),
+        (f"ranking_criterion_{it}.png", "Ranking score over the run",
+         "Every detector's score window by window, shaded by which one led."),
+    ):
+        found = _ls(d, pattern)
+        if found:
+            headline.append(_fig(found[0], title, caption))
+    channels = _variants(d, [f"ranking_channels_{it}.png", f"ranking_channels_all_{it}.png"],
+                         ["Top 3 detectors", "All detectors"])
+    if channels:
+        headline.append({"title": "Where each detector's score comes from",
+                         "caption": "Per-channel shares of the final weights. These are "
+                                    "sums of squared weights, so they are never "
+                                    "negative. " + CHANNEL_RULE,
+                         "variants": channels, "default": 0})
+    return headline, gallery
+
+
+def regime_plots(ds, ent, subdir_stem: str = "shap_per_regime") -> Dict[int, Dict[str, Any]]:
+    """Per-regime images keyed by regime index.
 
     Filenames are `regime_{NN}_w{start}-{end}_{model}.png` and 0-based, matching
-    the `ts.regime.N` atom ids, so each regime sentence can be shown beside its
-    own plot.
+    the `*.regime.N` atom ids, so each regime sentence can be shown beside its
+    own plot. `subdir_stem` selects which stage's regimes: `shap_per_regime` for
+    the expected-reward regimes, `ranking_per_regime` for the ||mu||^2 ones. Both
+    live in the same tree and mint the same filename shape, so one regex serves
+    both; the caller passes the stem from its STAGES row.
     """
     d = _dir_for(TREE_THOMPSON, ds, ent)
     it = _iteration_tag(d)
@@ -195,12 +250,20 @@ def regime_plots(ds, ent) -> Dict[int, Dict[str, Any]]:
         return {}
     out = {}
     pattern = re.compile(r"^regime_(\d+)_w(\d+)-(\d+)_(.+)\.png$")
-    for path in _ls(d / f"shap_per_regime_{it}"):
+    # The two stages' per-regime figures answer different questions over the
+    # same span, so the caption has to say which — "windows 10–62" alone reads
+    # as though both summarised the whole stretch.
+    detail = (" Weights as at the last window of the regime; the score is "
+              "cumulative, so this is the state reached by then, not what the "
+              "regime itself added."
+              if subdir_stem == "ranking_per_regime"
+              else " SHAP averaged over the regime's windows.")
+    for path in _ls(d / f"{subdir_stem}_{it}"):
         m = pattern.match(path.name)
         if m:
             out[int(m.group(1))] = _fig(
                 path, f"Regime {int(m.group(1))}",
-                f"Windows {m.group(2)}–{m.group(3)}, led by {m.group(4)}.")
+                f"Windows {m.group(2)}–{m.group(3)}, led by {m.group(4)}." + detail)
     return out
 
 
@@ -292,6 +355,7 @@ _BUILDERS = {
     "ga_selection": _ga_selection,
     "ga_combination": _ga_combination,
     "thompson": _thompson,
+    "ts_ranking": _ts_ranking,
     "monte_carlo": _monte_carlo,
     "off_by": _off_by,
     "gan": _gan,
@@ -318,22 +382,37 @@ def manifest(dataset: str, entity: str) -> Dict[str, Any]:
     return out
 
 
+# Groups whose lazy galleries live under TREE_THOMPSON. Both Thompson stages
+# write into that one directory and are told apart by filename prefix, so the
+# gallery id carries the plot_group and gallery_page validates against this map
+# rather than against a single hardcoded name.
+_GALLERY_TREES = {"thompson": TREE_THOMPSON, "ts_ranking": TREE_THOMPSON}
+
+
 def gallery_descriptors(dataset: str, entity: str) -> List[Dict[str, Any]]:
     """Large per-window sets, described but never listed eagerly."""
     d = _dir_for(TREE_THOMPSON, dataset, entity)
     it = _iteration_tag(d)
     out = []
     if it and d is not None:
-        for sub, title, caption in (
-            (f"shap_per_window_{it}", "Channel attribution per window (top 3)",
-             "One frame per window."),
-            (f"shap_per_window_all_{it}", "Channel attribution per window (all detectors)", ""),
-            (f"shap_per_window_every10_{it}", "Every 10th window", ""),
-            (f"shap_per_regime_all_{it}", "Per regime (all detectors)", ""),
+        for group, sub, title, caption in (
+            ("thompson", f"shap_per_window_{it}",
+             "Channel attribution per window (top 3)", "One frame per window."),
+            ("thompson", f"shap_per_window_all_{it}",
+             "Channel attribution per window (all detectors)", ""),
+            ("thompson", f"shap_per_window_every10_{it}", "Every 10th window", ""),
+            ("thompson", f"shap_per_regime_all_{it}", "Per regime (all detectors)", ""),
+            ("ts_ranking", f"ranking_per_window_{it}",
+             "Ranking score per window (top 3)",
+             "One frame per window, each showing the score as it stood then."),
+            ("ts_ranking", f"ranking_per_window_all_{it}",
+             "Ranking score per window (all detectors)", ""),
+            ("ts_ranking", f"ranking_per_window_every10_{it}",
+             "Every 10th window", ""),
         ):
             count = len(_ls(d / sub))
             if count:
-                out.append({"id": f"thompson/{sub}", "title": title,
+                out.append({"id": f"{group}/{sub}", "title": title,
                             "caption": caption, "count": count})
     return out
 
@@ -341,9 +420,9 @@ def gallery_descriptors(dataset: str, entity: str) -> List[Dict[str, Any]]:
 def gallery_page(dataset: str, entity: str, gallery_id: str,
                  offset: int = 0, limit: int = 60) -> Dict[str, Any]:
     group, _, sub = gallery_id.partition("/")
-    if group != "thompson" or not sub or "/" in sub or sub.startswith("."):
+    if group not in _GALLERY_TREES or not sub or "/" in sub or sub.startswith("."):
         return {"items": [], "total": 0, "offset": offset, "limit": limit}
-    d = _dir_for(TREE_THOMPSON, dataset, entity)
+    d = _dir_for(_GALLERY_TREES[group], dataset, entity)
     if d is None:
         return {"items": [], "total": 0, "offset": offset, "limit": limit}
     files = _ls(d / sub)

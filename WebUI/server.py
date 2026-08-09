@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 from flask import (Flask, Response, abort, jsonify, render_template, request,
-                   send_file)
+                   send_file, url_for)
 
 from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES, DEFAULT_LLM_BASE_URL,
                                  DEFAULT_LLM_MODEL)
@@ -69,6 +69,26 @@ def create_app(**overrides) -> Flask:
     app = Flask(__name__, static_folder="static", template_folder="templates")
     app.config.update(JSON_SORT_KEYS=False, **overrides)
     manager = jobs.manager()
+
+    @app.context_processor
+    def _asset_stamp():
+        """Cache-bust CSS/JS by their own mtime.
+
+        The server runs with use_reloader=False (the reloader would orphan a
+        running pipeline), so an edit to result.js or ramses.css needs a restart
+        already — and without a stamp the browser then keeps serving the old
+        file anyway, which reads as "the feature I just added is missing".
+        """
+        static_dir = Path(app.static_folder or "")
+
+        def asset(filename: str) -> str:
+            url = url_for("static", filename=filename)
+            try:
+                return f"{url}?v={int((static_dir / filename).stat().st_mtime)}"
+            except OSError:
+                return url
+
+        return {"asset": asset}
 
     # ── Pages ───────────────────────────────────────────────────────────────
 
@@ -201,13 +221,22 @@ def create_app(**overrides) -> Flask:
             return jsonify({"error": "no_artifacts",
                             "hint": "Run this dataset/entity with explanations enabled."}), 404
         payload["plots"] = plots.manifest(dataset, entity)
-        regimes = plots.regime_plots(dataset, entity)
+        # Each regime-bearing stage names its own plot subdirectory in STAGES,
+        # so both Thompson stages get their regimes paired without either one
+        # being named here.
         for stage in payload["stages"]:
-            if stage["key"] == "thompson_sampling":
-                for regime in stage.get("regimes", []):
-                    figure = regimes.get(regime["index"])
-                    if figure:
-                        regime["plot"] = figure["src"]
+            stem = (artifacts.STAGE_BY_KEY.get(stage["key"]) or {}).get("regimes")
+            if not stem:
+                continue
+            regimes = plots.regime_plots(dataset, entity, stem)
+            for regime in stage.get("regimes", []):
+                figure = regimes.get(regime["index"])
+                if figure:
+                    regime["plot"] = figure["src"]
+                    # The caption travels with the image: the two stages'
+                    # per-regime figures show different quantities over the same
+                    # window range, and only plots.py knows which.
+                    regime["plot_caption"] = figure.get("caption")
         return jsonify(payload)
 
     @app.get("/api/explanations/<dataset>/<entity>/download")

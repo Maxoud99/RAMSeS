@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}RAMSeS{% endblock %}</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/ramses.css') }}">
+<link rel="stylesheet" href="{{ asset('css/ramses.css') }}">
 <script>
   // Set the theme before first paint, or the page flashes the wrong one.
   (function () {
@@ -36,7 +36,9 @@
   {% block content %}{% endblock %}
 </main>
 
-<script type="module" src="{{ url_for('static', filename='js/dom.js') }}"></script>
+{# dom.js is not loaded here: every page's entry script imports it, and a
+   stamped tag would resolve to a different URL from their relative "./dom.js"
+   import, evaluating the module twice and binding the theme toggle twice. #}
 {% block scripts %}{% endblock %}
 </body>
 </html>

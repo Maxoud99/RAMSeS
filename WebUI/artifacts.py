@@ -35,21 +35,35 @@ STAGES: Tuple[Dict[str, Any], ...] = (
     {"key": "ga_combination", "title": "Ensemble weighting (meta-learner)",
      "cli": "ga", "ir": "ir_ga_combination", "nl": "nl_ga_combination",
      "plot_group": "ga_combination", "order": 2},
-    {"key": "thompson_sampling", "title": "Single-model selection (Thompson Sampling)",
+    # One CLI token, two stages — the same split as ga_selection/ga_combination.
+    # `thompson_ranking` explains mu^T mu, the criterion the detectors are
+    # ordered by; `thompson_sampling` explains mu^T x, the expected reward that
+    # drove per-window selection. Neither keeps the plain name.
+    #
+    # `plot_group` is deliberately `ts_ranking`, not `thompson_ranking`:
+    # result.js matches lazy-gallery descriptors with `id.startsWith(plot_group)`,
+    # so a group prefixed by "thompson" would let one card claim the other's
+    # galleries. `regimes` names the plot subdirectory whose per-regime figures
+    # pair with this stage's regime atoms; its presence is what makes a stage
+    # regime-bearing, replacing a hardcoded stage-key check here and in server.py.
+    {"key": "thompson_ranking", "title": "Thompson Sampling: ranking criterion",
+     "cli": "thompson", "ir": "ir_thompson_ranking", "nl": "nl_thompson_ranking",
+     "plot_group": "ts_ranking", "order": 3, "regimes": "ranking_per_regime"},
+    {"key": "thompson_sampling", "title": "Thompson Sampling: selection dynamics",
      "cli": "thompson", "ir": "ir_thompson", "nl": "nl_thompson",
-     "plot_group": "thompson", "order": 3},
+     "plot_group": "thompson", "order": 4, "regimes": "shap_per_regime"},
     {"key": "monte_carlo", "title": "Robustness: Monte Carlo noise sweep",
      "cli": "montecarlo", "ir": "ir_monte_carlo", "nl": "nl_monte_carlo",
-     "plot_group": "monte_carlo", "order": 4},
+     "plot_group": "monte_carlo", "order": 5},
     {"key": "off_by_threshold", "title": "Sensitivity: off-by-threshold test",
      "cli": "offby", "ir": "ir_off_by", "nl": "nl_off_by",
-     "plot_group": "off_by", "order": 5},
+     "plot_group": "off_by", "order": 6},
     {"key": "rank_aggregation_robust", "title": "Robustness consensus",
      "cli": None, "ir": "ir_rank_aggregation_robust", "nl": "nl_rank_aggregation_robust",
-     "plot_group": "rank_aggregation_robust", "order": 6, "iterated": True},
+     "plot_group": "rank_aggregation_robust", "order": 7, "iterated": True},
     {"key": "rank_aggregation_final", "title": "Final consensus",
      "cli": None, "ir": "ir_rank_aggregation_final", "nl": "nl_rank_aggregation_final",
-     "plot_group": "rank_aggregation_final", "order": 7, "iterated": True},
+     "plot_group": "rank_aggregation_final", "order": 8, "iterated": True},
 )
 
 STAGE_BY_KEY = {s["key"]: s for s in STAGES}
@@ -57,7 +71,7 @@ STAGE_BY_KEY = {s["key"]: s for s in STAGES}
 # The GAN test runs but has no explainability layer; the global IR records that
 # explicitly. Surfacing it as a stage with a reason beats an unexplained gap.
 GAN_STAGE = {"key": "gan", "title": "Robustness: GAN perturbations",
-             "cli": "gan", "plot_group": "gan", "order": 8}
+             "cli": "gan", "plot_group": "gan", "order": 9}
 
 
 def split_info(raw: str) -> Tuple[Optional[str], str]:
@@ -197,19 +211,22 @@ def comprehensive_report(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
     return {**info, "text": _read_text(path) or ""}
 
 
-_REGIME_RE = re.compile(r"^ts\.regime\.(\d+)$")
+# Matches both Thompson stages' regime atoms — `ts.regime.N` (expected-reward
+# regimes) and `tsr.regime.N` (||mu||^2 leadership regimes). Anchored on the
+# suffix rather than the prefix so a third producer needs no change here.
+_REGIME_RE = re.compile(r"\.regime\.(\d+)$")
 
 
 def _regimes_from_ir(ir_doc: dict) -> List[Dict[str, Any]]:
-    """Thompson regime atoms, ordered, ready to pair with their SHAP plots.
+    """Regime atoms, ordered, ready to pair with their per-regime plots.
 
-    `ts.regime.N` ids are 0-based and match `regime_{NN}_w{start}-{end}_{model}.png`
+    The ids are 0-based and match `regime_{NN}_w{start}-{end}_{model}.png`
     exactly, so each regime sentence can be shown beside its own plot instead of
     the reader hunting through fourteen images.
     """
     out = []
     for atom in ir_doc.get("evidence", []) or []:
-        m = _REGIME_RE.match(str(atom.get("id", "")))
+        m = _REGIME_RE.search(str(atom.get("id", "")))
         if not m:
             continue
         value = atom.get("value") or {}
@@ -239,7 +256,7 @@ def _attach_narrated_regimes(regimes: List[Dict[str, Any]], narrative: str,
     for sentence, atom in attribute_sentences(narrative, ir_doc):
         if not atom or atom.get("type") != "regime":
             continue
-        m = _REGIME_RE.match(str(atom.get("id", "")))
+        m = _REGIME_RE.search(str(atom.get("id", "")))
         if m:
             idx = int(m.group(1))
             # A regime can span two sentences; keep them in narrative order.
@@ -313,7 +330,13 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             "summary_mode": summary["mode"],
             "summary_table": summary.get("table"),
             "extended_in": summary.get("extended_in"),
-            "full": narrative,
+            # What the full-text disclosure shows. Usually the whole narrative;
+            # a stage that renders some of its sentences elsewhere on the card
+            # (Thompson's regime walk, beside its per-regime plots) hands back a
+            # trimmed body so the page never prints them twice. `words` and the
+            # download stay on the real narrative — the file on disk is the
+            # verbatim record, and the length is what the model actually wrote.
+            "full": summary.get("extended") or narrative,
             "words": len(narrative.split()) if narrative else 0,
             "info": info,
             "question": (ir_doc or {}).get("question"),
@@ -323,7 +346,7 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             "plot_group": stage["plot_group"],
             "nl_file": nl_path.name if nl_path else None,
         }
-        if stage["key"] == "thompson_sampling" and ir_doc:
+        if stage.get("regimes") and ir_doc:
             entry["regimes"] = _regimes_from_ir(ir_doc)
             _attach_narrated_regimes(entry["regimes"], narrative, ir_doc)
         stages_out.append(entry)

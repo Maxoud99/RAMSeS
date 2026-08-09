@@ -42,13 +42,20 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 # every regime sentence would satisfy equally.
 _REGIME_RE = re.compile(r"\bregime\s+(\d+)\b", re.IGNORECASE)
 
-# Per stage: which atom types leave the default view, or which table to build.
+# Per stage: which atom types leave the default view, which table to build, or
+# both. `drop_caveats` keeps limitations out of the default view: they qualify
+# the result rather than stating it, so they belong with the detail behind the
+# click. The two stages carrying `extended_in` are exempt from it by necessity
+# rather than by taste — they render no full-text disclosure at all, so a
+# dropped caveat would have nowhere left to appear.
 _STAGE_SUMMARY: Dict[str, Dict[str, Any]] = {
-    "ga_selection": {"mode": "drop", "drop": ("excluded_detector", "excluded_group")},
-    "monte_carlo": {"mode": "drop", "drop": ("win_region",)},
+    "ga_selection": {"mode": "drop", "drop": ("excluded_detector", "excluded_group"),
+                     "drop_caveats": True},
+    "monte_carlo": {"mode": "drop", "drop": ("win_region",), "drop_caveats": True},
     # Both importance families: the per-competitor "Against X …" atoms and the
     # "Across all competitors …" roll-up.
-    "off_by_threshold": {"mode": "drop", "drop": ("feature_importance", "summary")},
+    "off_by_threshold": {"mode": "drop", "drop": ("feature_importance", "summary"),
+                         "drop_caveats": True},
     # The per-regime walk is the bulk of this narrative, and it already has a
     # disclosure of its own where each regime sits beside its SHAP plot.
     # `extended_in` says the dropped sentences are rendered there, so the card
@@ -56,8 +63,26 @@ _STAGE_SUMMARY: Dict[str, Dict[str, Any]] = {
     # a second copy of the same fourteen sentences, without the plots.
     "thompson_sampling": {"mode": "drop", "drop": ("regime",),
                           "extended_in": "regimes"},
-    "ga_combination": {"mode": "table", "table": "ga_combination"},
-    "rank_aggregation_robust": {"mode": "table", "table": "rank_aggregation"},
+    # The default view answers the stage's question and stops: the winner, the
+    # channels its score is built from, and which channels decided the margin —
+    # plus the table, which is the answer at a glance. Everything after that in
+    # the narrative (selection counts, the regime walk, the limitations) is
+    # supporting detail behind the click. Unlike its sibling this stage DOES
+    # offer a full-text disclosure, so `drop_caveats` is safe here: the caveats
+    # have somewhere to land.
+    # `extended_drop` keeps the regime walk out of the full-text view as well:
+    # those sentences belong beside their own plots, in the regime disclosure,
+    # and printing them twice on one card is just a second copy without the
+    # figures. Everything else the summary held back — the selection counts, the
+    # regime roll-up, the limitations — is what the click buys.
+    "thompson_ranking": {"mode": "drop",
+                         "drop": ("support", "regime_summary", "regime"),
+                         "extended_drop": ("regime",),
+                         "table": "ts_ranking", "drop_caveats": True},
+    "ga_combination": {"mode": "table", "table": "ga_combination",
+                       "drop_caveats": True},
+    "rank_aggregation_robust": {"mode": "table", "table": "rank_aggregation",
+                                "drop_caveats": True},
     # rank_aggregation_final is deliberately absent: two sources, a couple of
     # sentences, nothing to hold back.
 }
@@ -121,11 +146,49 @@ def attribute_sentences(narrative: str,
     return out
 
 
+# Words too common to identify anything, plus a length floor. Caveats are
+# matched lexically rather than by the name/number scorer above: most carry
+# neither a detector name nor a number ("Correctness is judged on thresholded
+# predictions; PR-AUC has no per-point notion of correct or incorrect"), so
+# that scorer cannot see them at all.
+_STOPWORDS = frozenset("""
+that this these those with from have been were which when what over into
+each their there than then they them some such only also both more most
+""".split())
+_WORD_RE = re.compile(r"[a-z][a-z0-9\-]{3,}")
+# A narrator restating a caveat stays close to its wording, so a high bar is
+# safe and keeps evidence sentences that merely share vocabulary.
+_CAVEAT_OVERLAP = 0.5
+
+
+def _content_tokens(text: str) -> frozenset:
+    return frozenset(w for w in _WORD_RE.findall((text or "").lower())
+                     if w not in _STOPWORDS)
+
+
+def caveat_sentences(narrative: str, ir_doc: Dict[str, Any]) -> List[str]:
+    """Narrative sentences that restate one of the IR's caveats."""
+    caveats = [_content_tokens(str(c.get("text", "")))
+               for c in (ir_doc.get("caveats") or [])]
+    caveats = [c for c in caveats if c]
+    if not caveats:
+        return []
+    out = []
+    for sentence in split_sentences(narrative):
+        tokens = _content_tokens(sentence)
+        if not tokens:
+            continue
+        if any(len(tokens & c) / len(c) >= _CAVEAT_OVERLAP for c in caveats):
+            out.append(sentence)
+    return out
+
+
 def _drop_summary(narrative: str, ir_doc: Dict[str, Any],
-                  drop_types: Sequence[str]) -> str:
+                  drop_types: Sequence[str], drop_caveats: bool = False) -> str:
     drop = set(drop_types)
+    skip = set(caveat_sentences(narrative, ir_doc)) if drop_caveats else set()
     kept = [s for s, atom in attribute_sentences(narrative, ir_doc)
-            if not (atom and atom.get("type") in drop)]
+            if not (atom and atom.get("type") in drop) and s not in skip]
     return " ".join(s.strip() for s in kept).strip()
 
 
@@ -195,21 +258,72 @@ def _rank_aggregation_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _ts_ranking_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The winner's score split by channel, beside the margin over the runner-up.
+
+    Two columns from two atoms: the share is non-negative and sums to the
+    winner's score, the delta is signed and sums to the margin. They are shown
+    together because the reader's question — which channels produced this
+    ranking — needs both: a channel can carry most of the winner's score and
+    still be one the runner-up won.
+    """
+    winner = next(iter(_atoms_of(ir_doc, "winner_channels")), None)
+    if not winner:
+        return None
+    per_channel = winner["value"].get("per_channel") or []
+    if not per_channel:
+        return None
+    total = sum(float(v) for _c, v in per_channel if isinstance(v, (int, float)))
+
+    gap_atom = next(iter(_atoms_of(ir_doc, "rank_gap")), None)
+    runner = (gap_atom or {}).get("value", {}).get("runner_up")
+    gaps = dict((str(c), v) for c, v in
+                ((gap_atom or {}).get("value", {}).get("per_channel") or []))
+
+    rows = []
+    # Every channel, however many: the decomposition only means anything if the
+    # shares add up, so truncating it would misrepresent the total. `collapse_after`
+    # keeps the default view to the five that matter and puts the rest one click
+    # away, which is what an SMD entity's 38 channels need.
+    for channel, value in per_channel:
+        share = (100.0 * float(value) / total) if total else None
+        delta = gaps.get(str(channel))
+        rows.append([
+            f"channel {channel}",
+            None if share is None else f"{share:.1f}%",
+            round(float(value), 6),
+            None if delta is None else f"{float(delta):+.6f}",
+        ])
+    return {
+        "columns": ["Channel", "Share", "Contribution",
+                    f"vs {runner}" if runner else "vs runner-up"],
+        "align": ["name", "num", "num", "num"],
+        "rows": rows,
+        "collapse_after": 5,
+    }
+
+
 _TABLE_BUILDERS = {
     "ga_combination": _ga_combination_table,
     "rank_aggregation": _rank_aggregation_table,
+    "ts_ranking": _ts_ranking_table,
 }
 
 
 def _lead_sentence(narrative: str, ir_doc: Dict[str, Any],
-                   lead_types: Sequence[str]) -> str:
+                   lead_types: Sequence[str], skip_caveats: bool = False) -> str:
     """The narrative's own sentence for the stage's headline fact, so the table
     is introduced in the stage's voice rather than by invented copy."""
+    skip = set(caveat_sentences(narrative, ir_doc)) if skip_caveats else set()
     for sentence, atom in attribute_sentences(narrative, ir_doc):
-        if atom and atom.get("type") in lead_types:
+        if atom and atom.get("type") in lead_types and sentence not in skip:
             return sentence.strip()
-    sentences = split_sentences(narrative)
-    return sentences[0].strip() if sentences else ""
+    # Fallback: the opening sentence, but never a limitation — a table
+    # introduced by its own caveat reads as though the caveat were the finding.
+    for sentence in split_sentences(narrative):
+        if sentence not in skip:
+            return sentence.strip()
+    return ""
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -222,7 +336,10 @@ def summarize(text: str, *, stage: Optional[str] = None,
     frontend to render the disclosure pre-expanded and labelled "Full text"
     instead of offering a redundant expand. `extended_in`, when set, names a
     section of the card that already shows what the summary dropped, so the
-    card suppresses its own full-text disclosure.
+    card suppresses its own full-text disclosure. `extended`, when set, is what
+    that disclosure should show instead of the raw narrative — for sentences
+    that belong to a different section of the same card rather than to either
+    view of the prose.
     """
     body = (text or "").strip()
     if not body:
@@ -233,19 +350,33 @@ def summarize(text: str, *, stage: Optional[str] = None,
         return {"summary": body, "is_full": True, "mode": "full", "table": None}
 
     try:
+        drop_caveats = bool(spec.get("drop_caveats"))
         if spec["mode"] == "drop":
-            short = _drop_summary(body, ir_doc, spec["drop"])
+            short = _drop_summary(body, ir_doc, spec["drop"], drop_caveats)
+            # A stage may hold sentences back AND carry a table; the table is
+            # the answer at a glance, the kept prose says what it means.
+            table = (_TABLE_BUILDERS[spec["table"]](ir_doc)
+                     if spec.get("table") else None)
+            # Sentences that belong to another section of the card leave the
+            # full-text view too, so the card never shows them twice.
+            extended = None
+            if spec.get("extended_drop"):
+                trimmed = _drop_summary(body, ir_doc, spec["extended_drop"])
+                if trimmed and trimmed != body:
+                    extended = trimmed
             # An empty or unchanged result means attribution found nothing to
             # act on; showing the whole narrative is the safe outcome.
             if short and short != body:
                 return {"summary": short, "is_full": False, "mode": "drop",
-                        "table": None, "extended_in": spec.get("extended_in")}
-            return {"summary": body, "is_full": True, "mode": "full", "table": None}
+                        "table": table, "extended_in": spec.get("extended_in"),
+                        "extended": extended}
+            return {"summary": body, "is_full": True, "mode": "full",
+                    "table": table}
 
         if spec["mode"] == "table":
             table = _TABLE_BUILDERS[spec["table"]](ir_doc)
             if table:
-                lead = _lead_sentence(body, ir_doc, ("stage_output",))
+                lead = _lead_sentence(body, ir_doc, ("stage_output",), drop_caveats)
                 return {"summary": lead, "is_full": False, "mode": "table",
                         "table": table}
     except Exception:
