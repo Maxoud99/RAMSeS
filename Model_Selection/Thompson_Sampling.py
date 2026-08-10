@@ -318,6 +318,82 @@ def aggregate_shap_per_channel(shap_values: np.ndarray, n_channels: int) -> np.n
     return shap_values[: n_channels * window_size].reshape(n_channels, window_size).sum(axis=1)
 
 
+def reward_contribution_per_channel(mean: np.ndarray, context: np.ndarray,
+                                    n_channels: int) -> np.ndarray:
+    """
+    Split the expected reward mu^T x into one contribution per channel.
+
+    contrib(c) = sum over channel c's timesteps of mu_i * x_i, so the parts sum
+    to mu^T x EXACTLY — the model has no intercept, so there is no remainder.
+
+    This is the honest answer to "how much does this channel contribute to this
+    detector's expected reward". SHAP answers a different question: it measures
+    each channel's deviation from a TYPICAL window, so it explains only
+    mu^T x - mu^T baseline and discards the constant mu^T baseline, which is
+    usually the bulk of the prediction. Worse for any averaged view, the signed
+    SHAP average over all windows is identically zero by construction, because
+    the baseline IS the mean of those windows.
+
+    Signed: mu and the (L2-normalised) context can both be negative, so a
+    channel can pull the expected reward down.
+    """
+    if n_channels <= 0:
+        return np.zeros(0)
+    mu, x = mean.flatten(), context.flatten()
+    d = min(mu.size, x.size)
+    window_size = d // n_channels
+    if window_size == 0:
+        return np.zeros(n_channels)
+    keep = n_channels * window_size
+    return (mu[:keep] * x[:keep]).reshape(n_channels, window_size).sum(axis=1)
+
+
+def _per_channel_reward_map(
+    means: Dict[str, np.ndarray],
+    top_models: List[str],
+    context: np.ndarray,
+    n_channels: int,
+) -> Dict[str, np.ndarray]:
+    """Per-channel expected-reward contribution for each model at one context."""
+    return {m: reward_contribution_per_channel(means[m], context, n_channels)
+            for m in top_models}
+
+
+def _avg_per_channel_reward_map(
+    means: Dict[str, np.ndarray],
+    top_models: List[str],
+    contexts: List[np.ndarray],
+    n_channels: int,
+    means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Per-channel reward contribution averaged over a list of contexts.
+
+    No `absolute` switch, unlike the SHAP version: this average is not
+    structurally zero, so the signed mean is the meaningful quantity and there
+    is nothing to work around. Averaged over every window it is each channel's
+    share of the detector's expected reward on a typical window.
+
+    `means_per_context` explains window t with the beliefs held at window t;
+    the product mu*x is bilinear, so the per-window loop is the correct order.
+    """
+    out: Dict[str, np.ndarray] = {}
+    n = max(len(contexts), 1)
+    for m in top_models:
+        mu_fixed = means[m].flatten() if means_per_context is None else None
+        acc = np.zeros(n_channels)
+        for i, ctx in enumerate(contexts):
+            if mu_fixed is not None:
+                mu = mu_fixed
+            else:
+                if i >= len(means_per_context) or m not in means_per_context[i]:
+                    continue
+                mu = np.asarray(means_per_context[i][m]).flatten()
+            acc += reward_contribution_per_channel(mu, ctx, n_channels)
+        out[m] = acc / n
+    return out
+
+
 def aggregate_squared_per_channel(mean: np.ndarray, n_channels: int) -> np.ndarray:
     """
     Split the ranking score ||mu||^2 into one contribution per channel.
@@ -1014,19 +1090,30 @@ def _top_k_models_by_expected_reward(
     means: Dict[str, np.ndarray],
     contexts: List[np.ndarray],
     k: int,
+    means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
 ) -> List[str]:
     """
     Return the top-k models by expected reward mu·x averaged over the given
-    contexts. Uses the final mean vectors, so the ranking is consistent with the
-    SHAP decomposition plotted alongside (whose per-channel values sum to
-    mu·x - mu·baseline).
+    contexts.
+
+    means_per_context : the beliefs held at each context, aligned with
+        `contexts`. Supplying it makes the selection read the same mu·x the run
+        actually saw at each window — which is what the regime prose ranks by
+        (pre_expected_rewards_history) and what the plotted bars are computed
+        from. Falling back to the final `means` here would let a plot show three
+        detectors while the sentence beside it named a different runner-up.
     """
     if not contexts or not means:
         return list(means.keys())[:k]
     totals: Dict[str, float] = {m: 0.0 for m in means}
-    for ctx in contexts:
-        for m, v in compute_expected_rewards(means, ctx).items():
-            totals[m] += v
+    for i, ctx in enumerate(contexts):
+        at = means
+        if means_per_context and i < len(means_per_context) and means_per_context[i]:
+            at = {m: np.asarray(v).reshape(-1, 1)
+                  for m, v in means_per_context[i].items()}
+        for m, v in compute_expected_rewards(at, ctx).items():
+            if m in totals:
+                totals[m] += v
     ranked = sorted(totals.items(), key=lambda x: x[1], reverse=True)
     return [name for name, _ in ranked[:k]]
 
@@ -1412,7 +1499,8 @@ def plot_shap_per_regime(
             sel_models = every_model
             title = f'SHAP — regime {i} ({model}, windows {start}-{end}, all models)'
         else:
-            sel_models = _top_k_models_by_expected_reward(means, regime_ctx, top_k_models)
+            sel_models = _top_k_models_by_expected_reward(
+                means, regime_ctx, top_k_models, means_per_context=regime_mu)
             title = (f'SHAP — regime {i} ({model}, windows {start}-{end}, '
                      f'top {top_k_models} by E[R] in regime)')
         per_channel = _avg_per_channel_shap_map(
@@ -1425,6 +1513,177 @@ def plot_shap_per_regime(
             n_channels_total=n_channels,
             note=(f'SHAP averaged over the {end - start + 1} windows of this regime.'),
         )
+
+
+_REWARD_YLABEL = r'Contribution to expected reward  $\mu^\top x$'
+
+
+def plot_reward_per_window(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+    sample_stride: Optional[int] = None,
+) -> None:
+    """
+    Per-channel split of the expected reward, one plot per window — the sibling
+    of plot_shap_per_window, and the one whose bars sum to the prediction.
+
+    Same folders and same frame names as the SHAP sets so the two can be read
+    frame for frame: reward_per_window{,_all,_every{stride}}_{iterations}/.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    n_channels = shap_payload["n_channels"]
+
+    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
+    base = "reward_per_window_all" if all_models else "reward_per_window"
+    if sample_stride and sample_stride > 1:
+        base = f"{base}_every{sample_stride}"
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    mu_hist = shap_payload.get("means_history") or []
+    for t, ctx in enumerate(contexts):
+        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
+            continue
+        # Beliefs held at window t, so the plot explains the decision actually
+        # made there rather than re-reading it with end-of-run knowledge.
+        means_t = ({m: v.reshape(-1, 1) for m, v in mu_hist[t].items()}
+                   if t < len(mu_hist) else means)
+        if all_models:
+            sel_models = every_model
+            title = f'Expected-reward contribution — window {t} (all models)'
+        else:
+            sel_models = _top_k_models_by_expected_reward(means_t, [ctx], top_k_models)
+            title = (f'Expected-reward contribution — window {t} '
+                     f'(top {top_k_models} by E[R] in window)')
+        per_channel = _per_channel_reward_map(means_t, sel_models, ctx, n_channels)
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            ylabel=_REWARD_YLABEL,
+            n_channels_total=n_channels,
+            note=(f"Each detector's bars sum to its expected reward at window "
+                  f"{t}; no baseline is subtracted."),
+        )
+
+
+def plot_reward_per_regime(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    regime_shifts: List[Dict],
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+) -> None:
+    """
+    Per-channel expected-reward contribution averaged over each regime's
+    windows — the sibling of plot_shap_per_regime, and the default view beside
+    the regime prose.
+
+    Filenames match the SHAP set exactly (0-based index, window range, leader)
+    so one joiner pairs either set with the same regime sentence.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    n_channels = shap_payload["n_channels"]
+
+    fallback = _top_k_models_by_norm(means, 1)[0]
+    segments = reconstruct_regime_segments(regime_shifts, len(contexts),
+                                           fallback_model=fallback)
+    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
+    folder = (f'reward_per_regime_all_{iterations}' if all_models
+              else f'reward_per_regime_{iterations}')
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
+    mu_hist = shap_payload.get("means_history") or []
+    for i, (start, end, model, _duration) in enumerate(segments):
+        regime_ctx = contexts[start:end + 1]
+        if not regime_ctx:
+            continue
+        regime_mu = mu_hist[start:end + 1] if mu_hist else None
+        if all_models:
+            sel_models = every_model
+            title = (f'Expected-reward contribution — regime {i} ({model}, '
+                     f'windows {start}-{end}, all models)')
+        else:
+            sel_models = _top_k_models_by_expected_reward(
+                means, regime_ctx, top_k_models, means_per_context=regime_mu)
+            title = (f'Expected-reward contribution — regime {i} ({model}, '
+                     f'windows {start}-{end}, top {top_k_models} by E[R] in regime)')
+        per_channel = _avg_per_channel_reward_map(
+            means, sel_models, regime_ctx, n_channels, means_per_context=regime_mu)
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
+            ylabel=_REWARD_YLABEL,
+            n_channels_total=n_channels,
+            note=(f"Averaged over the {end - start + 1} windows of this regime; "
+                  f"each detector's bars sum to its mean expected reward here."),
+        )
+
+
+def plot_reward_average_all(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = True,
+) -> None:
+    """
+    One figure for the whole run: each channel's mean contribution to a
+    detector's expected reward, averaged over every window.
+
+    This replaces mean|SHAP| as the run-level summary. The signed SHAP average
+    over all windows is identically zero — the baseline IS the mean of those
+    windows — which forced the old figure onto absolute values, and mean|SHAP|
+    measures how much a channel's influence VARIES, not how much it contributes.
+    This average has no such defect: it is signed, non-degenerate, and its bars
+    sum to the detector's expected reward on a typical window.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    n_channels = shap_payload["n_channels"]
+
+    if all_models:
+        sel_models = _top_k_models_by_norm(means, len(means))
+        suffix, scope = 'all', 'all models'
+    else:
+        sel_models = _top_k_models_by_expected_reward(means, contexts, top_k_models)
+        suffix, scope = f'top{top_k_models}', f'top {top_k_models} by E[R]'
+
+    per_channel = _avg_per_channel_reward_map(
+        means, sel_models, contexts, n_channels,
+        means_per_context=shap_payload.get("means_history") or None)
+    _render_shap_comparison(
+        per_channel, sel_models, top_n_channels,
+        title=f'Mean expected-reward contribution across all windows — {scope}',
+        save_path=(f'myresults/Thomposon/{dataset}/{entity}/'
+                   f'reward_average_{suffix}_{iterations}.png'),
+        ylabel=_REWARD_YLABEL,
+        n_channels_total=n_channels,
+        note=("Averaged over every window; each detector's bars sum to its "
+              "expected reward on a typical window."),
+    )
 
 
 def plot_shap_average_all(
@@ -1574,8 +1833,11 @@ def explain_thompson_sampling(
                 return pos, neg
 
             shap_raising = shap_lowering = None
+            reward_raising = reward_lowering = None
             pref_favor_leader = pref_favor_runner = None
+            edge_favor_leader = edge_favor_runner = None
             pref_gap = float('nan')
+            edge_gap = float('nan')
             if leader is not None and n_ch > 0 and len(all_ctx) > seg_end:
                 # Per-window attribution with the beliefs held at that window,
                 # then averaged over the regime. SHAP is bilinear in (mu, x), so
@@ -1589,22 +1851,41 @@ def explain_thompson_sampling(
                 n_win = max(len(win), 1)
                 pc_l = np.zeros(n_ch)
                 pc_r = np.zeros(n_ch)
+                rc_l = np.zeros(n_ch)          # raw expected-reward contribution
+                rc_r = np.zeros(n_ch)
                 gap_acc = 0.0
+                edge_acc = 0.0
                 have_runner = runner is not None and runner in means
                 for t in win:
                     ctx_t = np.asarray(all_ctx[t], dtype=float)
                     mu_l = mu_at(t, leader)
                     pc_l += aggregate_shap_per_channel(
                         compute_shap_values(mu_l, ctx_t, base_ctx), n_ch)
+                    rc_l += reward_contribution_per_channel(mu_l, ctx_t, n_ch)
                     if have_runner:
                         mu_r = mu_at(t, runner)
                         pc_r += aggregate_shap_per_channel(
                             compute_shap_values(mu_r, ctx_t, base_ctx), n_ch)
+                        rc_r += reward_contribution_per_channel(mu_r, ctx_t, n_ch)
                         gap_acc += float(np.dot(mu_l - mu_r, ctx_t - base_ctx))
+                        edge_acc += float(np.dot(mu_l - mu_r, ctx_t))
                 pc_l /= n_win
+                rc_l /= n_win
+                # What the leader's expected reward is actually MADE OF here.
+                # These sum to its mean expected reward over the regime, which
+                # the SHAP split cannot claim — it drops the mu.baseline term.
+                reward_raising, reward_lowering = _split_by_sign(rc_l)
                 shap_raising, shap_lowering = _split_by_sign(pc_l)
                 if have_runner:
                     pc_r /= n_win
+                    rc_r /= n_win
+                    # The narrated edge: the leader's own expected-reward split
+                    # minus the runner-up's. These deltas sum to the gap in
+                    # expected reward the regime is actually decided by — the
+                    # same quantity `reward_gap` reports — so the sentence's
+                    # channel and its headline number describe one thing.
+                    edge_gap = edge_acc / n_win
+                    edge_favor_leader, edge_favor_runner = _split_by_sign(rc_l - rc_r)
                     delta = pc_l - pc_r
                     # Baseline-relative, so the channel deltas sum to it exactly.
                     pref_gap = gap_acc / n_win
@@ -1614,7 +1895,19 @@ def explain_thompson_sampling(
                 "index": seg_idx, "start": seg_start, "end": seg_end,
                 "duration": int(seg_dur), "leader": leader,
                 "rewards_top": top3, "reward_gap": gap, "runner_up": runner,
+                # The narrated channels: what the leader's expected reward is
+                # made of here. SHAP's split rides along for the deviation
+                # clause and the alternate plot, but no longer leads.
+                "reward_raising": reward_raising, "reward_lowering": reward_lowering,
                 "shap_raising": shap_raising, "shap_lowering": shap_lowering,
+                # The leader's edge over the runner-up in the SAME units as the
+                # clause before it — a slice of expected reward, not a
+                # baseline-relative deviation.
+                "edge_favor_leader": edge_favor_leader,
+                "edge_favor_runner": edge_favor_runner,
+                "edge_gap": edge_gap,
+                # The SHAP version of the same comparison, kept machine-readable
+                # for the alternate per-regime plot; it no longer feeds the prose.
                 "pref_favor_leader": pref_favor_leader,
                 "pref_favor_runner": pref_favor_runner,
                 "pref_gap": pref_gap,
@@ -1666,10 +1959,13 @@ def explain_thompson_sampling(
         else:
             f.write("No blips detected.\n")
 
-        f.write("\n--- Per-Regime Expected Rewards & SHAP ---\n")
+        f.write("\n--- Per-Regime Expected Rewards & Channel Attribution ---\n")
         f.write("(Mean E[reward] over each regime's windows from the recorded pre-update\n")
-        f.write(" beliefs; SHAP attributes the FINAL posterior means on the regime's\n")
-        f.write(" aggregated context. Matches the Intermediate Representation.)\n")
+        f.write(" beliefs. Two channel splits, both averaged over the regime's windows\n")
+        f.write(" using the beliefs held at each one. CONTRIBUTION is the raw split of\n")
+        f.write(" mu.x, whose parts sum to E[reward]; DEVIATION is the SHAP split, which\n")
+        f.write(" measures departure from the run's average window and sums to nothing\n")
+        f.write(" a reader can name. Matches the Intermediate Representation.)\n")
         if not regimes_data:
             f.write("Not available.\n")
         for r in regimes_data:
@@ -1680,13 +1976,35 @@ def explain_thompson_sampling(
                 gap_s = (f";  leader-vs-runner-up mean-reward gap {r['reward_gap']:+.4f}"
                          if not np.isnan(r["reward_gap"]) else "")
                 f.write(f"  Mean E[reward]: {rw}{gap_s}\n")
+            if r["reward_raising"] or r["reward_lowering"]:
+                raise_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["reward_raising"] or [])) or "none"
+                lower_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["reward_lowering"] or [])) or "none"
+                f.write(f"  CONTRIBUTION — channels supplying {r['leader']}'s "
+                        f"E[reward]: {raise_s}\n")
+                f.write(f"  CONTRIBUTION — channels reducing it: {lower_s}\n")
             if r["shap_raising"] or r["shap_lowering"]:
                 raise_s = ", ".join(f"ch {c} {v:+.4f}"
                                     for c, v in (r["shap_raising"] or [])) or "none"
                 lower_s = ", ".join(f"ch {c} {v:+.4f}"
                                     for c, v in (r["shap_lowering"] or [])) or "none"
-                f.write(f"  Channels raising {r['leader']}'s E[reward]: {raise_s}\n")
-                f.write(f"  Channels lowering {r['leader']}'s E[reward]: {lower_s}\n")
+                f.write(f"  DEVIATION — channels above their usual contribution: "
+                        f"{raise_s}\n")
+                f.write(f"  DEVIATION — channels below it: {lower_s}\n")
+            # The narrated edge, in contribution units: these deltas sum to the
+            # leader-vs-runner-up gap in expected reward reported above.
+            has_edge = r.get("edge_favor_leader") or r.get("edge_favor_runner")
+            if has_edge and r["runner_up"] and not np.isnan(r.get("edge_gap", float('nan'))):
+                favored = r["leader"] if r["edge_gap"] >= 0 else r["runner_up"]
+                fl = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["edge_favor_leader"] or [])) or "none"
+                fr = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["edge_favor_runner"] or [])) or "none"
+                f.write(f"  EDGE (contribution) {r['leader']} vs {r['runner_up']}: "
+                        f"E[reward] favors {favored} by {abs(r['edge_gap']):.4f}\n")
+                f.write(f"    channels favoring {r['leader']}: {fl}\n")
+                f.write(f"    channels favoring {r['runner_up']}: {fr}\n")
             has_pref = r["pref_favor_leader"] or r["pref_favor_runner"]
             if has_pref and r["runner_up"] and not np.isnan(r["pref_gap"]):
                 favored = r["leader"] if r["pref_gap"] >= 0 else r["runner_up"]
@@ -1694,7 +2012,7 @@ def explain_thompson_sampling(
                                for c, d in (r["pref_favor_leader"] or [])) or "none"
                 fr = ", ".join(f"ch {c} {d:+.4f}"
                                for c, d in (r["pref_favor_runner"] or [])) or "none"
-                f.write(f"  Preference {r['leader']} vs {r['runner_up']}: linear "
+                f.write(f"  EDGE (deviation) {r['leader']} vs {r['runner_up']}: linear "
                         f"preference score at the regime-average context favors "
                         f"{favored} by {abs(r['pref_gap']):.4f}\n")
                 f.write(f"    channels favoring {r['leader']}: {fl}\n")
@@ -2413,8 +2731,28 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations)
         plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations,
                              all_models=True)
+        # Kept, but demoted: mean|SHAP| measures how much a channel's influence
+        # VARIES across windows, not how much it contributes on average. The
+        # run-level summary is now plot_reward_average_all.
         plot_shap_average_all(means, shap_payload, dataset, entity, iterations)
         plot_shap_average_all(means, shap_payload, dataset, entity, iterations, all_models=False)
+
+        # ── Expected-reward contribution (mu^T x split per channel) ─────────
+        # Full parity with the SHAP sets above so the two can be read frame for
+        # frame. These are the ones whose bars sum to the prediction; the SHAP
+        # ones answer the narrower question of deviation from a typical window.
+        plot_reward_per_window(means, shap_payload, dataset, entity, iterations)
+        plot_reward_per_window(means, shap_payload, dataset, entity, iterations,
+                               all_models=True)
+        plot_reward_per_window(means, shap_payload, dataset, entity, iterations,
+                               sample_stride=10)
+        plot_reward_per_regime(means, shap_payload, regime_shifts, dataset, entity,
+                               iterations)
+        plot_reward_per_regime(means, shap_payload, regime_shifts, dataset, entity,
+                               iterations, all_models=True)
+        plot_reward_average_all(means, shap_payload, dataset, entity, iterations)
+        plot_reward_average_all(means, shap_payload, dataset, entity, iterations,
+                                all_models=False)
         explain_thompson_sampling(means, exp_rewards_hist, l2_norm_hist, pre_exp_rewards_hist,
                                   list_of_chosen_models,
                                   regime_shifts, blip_windows, selection_states,

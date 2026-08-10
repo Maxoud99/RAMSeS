@@ -255,6 +255,36 @@ class TestSplitInfo(unittest.TestCase):
 
 class TestBuildPayload(ArtifactTreeCase):
 
+    def test_a_narrative_older_than_its_ir_is_flagged_stale(self):
+        """`--stages X --explain` is a PARTIAL run: app.py returns before the
+        narration block, so it rewrites the IR and every plot but leaves the
+        prose alone. On SKAB/7 that left a narrative walking 14 regimes beside
+        an IR and plots holding 10, and nothing noticed — the two files are read
+        independently. Freshness is the only signal available."""
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        by = {s["key"]: s for s in p["stages"]}
+        self.assertFalse(any(s["stale"] for s in p["stages"]))
+
+        ir_file = self.ir_dir / "ir_thompson.json"
+        os.utime(ir_file, (time.time() + 60, time.time() + 60))
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        by = {s["key"]: s for s in p["stages"]}
+        self.assertTrue(by["thompson_sampling"]["stale"])
+        # Only the stage whose IR moved; the others are untouched.
+        self.assertFalse(by["monte_carlo"]["stale"])
+
+    def test_same_run_write_order_is_not_mistaken_for_staleness(self):
+        """A full run writes the IR and the narrative moments apart, in that
+        order. Without slack every healthy run would raise the warning."""
+        ir_file = self.ir_dir / "ir_thompson.json"
+        nl_file = self.nl_dir / "nl_thompson.txt"
+        now = time.time()
+        os.utime(ir_file, (now, now))
+        os.utime(nl_file, (now + 0.2, now + 0.2))
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        by = {s["key"]: s for s in p["stages"]}
+        self.assertFalse(by["thompson_sampling"]["stale"])
+
     def test_assembles_stages_in_pipeline_order(self):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
         # The ranking criterion precedes the selection dynamics: it explains the
@@ -574,11 +604,13 @@ class TestSummaryDropsAtomClasses(unittest.TestCase):
         self.assertNotIn("0.042", out["summary"])
 
 
-class TestCaveatsStayInTheExtendedView(unittest.TestCase):
-    """Caveats qualify a result rather than stating it, so they belong with the
-    detail behind the click. They are matched lexically, not by the name/number
-    scorer: most carry neither a detector name nor a number, so that scorer
-    cannot see them at all."""
+class TestCaveatsLeaveThePros(unittest.TestCase):
+    """The card renders the caveats verbatim from the IR in a section of their
+    own, so a narrated restatement is the same limitation twice — in looser
+    words, and wherever the narrator chose to put it. Every stage strips them
+    from every view of the prose. They are matched lexically, not by the
+    name/number scorer: most carry neither a detector name nor a number, so
+    that scorer cannot see them at all."""
 
     CAVEAT = ("Correctness is judged on thresholded predictions (the F1 side); "
               "PR-AUC has no per-point notion of correct or incorrect.")
@@ -608,8 +640,10 @@ class TestCaveatsStayInTheExtendedView(unittest.TestCase):
         self.assertNotIn("thresholded predictions", out["summary"])
         self.assertIn("highest-ranked model", out["summary"])
 
-    def test_thompson_keeps_its_caveats(self):
-        """Deliberately exempt — its caveats belong in the default view."""
+    def test_a_stage_without_a_full_text_view_still_drops_them(self):
+        """thompson_sampling renders no full-text disclosure, which used to
+        exempt it. It no longer needs one: the caveats section is where they
+        land, and it is on every card."""
         ir_doc = self._ir("thompson_sampling")
         ir_doc["evidence"][1] = {"id": "r0", "type": "regime", "subject": "NN_3",
                                  "value": {}, "text": "Regime 0 was led by NN_3."}
@@ -618,7 +652,8 @@ class TestCaveatsStayInTheExtendedView(unittest.TestCase):
                      "predictions (the F1 side), and PR-AUC has no per-point "
                      "notion of correct or incorrect.")
         out = summarize.summarize(narrative, stage="thompson_sampling", ir_doc=ir_doc)
-        self.assertIn("thresholded predictions", out["summary"])
+        self.assertNotIn("thresholded predictions", out["summary"])
+        self.assertNotIn("thresholded predictions", out["body"])
         self.assertNotIn("Regime 0", out["summary"])
 
     def test_a_table_lead_is_never_a_caveat(self):
@@ -652,11 +687,29 @@ class TestCaveatsStayInTheExtendedView(unittest.TestCase):
             "LOF_1 was judged correct on 4 points.", ir_doc)
         self.assertEqual(hits, [])
 
-    def test_final_consensus_keeps_everything(self):
-        # No entry in _STAGE_SUMMARY at all, so nothing is held back.
+    def test_a_stage_with_no_spec_at_all_still_drops_them(self):
+        """rank_aggregation_final holds nothing else back — the stripping is
+        not part of the per-stage policy, it happens before it."""
         out = summarize.summarize(self.NARRATIVE, stage="rank_aggregation_final",
                                   ir_doc=self._ir("rank_aggregation_final"))
         self.assertTrue(out["is_full"])
+        self.assertNotIn("thresholded predictions", out["summary"])
+        self.assertIn("highest-ranked model", out["summary"])
+
+    def test_the_full_text_view_is_stripped_too(self):
+        """`body` is what the full-text disclosure renders. Stripping only the
+        summary would move the duplicate one click away, not remove it."""
+        out = summarize.summarize(self.NARRATIVE, stage="off_by_threshold",
+                                  ir_doc=self._ir("off_by_threshold"))
+        self.assertNotIn("thresholded predictions", out["body"])
+        self.assertIn("importance 0.71", out["body"])
+
+    def test_an_all_caveat_narrative_is_never_blanked(self):
+        """A matcher that swallowed the whole narrative is a matcher failure.
+        A redundant card beats an empty one."""
+        ir_doc = self._ir("rank_aggregation_final")
+        out = summarize.summarize("Note that " + self.CAVEAT.lower(),
+                                  stage="rank_aggregation_final", ir_doc=ir_doc)
         self.assertIn("thresholded predictions", out["summary"])
 
 
@@ -849,15 +902,11 @@ class TestThompsonRankingStage(unittest.TestCase):
         self.assertIn("was led by NN_2", regimes[0]["narrated"])
         self.assertIn("was led by NN_1", regimes[1]["narrated"])
 
-    def test_a_stage_only_drops_caveats_when_it_has_a_full_text_view(self):
-        """`extended_in` suppresses the full-text disclosure, so dropping the
-        caveats there would delete them from the page with no error. This stage
-        has the disclosure and does drop them; its sibling has neither."""
-        self.assertTrue(
-            summarize._STAGE_SUMMARY["thompson_ranking"]["drop_caveats"])
+    def test_no_stage_carries_a_per_stage_caveat_policy(self):
+        """Caveat stripping is global and unconditional. A leftover
+        `drop_caveats` key would read as though some stage still opted in."""
         for key, spec in summarize._STAGE_SUMMARY.items():
-            if spec.get("extended_in"):
-                self.assertFalse(spec.get("drop_caveats"), key)
+            self.assertNotIn("drop_caveats", spec, key)
 
 
 class TestSummaryTables(unittest.TestCase):
@@ -872,13 +921,21 @@ class TestSummaryTables(unittest.TestCase):
             {"id": "d1", "type": "detector_role", "subject": "LOF_1",
              "value": {"final_rank": 1, "final_rank_tied": False,
                        "markov_score": 0.1835, "mean_abs_shap_rank": 2,
-                       "pfi_rank": 1, "signed_direction": "positive"},
+                       "pfi_rank": 1, "ale_rank": 1, "sign": "positive",
+                       "sign_support": []},
              "text": "LOF_1 carries the most weight."},
             {"id": "d2", "type": "detector_role", "subject": "NN_3",
              "value": {"final_rank": 2, "final_rank_tied": True,
                        "markov_score": 0.0777, "mean_abs_shap_rank": 1,
-                       "pfi_rank": 2, "signed_direction": "negative"},
+                       "pfi_rank": 2, "ale_rank": 3, "sign": "negative",
+                       "sign_support": ["low_consistency"]},
              "text": "NN_3 carries the second-most weight."},
+            {"id": "d3", "type": "detector_role", "subject": "CBLOF_2",
+             "value": {"final_rank": 3, "final_rank_tied": False,
+                       "markov_score": 0.0431, "mean_abs_shap_rank": 3,
+                       "pfi_rank": 3, "ale_rank": 2, "sign": "not_available",
+                       "sign_support": []},
+             "text": "CBLOF_2 carries the third-most weight."},
         ])
         out = summarize.summarize("The combination step selected 2 detectors. "
                                   "LOF_1 carries the most weight.",
@@ -886,9 +943,18 @@ class TestSummaryTables(unittest.TestCase):
         self.assertEqual(out["mode"], "table")
         table = out["table"]
         self.assertEqual(table["columns"],
-                         ["Weight rank", "Detector", "|SHAP| rank", "PFI rank", "Sign"])
-        self.assertEqual(table["rows"][0], [1, "LOF_1", 2, 1, "positive"])
-        self.assertEqual(table["rows"][1], ["2 (tie)", "NN_3", 1, 2, "negative"])
+                         ["Weight rank", "Detector", "|SHAP| rank", "PFI rank",
+                          "ALE rank", "Sign", "Sign support"])
+        self.assertEqual(table["rows"][0],
+                         [1, "LOF_1", 2, 1, 1, "positive", "strong"])
+        # A thinly-evidenced sign is still SHOWN — the support column is what
+        # qualifies it. Blanking the sign would read as missing data.
+        self.assertEqual(table["rows"][1],
+                         ["2 (tie)", "NN_3", 1, 2, 3, "negative", "low consistency"])
+        # The IR's underscored state renders as words for a reader, and a
+        # detector with no sign has no support to report either.
+        self.assertEqual(table["rows"][2],
+                         [3, "CBLOF_2", 3, 3, 2, "not available", "—"])
         # The raw stationary-distribution values never reach the page: their
         # ties are decided at the 16th decimal.
         self.assertNotIn("0.1835", json.dumps(table))
@@ -1154,6 +1220,30 @@ class TestPlots(unittest.TestCase):
         self.assertEqual(headline[0]["default"], 0)
         self.assertIn("_F1_plain.png", headline[0]["variants"][0]["name"])
 
+    def test_ale_views_are_one_toggle_with_the_plain_curve_first(self):
+        """Both ALE figures share the `ga_combination_ale` prefix, and the
+        dataset name follows it — so they are split by name, not by a glob
+        character class that a dataset beginning with 'b' would defeat. The
+        plain curve is the default: the bin rules are for digging."""
+        self._touch("GA_Ens/bats/7/ga_combination_importance_bats_7.png")
+        self._touch("GA_Ens/bats/7/ga_combination_ale_bats_7.png")
+        self._touch("GA_Ens/bats/7/ga_combination_ale_bins_bats_7.png")
+        headline, _ = self.plots._ga_combination("bats", "7")
+        toggle = next(f for f in headline if "variants" in f)
+        self.assertEqual(toggle["default"], 0)
+        self.assertEqual([v["title"] for v in toggle["variants"]],
+                         ["Plain", "Bin edges marked"])
+        self.assertEqual(toggle["variants"][0]["name"],
+                         "ga_combination_ale_bats_7.png")
+
+    def test_ale_toggle_survives_a_missing_second_view(self):
+        """Entities explained before the bin view existed keep the plain curve
+        rather than losing the figure to a half-built toggle."""
+        self._touch("GA_Ens/SKAB/7/ga_combination_ale_SKAB_7.png")
+        headline, _ = self.plots._ga_combination("SKAB", "7")
+        toggle = next(f for f in headline if "variants" in f)
+        self.assertEqual([v["title"] for v in toggle["variants"]], ["Plain"])
+
     def test_aggregation_is_glob_driven(self):
         """_kendall_only only exists for two-source aggregations, so the set is
         whatever is on disk rather than a fixed list."""
@@ -1203,17 +1293,37 @@ class TestPlots(unittest.TestCase):
         self.assertEqual(page["total"], 30)
 
     def test_per_regime_captions_say_which_quantity_they_show(self):
-        """The two stages' per-regime figures cover the same window range but
-        show different things — an averaged attribution vs a single cumulative
-        snapshot — so "windows 10–62" alone under-describes both."""
+        """Three per-regime sets cover the same window range and show three
+        different things — a share of the expected reward, a departure from a
+        typical window, and a cumulative ranking snapshot. "Windows 10–62"
+        alone under-describes all of them."""
         self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        for stem in ("reward_per_regime", "shap_per_regime", "ranking_per_regime"):
+            self._touch(f"Thomposon/SKAB/7/{stem}_50/regime_00_w0-4_NN_3.png")
+        cap = {stem: self.plots.regime_plots("SKAB", "7", stem)[0]["caption"]
+               for stem in ("reward_per_regime", "shap_per_regime", "ranking_per_regime")}
+        self.assertIn("sum to that reward", cap["reward_per_regime"])
+        self.assertIn("does not sum to it", cap["shap_per_regime"])
+        self.assertIn("cumulative", cap["ranking_per_regime"])
+        self.assertEqual(len(set(cap.values())), 3)
+
+    def test_regime_variants_are_ordered_with_the_default_first(self):
+        """The selection-dynamics card offers a toggle: the expected-reward
+        contribution by default, SHAP's deviation view one click away. Order is
+        the contract — the frontend shows variants[0]."""
+        self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
+        self._touch("Thomposon/SKAB/7/reward_per_regime_50/regime_00_w0-4_NN_3.png")
+        self._touch("Thomposon/SKAB/7/reward_per_regime_50/regime_01_w5-9_NN_1.png")
         self._touch("Thomposon/SKAB/7/shap_per_regime_50/regime_00_w0-4_NN_3.png")
-        self._touch("Thomposon/SKAB/7/ranking_per_regime_50/regime_00_w10-62_NN_3.png")
-        shap = self.plots.regime_plots("SKAB", "7")[0]["caption"]
-        ranking = self.plots.regime_plots("SKAB", "7", "ranking_per_regime")[0]["caption"]
-        self.assertIn("averaged over the regime", shap)
-        self.assertIn("last window of the regime", ranking)
-        self.assertIn("cumulative", ranking)
+        variants = self.plots.regime_plot_variants(
+            "SKAB", "7", ["reward_per_regime", "shap_per_regime"])
+        self.assertEqual(sorted(variants), [0, 1])
+        self.assertEqual([f["title"] for f in variants[0]],
+                         ["Expected-reward contribution", "Deviation from a typical window"])
+        # A regime present in only one set keeps that set, rather than the
+        # missing one shifting the others.
+        self.assertEqual([f["title"] for f in variants[1]],
+                         ["Expected-reward contribution"])
 
     def test_channel_plot_captions_state_the_selection_rule(self):
         """These figures plot a subset — 9 channels on SKAB, 38 on SMD — and the

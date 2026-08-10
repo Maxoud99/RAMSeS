@@ -42,15 +42,22 @@ def _ga_selection_result():
 
 
 def _ga_combination_result():
-    # A: rank 1 on all three (positive); B: rank 2 on |SHAP|+signed but 3 on PFI
-    # (positive); C: rank 3 on |SHAP|+signed but 2 on PFI (negative). Exercises
-    # the shared-rank collapse and the positive/negative sign grouping.
+    # A: rank 1 on all three, pushes toward anomaly. B: rank 2 on |SHAP| and
+    # ALE but 3 on PFI, also toward anomaly. C: rank 3 on |SHAP| and ALE but 2
+    # on PFI, and pushes the other way. Exercises the shared-rank collapse and
+    # the two-way sign grouping. `shap_signed_importance` is still
+    # produced (the report keeps it for comparison) but the IR must ignore it.
     return {
         "best_ensemble": ["A", "B", "C"], "feature_names": ["A", "B", "C"],
         "meta_model_type": "rf", "model_source": "captured", "baseline_f1": 0.87,
         "shap_importance": {"A": 0.4, "B": 0.2, "C": 0.1},
         "shap_signed_importance": {"A": 0.35, "B": 0.15, "C": -0.05},
         "pfi_importance": {"A": 0.2, "B": 0.05, "C": 0.08},
+        "ale_total_variation": {"A": 0.5, "B": 0.3, "C": 0.2},
+        "ale_net": {"A": 0.5, "B": 0.3, "C": -0.2},
+        "ale_consistency": {"A": 1.0, "B": 1.0, "C": 1.0},
+        "ale_sign": {"A": "positive", "B": "positive", "C": "negative"},
+        "ale_sign_support": {"A": [], "B": [], "C": []},
         "markov_scores": {"A": 0.5, "B": 0.3, "C": 0.2},
         "final_ranking": ["A", "B", "C"],
     }
@@ -130,12 +137,24 @@ def _thompson_kwargs():
         regimes=[{"index": 0, "start": 0, "end": 2, "duration": 3, "leader": "A",
                   "rewards_top": [("A", 0.5), ("B", 0.2)], "reward_gap": 0.3,
                   "runner_up": "B",
+                  # Three distinct quantities: what the reward is MADE of,
+                  # where the leader's EDGE over the runner-up comes from (same
+                  # units, differenced), and how far each channel departs from
+                  # its usual contribution.
+                  "reward_raising": [(0, 0.6), (1, 0.2)],
+                  "reward_lowering": [(4, -0.05)],
+                  "edge_favor_leader": [(0, 0.25)],
+                  "edge_favor_runner": [(3, -0.04)], "edge_gap": 0.3,
                   "shap_raising": [(0, 0.4)], "shap_lowering": [(2, -0.1)],
                   "pref_favor_leader": [(0, 0.3)],
                   "pref_favor_runner": [(3, -0.05)], "pref_gap": 0.3},
                  {"index": 1, "start": 3, "end": 5, "duration": 3, "leader": "B",
                   "rewards_top": [("B", 0.6), ("A", 0.4)], "reward_gap": 0.2,
-                  "runner_up": "A", "shap_raising": None, "shap_lowering": None,
+                  "runner_up": "A",
+                  "reward_raising": None, "reward_lowering": None,
+                  "edge_favor_leader": None, "edge_favor_runner": None,
+                  "edge_gap": float("nan"),
+                  "shap_raising": None, "shap_lowering": None,
                   "pref_favor_leader": None, "pref_favor_runner": None,
                   "pref_gap": float("nan")}],
         shifts=[{"window": 3, "from_model": "A", "to_model": "B",
@@ -255,12 +274,16 @@ class TestBuilders(unittest.TestCase):
             "Thompson Sampling ranked A first with a final score of 1.500000, "
             "ahead of B by 0.800000.")
 
-        # ONE atom per regime: span + leader + channels in a single sentence.
+        # One atom per regime, carrying THREE distinct claims: what the reward
+        # was made of, where the edge over the runner-up came from (the same
+        # units, so the two share a sentence), and — separately, because it is
+        # a different quantity — which channel departed furthest from its usual.
         self.assertEqual(
             by_id["ts.regime.0"]["text"],
-            "Regime 0 (windows 0 to 2, 3 windows) was led by A. Channel 0 raised "
-            "its expected reward the most, with channel 0 also giving it its "
-            "biggest edge over B.")
+            "Regime 0 (windows 0 to 2, 3 windows) was led by A. Channel 0 and "
+            "channel 1 raised its expected reward the most, with channel 0 "
+            "also giving it its biggest edge over B. Channel 0 departed "
+            "furthest from its usual contribution here, running above it.")
         # Regime 1 has no SHAP/preference data -> just the span sentence.
         self.assertEqual(
             by_id["ts.regime.1"]["text"],
@@ -298,31 +321,67 @@ class TestBuilders(unittest.TestCase):
 
     def test_thompson_regime_channels_kept_with_their_own_regime(self):
         """Each regime's channels are named inside that regime's sentence, and a
-        differing edge channel is reported separately from the raising ones."""
+        differing edge channel is reported separately from the supplying ones.
+
+        Both clauses read the CONTRIBUTION split — the edge is that split
+        differenced against the runner-up — so they are slices of one total and
+        can share a sentence. Sourcing the edge from SHAP is what this pins
+        against: it would put a deviation and a share in one breath.
+        """
         kwargs = _thompson_kwargs()
-        kwargs["regimes"][0]["shap_raising"] = [(2, 0.5), (5, 0.2)]
-        kwargs["regimes"][0]["pref_favor_leader"] = [(7, 0.3)]
+        kwargs["regimes"][0]["reward_raising"] = [(2, 0.5), (5, 0.2)]
+        kwargs["regimes"][0]["edge_favor_leader"] = [(7, 0.3)]
         doc = ir.build_thompson_ir("DS", "e1", **kwargs)
         txt = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")["text"]
         self.assertIn("Channel 2 and channel 5 raised its expected reward the most",
                       txt)
         self.assertIn("channel 7 gave it its biggest edge over B", txt)
 
-    def test_thompson_negative_pref_gap_is_not_dramatised(self):
-        """A negative preference score is a level-vs-deviation difference, not a
-        contradiction: the prose names the leader's best channel either way and
-        never editorialises with 'although'."""
+    def test_thompson_edge_never_comes_from_the_deviation_split(self):
+        """The edge clause is in expected-reward units. A run whose SHAP
+        comparison points at a different channel must not move it: the two
+        measure different things and only one sums to the reported gap."""
         kwargs = _thompson_kwargs()
-        kwargs["regimes"][0]["pref_gap"] = -0.12
-        kwargs["regimes"][0]["pref_favor_leader"] = [(1, 0.02)]
-        kwargs["regimes"][0]["pref_favor_runner"] = [(0, -0.14)]
+        kwargs["regimes"][0]["edge_favor_leader"] = [(1, 0.25)]
+        kwargs["regimes"][0]["pref_favor_leader"] = [(6, 0.9)]
         doc = ir.build_thompson_ir("DS", "e1", **kwargs)
         atom = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")
-        self.assertIn("channel 1 gave it its biggest edge over B", atom["text"])
+        self.assertIn("channel 1 also giving it its biggest edge over B",
+                      atom["text"])
+        self.assertNotIn("channel 6", atom["text"])
+        # SHAP's version of the comparison survives for the alternate plot.
+        self.assertEqual(atom["value"]["deviation_edge_channels"], [[6, 0.9]])
+
+    def test_thompson_deviation_sentence_names_the_furthest_departure(self):
+        """The deviation clause reports the largest departure in EITHER
+        direction and says which way — taking only the positive list would
+        silently drop a channel that collapsed below its usual."""
+        kwargs = _thompson_kwargs()
+        kwargs["regimes"][0]["shap_raising"] = [(1, 0.2)]
+        kwargs["regimes"][0]["shap_lowering"] = [(3, -0.9)]
+        doc = ir.build_thompson_ir("DS", "e1", **kwargs)
+        atom = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")
+        self.assertIn("Channel 3 departed furthest from its usual contribution "
+                      "here, running below it.", atom["text"])
+        self.assertEqual(atom["value"]["deviation_lowering"], [[3, -0.9]])
+
+    def test_thompson_negative_edge_gap_is_not_dramatised(self):
+        """A regime whose leader trails on the aggregate gap is still narrated
+        by naming its best channel — the prose never editorialises with
+        'although' or leaks the signed gap into the sentence."""
+        kwargs = _thompson_kwargs()
+        kwargs["regimes"][0]["edge_gap"] = -0.12
+        kwargs["regimes"][0]["edge_favor_leader"] = [(1, 0.02)]
+        kwargs["regimes"][0]["edge_favor_runner"] = [(0, -0.14)]
+        doc = ir.build_thompson_ir("DS", "e1", **kwargs)
+        atom = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")
+        self.assertIn("channel 1 also giving it its biggest edge over B",
+                      atom["text"])
         for word in ("although", "however", "despite", "-0.12"):
             self.assertNotIn(word, atom["text"])
-        # The signed gap is still grounded in `value` for the verifier.
-        self.assertEqual(atom["value"]["preference_score_gap"], -0.12)
+        # The signed gaps are still grounded in `value` for the verifier.
+        self.assertEqual(atom["value"]["edge_gap"], -0.12)
+        self.assertEqual(atom["value"]["preference_score_gap"], 0.3)
 
     def test_thompson_channel_names_used_when_available(self):
         kwargs = _thompson_kwargs()
@@ -332,7 +391,7 @@ class TestBuilders(unittest.TestCase):
             "DS", "e1", channel_names=["Pressure", "Accelerometer1RMS"], **kwargs)
         txt = next(a for a in named["evidence"] if a["id"] == "ts.regime.0")["text"]
         # Name is used verbatim — never lower-cased by a blanket .capitalize().
-        self.assertIn("Accelerometer1RMS raised its expected reward", txt)
+        self.assertIn("Accelerometer1RMS raised its expected reward the most", txt)
         self.assertNotIn("channel 1", txt)
         # Out-of-range indices fall back to the numeric form.
         short = ir.build_thompson_ir("DS", "e1", channel_names=["Pressure"], **kwargs)
@@ -373,8 +432,8 @@ class TestBuilders(unittest.TestCase):
         # forwarded contributions rather than restated by the caller.
         self.assertEqual(
             by_id["tsr.winner.channels"]["text"],
-            "A's score is built mostly from channel 0 (60.0%), channel 2 "
-            "(26.7%), and channel 1 (13.3%).")
+            "channel 0 (60.0%), channel 2 (26.7%), and channel 1 (13.3%) "
+            "contributed the majority of A's score.")
         # No concentration atom: "the top 3 channels are N% of the score" is a
         # restatement of the shares just given, and the narrator turned it into
         # editorial ("indicating the remaining six contributed less
@@ -388,8 +447,8 @@ class TestBuilders(unittest.TestCase):
         # inverted the claim in a real narration.
         self.assertEqual(
             by_id["tsr.gap.runner_up"]["text"],
-            "A's lead over B came mostly from channel 0 and channel 2, while "
-            "channel 1 favoured B the most.")
+            "Channel 0 and channel 2 contributed significantly to the lead "
+            "that A had over B, while channel 1 favoured B more than A.")
         for atom_id in ("tsr.gap.runner_up", "tsr.winner.channels"):
             self.assertNotIn("0.700000", by_id[atom_id]["text"])
         self.assertEqual(by_id["tsr.gap.runner_up"]["value"]["per_channel"],
@@ -475,7 +534,7 @@ class TestBuilders(unittest.TestCase):
         # the detector the channel went to, so direction cannot be inferred
         # from a sign the narrator has to interpret.
         gap = next(a for a in doc["evidence"] if a["type"] == "rank_gap")
-        self.assertIn("favoured B the most", gap["text"])
+        self.assertIn("favoured B more than A", gap["text"])
 
     def test_thompson_ranking_degenerate_runs(self):
         kwargs = _thompson_ranking_kwargs()
@@ -515,6 +574,101 @@ class TestBuilders(unittest.TestCase):
         picks = re.search(r"stage_picks = \{(.*?)\n    \}", source, re.S)
         self.assertIsNotNone(picks)
         self.assertNotIn("thompson_ranking", picks.group(1))
+
+    def test_ga_combination_reports_a_thinly_supported_sign_and_qualifies_it(self):
+        """A detector whose effect changes sign across its range still ends
+        somewhere, and where it ends is a measurement. Withholding it turned a
+        measured negative into a blank that read as missing data; the sign is
+        reported and the caveat is what says how far to trust it."""
+        result = _ga_combination_result()
+        result["ale_net"] = {"A": 0.5, "B": -0.01, "C": -0.2}
+        result["ale_consistency"] = {"A": 1.0, "B": 0.03, "C": 1.0}
+        result["ale_sign"] = {"A": "positive", "B": "negative", "C": "negative"}
+        result["ale_sign_support"] = {"A": [], "B": ["low_consistency"], "C": []}
+        doc = ir.build_ga_combination_ir("DS", "e1", result)
+        by_id = {a["id"]: a for a in doc["evidence"]}
+
+        role = by_id["ga_comb.detector.B.role"]["value"]
+        self.assertEqual(role["sign"], "negative")
+        self.assertEqual(role["sign_support"], ["low_consistency"])
+        # B still carries full weight — it is rank 2 of 3 — so a qualified sign
+        # must not read as "unimportant".
+        self.assertIn("second-most weight",
+                      by_id["ga_comb.detector.B.role"]["text"])
+        # B is grouped with the other negative, not exiled to a third bucket.
+        sign = by_id["ga_comb.sign_summary"]
+        self.assertEqual(
+            sign["text"],
+            "A is positive, while B and C are negative.")
+        self.assertEqual(sign["value"]["no_sign"], [])
+
+        # The run-dependent caveat fires, names exactly the affected detector,
+        # and gives the reason its sign is thin.
+        caveat = next(c for c in doc["caveats"]
+                      if c["id"] == "ga_comb.caveat.sign_consistency")
+        self.assertEqual(
+            caveat["text"],
+            "Weakly supported sign: B pushed the meta-learner both ways across "
+            "its score range. Keep that in mind when reading it.")
+        self.assertEqual(caveat["value"]["weakly_supported"], ["B"])
+        # A detector with a well-supported sign is never dragged in with it.
+        self.assertNotIn("A and", caveat["text"])
+
+    def test_ga_combination_weak_and_missing_signs_are_separate_caveats(self):
+        """Two different statements. 'Trust this less' and 'there is nothing
+        here' collapsed into one atom would let a narrator report either as the
+        other."""
+        result = _ga_combination_result()
+        result["ale_sign"] = {"A": "positive", "B": "negative",
+                              "C": "not_available"}
+        result["ale_sign_support"] = {"A": [], "B": ["weak_influence"], "C": []}
+        doc = ir.build_ga_combination_ir("DS", "e1", result)
+        by_cid = {c["id"]: c for c in doc["caveats"]}
+
+        self.assertEqual(by_cid["ga_comb.caveat.sign_consistency"]
+                         ["value"]["weakly_supported"], ["B"])
+        self.assertIn("moved the meta-learner too little",
+                      by_cid["ga_comb.caveat.sign_consistency"]["text"])
+        self.assertEqual(by_cid["ga_comb.caveat.sign_missing"]["value"]["no_sign"],
+                         ["C"])
+        self.assertIn("no net effect to take a sign from",
+                      by_cid["ga_comb.caveat.sign_missing"]["text"])
+
+    def test_ga_combination_no_weak_signs_emits_no_caveat(self):
+        """The qualification is run-dependent: a run where every sign is well
+        supported must not carry a caveat implying otherwise."""
+        result = _ga_combination_result()
+        result["ale_sign_support"] = {"A": [], "B": [], "C": []}
+        doc = ir.build_ga_combination_ir("DS", "e1", result)
+        ids = {c["id"] for c in doc["caveats"]}
+        self.assertNotIn("ga_comb.caveat.sign_consistency", ids)
+        self.assertNotIn("ga_comb.caveat.sign_missing", ids)
+
+    def test_ga_combination_sign_absent_for_every_detector(self):
+        """When nothing has a sign the summary must still say something
+        true, not fall through to an empty atom."""
+        result = _ga_combination_result()
+        result["ale_sign"] = {"A": "not_available", "B": "not_available",
+                              "C": "not_available"}
+        doc = ir.build_ga_combination_ir("DS", "e1", result)
+        sign = next(a for a in doc["evidence"] if a["id"] == "ga_comb.sign_summary")
+        self.assertEqual(
+            sign["text"],
+            "No detector has a sign: A, B, and C have no net effect.")
+        self.assertIn("ga_comb.sign_summary", doc["required_atom_ids"])
+
+    def test_ga_combination_output_does_not_credit_the_stage_with_selecting(self):
+        """The GA picks the subset; this stage only measures. The atom used to
+        say the 'combination step selected' the ensemble and that the
+        meta-learner 'then weighted' it — two claims about steps that do not
+        happen."""
+        doc = ir.build_ga_combination_ir("DS", "e1", _ga_combination_result())
+        atom = next(a for a in doc["evidence"] if a["id"] == "ga_comb.output.subset")
+        self.assertEqual(
+            atom["text"],
+            "The genetic algorithm selected the 3-detector ensemble {A, B, C}; "
+            "the ranking below measures how much each of those detectors moves "
+            "the trained meta-learner's output.")
 
     def test_ga_selection_no_archetype_codes_or_complementarity(self):
         doc = ir.build_ga_selection_ir("DS", "e1", _ga_selection_result())
@@ -669,43 +823,61 @@ class TestBuilders(unittest.TestCase):
         for d in ("A", "B", "C"):
             self.assertIn(f"ga_comb.detector.{d}.role", by_id)
             self.assertIn(f"ga_comb.detector.{d}.role", doc["required_atom_ids"])
-        # Only the two MAGNITUDE measures are quoted: signed SHAP no longer
-        # feeds the aggregation, so citing its rank here would imply a
-        # contribution to the weight that it does not make.
+        # The three MAGNITUDE measures are quoted — the ones that actually feed
+        # the aggregation. Signed SHAP is not among them and no longer supplies
+        # the direction either, so citing it here would imply a contribution it
+        # does not make.
         # The overall weight rank carries its own LABEL and its own NUMBER: as a
         # bare ordinal it was the only quantity in the sentence without a digit,
-        # sitting beside two digit method ranks, and narrators re-derived it from
+        # sitting beside the digit method ranks, and narrators re-derived it from
         # whichever digit was nearest.
         a = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.A.role")
         self.assertEqual(
             a["text"],
             "A carries the most weight in the ensemble (overall weight rank 1 of "
-            "3), ranking 1 on absolute SHAP and PFI.")
+            "3), ranking 1 on absolute SHAP, PFI, and total ALE.")
+        # Two rank groups where one holds two measures: the comma before the
+        # final "and" is what separates the groups. Without it this reads
+        # "...absolute SHAP and total ALE and 3 on PFI".
         b = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.B.role")
         self.assertEqual(
             b["text"],
             "B carries the second-most weight in the ensemble (overall weight "
-            "rank 2 of 3), ranking 2 on absolute SHAP and 3 on PFI.")
+            "rank 2 of 3), ranking 2 on absolute SHAP and total ALE, and 3 on PFI.")
         c = next(x for x in doc["evidence"] if x["id"] == "ga_comb.detector.C.role")
         self.assertEqual(
             c["text"],
             "C carries the third-most weight in the ensemble (overall weight "
-            "rank 3 of 3), ranking 3 on absolute SHAP and 2 on PFI.")
+            "rank 3 of 3), ranking 3 on absolute SHAP and total ALE, and 2 on PFI.")
         prose = " ".join(x["text"] for x in doc["evidence"])
         self.assertNotIn("signed SHAP", prose)
-        # ...but the signed value and its rank stay machine-readable.
-        self.assertEqual(b["value"]["signed_shap"], 0.15)
-        self.assertEqual(b["value"]["signed_shap_rank"], 2)
+        # Signed SHAP is gone from the machine-readable block too: the verifier
+        # admits every number in a `value` dict, so leaving the superseded one
+        # there would let a narrator quote it unflagged.
+        self.assertNotIn("signed_shap", b["value"])
+        self.assertNotIn("signed_shap_rank", b["value"])
+        # ALE supplies magnitude, its rank, the net effect and the consistency
+        # that decided whether a sign could be claimed at all.
+        self.assertEqual(b["value"]["ale_total"], 0.3)
+        self.assertEqual(b["value"]["ale_rank"], 2)
+        self.assertEqual(b["value"]["ale_net"], 0.3)
+        self.assertEqual(b["value"]["sign_consistency"], 1.0)
         # No raw magnitude leaks into the prose (they stay in `value`).
         self.assertNotIn("Markov", a["text"])
         self.assertNotIn("0.35", b["text"])
-        self.assertEqual(b["value"]["signed_direction"], "positive")
-        self.assertEqual(c["value"]["signed_direction"], "negative")
+        self.assertEqual(b["value"]["sign"], "positive")
+        self.assertEqual(c["value"]["sign"], "negative")
 
-        # One sign-summary atom classifies all members by full name.
+        # One sign-summary atom classifies all members by full name, and says
+        # what the sign MEANS rather than just naming it.
         self.assertIn("ga_comb.sign_summary", doc["required_atom_ids"])
         sign = next(a for a in doc["evidence"] if a["id"] == "ga_comb.sign_summary")
-        self.assertEqual(sign["text"], "A and B signed positive, while C signed negative.")
+        self.assertEqual(
+            sign["text"],
+            "A and B are positive, while C is negative.")
+        # Every detector has a sign here, so no consistency caveat fires.
+        self.assertNotIn("ga_comb.caveat.sign_consistency",
+                         {x["id"] for x in doc["caveats"]})
 
         # Retired atoms from the old dense layout are gone.
         for gone in ("ga_comb.output.top", "ga_comb.context.members",
@@ -714,7 +886,8 @@ class TestBuilders(unittest.TestCase):
 
         # Envelope carries the headline question and the sign/rank glossary.
         self.assertIn("push the meta-learner's decision", doc["question"])
-        self.assertIn("A positive sign means", doc["info_footer"])
+        self.assertIn("The sign is the sign of ALE's net accumulated effect",
+                      doc["info_footer"])
         self.assertEqual(doc["output"]["ensemble_members"], ["A", "B", "C"])
 
     def test_rank_aggregation_robust_and_final(self):

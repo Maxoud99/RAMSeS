@@ -344,6 +344,15 @@ td.detector { font-family: var(--font-detector); letter-spacing: -0.02em; }
 .summary-table tbody tr:last-child td { border-bottom: none; }
 .summary-table tbody tr:hover { background: var(--surface-sunken); }
 
+/* An inline warning about the content below it. Reuses the warn tokens, and
+   carries a glyph as well as colour so it survives a black-and-white print. */
+.notice {
+  background: var(--warn-soft); color: var(--warn);
+  border-left: 3px solid var(--warn);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm); border-radius: 3px;
+}
+
 /* Sortable headers. The glyph is generated from aria-sort, so the visual state
    and the state announced to a screen reader cannot drift apart. */
 th[aria-sort] { cursor: pointer; user-select: none; white-space: nowrap; }

@@ -48,10 +48,12 @@ STAGES: Tuple[Dict[str, Any], ...] = (
     # regime-bearing, replacing a hardcoded stage-key check here and in server.py.
     {"key": "thompson_ranking", "title": "Thompson Sampling: ranking criterion",
      "cli": "thompson", "ir": "ir_thompson_ranking", "nl": "nl_thompson_ranking",
-     "plot_group": "ts_ranking", "order": 3, "regimes": "ranking_per_regime"},
+     "plot_group": "ts_ranking", "order": 3,
+     "regimes": ["ranking_per_regime"]},
     {"key": "thompson_sampling", "title": "Thompson Sampling: selection dynamics",
      "cli": "thompson", "ir": "ir_thompson", "nl": "nl_thompson",
-     "plot_group": "thompson", "order": 4, "regimes": "shap_per_regime"},
+     "plot_group": "thompson", "order": 4,
+     "regimes": ["reward_per_regime", "shap_per_regime"]},
     {"key": "monte_carlo", "title": "Robustness: Monte Carlo noise sweep",
      "cli": "montecarlo", "ir": "ir_monte_carlo", "nl": "nl_monte_carlo",
      "plot_group": "monte_carlo", "order": 5},
@@ -123,22 +125,42 @@ def _newest(pattern_dir: Path, pattern: str) -> Optional[Path]:
     return Path(max(matches, key=lambda p: os.path.getmtime(p)))
 
 
+# A narrative is stale once its IR has been rewritten under it. This happens
+# for real: `--stages X --explain` is a PARTIAL run, and app.py returns before
+# the narration block, so it regenerates the IR and every plot but leaves the
+# prose alone. The page then shows fresh figures beside sentences describing a
+# run that no longer exists — on SKAB/7 the narrative walked 14 regimes while
+# the IR and the plots had 10. Nothing else notices, because the two files are
+# read independently. One second of slack absorbs same-run write ordering.
+_STALE_SLACK_SECONDS = 1.0
+
+
+def _mtime(path: Optional[Path]) -> Optional[float]:
+    try:
+        return path.stat().st_mtime if path is not None else None
+    except OSError:
+        return None
+
+
 def _load_stage_files(ir_dir: Optional[Path], nl_dir: Optional[Path],
-                      stage: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str], Optional[Path]]:
-    """(ir_doc, raw_nl_text, nl_path) for one stage, tolerating iteration drift."""
+                      stage: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str],
+                                                      Optional[Path], bool]:
+    """(ir_doc, raw_nl_text, nl_path, narrative_is_stale) for one stage."""
     ir_doc = raw = None
-    nl_path = None
+    ir_path = nl_path = None
     if ir_dir is not None:
         exact = ir_dir / f"{stage['ir']}.json"
-        path = exact if exact.exists() else _newest(ir_dir, f"{stage['ir']}*.json")
-        if path is not None:
-            ir_doc = _read_json(path)
+        ir_path = exact if exact.exists() else _newest(ir_dir, f"{stage['ir']}*.json")
+        if ir_path is not None:
+            ir_doc = _read_json(ir_path)
     if nl_dir is not None:
         exact = nl_dir / f"{stage['nl']}.txt"
         nl_path = exact if exact.exists() else _newest(nl_dir, f"{stage['nl']}*.txt")
         if nl_path is not None:
             raw = _read_text(nl_path)
-    return ir_doc, raw, nl_path
+    ir_at, nl_at = _mtime(ir_path), _mtime(nl_path)
+    stale = bool(ir_at and nl_at and nl_at + _STALE_SLACK_SECONDS < ir_at)
+    return ir_doc, raw, nl_path, stale
 
 
 def load_global_ir(dataset: str, entity: str) -> Optional[dict]:
@@ -309,7 +331,7 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
     missing: List[Dict[str, Any]] = []
 
     for stage in STAGES:
-        ir_doc, raw, nl_path = _load_stage_files(ir_dir, nl_dir, stage)
+        ir_doc, raw, nl_path, stale = _load_stage_files(ir_dir, nl_dir, stage)
         if ir_doc is None and raw is None:
             continue
         info, narrative = split_info(raw or "")
@@ -336,7 +358,10 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             # trimmed body so the page never prints them twice. `words` and the
             # download stay on the real narrative — the file on disk is the
             # verbatim record, and the length is what the model actually wrote.
-            "full": summary.get("extended") or narrative,
+            # `body` is that narrative minus any sentence restating a caveat:
+            # the card lists the caveats verbatim below, so the disclosure must
+            # not be a second, looser copy of them.
+            "full": summary.get("extended") or summary.get("body") or narrative,
             "words": len(narrative.split()) if narrative else 0,
             "info": info,
             "question": (ir_doc or {}).get("question"),
@@ -345,6 +370,10 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             "faithfulness": _stage_faithfulness(faith, stage["key"]),
             "plot_group": stage["plot_group"],
             "nl_file": nl_path.name if nl_path else None,
+            # The narrative predates its own IR: the numbers on this card
+            # may describe a previous run. Surfaced rather than silently
+            # rendered, and cleared by re-running the narrator.
+            "stale": stale,
         }
         if stage.get("regimes") and ir_doc:
             entry["regimes"] = _regimes_from_ir(ir_doc)

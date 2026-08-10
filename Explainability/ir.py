@@ -357,12 +357,20 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     SHAP helpers): {"index","start","end","duration","leader",
     "rewards_top": [(model, mean_reward)], "reward_gap": float|None,
     "runner_up": str|None,
+    "reward_raising": [(ch, val)]|None, "reward_lowering": [(ch, val)]|None,
     "shap_raising": [(ch, val)]|None, "shap_lowering": [(ch, val)]|None,
+    "edge_favor_leader": [(ch, delta)]|None,
+    "edge_favor_runner": [(ch, delta)]|None, "edge_gap": float|None,
     "pref_favor_leader": [(ch, delta)]|None,
     "pref_favor_runner": [(ch, delta)]|None,
     "pref_gap": float|None}.
-    SHAP/preference channels arrive pre-split by sign so no consumer ever has
-    to infer direction from a signed list sorted by magnitude.
+    Every channel list arrives pre-split by sign so no consumer ever has to
+    infer direction from a signed list sorted by magnitude.
+
+    Two comparisons against the runner-up are supplied and they are not
+    interchangeable: `edge_*` differences the raw expected-reward split (its
+    parts sum to the leader's margin, and it is what the prose says), while
+    `pref_*` differences the SHAP split against the run's average window.
 
     `shifts` and `final_state` are accepted for call-site compatibility but are
     not narrated: a shift is the boundary between two regime spans (the spans
@@ -439,30 +447,52 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     for i, r in enumerate(sorted(regimes, key=lambda x: x.get("index", 0))):
         idx = r.get("index", i)
         leader = str(r.get("leader", NOT_AVAILABLE))
-        raising = [c for c, _ in (r.get("shap_raising") or [])][:2]
-        favor = [c for c, _ in (r.get("pref_favor_leader") or [])][:1]
+        # Both narrated channel facts are now slices of the same total — the raw
+        # split of mu.x, whose parts sum to the prediction. `edge_favor_leader`
+        # is that same split differenced against the runner-up, so its parts sum
+        # to the leader's margin in expected reward. Putting the edge in SHAP's
+        # units made one sentence carry two incomparable quantities.
+        supplying = [c for c, _ in (r.get("reward_raising") or [])][:2]
+        favor = [c for c, _ in (r.get("edge_favor_leader") or [])][:1]
         runner = r.get("runner_up")
 
         parts = [f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
                  f"{r.get('duration')} windows) was led by {leader}."]
-        if raising:
+        has_edge = bool(favor and runner)
+
+        def _edge(verb: str) -> str:
+            return f"{verb} it its biggest edge over {runner}"
+
+        if supplying:
             # Uppercase only the first letter — .capitalize() would lowercase
             # the rest, mangling real channel names like Accelerometer1RMS.
-            labels = _oxford([_ch(c) for c in raising])
+            labels = _oxford([_ch(c) for c in supplying])
             labels = labels[:1].upper() + labels[1:]
             tail = ""
-            if favor and runner:
-                if favor[0] == raising[0]:
-                    tail = (f", with {_ch(favor[0])} also giving it its biggest "
-                            f"edge over {runner}")
-                else:
-                    tail = (f", and {_ch(favor[0])} gave it its biggest edge "
-                            f"over {runner}")
+            if has_edge:
+                # One channel often does both jobs; "with X also" says so
+                # instead of naming the same channel twice as though they were
+                # two separate findings. That clause takes a participle, the
+                # coordinate one takes the past tense.
+                tail = (f", with {_ch(favor[0])} also {_edge('giving')}"
+                        if favor[0] in supplying
+                        else f", and {_ch(favor[0])} {_edge('gave')}")
             parts.append(f"{labels} raised its expected reward the most{tail}.")
-        elif favor and runner:
+        elif has_edge:
             lbl = _ch(favor[0])
-            parts.append(f"{lbl[:1].upper() + lbl[1:]} gave it its biggest edge "
-                         f"over {runner}.")
+            parts.append(f"{lbl[:1].upper() + lbl[1:]} {_edge('gave')}.")
+
+        # SHAP gets its own sentence, because it answers a different question:
+        # not what the reward was made of, but which channel behaved least like
+        # itself here. Merged into the clause above it read as a third slice of
+        # the same total, which it is not.
+        deviating = ((r.get("shap_raising") or []) + (r.get("shap_lowering") or []))
+        if deviating:
+            c, v = max(deviating, key=lambda cv: abs(cv[1]) if not _is_nan(cv[1]) else -1)
+            lbl = _ch(c)
+            direction = "above" if (not _is_nan(v) and float(v) >= 0) else "below"
+            parts.append(f"{lbl[:1].upper() + lbl[1:]} departed furthest from its "
+                         f"usual contribution here, running {direction} it.")
 
         rid = f"ts.regime.{idx}"
         evidence.append(make_atom(
@@ -470,8 +500,20 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
             {"index": idx, "start": r.get("start"), "end": r.get("end"),
              "duration": r.get("duration"), "leader": leader,
              "runner_up": runner,
-             "raising_channels": [(c, _val(v, 4)) for c, v in (r.get("shap_raising") or [])],
-             "edge_channels": [(c, _val(v, 4)) for c, v in (r.get("pref_favor_leader") or [])],
+             "supplying_channels": [(c, _val(v, 4)) for c, v in (r.get("reward_raising") or [])],
+             "reducing_channels": [(c, _val(v, 4)) for c, v in (r.get("reward_lowering") or [])],
+             # The edge, in contribution units: these sum to the leader's margin
+             # in expected reward over the runner-up.
+             "edge_channels": [(c, _val(v, 4)) for c, v in (r.get("edge_favor_leader") or [])],
+             "edge_gap": _val(r.get("edge_gap"), 4),
+             # SHAP's deviation split, kept machine-readable: it is what the
+             # deviation sentence and the alternate per-regime plot are built
+             # from. `deviation_edge_channels` is the same comparison as
+             # `edge_channels` measured against the average window instead, and
+             # is retained for provenance only.
+             "deviation_raising": [(c, _val(v, 4)) for c, v in (r.get("shap_raising") or [])],
+             "deviation_lowering": [(c, _val(v, 4)) for c, v in (r.get("shap_lowering") or [])],
+             "deviation_edge_channels": [(c, _val(v, 4)) for c, v in (r.get("pref_favor_leader") or [])],
              "mean_rewards": [(m, _val(v, 4)) for m, v in (r.get("rewards_top") or [])],
              "mean_reward_gap": _val(r.get("reward_gap"), 4),
              "preference_score_gap": _val(r.get("pref_gap"), 4)},
@@ -484,7 +526,7 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
         for r in regimes:
             if str(r.get("leader")) != str(top_model):
                 continue
-            for c, v in (r.get("shap_raising") or []):
+            for c, v in (r.get("reward_raising") or []):
                 if not _is_nan(v):
                     totals[c] = totals.get(c, 0.0) + float(v)
         if totals:
@@ -528,22 +570,22 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
                 "and how much of the run was spent exploring rather than "
                 "exploiting?")
     info_footer = (
-        "Thompson Sampling learns a weight vector for each detector and, at every "
+        "Thompson Sampling learns a mean vector μ for each detector and, at every "
         "window, predicts that detector's reward as the weights applied to the "
-        "window's data; that prediction is its expected reward. The reward it "
-        "learns from is half the F1 score plus half the PR-AUC on that window. "
-        "The score in the ranking above is a different quantity — the overall "
-        "size of those learned weights — and the ranking-criterion stage is "
-        "where it is explained; here it is only the headline, so a detector can "
-        "lead much of the run without finishing first. A regime is a stretch of "
-        "at least three consecutive windows in which one detector holds the "
-        "highest expected reward; shorter changes are counted as blips. These "
-        "regimes follow expected reward and need not line up with the "
-        "ranking-criterion stage's, which follow the ranking score. Channel "
-        "contributions are computed with "
-        "SHAP, which splits an expected reward into one number per input channel. "
-        "The three selection states describe each choice: exploitation means the "
-        "sampler picked the detector it already believed was best, informed "
+        "window's data μᵀx; that prediction is its expected reward. The score in "
+        "the resulting ranking is a different quantity and the ranking-criterion "
+        "stage is where it is explained; here it is only the headline, so a "
+        "detector can lead much of the run without finishing first. A regime is a "
+        "stretch of at least three consecutive windows in which one detector "
+        "holds the highest expected reward μᵀx; shorter changes are counted as "
+        "blips. These regimes need not line up with the ranking-criterion "
+        "stage's.  A channel's contribution is its own share of that expected "
+        "reward: the weights on that channel applied to that channel's readings, "
+        "and those shares add up to the whole prediction μᵀx. A second, narrower "
+        "measure also appears: how far a channel's contribution departs from what "
+        "that channel usually contributes, measured against the average of the "
+        "run. The three selection states describe each choice: exploitation means "
+        "the sampler picked the detector it already believed was best, informed "
         "exploration means the random draw over its uncertainty steered it "
         "elsewhere (a high share means the detectors stayed closely matched and "
         "the beliefs uncertain), and random means a forced exploration step fired "
@@ -634,7 +676,8 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             {"channel": lead_ch[0][0], "total": _val(total, 6),
              "per_channel": [(c, _val(v, 6)) for c, v in winner_channels],
              "top_shares": [(c, _val(p, 1)) for c, p in shares]},
-            f"{top_model}'s score is built mostly from {listed}.", order=10))
+            f"{listed} contributed the majority of {top_model}'s score.",
+            order=10))
         required.append("tsr.winner.channels")
 
     # ── What actually decided the top spot ──
@@ -646,15 +689,20 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             # No raw values in the prose. The table and the gap plot carry the
             # per-channel numbers, and quoting six-decimal figures mid-sentence
             # only invites the narrator to gloss what they mean.
-            parts.append(f"{top_model}'s lead over {runner_up} came mostly from "
-                         f"{_oxford([_ch(c) for c, _v in gains])}")
+            labels = _oxford([_ch(c) for c, _v in gains])
+            parts.append(f"{labels[:1].upper() + labels[1:]} contributed "
+                         f"significantly to the lead that {top_model} had over "
+                         f"{runner_up}")
         if losses:
             c, _v = losses[0]
             # Direction in words, no number and no sign to interpret. An earlier
             # phrasing paired the signed value with "in NN_3's favour" and got
             # read the other way round ("channel 8 had a negative impact on
             # NN_3's score"), inverting the one claim this stage exists to make.
-            parts.append(f"while {_ch(c)} favoured {runner_up} the most")
+            # Naming BOTH sides ("favoured X more than Y") is what makes the
+            # comparison unambiguous without a number.
+            parts.append(f"while {_ch(c)} favoured {runner_up} more than "
+                         f"{top_model}")
         if parts:
             evidence.append(make_atom(
                 "tsr.gap.runner_up", "rank_gap", str(top_model),
@@ -801,22 +849,19 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
                 "channels drove each detector's ranking score up, and how much "
                 "of the winner's margin came from each channel?")
     info_footer = (
-        "Thompson Sampling learns a weight vector for each detector, one weight "
+        "Thompson Sampling learns a mean vector μ for each detector, one weight "
         "per channel per timestep of a window. It ranks the detectors by the "
-        "overall size of those weights — the sum of every squared weight — "
-        "which converges to the reward level that detector earned, where the "
-        "reward is half the F1 score plus half the PR-AUC. That total splits "
-        "exactly into one number per channel: each channel's share is the sum "
-        "of its own squared weights, and the shares add up to the whole score. "
-        "Because they are squares, shares are never negative, so a small share "
-        "means a channel contributed little, not that it worked against the "
-        "detector. Comparing two detectors channel by channel does have a "
-        "direction: the difference between their shares adds up exactly to the "
-        "gap between their scores, and a negative difference marks a channel on "
-        "which the rival was stronger. A regime here is a stretch of windows in "
-        "which one detector held the highest score; these are not the same "
-        "regimes as the selection-dynamics stage reports, which follow expected "
-        "reward instead and need not line up. Thompson Sampling is a seeded "
+        "overall size of those weights μᵀμ (‖μ_k‖²). That total splits exactly "
+        "into one number per channel: each channel's share is the sum of its own "
+        "squared weights, and the shares add up to the whole score. Because they "
+        "are squares, shares are never negative, so a small share means a channel "
+        "contributed little, not that it worked against the detector. Comparing "
+        "two detectors channel by channel does have a direction: the difference "
+        "between their shares adds up exactly to the gap between their scores, "
+        "and a negative difference marks a channel on which the rival was "
+        "stronger. A regime here is a stretch of windows in which one detector "
+        "held the highest score; these are not the same regimes as the "
+        "selection-dynamics stage reports. Thompson Sampling is a seeded "
         "stochastic sampler, so a different seed can produce a different "
         "trajectory.")
 
@@ -1051,8 +1096,8 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
 
 
 # Markov scores that differ by less than this are one tie. The chain behind
-# them is fed by only two measures, so C[j,i] - C[i,j] takes three values and
-# exact ties are the norm; np.linalg.eig then returns those ties a few ulp
+# them is fed by three measures, so C[j,i] - C[i,j] takes only five values and
+# exact ties are common; np.linalg.eig then returns those ties a few ulp
 # apart. Comparing raw floats turned a 1.1e-16 wobble into "carries the most
 # weight", with the eigen-solver — not the data — deciding which detector led.
 _RANK_TIE_ATOL = 1e-9
@@ -1096,11 +1141,12 @@ def _leaders(scores: Dict[str, Any], order: List[str]) -> List[str]:
     return [d for d in order if _tied(scores.get(d), scores.get(order[0]))]
 
 
-# The measures whose RANKS explain a detector's weight. Signed SHAP is absent
-# on purpose: it no longer feeds the Markov aggregation (it measures direction,
-# not magnitude), so quoting its rank beside these would imply a contribution it
-# does not make. It still supplies the sign summary further down.
-_GA_METHODS = ("absolute SHAP", "PFI")
+# The measures whose RANKS explain a detector's weight — the three magnitudes
+# that feed the Markov aggregation. Signed SHAP is absent on purpose: it does
+# not feed the aggregation, and it no longer supplies the sign either
+# (that is now ALE's net effect), so quoting its rank here would imply a
+# contribution it does not make.
+_GA_METHODS = ("absolute SHAP", "PFI", "total ALE")
 
 _WEIGHT_ORD = {1: "the most", 2: "the second-most", 3: "the third-most",
                4: "the fourth-most", 5: "the fifth-most", 6: "the sixth-most",
@@ -1138,8 +1184,8 @@ def _oxford(items: Sequence[str]) -> str:
 
 def _rank_phrase(ranks: Sequence[Any]) -> str:
     """Render the weight-bearing method ranks, grouping measures that share one:
-    (1, 1) -> 'ranking 1 on absolute SHAP and PFI';
-    (2, 3) -> 'ranking 2 on absolute SHAP and 3 on PFI'."""
+    (1, 1, 1) -> 'ranking 1 on absolute SHAP, PFI, and total ALE';
+    (2, 3, 2) -> 'ranking 2 on absolute SHAP and total ALE, and 3 on PFI'."""
     order: List[int] = []
     groups: Dict[int, List[str]] = {}
     na: List[str] = []
@@ -1155,9 +1201,13 @@ def _rank_phrase(ranks: Sequence[Any]) -> str:
     parts = [f"{rk} on {_oxford(groups[rk])}" for rk in order]
     if not parts:
         phrase = "with no method ranking available"
+    elif len(parts) == 2 and any(" and " in p for p in parts):
+        # _oxford drops the serial comma for two items, which with three
+        # measures can put an "and" inside a group AND between the groups
+        # ("2 on absolute SHAP and total ALE and 3 on PFI"). Forcing the comma
+        # back in is what marks where one rank group ends and the next begins.
+        phrase = f"ranking {parts[0]}, and {parts[1]}"
     else:
-        # _oxford drops the serial comma for two items ("X and Y"), which is
-        # the common case now that only two measures carry weight.
         phrase = "ranking " + _oxford(parts)
     if na:
         phrase += f" (not ranked on {_oxford(na)})"
@@ -1165,20 +1215,38 @@ def _rank_phrase(ranks: Sequence[Any]) -> str:
 
 
 def _sign_summary_text(members: Sequence[str], signs: Dict[str, str]) -> str:
-    """One sentence classifying every member as positive- or negative-signed."""
+    """One sentence naming each member's sign.
+
+    Names the sign and stops. What a sign MEANS — which way a rising score
+    moves the meta-learner — is defined once in the info footer, so spelling it
+    out per detector here restates the glossary in every run.
+
+    The third bucket is narrow: every detector with a net effect gets its sign,
+    however thinly supported (the caveat carries that), so landing here means
+    the effect nets to nothing at all rather than that the sign was withheld.
+    """
     pos = [d for d in members if signs.get(d) == "positive"]
     neg = [d for d in members if signs.get(d) == "negative"]
     na = [d for d in members if signs.get(d) not in ("positive", "negative")]
+    # Ensembles of one are ordinary here, so the verb has to agree or every
+    # such run reads as broken English.
+    def _v(group: Sequence[str], singular: str, plural: str) -> str:
+        return singular if len(group) == 1 else plural
+
     if pos and neg:
-        text = f"{_oxford(pos)} signed positive, while {_oxford(neg)} signed negative"
+        text = (f"{_oxford(pos)} {_v(pos, 'is', 'are')} positive, while "
+                f"{_oxford(neg)} {_v(neg, 'is', 'are')} negative")
     elif pos:
-        text = f"{_oxford(pos)} signed positive"
+        text = f"{_oxford(pos)} {_v(pos, 'is', 'are')} positive"
     elif neg:
-        text = f"{_oxford(neg)} signed negative"
+        text = f"{_oxford(neg)} {_v(neg, 'is', 'are')} negative"
+    elif na:
+        return (f"No detector has a sign: {_oxford(na)} "
+                f"{_v(na, 'has', 'have')} no net effect.")
     else:
         return ""
     if na:
-        text += f"; {_oxford(na)} had no signed direction"
+        text += f"; {_oxford(na)} {_v(na, 'has', 'have')} no sign"
     return text + "."
 
 
@@ -1187,15 +1255,23 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
     members = list(result.get("best_ensemble", []))
     pi: Dict[str, float] = result.get("markov_scores", {})
     s_abs: Dict[str, float] = result.get("shap_importance", {})
-    s_sgn: Dict[str, float] = result.get("shap_signed_importance", {})
     pfi: Dict[str, float] = result.get("pfi_importance", {})
+    ale_tv: Dict[str, float] = result.get("ale_total_variation", {})
+    ale_net: Dict[str, float] = result.get("ale_net", {})
+    ale_cons: Dict[str, float] = result.get("ale_consistency", {})
+    # The sign is decided by the producer, which owns the gate thresholds and
+    # the ALE curves they are read from. Reproducing that logic here would give
+    # the report and the narrative two chances to disagree.
+    ale_sign: Dict[str, str] = result.get("ale_sign", {})
+    # Per detector, the reasons its sign is weakly supported ([] when it is not).
+    ale_support: Dict[str, Any] = result.get("ale_sign_support", {})
 
     def _rank_of(imp: Dict[str, float]) -> Dict[str, int]:
         order = sorted((d for d in ranking if not _is_nan(imp.get(d))),
                        key=lambda d: imp[d], reverse=True)
         return {d: i + 1 for i, d in enumerate(order)}
 
-    r_abs, r_sgn, r_pfi = _rank_of(s_abs), _rank_of(s_sgn), _rank_of(pfi)
+    r_abs, r_pfi, r_ale = _rank_of(s_abs), _rank_of(pfi), _rank_of(ale_tv)
     final_rank = _competition_rank(pi, ranking)  # competition rank, display only
     # How many detectors share each rank, so a tied member says so instead of
     # claiming a lead that rests on eigen-solver noise.
@@ -1210,11 +1286,14 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
     # classify all of them, and GA ensembles are small. `detectors` ARE the
     # ensemble members — never rank-aggregation sources.
     detectors = ranking if ranking else members
-    signs: Dict[str, str] = {}
-    for d in detectors:
-        sgn = s_sgn.get(d, float("nan"))
-        signs[d] = (NOT_AVAILABLE if _is_nan(sgn)
-                    else ("positive" if sgn >= 0 else "negative"))
+    signs: Dict[str, str] = {d: str(ale_sign.get(d, NOT_AVAILABLE)) for d in detectors}
+    support: Dict[str, List[str]] = {
+        d: [str(r) for r in (ale_support.get(d) or [])] for d in detectors}
+    # Detectors with no sign at all: ALE was undefined for the column, or the
+    # net effect is exactly zero. A sign that merely rests on thin evidence is
+    # NOT in here — it is reported, and qualified by the caveat below.
+    unsigned = [d for d in detectors if signs[d] not in ("positive", "negative")]
+    weak = [d for d in detectors if support[d] and d not in unsigned]
 
     evidence: List[Dict[str, Any]] = []
     required: List[str] = []
@@ -1235,13 +1314,18 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         n = len(detectors)
         evidence.append(make_atom(
             "ga_comb.output.subset", "stage_output", "best_ensemble", list(detectors),
-            f"The genetic algorithm's combination step selected the {n}-detector "
-            f"ensemble {{{', '.join(detectors)}}}; the meta-learner then weighted "
-            f"these detectors by how much each drives its output.", order=1))
+            # "this stage measures…" left the subject implicit and a narrator
+            # reattached it to the nearest noun ("This ensemble measures how
+            # each detector influences…"), which is nonsense the verifier
+            # cannot see — every name and number in it is correct. Naming the
+            # ranking gives the clause a referent it cannot slide off.
+            f"The genetic algorithm selected the {n}-detector ensemble "
+            f"{{{', '.join(detectors)}}}; the ranking below measures how much "
+            f"each of those detectors moves the trained meta-learner's output.",
+            order=1))
         required.append("ga_comb.output.subset")
 
     for i, d in enumerate(detectors):
-        sgn = s_sgn.get(d, float("nan"))
         rid = f"ga_comb.detector.{d}.role"
         evidence.append(make_atom(
             rid, "detector_role", d,
@@ -1249,14 +1333,17 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
              "final_rank_tied": rank_counts.get(final_rank.get(d), 1) > 1,
              "markov_score": _val(pi.get(d), 4),
              "mean_abs_shap": _val(s_abs.get(d), 6), "mean_abs_shap_rank": r_abs.get(d),
-             # Signed SHAP keeps its value and rank in the machine-readable
-             # block for transparency; only the prose stops quoting the rank.
-             "signed_shap": _val(sgn, 6), "signed_shap_rank": r_sgn.get(d),
-             "signed_direction": signs[d],
-             "pfi_f1_drop": _val(pfi.get(d), 6), "pfi_rank": r_pfi.get(d)},
+             "pfi_f1_drop": _val(pfi.get(d), 6), "pfi_rank": r_pfi.get(d),
+             "ale_total": _val(ale_tv.get(d), 6), "ale_rank": r_ale.get(d),
+             # Net and consistency travel with the sign they produced, so a
+             # reader can see WHY a detector was left without one.
+             "ale_net": _val(ale_net.get(d), 6),
+             "sign_consistency": _val(ale_cons.get(d), 2),
+             "sign": signs[d],
+             "sign_support": support[d]},
             f"{d} carries "
             f"{_weight_phrase(final_rank.get(d), len(detectors), tied=rank_counts.get(final_rank.get(d), 1) > 1)}, "
-            f"{_rank_phrase((r_abs.get(d), r_pfi.get(d)))}.",
+            f"{_rank_phrase((r_abs.get(d), r_pfi.get(d), r_ale.get(d)))}.",
             order=10 * (i + 1)))
         required.append(rid)
 
@@ -1264,39 +1351,83 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         sign_text = _sign_summary_text(detectors, signs)
         if sign_text:
             evidence.append(make_atom(
-                "ga_comb.sign_summary", "sign_summary", "signed_shap",
+                "ga_comb.sign_summary", "sign_summary", "sign",
                 {"positive": [d for d in detectors if signs[d] == "positive"],
-                 "negative": [d for d in detectors if signs[d] == "negative"]},
+                 "negative": [d for d in detectors if signs[d] == "negative"],
+                 "no_sign": unsigned},
                 sign_text, order=10 * (len(detectors) + 1)))
             required.append("ga_comb.sign_summary")
 
     caveats = [
         make_atom("ga_comb.caveat.methods", "caveat", "attribution", None,
-                  "Absolute SHAP and signed SHAP are label-free — they explain the "
+                  "Absolute SHAP and ALE are label-free — they explain the "
                   "meta-learner's own output — while PFI is label-based, measuring "
                   "the F1 drop when a detector's scores are shuffled."),
         make_atom("ga_comb.caveat.aggregation", "caveat", "markov", None,
                   "The overall weighting is the stationary distribution of a Markov "
-                  "chain over the pairwise preferences of the two magnitude "
+                  "chain over the pairwise preferences of the three magnitude "
                   "measures."),
     ]
+    # Run-dependent, unlike the two standing caveats above. A weakly supported
+    # sign is still REPORTED — withholding it turned measured negatives into
+    # blanks that read as missing data — so this is where the qualification
+    # lives, naming the detectors and the reason for each.
+    if weak:
+        # Short on purpose. This is read as a limitation beside the findings,
+        # not as prose, and the long form ("pushes the meta-learner one way
+        # over part of its score range and the other way over the rest, so the
+        # sign is only where the effect happens to end up") buried the two
+        # detector names it exists to name.
+        reason_text = {
+            "low_consistency": "pushed the meta-learner both ways across {its} "
+                               "score range",
+            "weak_influence": "moved the meta-learner too little",
+        }
+        by_reason: Dict[str, List[str]] = {}
+        for d in weak:
+            by_reason.setdefault(" and ".join(support[d]), []).append(d)
+        clauses = []
+        for key, names in by_reason.items():
+            its = "its" if len(names) == 1 else "their"
+            why = _oxford([reason_text.get(r, r).format(its=its)
+                           for r in key.split(" and ")])
+            clauses.append(f"{_oxford(names)} {why}")
+        caveats.append(make_atom(
+            "ga_comb.caveat.sign_consistency", "caveat", "sign",
+            {"weakly_supported": weak,
+             "reasons": {d: support[d] for d in weak}},
+            f"Weakly supported sign: {'; '.join(clauses)}. Keep that in mind "
+            f"when reading it."))
+    # Separate case, and a different statement: these detectors have no sign at
+    # all, because ALE could not be computed for them or their net effect is
+    # exactly zero.
+    if unsigned:
+        plural = "detector" if len(unsigned) == 1 else "detectors"
+        caveats.append(make_atom(
+            "ga_comb.caveat.sign_missing", "caveat", "sign",
+            {"no_sign": unsigned},
+            f"No sign for {_oxford(unsigned)}: the meta-learner's output ends "
+            f"where it started as that {plural} sweeps its range, so there is "
+            f"no net effect to take a sign from."))
 
     question = ("Which detectors does the GA-selected ensemble rely on most, and "
                 "which way does each push the meta-learner's decision?")
     info_footer = (
-        "A positive sign means the detector, on average, pushes the meta-learner "
-        "toward flagging the point as an anomaly (a higher predicted anomaly "
-        "probability); a negative sign means it pushes toward 'not an anomaly'. "
-        "The two ranks are positions where rank 1 is strongest: absolute SHAP "
-        "ranks detectors by overall importance to the meta-learner, and PFI by "
-        "the F1 drop when their scores are shuffled. The overall weight rank is "
-        "a third, separate position that merges those two rankings only; because "
-        "it merges just two, detectors often tie for it, and a tie is reported as "
-        "one rather than split. Signed SHAP is what gives each detector "
-        "its sign, and it is kept out of the weighting on purpose: it measures "
-        "net direction, so a detector that pushes the output hard both ways "
-        "averages toward zero and would look unimportant despite carrying real "
-        "weight.")
+        "Three measures rank how much weight a detector carries, each a position "
+        "where rank 1 is strongest. Absolute SHAP ranks detectors by the size of "
+        "their influence on the meta-learner's output; PFI by the F1 drop when "
+        "their scores are shuffled; total ALE by how far the meta-learner's "
+        "predicted anomaly probability moves in total as that detector sweeps "
+        "its own observed range. Absolute SHAP and ALE are label-free, PFI is "
+        "label-based. The overall weight rank is a fourth, separate position "
+        "that merges the three. "
+        "The sign is the sign of ALE's net accumulated effect, read as a "
+        "detector's score rises from its lowest to its highest observed value: "
+        "a detector whose rising score pushes the meta-learner toward flagging "
+        "the point as an anomaly has a positive sign, and one whose rising "
+        "score pushes it toward 'not an anomaly' has a negative sign. A sign is "
+        "called weakly supported when the effect changes direction across the "
+        "score range or when the detector barely moves the meta-learner at all.")
 
     return _envelope("ga_combination", dataset, entity, output, evidence, caveats,
                      required, question=question, info_footer=info_footer)

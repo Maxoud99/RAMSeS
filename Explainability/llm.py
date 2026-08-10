@@ -12,9 +12,10 @@ this layer: narratives are generated on demand from the IR files an
 
 The anti-hallucination contract lives in SYSTEM_PROMPT: the model may only
 restate the numbered fact sentences, must copy numbers and names verbatim,
-must convey every [REQUIRED] fact, and may use [CAVEAT] lines only as
-limitations. The verifier then measures how well the output honoured that
-contract (hallucination + omission rates).
+must convey every [REQUIRED] fact, and must respect the [CAVEAT] lines
+without restating them — the card renders those verbatim from the IR in a
+section of their own. The verifier then measures how well the output honoured
+that contract (hallucination + omission rates).
 """
 
 from __future__ import annotations
@@ -118,8 +119,10 @@ SYSTEM_PROMPT = (
     "accompanies in the facts — never re-attach it to a different value.\n"
     "3. Every fact marked [REQUIRED] must be conveyed. Unmarked facts may be "
     "omitted if space demands.\n"
-    "4. Lines marked [CAVEAT] are limitations, not findings: weave the "
-    "relevant ones in briefly (e.g. 'note that ...') and do not merge them together.\n"
+    "4. Lines marked [CAVEAT] are limits on what the facts mean. Respect them "
+    "— never write a claim one of them rules out — but do NOT restate them: "
+    "they are shown to the reader separately, and a second, looser copy in "
+    "your paragraph is the same limitation said twice.\n"
     "5. If a value reads 'not_available', either omit it or say the data is "
     "not available — never fill it in.\n"
     "6. Write ONE coherent paragraph of plain prose. No headings, lists, "
@@ -154,10 +157,15 @@ def _output_lines(output: Dict[str, Any]) -> List[str]:
 
 
 def _content_words(ir_doc: Dict[str, Any]) -> int:
-    """How many words of material the narrative actually has to convey."""
-    parts = [str(a.get("text", "")) for a in ir_doc.get("evidence", [])]
-    parts += [str(c.get("text", "")) for c in ir_doc.get("caveats", [])]
-    return sum(len(p.split()) for p in parts)
+    """How many words of material the narrative actually has to convey.
+
+    Evidence only. Caveats are shown to the reader from the IR rather than
+    narrated, so counting them would budget words for prose that must not be
+    written — and a floor set above what there is to say is what forces
+    padding.
+    """
+    return sum(len(str(a.get("text", "")).split())
+               for a in ir_doc.get("evidence", []))
 
 
 # The floor is deliberately BELOW the content length: the narrative restates the
@@ -239,7 +247,8 @@ def _caveat_lines(ir_doc: Dict[str, Any]) -> List[str]:
     caveats = ir_doc.get("caveats", [])
     if not caveats:
         return []
-    lines = ["", "CAVEATS (limitations to weave in where relevant, not findings):"]
+    lines = ["", "CAVEATS (limits to respect; the reader is shown these "
+                 "separately, so do not restate them):"]
     lines.extend(f"- [CAVEAT] {c.get('text', '')}" for c in caveats)
     return lines
 
@@ -264,10 +273,14 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
     ),
     "ga_combination": (
         " Describe each detector in the order given; for each one, state its "
-        "overall weight rank and its rank on absolute SHAP and PFI (rank 1 is "
-        "strongest). Where a fact says a rank is a tie, say it is tied. Finish "
-        "with the sign summary, listing which detectors signed positive and "
-        "which signed negative."
+        "overall weight rank and its rank on absolute SHAP, PFI and total ALE "
+        "(rank 1 is strongest). Where a fact says a rank is a tie, say it is "
+        "tied. Finish with the sign summary, saying which detectors push "
+        "the meta-learner toward flagging an anomaly and which push the other "
+        "way. Report each sign exactly as the facts give it; how well a sign "
+        "is supported is a caveat, so leave it out of the paragraph. A detector "
+        "the facts give no sign at all keeps none — never assign it one of "
+        "your own."
     ),
     "ga_selection": (
         " Open by naming the chosen ensemble. Then explain why the chosen "
@@ -308,8 +321,14 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
         "together. Write every regime sentence in the same shape: the regime "
         "and its window range, then the detector that led it, then its "
         "channels. Name that detector outright — never describe it by reference "
-        "to the previous regime. Finish with the winner's overall channel and "
-        "the selection-state percentages."
+        "to the previous regime. Three different things are said about channels "
+        "and they must not be merged or traded for one another: one channel "
+        "SUPPLIES a share of a detector's expected reward, one GIVES IT AN EDGE "
+        "over the named rival, and one DEPARTS FURTHEST FROM ITS USUAL "
+        "contribution. The last is a separate sentence in the facts and must "
+        "stay a separate clause. Keep whichever wording the fact uses. "
+        "Finish with the winner's overall channel and the selection-state "
+        "percentages."
     ),
     "monte_carlo": (
         " Open with one sentence restating the production-test result exactly "

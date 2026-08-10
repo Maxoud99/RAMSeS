@@ -46,9 +46,11 @@ from Thompson_Sampling import (
     compute_shap_values,
     aggregate_shap_per_channel,
     reconstruct_regime_segments,
+    reward_contribution_per_channel,
     aggregate_squared_per_channel,
     rank_gap_decomposition,
     leadership_regimes,
+    _top_k_models_by_expected_reward,
 )
 
 
@@ -582,6 +584,94 @@ class TestReconstructRegimeSegments(unittest.TestCase):
         for earlier, later in zip(segs, segs[1:]):
             self.assertEqual(earlier[1] + 1, later[0])
         self.assertEqual(sum(d for _, _, _, d in segs), T)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 11b. Expected-reward decomposition (mu^T x per channel)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestRewardContribution(unittest.TestCase):
+    """The claim this decomposition makes, and SHAP cannot: the per-channel
+    parts ARE the prediction. SHAP explains only the deviation from a typical
+    window, discarding the mu.baseline term."""
+
+    def test_parts_sum_to_the_expected_reward(self):
+        rng = np.random.default_rng(4)
+        mu, x = rng.normal(size=(24, 1)), rng.normal(size=24)
+        parts = reward_contribution_per_channel(mu, x, n_channels=6)
+        self.assertEqual(parts.shape, (6,))
+        self.assertAlmostEqual(float(parts.sum()),
+                               float(np.dot(mu.flatten(), x)), places=12)
+
+    def test_signed_both_ways(self):
+        # mu and the normalised context can each be negative, so a channel can
+        # pull the expected reward down. An all-positive split would be a bug.
+        mu = np.array([1.0, 1.0, -1.0, -1.0])
+        x = np.array([1.0, 1.0, 1.0, 1.0])
+        np.testing.assert_array_almost_equal(
+            reward_contribution_per_channel(mu, x, n_channels=2), [2.0, -2.0])
+
+    def test_differs_from_shap_by_the_discarded_baseline_term(self):
+        """SHAP per channel = this, minus what the channel contributes at the
+        baseline. That difference is exactly the term SHAP throws away."""
+        rng = np.random.default_rng(5)
+        mu, x, b = rng.normal(size=12), rng.normal(size=12), rng.normal(size=12)
+        raw = reward_contribution_per_channel(mu, x, 3)
+        shap = aggregate_shap_per_channel(compute_shap_values(mu, x, b), 3)
+        at_baseline = reward_contribution_per_channel(mu, b, 3)
+        np.testing.assert_array_almost_equal(shap, raw - at_baseline)
+
+    def test_degenerate_channel_counts(self):
+        mu = x = np.array([1.0, 2.0])
+        self.assertEqual(reward_contribution_per_channel(mu, x, 0).size, 0)
+        np.testing.assert_array_almost_equal(
+            reward_contribution_per_channel(mu, x, 4), np.zeros(4))
+
+    def test_leader_minus_runner_sums_to_the_expected_reward_gap(self):
+        """The regime prose's edge clause. Differencing two contribution splits
+        gives channel terms that sum EXACTLY to the gap in expected reward the
+        same regime reports — so the sentence's channel and its headline number
+        describe one quantity. SHAP's version of the comparison sums to a
+        baseline-relative gap instead, which is a different number."""
+        rng = np.random.default_rng(11)
+        mu_l, mu_r, x = (rng.normal(size=15), rng.normal(size=15),
+                         rng.normal(size=15))
+        delta = (reward_contribution_per_channel(mu_l, x, 5)
+                 - reward_contribution_per_channel(mu_r, x, 5))
+        self.assertAlmostEqual(float(delta.sum()),
+                               float(np.dot(mu_l - mu_r, x)), places=12)
+
+
+class TestTopKByExpectedReward(unittest.TestCase):
+    """Which detectors a per-regime figure draws. The bars are computed from the
+    beliefs held at each window, so the selection has to read the same ones — or
+    a plot shows three detectors while the sentence beside it names a fourth as
+    the runner-up."""
+
+    def _means(self, a, b):
+        return {"A": np.array([[a]]), "B": np.array([[b]])}
+
+    def test_per_context_beliefs_beat_the_final_ones(self):
+        contexts = [np.array([1.0]), np.array([1.0])]
+        # A ends the run stronger, but B held the higher mu.x in both windows.
+        final = self._means(5.0, 0.1)
+        history = [{"A": np.array([0.1]), "B": np.array([9.0])},
+                   {"A": np.array([0.1]), "B": np.array([9.0])}]
+        self.assertEqual(
+            _top_k_models_by_expected_reward(final, contexts, 1), ["A"])
+        self.assertEqual(
+            _top_k_models_by_expected_reward(final, contexts, 1,
+                                             means_per_context=history), ["B"])
+
+    def test_falls_back_per_window_when_history_is_short(self):
+        """A truncated history must not drop the windows it does not cover."""
+        contexts = [np.array([1.0]), np.array([1.0])]
+        final = self._means(1.0, 1.0)
+        history = [{"A": np.array([10.0]), "B": np.array([0.0])}]
+        self.assertEqual(
+            _top_k_models_by_expected_reward(final, contexts, 2,
+                                             means_per_context=history),
+            ["A", "B"])
 
 
 # ════════════════════════════════════════════════════════════════════════════

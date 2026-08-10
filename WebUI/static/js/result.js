@@ -36,8 +36,18 @@ function variantFigure(spec) {
   let index = spec.default || 0;
   const img = el("img", { src: spec.variants[index].src, alt: spec.title, loading: "lazy" });
   const tabs = el("div", { class: "variant-tabs" });
-  const caption = el("figcaption", {}, el("strong", { text: spec.title }),
-    spec.caption ? ` ${spec.caption}` : "");
+  // The caption follows the active variant unless the spec overrides it for
+  // the whole group. Variants are not always the same quantity in different
+  // slices — Thompson's regime tabs switch between a share of the expected
+  // reward and a deviation from a typical window — so a fixed caption would
+  // describe whichever one happened to be first.
+  const captionText = el("span", {});
+  const setCaption = () => {
+    const text = spec.caption || spec.variants[index].caption || "";
+    captionText.textContent = text ? ` ${text}` : "";
+  };
+  const caption = el("figcaption", {}, el("strong", { text: spec.title }), captionText);
+  setCaption();
 
   spec.variants.forEach((variant, i) => {
     const button = el("button", {
@@ -45,6 +55,7 @@ function variantFigure(spec) {
       onclick: () => {
         index = i;
         img.src = variant.src;
+        setCaption();
         $$("button", tabs).forEach((b, j) => b.setAttribute("aria-pressed", String(j === i)));
       },
     });
@@ -158,20 +169,39 @@ function summaryTable(spec) {
   return el("div", {}, wrap, button);
 }
 
+/* One regime's figure. Several sets for the same regime become a variant
+ * toggle; the server orders them, so the default is whatever it put first. */
+function regimeFigure(regime) {
+  const figures = regime.plots || (regime.plot
+    ? [{ src: regime.plot, title: `Regime ${regime.index}`,
+         caption: regime.plot_caption }]
+    : []);
+  if (!figures.length) {
+    return el("p", { class: "muted small", text: "No plot for this regime." });
+  }
+  const fallback = `Windows ${regime.start}–${regime.end}, led by ${regime.leader}.`;
+  const prepared = figures.map((f) => ({
+    ...f,
+    title: f.title || `Regime ${regime.index}`,
+    caption: f.caption || fallback,
+  }));
+  if (prepared.length === 1) return figureNode(prepared[0]);
+  return figureNode({ title: `Regime ${regime.index}`,
+                      variants: prepared, default: 0 });
+}
+
 function regimeSection(stage) {
   if (!stage.regimes || !stage.regimes.length) return null;
   const rows = stage.regimes.map((regime) => el("div", { class: "regime" },
     // The narrated sentence when the model wrote one; the IR's own text is the
     // fallback so a regime is never blank.
     el("div", {}, el("p", { class: "prose", text: regime.narrated || regime.text })),
-    regime.plot
-      // The caption comes from the server when it has one: the two Thompson
-      // stages plot different quantities over the same window range, so a
-      // generic "windows X–Y" here would under-describe both.
-      ? figureNode({ src: regime.plot, title: `Regime ${regime.index}`,
-                     caption: regime.plot_caption
-                       || `Windows ${regime.start}–${regime.end}, led by ${regime.leader}.` })
-      : el("p", { class: "muted small", text: "No plot for this regime." })));
+    // Several figures per regime become a variant toggle, first one default —
+    // the expected-reward contribution, with SHAP's deviation view a click
+    // away. Titles and captions come from the server: these sets show different
+    // quantities over the same window range, so a generic "windows X–Y" here
+    // would under-describe all of them.
+    regimeFigure(regime)));
   // Printable: this disclosure is the only place the per-regime prose appears
   // now that the stage has no full-text disclosure, and the print stylesheet
   // forces every <details> open.
@@ -191,6 +221,14 @@ function stageCard(stage, payload) {
     stage.question ? el("p", { class: "muted small", text: stage.question }) : null);
 
   const body = el("div", { class: "stack" });
+  // The prose is older than the facts it describes, so it may be narrating a
+  // previous run. Said plainly and at the top, because everything below it —
+  // summary, table, regime sentences — inherits the doubt.
+  if (stage.stale) {
+    body.append(el("p", { class: "notice", text:
+      "⚠ This explanation is older than the results it describes: the stage was "
+      + "re-run without re-generating its narrative. Re-run the narrator to refresh it." }));
+  }
   body.append(infoDisclosure(stage.info));
   body.append(proseNode(stage.summary));
   if (stage.summary_table) body.append(summaryTable(stage.summary_table));

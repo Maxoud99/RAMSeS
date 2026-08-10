@@ -146,8 +146,30 @@ def _ga_selection(ds, ent):
 def _ga_combination(ds, ent):
     d = _dir_for(TREE_GA, ds, ent)
     headline = [_fig(p, "Detector weighting",
-                     "Absolute SHAP, signed SHAP and PFI, with the Markov consensus ranking.")
+                     "Absolute SHAP, PFI and total ALE — the three magnitude measures "
+                     "that feed the Markov consensus ranking. All are magnitudes; "
+                     "the sign is in the next figure.")
                 for p in _ls(d, "ga_combination_importance_*.png")]
+    # Both ALE figures live under the same prefix, so they are split by name
+    # rather than by glob: the dataset name follows the prefix and could itself
+    # begin with any letter, which rules out a character-class pattern.
+    ale = _ls(d, "ga_combination_ale*.png")
+    plain = [p for p in ale if not p.name.startswith("ga_combination_ale_bins_")]
+    binned = [p for p in ale if p.name.startswith("ga_combination_ale_bins_")]
+    variants = ([_fig(plain[0], "Plain")] if plain else []) + \
+               ([_fig(binned[0], "Bin edges marked")] if binned else [])
+    if variants:
+        headline.append({
+            "title": "How each detector moves the meta-learner",
+            "caption": "One accumulated-effect curve per detector, over that "
+                       "detector's own score range. Rising means higher scores "
+                       "from it push the ensemble toward flagging an anomaly, "
+                       "falling means toward normal. The sign is where the curve "
+                       "ends; a dashed curve is one whose sign is weakly "
+                       "supported. The second view marks the quantile bins the "
+                       "curve is built from, which is what shows whether a turn "
+                       "is structure or coarse resolution.",
+            "variants": variants, "default": 0})
     return headline, []
 
 
@@ -177,12 +199,14 @@ def _thompson(ds, ent):
             found = _ls(d, pattern)
             if found:
                 headline.append(_fig(found[0], title, caption))
-        avg = _variants(d, [f"shap_average_top3_{it}.png", f"shap_average_all_{it}.png"],
+        avg = _variants(d, [f"reward_average_top3_{it}.png", f"reward_average_all_{it}.png"],
                         ["Top 3 detectors", "All detectors"])
         if avg:
             headline.append({"title": "Mean channel contribution across all windows",
-                             "caption": "Which channels carried each detector's expected "
-                                        "reward. " + CHANNEL_RULE,
+                             "caption": "Each channel's own share of a detector's expected "
+                                        "reward, averaged over every window. The bars sum "
+                                        "to the detector's expected reward on a typical "
+                                        "window. " + CHANNEL_RULE,
                              "variants": avg, "default": 0})
         for pattern, title, caption in (
             (f"history_plot_{it}.png", "Posterior history", ""),
@@ -191,6 +215,16 @@ def _thompson(ds, ent):
              "contributions; a detector's other channels are not drawn."),
             (f"shap_comparison_{it}.png", "Channel comparison (top 3)", CHANNEL_RULE),
             (f"shap_comparison_all_{it}.png", "Channel comparison (all)", CHANNEL_RULE),
+            # Demoted from the headline. mean|SHAP| measures how much a
+            # channel's influence VARIES between windows — the signed average
+            # is zero by construction, which is why it had to take absolute
+            # values — so it is a dispersion measure, not an average share.
+            (f"shap_average_top3_{it}.png", "Channel influence variability (top 3)",
+             "Mean |SHAP|: how much each channel's influence varies from window "
+             "to window. Not an average contribution. " + CHANNEL_RULE),
+            (f"shap_average_all_{it}.png", "Channel influence variability (all)",
+             "Mean |SHAP|: how much each channel's influence varies from window "
+             "to window. Not an average contribution. " + CHANNEL_RULE),
         ):
             for path in _ls(d, pattern):
                 gallery.append(_fig(path, title, caption))
@@ -234,15 +268,33 @@ def _ts_ranking(ds, ent):
     return headline, gallery
 
 
+# What each per-regime figure actually shows. The stems all mint the same
+# filename shape over the same window range, so without this a reader has three
+# identical "windows 10–62" captions describing three different quantities.
+_REGIME_SET_LABELS = {
+    "reward_per_regime": (
+        "Expected-reward contribution",
+        " Each channel's own share of the leader's expected reward, averaged "
+        "over the regime; the bars sum to that reward."),
+    "shap_per_regime": (
+        "Deviation from a typical window",
+        " How far each channel's contribution departs from what it usually "
+        "contributes. This is what separates one detector from another, but it "
+        "is not a share of the reward and does not sum to it."),
+    "ranking_per_regime": (
+        "Ranking score",
+        " Weights as at the last window of the regime; the score is cumulative, "
+        "so this is the state reached by then, not what the regime itself added."),
+}
+
+
 def regime_plots(ds, ent, subdir_stem: str = "shap_per_regime") -> Dict[int, Dict[str, Any]]:
-    """Per-regime images keyed by regime index.
+    """Per-regime images keyed by regime index, for ONE set.
 
     Filenames are `regime_{NN}_w{start}-{end}_{model}.png` and 0-based, matching
     the `*.regime.N` atom ids, so each regime sentence can be shown beside its
-    own plot. `subdir_stem` selects which stage's regimes: `shap_per_regime` for
-    the expected-reward regimes, `ranking_per_regime` for the ||mu||^2 ones. Both
-    live in the same tree and mint the same filename shape, so one regex serves
-    both; the caller passes the stem from its STAGES row.
+    own plot. `subdir_stem` selects the set; every set mints the same filename
+    shape, so one regex serves all of them.
     """
     d = _dir_for(TREE_THOMPSON, ds, ent)
     it = _iteration_tag(d)
@@ -250,20 +302,28 @@ def regime_plots(ds, ent, subdir_stem: str = "shap_per_regime") -> Dict[int, Dic
         return {}
     out = {}
     pattern = re.compile(r"^regime_(\d+)_w(\d+)-(\d+)_(.+)\.png$")
-    # The two stages' per-regime figures answer different questions over the
-    # same span, so the caption has to say which — "windows 10–62" alone reads
-    # as though both summarised the whole stretch.
-    detail = (" Weights as at the last window of the regime; the score is "
-              "cumulative, so this is the state reached by then, not what the "
-              "regime itself added."
-              if subdir_stem == "ranking_per_regime"
-              else " SHAP averaged over the regime's windows.")
+    label, detail = _REGIME_SET_LABELS.get(subdir_stem, ("", ""))
     for path in _ls(d / f"{subdir_stem}_{it}"):
         m = pattern.match(path.name)
         if m:
             out[int(m.group(1))] = _fig(
-                path, f"Regime {int(m.group(1))}",
+                path, label or f"Regime {int(m.group(1))}",
                 f"Windows {m.group(2)}–{m.group(3)}, led by {m.group(4)}." + detail)
+    return out
+
+
+def regime_plot_variants(ds, ent, stems: List[str]) -> Dict[int, List[Dict[str, Any]]]:
+    """The same regime across several sets, ready for a variant toggle.
+
+    Returns {regime_index: [figure, ...]} in the order `stems` is given, so the
+    first stem is what the card shows by default. Indices missing from a set are
+    simply absent from that regime's list rather than shifting the others.
+    """
+    per_stem = [(stem, regime_plots(ds, ent, stem)) for stem in stems]
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for _stem, figures in per_stem:
+        for index, figure in figures.items():
+            out.setdefault(index, []).append(figure)
     return out
 
 
@@ -396,12 +456,24 @@ def gallery_descriptors(dataset: str, entity: str) -> List[Dict[str, Any]]:
     out = []
     if it and d is not None:
         for group, sub, title, caption in (
+            ("thompson", f"reward_per_window_{it}",
+             "Reward contribution per window (top 3)",
+             "One frame per window; each detector's bars sum to its expected reward."),
+            ("thompson", f"reward_per_window_all_{it}",
+             "Reward contribution per window (all detectors)", ""),
+            ("thompson", f"reward_per_window_every10_{it}",
+             "Reward contribution, every 10th window", ""),
+            ("thompson", f"reward_per_regime_all_{it}",
+             "Reward contribution per regime (all detectors)", ""),
             ("thompson", f"shap_per_window_{it}",
-             "Channel attribution per window (top 3)", "One frame per window."),
+             "Deviation per window (top 3)",
+             "Departure from a typical window — not a share of the reward."),
             ("thompson", f"shap_per_window_all_{it}",
-             "Channel attribution per window (all detectors)", ""),
-            ("thompson", f"shap_per_window_every10_{it}", "Every 10th window", ""),
-            ("thompson", f"shap_per_regime_all_{it}", "Per regime (all detectors)", ""),
+             "Deviation per window (all detectors)", ""),
+            ("thompson", f"shap_per_window_every10_{it}",
+             "Deviation, every 10th window", ""),
+            ("thompson", f"shap_per_regime_all_{it}",
+             "Deviation per regime (all detectors)", ""),
             ("ts_ranking", f"ranking_per_window_{it}",
              "Ranking score per window (top 3)",
              "One frame per window, each showing the score as it stood then."),

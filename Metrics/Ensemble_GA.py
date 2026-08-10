@@ -1829,43 +1829,44 @@ def _best_threshold_f1(y_true: np.ndarray, y_scores: np.ndarray) -> float:
     return float(best)
 
 
-def compute_meta_shap(
+def compute_meta_shap_values(
     predict_fn: Callable[[np.ndarray], np.ndarray],
     X_explain: np.ndarray,
     baseline_row: np.ndarray,
-    feature_names: List[str],
-    mode: str = "abs",
-) -> Dict[str, float]:
+    n_features: int,
+) -> np.ndarray:
     """
-    Exact interventional Shapley values of the meta-learner over its detector
-    features, using a SINGLE mean baseline. Global importance per feature:
-      mode="abs"    → mean over explained rows of |phi_i(x)|  (magnitude of influence)
-      mode="signed" → mean over explained rows of  phi_i(x)   (net direction of influence)
+    The per-row Shapley matrix, shape (n_rows, n_features).
 
-    For instance x and subset S of features, F(S) marginalises the absent
-    features to the baseline:  z_j = x_j if j in S else baseline_row[j].
+    Exact interventional Shapley values of the meta-learner over its detector
+    features, using a SINGLE mean baseline. For instance x and subset S of
+    features, F(S) marginalises the absent features to the baseline:
+    z_j = x_j if j in S else baseline_row[j].
     phi_i(x) = Σ_{S ⊆ F\\{i}} w(|S|) (F(S∪i) − F(S)),  w(s)=s!(d−s−1)!/d!.
 
-    Because features are binary-ish score columns and d = ensemble size is small,
-    all 2^d subset predictions are enumerated exactly (cheap).
+    Because d = ensemble size is small, all 2^d subset predictions are
+    enumerated exactly (cheap).
+
+    Returned per row rather than pre-aggregated because the callers want
+    several different summaries of the same numbers — mean|phi| and mean phi
+    at minimum — and the 2^d enumeration is by far the most expensive thing
+    this stage does. Collapsing inside meant it ran twice for identical work.
     """
-    _agg = (lambda p: float(np.mean(np.abs(p)))) if mode == "abs" else (lambda p: float(np.mean(p)))
-    d = len(feature_names)
-    n = X_explain.shape[0]
+    d, n = int(n_features), X_explain.shape[0]
     if d == 0 or n == 0:
-        return {f: float('nan') for f in feature_names}
+        return np.full((n, d), np.nan, dtype=float)
     if d == 1:
         # Single feature carries the entire deviation from baseline.
-        Z1 = X_explain.copy()
-        Z0 = np.tile(baseline_row, (n, 1))
-        phi = np.asarray(predict_fn(Z1), float) - np.asarray(predict_fn(Z0), float)
-        return {feature_names[0]: _agg(phi)}
+        Z0 = np.tile(np.asarray(baseline_row, dtype=float), (n, 1))
+        phi = (np.asarray(predict_fn(X_explain.copy()), float)
+               - np.asarray(predict_fn(Z0), float))
+        return phi.reshape(n, 1)
 
     import math
     # Cache F(S) for every subset mask (bitmask over feature indices).
     pred_cache: Dict[int, np.ndarray] = {}
     for mask in range(1 << d):
-        Z = np.tile(baseline_row.astype(float), (n, 1))
+        Z = np.tile(np.asarray(baseline_row, dtype=float), (n, 1))
         for j in range(d):
             if mask & (1 << j):
                 Z[:, j] = X_explain[:, j]
@@ -1874,7 +1875,7 @@ def compute_meta_shap(
 
     fact = math.factorial
     weight = {s: fact(s) * fact(d - s - 1) / fact(d) for s in range(d)}
-    out: Dict[str, float] = {}
+    out = np.zeros((n, d), dtype=float)
     for i in range(d):
         phi = np.zeros(n, dtype=float)
         others = [j for j in range(d) if j != i]
@@ -1887,8 +1888,37 @@ def compute_meta_shap(
                     mask |= (1 << j)
                     s += 1
             phi += weight[s] * (pred_cache[mask | (1 << i)] - pred_cache[mask])
-        out[feature_names[i]] = _agg(phi)
+        out[:, i] = phi
     return out
+
+
+def compute_meta_shap(
+    predict_fn: Callable[[np.ndarray], np.ndarray],
+    X_explain: np.ndarray,
+    baseline_row: np.ndarray,
+    feature_names: List[str],
+    mode: str = "abs",
+) -> Dict[str, float]:
+    """
+    Global SHAP importance per feature, aggregated over the explained rows:
+      mode="abs"    → mean of |phi_i(x)|  (magnitude of influence)
+      mode="signed" → mean of  phi_i(x)   (net direction of influence)
+
+    A thin aggregation over compute_meta_shap_values. NOTE on mode="signed":
+    Shapley efficiency makes the signed means decompose
+    (mean prediction over the explained rows) − (prediction at the baseline
+    row), so they measure how far the explained set sits from that one
+    synthetic row, not which way a feature pushes. With correlated detector
+    columns the baseline row is off-manifold and the signed mean can carry the
+    wrong sign outright. The sign now comes from compute_meta_ale instead;
+    this mode is retained only for the report's superseded comparison table.
+    """
+    d = len(feature_names)
+    if d == 0 or X_explain.shape[0] == 0:
+        return {f: float('nan') for f in feature_names}
+    phi = compute_meta_shap_values(predict_fn, X_explain, baseline_row, d)
+    agg = np.abs(phi).mean(axis=0) if mode == "abs" else phi.mean(axis=0)
+    return {f: float(agg[i]) for i, f in enumerate(feature_names)}
 
 
 def compute_meta_pfi(
@@ -1924,6 +1954,184 @@ def compute_meta_pfi(
                                nan=0.0, posinf=1.0, neginf=0.0)
             drops.append(baseline - score_fn(y, sp))
         out[feature_names[i]] = float(np.mean(drops))
+    return out
+
+
+# The sign is the sign of ALE's net accumulated effect. It is ALWAYS reported
+# when there is a net effect to take the sign of — withholding it turned a
+# measured negative into a blank, which reads as missing data rather than as the
+# weakly-supported finding it is. The two gates below no longer decide WHETHER a
+# sign is shown, only whether it is shown as well supported; each has a reason
+# rather than a round number:
+#
+# ALE_CONSISTENCY_MIN. Consistency is |net| / total. If P is the movement in the
+# dominant direction and N against it, then consistency = (P−N)/(P+N), so the
+# dominant share is (1+consistency)/2. A threshold of 0.6 therefore means "at
+# least 80% of everything the meta-learner did went one way" — the number is
+# readable as a statement, which a bare cut-off is not. Observed on real runs:
+# SKAB/7 gave 1.00, 0.78, 0.78, 0.63, 0.47 and SMD/machine-1-6 gave 0.88, 0.71,
+# 0.58, 0.29, 0.19, 0.18, 0.14, so 0.6 falls in a gap on both rather than
+# splitting a cluster.
+#
+# ALE_MAGNITUDE_FLOOR. Consistency alone would label noise: a detector that
+# barely moves the model can still move it consistently (SKAB/7's NN_3 scored
+# consistency 1.00 on a total of 0.012, and a synthetic noise column scored 0.61
+# on 0.066). The floor is relative to the strongest detector in the same
+# ensemble because the units are that meta-learner's own probability scale.
+ALE_N_BINS = 10
+ALE_CONSISTENCY_MIN = 0.6
+ALE_MAGNITUDE_FLOOR = 0.05      # as a fraction of the largest total variation
+
+
+def compute_meta_ale(
+    predict_fn: Callable[[np.ndarray], np.ndarray],
+    X: np.ndarray,
+    feature_names: List[str],
+    n_bins: int = ALE_N_BINS,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Accumulated Local Effects of the meta-learner, per detector column.
+
+    For each feature the observed range is cut into `n_bins` quantile bins. In
+    each bin, ONLY the rows whose value falls in that bin are used, and only
+    that feature is moved — from the bin's lower edge to its upper edge. Every
+    other detector keeps the value it actually had.
+
+    That locality is the whole point. It makes the measurement interventional,
+    so it isolates this detector's own influence rather than everything
+    correlated with it — while never asking the model about a combination that
+    does not occur, which is what breaks single-baseline SHAP and PDP on
+    correlated score columns.
+
+    Per feature:
+      deltas          the per-bin local effects, in probability units
+      edges           the bin boundaries (len(deltas) + 1)
+      curve           the accumulated effect at each edge (len(edges)); the
+                      ALE curve, starting at 0
+      net             sum(deltas) — where the curve ends; its SIGN is the
+                      detector's sign
+      total_variation sum(|deltas|) — how much the model moved in total; this
+                      is the magnitude, and unlike `net` it cannot cancel
+      consistency     |net| / total_variation in [0, 1]; 1 means every bin
+                      pushed the same way, 0 means the ups exactly cancel the
+                      downs and NO single sign is honest
+
+    A constant (or near-constant) column has fewer than two distinct bin edges;
+    everything is NaN for it and the caller reports no sign.
+    """
+    d, n = len(feature_names), X.shape[0]
+    out: Dict[str, Dict[str, Any]] = {}
+    for i, name in enumerate(feature_names):
+        blank = {"deltas": [], "edges": [], "curve": [],
+                 "net": float("nan"), "total_variation": float("nan"),
+                 "consistency": float("nan"), "n_bins": 0}
+        if d == 0 or n == 0:
+            out[name] = blank
+            continue
+        column = np.asarray(X[:, i], dtype=float)
+        edges = np.unique(np.quantile(column, np.linspace(0.0, 1.0, int(n_bins) + 1)))
+        if edges.size < 2:
+            out[name] = blank
+            continue
+
+        deltas: List[float] = []
+        for k in range(1, edges.size):
+            lo_e, hi_e = float(edges[k - 1]), float(edges[k])
+            # The lowest bin is closed on both sides so the minimum row is used.
+            rows = ((column > lo_e) & (column <= hi_e) if k > 1
+                    else (column >= lo_e) & (column <= hi_e))
+            if not rows.any():
+                deltas.append(0.0)
+                continue
+            lo = X[rows].astype(float).copy()
+            hi = lo.copy()
+            lo[:, i] = lo_e
+            hi[:, i] = hi_e
+            p_lo = np.nan_to_num(np.asarray(predict_fn(lo), float),
+                                 nan=0.0, posinf=1.0, neginf=0.0)
+            p_hi = np.nan_to_num(np.asarray(predict_fn(hi), float),
+                                 nan=0.0, posinf=1.0, neginf=0.0)
+            deltas.append(float(np.mean(p_hi - p_lo)))
+
+        arr = np.asarray(deltas, dtype=float)
+        net, tv = float(arr.sum()), float(np.abs(arr).sum())
+        out[name] = {
+            "deltas": [float(v) for v in arr],
+            "edges": [float(v) for v in edges],
+            "curve": [0.0] + [float(v) for v in np.cumsum(arr)],
+            "net": net,
+            "total_variation": tv,
+            "consistency": (abs(net) / tv) if tv > 0 else float("nan"),
+            "n_bins": int(arr.size),
+        }
+    return out
+
+
+def ale_signs(
+    ale: Dict[str, Dict[str, Any]],
+    feature_names: List[str],
+) -> Dict[str, str]:
+    """
+    The sign of the net accumulated effect, per detector: "positive" /
+    "negative" / "not_available".
+
+    The sign is read off `net` and nothing else. A detector whose curve wanders
+    still ends somewhere, and where it ends is a measurement; how well that end
+    point is supported is a separate question, answered by `ale_sign_support`.
+    Folding the two together suppressed real negatives and left them looking
+    like missing data.
+
+    "not_available" is reserved for the two cases with genuinely no sign to
+    take: ALE could not be computed at all (a constant column has no bins to
+    walk), or the net effect is exactly zero, where "positive" and "negative"
+    are equally wrong. A detector the meta-learner ignores outright lands in the
+    latter.
+    """
+    out: Dict[str, str] = {}
+    for name in feature_names:
+        rec = ale.get(name) or {}
+        net = rec.get("net", float("nan"))
+        if not rec.get("n_bins") or net != net or net == 0.0:
+            out[name] = "not_available"
+        else:
+            out[name] = "positive" if net > 0 else "negative"
+    return out
+
+
+def ale_sign_support(
+    ale: Dict[str, Dict[str, Any]],
+    feature_names: List[str],
+    consistency_min: float = ALE_CONSISTENCY_MIN,
+    magnitude_floor: float = ALE_MAGNITUDE_FLOOR,
+) -> Dict[str, List[str]]:
+    """
+    Why a reported sign should be read with care, per detector: a list holding
+    any of "low_consistency" and "weak_influence", empty when neither applies.
+
+    low_consistency  the curve turns — the sign is where it happened to end up,
+                     not a property of the whole range.
+    weak_influence   the detector barely moves the meta-learner relative to the
+                     strongest one here, so the sign is of a small effect.
+
+    Detectors with no sign at all get an empty list: there is nothing to qualify.
+    """
+    tvs = [(ale.get(f) or {}).get("total_variation", float("nan")) for f in feature_names]
+    finite = [v for v in tvs if v == v]
+    floor = magnitude_floor * (max(finite) if finite else 0.0)
+
+    out: Dict[str, List[str]] = {}
+    signed = ale_signs(ale, feature_names)
+    for name in feature_names:
+        rec = ale.get(name) or {}
+        reasons: List[str] = []
+        if signed.get(name) in ("positive", "negative"):
+            tv = rec.get("total_variation", float("nan"))
+            cons = rec.get("consistency", float("nan"))
+            if cons != cons or cons < consistency_min:
+                reasons.append("low_consistency")
+            if tv != tv or tv < floor:
+                reasons.append("weak_influence")
+        out[name] = reasons
     return out
 
 
@@ -1990,11 +2198,12 @@ def markov_aggregate_importances(
 
 
 # Points closer than this are one tie. When the points are Markov scores from
-# markov_aggregate_importances, exact ties are the norm — only two measures feed
-# the chain, so C[j,i] - C[i,j] takes three values — and np.linalg.eig returns
+# markov_aggregate_importances, exact ties are common — three measures feed the
+# chain, so C[j,i] - C[i,j] takes only five values — and np.linalg.eig returns
 # those ties a few ulp apart. An exact `!=` promoted a 1.1e-16 eigenvector
 # wobble into a real rank difference, letting the solver rather than the data
-# decide which feature led.
+# decide which feature led. (Ties were the NORM at two measures, where the
+# difference took three values; the third source made them rarer, not rare.)
 _RANK_TIE_ATOL = 1e-9
 
 
@@ -2021,8 +2230,8 @@ def _competition_ranks(points: Dict[str, float], order: List[str]) -> Dict[str, 
 
 def plot_ga_combination(
     shap_abs: Dict[str, float],
-    shap_signed: Dict[str, float],
     pfi_imp: Dict[str, float],
+    ale_total: Dict[str, float],
     markov_scores: Dict[str, float],
     final_ranking: List[str],
     feature_names: List[str],
@@ -2031,13 +2240,16 @@ def plot_ga_combination(
 ) -> None:
     """
     Two-panel summary of the meta-learner weighting.
-      Left  — grouped horizontal bars per detector: mean|SHAP|, mean SHAP (signed),
-              and PFI importances, each normalised to its own max abs so the three
-              methods are comparable (signed SHAP can be negative).
+      Left  — grouped horizontal bars per detector: mean|SHAP|, PFI and total
+              |ALE|, each normalised to its own max so the three are comparable.
+              All three are magnitudes, all three feed the ranking on the right,
+              and none can be negative — the panel answers "how much", only.
       Right — Markov final ranking: horizontal bars of the stationary-probability
-              score, winner on top. Aggregated over mean|SHAP| and PFI only —
-              signed SHAP measures direction, not weight, so it is shown on the
-              left but excluded from the ranking.
+              score, winner on top.
+
+    The sign is deliberately absent here. It lives in the companion ALE-curve
+    figure, which can show a detector whose effect changes sign across its range
+    — something a single bar cannot represent without reading as "unimportant".
 
     Saves to ga_combination_importance_{dataset}_{entity}.png.
     """
@@ -2054,14 +2266,14 @@ def plot_ga_combination(
     y = np.arange(len(feature_names))
     h = 0.27
     ax_imp.barh(y - h, _norm(shap_abs), height=h, label="mean|SHAP|", color="#1f77b4")
-    ax_imp.barh(y, _norm(shap_signed), height=h, label="mean SHAP (signed)", color="#9467bd")
-    ax_imp.barh(y + h, _norm(pfi_imp), height=h, label="PFI (F1 drop)", color="#ff7f0e")
+    ax_imp.barh(y, _norm(pfi_imp), height=h, label="PFI (F1 drop)", color="#ff7f0e")
+    ax_imp.barh(y + h, _norm(ale_total), height=h, label="total |ALE|", color="#2ca02c")
     ax_imp.axvline(0, color="black", linewidth=0.6)
     ax_imp.set_yticks(y)
     ax_imp.set_yticklabels(feature_names)
     ax_imp.invert_yaxis()
     ax_imp.set_xlabel("Importance (normalised to each method's max |·|)")
-    ax_imp.set_title("Meta-learner feature attribution")
+    ax_imp.set_title("Meta-learner feature attribution (magnitude)")
     ax_imp.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
     ax_imp.legend(loc="lower right", frameon=False)
 
@@ -2075,13 +2287,134 @@ def plot_ga_combination(
     ax_markov.set_yticklabels([f"{rk[f]}. {f}" for f in ranked])
     ax_markov.invert_yaxis()
     ax_markov.set_xlabel("Markov score (stationary prob.)")
-    ax_markov.set_title("Final ranking (Markov: mean|SHAP| + PFI)")
+    # Names all three sources, and the same three the left panel draws. The
+    # label said "mean|SHAP| + PFI" for as long as ALE had been feeding the
+    # chain, so the figure claimed a two-source consensus beside a panel
+    # showing three bars.
+    ax_markov.set_title("Final ranking (Markov: mean|SHAP| + PFI + total |ALE|)")
     ax_markov.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
 
     plt.tight_layout(pad=1.2)
     directory = f"myresults/GA_Ens/{dataset}/{entity}/"
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f"{directory}/ga_combination_importance_{dataset}_{entity}.png",
+                format="png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+_ALE_SIGN_COLOUR = {"positive": "#2ca02c", "negative": "#c92a2a",
+                         "mixed": "#7f7f7f", "not_available": "#bbbbbb"}
+
+# What a support reason is called on the figure. Spelled out rather than shown
+# as a flag, because the panel is where a reader decides how much to trust the
+# sign in its title.
+_ALE_SUPPORT_LABEL = {"low_consistency": "low consistency",
+                      "weak_influence": "weak influence"}
+
+
+def plot_ga_combination_ale(
+    ale: Dict[str, Dict[str, Any]],
+    signs: Dict[str, str],
+    feature_names: List[str],
+    dataset: str,
+    entity: str,
+    support: Optional[Dict[str, List[str]]] = None,
+    mark_bins: bool = False,
+) -> None:
+    """
+    One ALE curve per detector: how the meta-learner's predicted anomaly
+    probability accumulates as that detector sweeps its own observed range.
+
+    Small multiples with a SHARED Y AXIS and independent x axes. Detectors emit
+    scores on their own scales, so one shared x would put unrelated values on
+    top of each other; the shared y is what makes the magnitudes comparable,
+    which is the comparison that matters.
+
+    Reading it: a curve that climbs means higher scores from this detector push
+    the ensemble toward flagging an anomaly; falling means toward normal; one
+    that rises and then falls ends with a sign that only describes where it
+    happened to finish — that case is drawn dashed and labelled.
+
+    mark_bins : bool
+        Draw the quantile bin edges the curve is built from, as vertical rules
+        under the curve. Every vertex IS a bin edge, so this adds no data — it
+        makes the resolution visible, which is what tells a reader whether a
+        turn in the curve is structure or one coarse bin. Saved as a separate
+        figure so the plain curve stays uncluttered.
+
+    Saves to ga_combination_ale{_bins}_{dataset}_{entity}.png.
+    """
+    usable = [f for f in feature_names if (ale.get(f) or {}).get("n_bins")]
+    if not usable:
+        return
+    support = support or {}
+    _ga_plot_rcparams()
+
+    ncols = min(3, len(usable))
+    nrows = int(np.ceil(len(usable) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, sharey=True,
+                             figsize=(4.2 * ncols, 3.1 * nrows),
+                             squeeze=False)
+    flat = [ax for row in axes for ax in row]
+
+    any_weak = False
+    for ax, name in zip(flat, usable):
+        rec = ale[name]
+        edges, curve = rec["edges"], rec["curve"]
+        colour = _ALE_SIGN_COLOUR.get(signs.get(name), "#7f7f7f")
+        reasons = list(support.get(name) or [])
+        any_weak = any_weak or bool(reasons)
+        if mark_bins:
+            for edge in edges:
+                ax.axvline(edge, color="#c8c8c8", linewidth=0.6, zorder=0)
+        ax.plot(edges, curve, marker="o", markersize=3, linewidth=1.6,
+                color=colour, linestyle="--" if reasons else "-")
+        ax.axhline(0, color="black", linewidth=0.7)
+        # The qualifier belongs beside the sign, not in a corner: the title is
+        # the only part of the panel a reader is guaranteed to take away.
+        qualifier = (f" ({', '.join(_ALE_SUPPORT_LABEL.get(r, r) for r in reasons)})"
+                     if reasons else "")
+        sign = signs.get(name, "not_available")
+        label = "no sign (no net effect)" if sign == "not_available" else sign
+        ax.set_title(f"{name} — {label}{qualifier}", fontsize=11)
+        ax.set_xlabel(f"{name} score" + (f" ({rec['n_bins']} bins)" if mark_bins else ""))
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+        cons = rec["consistency"]
+        ax.text(0.02, 0.02,
+                f"net {rec['net']:+.4f}\ntotal {rec['total_variation']:.4f}\n"
+                f"consistency {'N/A' if cons != cons else f'{cons:.2f}'}",
+                transform=ax.transAxes, fontsize=8, va="bottom", ha="left",
+                color="dimgrey")
+    for ax in flat[len(usable):]:
+        ax.set_visible(False)
+    # One figure-level label: the y axis is shared, so repeating it per row just
+    # crowds the left edge with the same sentence.
+    ylabel = "Accumulated effect on P(anomaly)"
+    if hasattr(fig, "supylabel"):
+        fig.supylabel(ylabel)
+    else:
+        axes[0][0].set_ylabel(ylabel)
+
+    skipped = [f for f in feature_names if f not in usable]
+    note = ("Curve rising = higher scores push toward anomaly; falling = toward "
+            "normal. The sign is where the curve ends.")
+    if any_weak:
+        note += ("  Dashed = the sign is weakly supported, for the reason named "
+                 "in the panel title.")
+    if mark_bins:
+        note += ("  Vertical rules are the quantile bin edges; the curve has one "
+                 "vertex per edge and no detail between them.")
+    if skipped:
+        note += f"  Not shown (no ALE could be computed): {', '.join(skipped)}."
+    fig.suptitle("How each detector moves the meta-learner (ALE)"
+                 + (" — bins marked" if mark_bins else ""), fontsize=13)
+    fig.text(0.5, -0.01, note, ha="center", fontsize=8, color="dimgrey")
+
+    plt.tight_layout(pad=1.2)
+    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    os.makedirs(directory, exist_ok=True)
+    stem = "ga_combination_ale_bins" if mark_bins else "ga_combination_ale"
+    plt.savefig(f"{directory}/{stem}_{dataset}_{entity}.png",
                 format="png", dpi=300, bbox_inches="tight")
     plt.close()
 
@@ -2105,7 +2438,7 @@ def explain_ga_combination(
     Combination-layer explainability: attribute the best-ensemble meta-learner's
     output to its detector score-columns via SHAP and PFI, then merge the three
     magnitude rankings (mean|SHAP| and PFI) with a Markov-chain rank aggregation;
-    signed SHAP supplies each detector's direction but is kept out of the ranking.
+    ALE supplies each detector's sign; signed SHAP is superseded.
     Writes a report + plot under myresults/GA_Ens/{dataset}/{entity}/ and returns a
     dict (None if explain=False).
 
@@ -2163,22 +2496,38 @@ def explain_ga_combination(
         X_explain = X_test_f
     baseline_row = X_train_f.mean(axis=0) if X_train_f.shape[0] > 0 else np.zeros(d)
 
-    shap_abs = compute_meta_shap(predict_fn, X_explain, baseline_row, feature_names, mode="abs")
-    shap_signed = compute_meta_shap(predict_fn, X_explain, baseline_row, feature_names, mode="signed")
+    # One 2^d enumeration, both summaries. These used to be two identical passes.
+    phi = compute_meta_shap_values(predict_fn, X_explain, baseline_row, d)
+    shap_abs = {f: float(np.abs(phi[:, i]).mean()) for i, f in enumerate(feature_names)}
+    shap_signed = {f: float(phi[:, i].mean()) for i, f in enumerate(feature_names)}
     pfi_imp = compute_meta_pfi(predict_fn, X_test_f, y_true_test, feature_names)
-    # Signed SHAP is deliberately NOT an aggregation input. The aggregate answers
-    # "how much weight does this detector carry", and signed SHAP measures net
-    # direction — a detector that pushes hard both ways cancels toward zero and
-    # would rank as unimportant. It still supplies the per-detector sign below.
+    # ALE on the FULL test set, matching PFI rather than SHAP's subsample: at
+    # ~2*n*d predictions it is an order of magnitude cheaper than the SHAP pass,
+    # so subsampling would buy nothing.
+    ale = compute_meta_ale(predict_fn, X_test_f, feature_names, n_bins=ALE_N_BINS)
+    ale_total = {f: ale[f]["total_variation"] for f in feature_names}
+    ale_net = {f: ale[f]["net"] for f in feature_names}
+    ale_consistency = {f: ale[f]["consistency"] for f in feature_names}
+    signs = ale_signs(ale, feature_names)
+    sign_support = ale_sign_support(ale, feature_names)
+
+    # Three magnitude measures feed the chain. ALE contributes its TOTAL
+    # VARIATION, not its net: the net cancels for a detector whose effect
+    # changes sign across its range, which is exactly how signed SHAP came to
+    # rank a genuinely influential detector as unimportant.
     markov_scores, final_ranking = markov_aggregate_importances(
-        {"SHAP_abs": shap_abs, "PFI": pfi_imp}, feature_names)
+        {"SHAP_abs": shap_abs, "PFI": pfi_imp, "ALE": ale_total}, feature_names)
 
     baseline_f1 = _best_threshold_f1(
         y_true_test, np.nan_to_num(np.asarray(predict_fn(X_test_f), float),
                                    nan=0.0, posinf=1.0, neginf=0.0))
 
-    plot_ga_combination(shap_abs, shap_signed, pfi_imp, markov_scores, final_ranking,
+    plot_ga_combination(shap_abs, pfi_imp, ale_total, markov_scores, final_ranking,
                         feature_names, dataset, entity)
+    plot_ga_combination_ale(ale, signs, feature_names, dataset, entity,
+                            support=sign_support)
+    plot_ga_combination_ale(ale, signs, feature_names, dataset, entity,
+                            support=sign_support, mark_bins=True)
 
     # Per-method ranks (1 = most important / most positive).
     def _ranks(imp):
@@ -2186,7 +2535,8 @@ def explain_ga_combination(
                        key=lambda f: (imp[f] if not np.isnan(imp[f]) else -np.inf),
                        reverse=True)
         return {f: i + 1 for i, f in enumerate(order)}
-    shap_abs_rank, shap_signed_rank, pfi_rank = _ranks(shap_abs), _ranks(shap_signed), _ranks(pfi_imp)
+    shap_abs_rank, shap_signed_rank = _ranks(shap_abs), _ranks(shap_signed)
+    pfi_rank, ale_rank = _ranks(pfi_imp), _ranks(ale_total)
 
     directory = f"myresults/GA_Ens/{dataset}/{entity}/"
     os.makedirs(directory, exist_ok=True)
@@ -2208,14 +2558,6 @@ def explain_ga_combination(
             vs = f"{v:.6f}" if not np.isnan(v) else "N/A"
             f.write(f"      {f_:<14} {vs:>12} {shap_abs_rank[f_]:>6}\n")
 
-        f.write("\n--- SHAP signed (mean SHAP: net direction of contribution; label-free) ---\n")
-        f.write(f"      {'detector':<14} {'mean SHAP':>12} {'rank':>6}\n")
-        f.write("      " + "-" * 34 + "\n")
-        for f_ in sorted(feature_names, key=lambda x: shap_signed_rank[x]):
-            v = shap_signed[f_]
-            vs = f"{v:+.6f}" if not np.isnan(v) else "N/A"
-            f.write(f"      {f_:<14} {vs:>12} {shap_signed_rank[f_]:>6}\n")
-
         f.write("\n--- PFI (F1 drop when the detector's column is shuffled; label-based) ---\n")
         f.write(f"      {'detector':<14} {'F1 drop':>12} {'rank':>6}\n")
         f.write("      " + "-" * 34 + "\n")
@@ -2224,15 +2566,55 @@ def explain_ga_combination(
             vs = f"{v:+.6f}" if not np.isnan(v) else "N/A"
             f.write(f"      {f_:<14} {vs:>12} {pfi_rank[f_]:>6}\n")
 
-        f.write("\n--- Markov aggregation (SHAP |.| + PFI) ---\n")
-        f.write(f"      {'detector':<14} {'|SHAP| rk':>9} {'PFI rk':>7} "
-                f"{'sign':>6} {'Markov π':>10}\n")
-        f.write("      " + "-" * 50 + "\n")
+        f.write("\n--- ALE (accumulated local effects; magnitude, sign and "
+                "consistency; label-free) ---\n")
+        f.write(f"      {'detector':<14} {'total |ALE|':>12} {'rank':>6} "
+                f"{'net':>12} {'consist.':>9} {'sign':>14} {'support':>32}\n")
+        f.write("      " + "-" * 104 + "\n")
+        for f_ in sorted(feature_names, key=lambda x: ale_rank[x]):
+            tv, nt = ale_total[f_], ale_net[f_]
+            cs = ale_consistency[f_]
+            reasons = sign_support.get(f_) or []
+            if signs[f_] not in ("positive", "negative"):
+                sup = "-"
+            elif reasons:
+                sup = ", ".join(_ALE_SUPPORT_LABEL.get(r, r) for r in reasons)
+            else:
+                sup = "strong"
+            f.write(f"      {f_:<14} "
+                    f"{('N/A' if np.isnan(tv) else f'{tv:.6f}'):>12} {ale_rank[f_]:>6} "
+                    f"{('N/A' if np.isnan(nt) else f'{nt:+.6f}'):>12} "
+                    f"{('N/A' if np.isnan(cs) else f'{cs:.2f}'):>9} "
+                    f"{signs[f_]:>14} {sup:>32}\n")
+        f.write(f"      (sign = sign of net, always reported when net is non-zero; "
+                f"support is 'strong' at consistency >= {ALE_CONSISTENCY_MIN} and "
+                f"total |ALE| >= {ALE_MAGNITUDE_FLOOR:g} x the largest; "
+                f"{ALE_N_BINS} bins)\n")
+
+        # Kept for provenance only. This was the sign until ALE
+        # replaced it; nothing downstream reads it any more. It is retained so
+        # the change can be audited side by side — see the closing Note.
+        f.write("\n--- SHAP signed (SUPERSEDED BY ALE; retained for comparison) ---\n")
+        f.write(f"      {'detector':<14} {'mean SHAP':>12} {'rank':>6}\n")
+        f.write("      " + "-" * 34 + "\n")
+        for f_ in sorted(feature_names, key=lambda x: shap_signed_rank[x]):
+            v = shap_signed[f_]
+            vs = f"{v:+.6f}" if not np.isnan(v) else "N/A"
+            f.write(f"      {f_:<14} {vs:>12} {shap_signed_rank[f_]:>6}\n")
+
+        f.write("\n--- Markov aggregation (SHAP |.| + PFI + ALE) ---\n")
+        f.write(f"      {'detector':<14} {'|SHAP| rk':>9} {'PFI rk':>7} {'ALE rk':>7} "
+                f"{'sign':>14} {'Markov π':>10}\n")
+        f.write("      " + "-" * 72 + "\n")
         for f_ in final_ranking:
-            sv = shap_signed[f_]
-            sign = "N/A" if np.isnan(sv) else ("+" if sv >= 0 else "-")
+            # A trailing * flags a sign the ALE table qualifies, so this summary
+            # never reads as more certain than the section it summarises.
+            mark = "*" if (sign_support.get(f_) or []) else ""
             f.write(f"      {f_:<14} {shap_abs_rank[f_]:>9} {pfi_rank[f_]:>7} "
-                    f"{sign:>6} {markov_scores[f_]:>10.4f}\n")
+                    f"{ale_rank[f_]:>7} {signs[f_] + mark:>14} "
+                    f"{markov_scores[f_]:>10.4f}\n")
+        if any(sign_support.get(f_) for f_ in final_ranking):
+            f.write("      (* weakly supported sign — see the support column above)\n")
         # Final ranking with ties shown as equals (e.g. "1.A > 2.B = C > 4.D").
         ranks = _competition_ranks(markov_scores, final_ranking)
         groups: List[Tuple[int, List[str]]] = []
@@ -2244,15 +2626,26 @@ def explain_ga_combination(
                 groups.append((r, [f_]))
         f.write("\nFinal ranking (Markov): "
                 + " > ".join(f"{r}.{' = '.join(fs)}" for r, fs in groups) + "\n")
-        f.write("\nNote: mean|SHAP| = magnitude of the detector's influence on the meta-learner's "
-                "output; mean SHAP = its net (signed) direction; both are label-free. PFI = F1 drop "
-                "when the column is shuffled (label-based). A Markov-chain rank aggregation "
-                "(stationary distribution over the pairwise preferences of mean|SHAP| and PFI) "
-                "merges the two magnitude rankings; π is each detector's stationary probability "
-                "(higher = stronger consensus). Signed SHAP is excluded from the aggregation on "
-                "purpose: it measures net direction, so a detector that pushes the output hard in "
-                "both directions cancels toward zero and would rank as unimportant despite "
-                "carrying real weight. It contributes only the sign column above.\n")
+        f.write("\nNote: three magnitude measures feed the ranking. mean|SHAP| = the size of the "
+                "detector's influence on the meta-learner's output (label-free); PFI = the F1 drop "
+                "when its column is shuffled (label-based); total |ALE| = how far the output moves "
+                "in total as the detector sweeps its own observed range (label-free). A "
+                "Markov-chain rank aggregation over the pairwise preferences of all three gives "
+                "π, each detector's stationary probability (higher = stronger consensus).\n"
+                "\nThe sign is the sign of ALE's NET accumulated effect — where the curve "
+                "ends — and is reported whenever there is a non-zero net to take the sign of. "
+                "How well that sign is supported is reported separately: consistency = "
+                "|net| / total, so 1.0 means every bin pushed the same way and 0.0 means the "
+                "ups cancel the downs, and the magnitude gate asks whether the detector moves "
+                "the meta-learner enough for the question to arise. A sign failing either is "
+                "still shown, marked as weakly supported — withholding it hid measured "
+                "negatives behind what looked like missing data.\n"
+                "\nSigned SHAP used to supply the sign and no longer does. It is measured "
+                "against one synthetic 'every detector at its average' row; when the detector "
+                "columns are correlated that row does not occur in the data, the meta-learner "
+                "extrapolates there, and the resulting sign can be wrong outright — a contrarian "
+                "detector scored a confident positive in testing. Its table above is retained "
+                "only so the two can be compared.\n")
 
     result = {
         "best_ensemble": list(best_ensemble),
@@ -2261,8 +2654,21 @@ def explain_ga_combination(
         "model_source": used_source,
         "baseline_f1": baseline_f1,
         "shap_importance": shap_abs,
+        # Superseded by ALE for the sign; kept for the report's comparison
+        # table only. The IR no longer reads it.
         "shap_signed_importance": shap_signed,
         "pfi_importance": pfi_imp,
+        "ale_total_variation": ale_total,
+        "ale_net": ale_net,
+        "ale_consistency": ale_consistency,
+        "ale_sign": signs,
+        # Per detector, why its sign should be read with care ([] = no caveat).
+        "ale_sign_support": sign_support,
+        "ale_curves": {f: {"edges": ale[f]["edges"], "curve": ale[f]["curve"]}
+                       for f in feature_names},
+        "ale_n_bins": ALE_N_BINS,
+        "ale_consistency_min": ALE_CONSISTENCY_MIN,
+        "ale_magnitude_floor": ALE_MAGNITUDE_FLOOR,
         "markov_scores": markov_scores,
         "final_ranking": final_ranking,
     }

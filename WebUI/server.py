@@ -225,18 +225,23 @@ def create_app(**overrides) -> Flask:
         # so both Thompson stages get their regimes paired without either one
         # being named here.
         for stage in payload["stages"]:
-            stem = (artifacts.STAGE_BY_KEY.get(stage["key"]) or {}).get("regimes")
-            if not stem:
+            stems = (artifacts.STAGE_BY_KEY.get(stage["key"]) or {}).get("regimes")
+            if not stems:
                 continue
-            regimes = plots.regime_plots(dataset, entity, stem)
+            # Several stems mean the card offers a toggle; the first is default.
+            variants = plots.regime_plot_variants(dataset, entity, list(stems))
             for regime in stage.get("regimes", []):
-                figure = regimes.get(regime["index"])
-                if figure:
-                    regime["plot"] = figure["src"]
-                    # The caption travels with the image: the two stages'
-                    # per-regime figures show different quantities over the same
-                    # window range, and only plots.py knows which.
-                    regime["plot_caption"] = figure.get("caption")
+                figures = variants.get(regime["index"])
+                if figures:
+                    # `plots` carries every set for the toggle; `plot` and
+                    # `plot_caption` stay as the default one so a client that
+                    # ignores the toggle still renders correctly. The captions
+                    # travel with the images: these sets show different
+                    # quantities over the same window range, and only plots.py
+                    # knows which is which.
+                    regime["plots"] = figures
+                    regime["plot"] = figures[0]["src"]
+                    regime["plot_caption"] = figures[0].get("caption")
         return jsonify(payload)
 
     @app.get("/api/explanations/<dataset>/<entity>/download")

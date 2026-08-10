@@ -33,12 +33,20 @@ llm = _load("llm")
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 def _ga_combination_result():
+    # Kept byte-identical to the copy in test_ir.py: the two suites explain the
+    # same builder, and a drift between them would let one pass on a shape the
+    # other has already moved off.
     return {
         "best_ensemble": ["A", "B", "C"], "feature_names": ["A", "B", "C"],
         "meta_model_type": "rf", "model_source": "captured", "baseline_f1": 0.87,
         "shap_importance": {"A": 0.4, "B": 0.2, "C": 0.1},
         "shap_signed_importance": {"A": 0.35, "B": 0.15, "C": -0.05},
         "pfi_importance": {"A": 0.2, "B": 0.05, "C": 0.08},
+        "ale_total_variation": {"A": 0.5, "B": 0.3, "C": 0.2},
+        "ale_net": {"A": 0.5, "B": 0.3, "C": -0.2},
+        "ale_consistency": {"A": 1.0, "B": 1.0, "C": 1.0},
+        "ale_sign": {"A": "positive", "B": "positive", "C": "negative"},
+        "ale_sign_support": {"A": [], "B": [], "C": []},
         "markov_scores": {"A": 0.5, "B": 0.3, "C": 0.2},
         "final_ranking": ["A", "B", "C"],
     }

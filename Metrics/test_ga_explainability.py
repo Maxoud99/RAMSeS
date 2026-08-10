@@ -6,6 +6,7 @@ functions can be imported in any env that has numpy + matplotlib.
 """
 
 import os
+import re
 import sys
 import tempfile
 import types
@@ -71,7 +72,11 @@ from Metrics.Ensemble_GA import (
     classify_detector_archetypes,
     explain_ga_selection,
     compute_meta_shap,
+    compute_meta_shap_values,
     compute_meta_pfi,
+    compute_meta_ale,
+    ale_signs,
+    ale_sign_support,
     markov_aggregate_importances,
     explain_ga_combination,
 )
@@ -340,6 +345,127 @@ class TestCombination(unittest.TestCase):
         # abs magnitude is positive for the negative-direction feature too.
         self.assertGreater(abs_["neg"], 0.0)
 
+    def test_shap_matrix_and_aggregates_agree(self):
+        """compute_meta_shap is now a thin aggregation over the per-row matrix,
+        so the enumeration runs once for both summaries instead of twice."""
+        feats = ["a", "b", "c"]
+        X = np.random.RandomState(3).rand(50, 3)
+        baseline = X.mean(axis=0)
+        f = lambda Z: 2 * Z[:, 0] - Z[:, 1]
+        phi = compute_meta_shap_values(f, X, baseline, len(feats))
+        self.assertEqual(phi.shape, (50, 3))
+        for i, name in enumerate(feats):
+            self.assertAlmostEqual(
+                compute_meta_shap(f, X, baseline, feats, mode="abs")[name],
+                float(np.abs(phi[:, i]).mean()))
+            self.assertAlmostEqual(
+                compute_meta_shap(f, X, baseline, feats, mode="signed")[name],
+                float(phi[:, i].mean()))
+
+    # ── ALE ─────────────────────────────────────────────────────────────────
+
+    def test_ale_recovers_weight_times_range_for_a_linear_model(self):
+        """For a linear model the accumulated effect IS the coefficient times
+        how far the feature actually moves — the anchor that makes ALE the
+        generalisation of 'the weight' for a model that has none."""
+        feats = ["a", "b"]
+        a = np.linspace(0.05, 0.95, 200)
+        X = np.column_stack([a, np.random.RandomState(0).rand(200)])
+        ale = compute_meta_ale(lambda Z: 0.5 * Z[:, 0], X, feats)
+        self.assertAlmostEqual(ale["a"]["net"], 0.5 * (0.95 - 0.05), places=6)
+        self.assertAlmostEqual(ale["a"]["consistency"], 1.0, places=6)
+        # A feature the model ignores moves nothing.
+        self.assertAlmostEqual(ale["b"]["total_variation"], 0.0, places=9)
+
+    def test_ale_book_keeping(self):
+        feats = ["a", "b"]
+        X = np.random.RandomState(1).rand(120, 2)
+        ale = compute_meta_ale(lambda Z: Z[:, 0] ** 2 - Z[:, 1], X, feats)
+        for rec in ale.values():
+            self.assertAlmostEqual(sum(rec["deltas"]), rec["net"], places=12)
+            self.assertAlmostEqual(sum(abs(v) for v in rec["deltas"]),
+                                   rec["total_variation"], places=12)
+            # The curve starts at zero and ends at the net effect.
+            self.assertEqual(len(rec["curve"]), len(rec["edges"]))
+            self.assertAlmostEqual(rec["curve"][0], 0.0)
+            self.assertAlmostEqual(rec["curve"][-1], rec["net"], places=12)
+
+    def test_ale_separates_a_cancelling_effect_from_no_effect(self):
+        """The failure that made signed SHAP unusable: an effect that rises then
+        falls nets to nothing. Total variation must still see it, or the
+        detector ranks below pure noise."""
+        feats = ["u", "n"]
+        u = np.linspace(0.0, 1.0, 300)
+        X = np.column_stack([u, np.random.RandomState(2).rand(300)])
+        ale = compute_meta_ale(lambda Z: np.abs(Z[:, 0] - 0.5) * 2, X, feats)
+        self.assertAlmostEqual(ale["u"]["net"], 0.0, places=2)
+        self.assertGreater(ale["u"]["total_variation"], 0.9)
+        self.assertLess(ale["u"]["consistency"], 0.1)
+
+    def test_ale_is_deterministic_and_handles_a_constant_column(self):
+        feats = ["a", "const"]
+        X = np.column_stack([np.linspace(0, 1, 60), np.full(60, 0.7)])
+        f = lambda Z: Z[:, 0] + Z[:, 1]
+        first = compute_meta_ale(f, X, feats)
+        self.assertEqual(first["const"]["n_bins"], 0)
+        self.assertNotEqual(first["const"]["net"], first["const"]["net"])  # NaN
+        self.assertEqual(first["a"]["net"], compute_meta_ale(f, X, feats)["a"]["net"])
+
+    def _sign_fixture(self):
+        return {
+            "up":     {"net": 0.8, "total_variation": 0.8, "consistency": 1.0, "n_bins": 10},
+            "down":   {"net": -0.8, "total_variation": 0.8, "consistency": 1.0, "n_bins": 10},
+            "swings": {"net": -0.01, "total_variation": 0.8, "consistency": 0.0125, "n_bins": 10},
+            "tiny":   {"net": 0.01, "total_variation": 0.01, "consistency": 1.0, "n_bins": 10},
+            "flat":   {"net": 0.0, "total_variation": 0.0,
+                       "consistency": float("nan"), "n_bins": 10},
+            "gone":   {"net": float("nan"), "total_variation": float("nan"),
+                       "consistency": float("nan"), "n_bins": 0},
+        }
+
+    def test_sign_is_reported_whenever_there_is_one(self):
+        """The sign is where the curve ends, and nothing else decides it.
+
+        A weakly-supported sign is still a measurement: suppressing it turned a
+        detector measured at a clear negative into a blank, which reads as
+        missing data. Only two cases have no sign to take — a net of exactly
+        zero (neither direction is true) and an ALE that could not be computed.
+        """
+        ale = self._sign_fixture()
+        got = ale_signs(ale, list(ale))
+        self.assertEqual(got["up"], "positive")
+        self.assertEqual(got["down"], "negative")
+        self.assertEqual(got["swings"], "negative")   # moves both ways, ends down
+        self.assertEqual(got["tiny"], "positive")     # small, but a real direction
+        self.assertEqual(got["flat"], "not_available")
+        self.assertEqual(got["gone"], "not_available")
+
+    def test_sign_support_names_why_a_sign_is_thin(self):
+        """The gates that used to suppress a sign now qualify it, and each
+        reports its own reason — the two are different findings."""
+        ale = self._sign_fixture()
+        got = ale_sign_support(ale, list(ale))
+        self.assertEqual(got["up"], [])
+        self.assertEqual(got["down"], [])
+        self.assertEqual(got["swings"], ["low_consistency"])
+        self.assertEqual(got["tiny"], ["weak_influence"])
+        # Nothing to qualify where there is no sign in the first place.
+        self.assertEqual(got["flat"], [])
+        self.assertEqual(got["gone"], [])
+
+    def test_sign_support_floor_is_relative_to_this_ensemble(self):
+        """The magnitude gate is a fraction of the strongest detector here, so
+        the same absolute movement is weak beside a big detector and strong on
+        its own. Units are the meta-learner's own probability scale, which has
+        no absolute threshold to appeal to."""
+        rec = lambda tv: {"net": tv, "total_variation": tv,
+                          "consistency": 1.0, "n_bins": 10}
+        beside_big = ale_sign_support({"small": rec(0.01), "big": rec(1.0)},
+                                      ["small", "big"])
+        self.assertEqual(beside_big["small"], ["weak_influence"])
+        alone = ale_sign_support({"small": rec(0.01)}, ["small"])
+        self.assertEqual(alone["small"], [])
+
     def test_pfi_informative_vs_noise(self):
         # f uses only column 0; y derived from column 0. Permuting col 0 hurts the
         # score; permuting the noise col 1 does not.
@@ -364,6 +490,28 @@ class TestCombination(unittest.TestCase):
         self.assertEqual(final[0], "A")                       # wins both → top
         self.assertEqual(scores["A"], max(scores.values()))  # highest stationary prob
         self.assertAlmostEqual(sum(scores.values()), 1.0)    # π is a distribution
+
+    def test_markov_plot_title_names_every_source_that_feeds_the_chain(self):
+        """The figure's label and the chain's actual inputs, checked against
+        each other. ALE was added to the aggregation but the title kept saying
+        "mean|SHAP| + PFI", so the plot claimed a two-source consensus beside a
+        panel drawing three bars — a caption drifting off its own figure is
+        invisible to every other test here.
+        """
+        import inspect
+        from Metrics import Ensemble_GA
+        agg = inspect.getsource(Ensemble_GA.explain_ga_combination)
+        title = inspect.getsource(Ensemble_GA.plot_ga_combination)
+        call = agg.split("markov_aggregate_importances(")[1].split(")")[0]
+        # Every source key handed to the aggregator must be recognisable in the
+        # title, and the count must match — a title naming four would be as
+        # wrong as one naming two.
+        keys = re.findall(r'"([A-Za-z_]+)":', call)
+        self.assertEqual(sorted(keys), ["ALE", "PFI", "SHAP_abs"])
+        shown = title.split('set_title("Final ranking')[1].split('")')[0]
+        for token in ("SHAP", "PFI", "ALE"):
+            self.assertIn(token, shown, shown)
+        self.assertEqual(shown.count("+"), len(keys) - 1, shown)
 
     def test_markov_single_feature(self):
         scores, final = markov_aggregate_importances({"SHAP": {"only": 0.5}}, ["only"])
@@ -455,15 +603,35 @@ class TestCombination(unittest.TestCase):
                 self.assertIsInstance(result, dict)
                 for key in ("feature_names", "shap_importance", "shap_signed_importance",
                             "pfi_importance", "markov_scores", "final_ranking",
-                            "baseline_f1", "model_source"):
+                            "baseline_f1", "model_source",
+                            "ale_total_variation", "ale_net", "ale_consistency",
+                            "ale_sign", "ale_sign_support", "ale_curves",
+                            "ale_n_bins"):
                     self.assertIn(key, result)
                 self.assertEqual(result["feature_names"], ["A", "C"])
                 self.assertEqual(sorted(result["final_ranking"]), ["A", "C"])
+                # predict_fn returns column 0 (=A) unchanged, so A rises with its
+                # own score and C does nothing at all.
+                self.assertEqual(result["ale_sign"]["A"], "positive")
+                self.assertAlmostEqual(result["ale_total_variation"]["C"], 0.0,
+                                       places=9)
                 out = os.path.join("myresults", "GA_Ens", "TEST", "e1")
                 self.assertTrue(os.path.exists(os.path.join(
                     out, "ga_combination_explainability_TEST_e1.txt")))
                 self.assertTrue(os.path.exists(os.path.join(
                     out, "ga_combination_importance_TEST_e1.png")))
+                self.assertTrue(os.path.exists(os.path.join(
+                    out, "ga_combination_ale_TEST_e1.png")))
+                # The bin-marked view is a second figure, not a replacement:
+                # the plain curve is the one that belongs in a thesis.
+                self.assertTrue(os.path.exists(os.path.join(
+                    out, "ga_combination_ale_bins_TEST_e1.png")))
+                # The superseded signed-SHAP table stays in the report, labelled.
+                with open(os.path.join(
+                        out, "ga_combination_explainability_TEST_e1.txt")) as fh:
+                    report = fh.read()
+                self.assertIn("SUPERSEDED BY ALE", report)
+                self.assertIn("Markov aggregation (SHAP |.| + PFI + ALE)", report)
                 # Intermediate Representation JSON is emitted alongside.
                 import json
                 ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
