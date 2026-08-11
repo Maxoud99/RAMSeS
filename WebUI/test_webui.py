@@ -739,11 +739,49 @@ class TestThompsonRegimeHandling(unittest.TestCase):
         "was led by NN_1. Across the regimes NN_1 led, channel 7 contributed "
         "most.")
 
+    # A regime's second sentence — the deviation clause — carries no detector
+    # name and no window range. Its ONLY anchor is "In regime N".
+    TWO_SENTENCE_NARRATIVE = (
+        "Thompson Sampling ranked NN_1 first. The run was divided into 2 "
+        "regimes led by 2 detectors. Regime 0 (windows 0 to 4) was led by "
+        "NN_3, with channel 7 raising its reward. In regime 0, channel 4 "
+        "departed furthest from its usual contribution, running below it. "
+        "Regime 1 (windows 5 to 18) was led by NN_1. In regime 1, channel 7 "
+        "departed furthest from its usual contribution, running above it. "
+        "Across the regimes NN_1 led, channel 7 contributed most.")
+
     def test_regime_walk_leaves_the_default_view(self):
         out = summarize.summarize(self.NARRATIVE, stage="thompson_sampling",
                                   ir_doc=self._ir())
         self.assertNotIn("Regime 0", out["summary"])
         self.assertNotIn("Regime 1", out["summary"])
+
+    def test_a_regimes_second_sentence_goes_with_its_regime(self):
+        """Resilience, not the primary path: the IR now packs every claim about
+        a regime into ONE sentence, so there is normally no second sentence to
+        strand. But the narrator may still split one off, and if it does the
+        clause must carry the regime number — that name is the only thing
+        attribution can key on. It has no detector name, and its lone channel
+        index gets captured by whichever unrelated atom holds that integer
+        ("channel 4" landing on the regime summary's "4 detectors"). Unanchored,
+        such sentences escaped the walk, survived the summary drop, and piled up
+        as a block of context-free sentences at the end of the card.
+        """
+        ir_doc = self._ir()
+        out = summarize.summarize(self.TWO_SENTENCE_NARRATIVE,
+                                  stage="thompson_sampling", ir_doc=ir_doc)
+        # Gone from the default view, with the rest of the walk.
+        self.assertNotIn("departed furthest", out["summary"])
+        # And filed under the right regime — channel 4 with 0, channel 7 with 1.
+        regimes = artifacts._regimes_from_ir(ir_doc)
+        artifacts._attach_narrated_regimes(regimes, self.TWO_SENTENCE_NARRATIVE,
+                                           ir_doc)
+        self.assertIn("channel 4 departed furthest", regimes[0]["narrated"])
+        self.assertNotIn("channel 7 departed", regimes[0]["narrated"])
+        self.assertIn("channel 7 departed furthest", regimes[1]["narrated"])
+        # The roll-up says "regimes" with no index and must NOT be swallowed by
+        # the last regime just because it trails the walk.
+        self.assertNotIn("contributed most", regimes[1]["narrated"])
 
     def test_the_regime_disclosure_is_the_only_extended_view(self):
         """The regime sentences belong beside their SHAP plots, not in a second

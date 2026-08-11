@@ -456,43 +456,52 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
         favor = [c for c, _ in (r.get("edge_favor_leader") or [])][:1]
         runner = r.get("runner_up")
 
-        parts = [f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
-                 f"{r.get('duration')} windows) was led by {leader}."]
-        has_edge = bool(favor and runner)
-
-        def _edge(verb: str) -> str:
-            return f"{verb} it its biggest edge over {runner}"
-
-        if supplying:
-            # Uppercase only the first letter — .capitalize() would lowercase
-            # the rest, mangling real channel names like Accelerometer1RMS.
-            labels = _oxford([_ch(c) for c in supplying])
-            labels = labels[:1].upper() + labels[1:]
-            tail = ""
-            if has_edge:
-                # One channel often does both jobs; "with X also" says so
-                # instead of naming the same channel twice as though they were
-                # two separate findings. That clause takes a participle, the
-                # coordinate one takes the past tense.
-                tail = (f", with {_ch(favor[0])} also {_edge('giving')}"
-                        if favor[0] in supplying
-                        else f", and {_ch(favor[0])} {_edge('gave')}")
-            parts.append(f"{labels} raised its expected reward the most{tail}.")
-        elif has_edge:
-            lbl = _ch(favor[0])
-            parts.append(f"{lbl[:1].upper() + lbl[1:]} {_edge('gave')}.")
-
-        # SHAP gets its own sentence, because it answers a different question:
-        # not what the reward was made of, but which channel behaved least like
-        # itself here. Merged into the clause above it read as a third slice of
-        # the same total, which it is not.
+        # ONE sentence, carrying the regime index and every claim about it.
+        #
+        # This is structural, not stylistic. summarize.attribute_sentences files
+        # a sentence under a regime only when it says "regime N" — the atoms
+        # otherwise share all their names and numbers and cannot be told apart.
+        # A trailing sentence carrying just a channel index therefore attributed
+        # to nothing, or was captured by whichever unrelated atom held that
+        # integer ("channel 4" landing on the regime summary's "4 different
+        # detectors"); either way it escaped the walk, survived the summary drop
+        # and piled up as a block of context-free sentences. Repeating "In
+        # regime N" to anchor it worked only while the narrator cooperated, and
+        # it stopped cooperating whenever the repetition read as redundant.
+        # Keeping everything in one sentence removes the anchor problem instead
+        # of policing it — and there is no second sentence to lose.
+        #
+        # The three claims stay three distinct clauses, in parallel participles.
+        # They are different quantities: a SHARE of the expected reward, an EDGE
+        # over the runner-up in those same units, and a DEPARTURE from what the
+        # channel usually contributes, which is not a share of anything.
         deviating = ((r.get("shap_raising") or []) + (r.get("shap_lowering") or []))
+        clauses: List[str] = []
+        if supplying:
+            clauses.append(f"{_oxford([_ch(c) for c in supplying])} raising its "
+                           f"expected reward the most")
+        if favor and runner:
+            # One channel often does both jobs; "also" says so rather than
+            # presenting the same channel twice as two separate findings.
+            also = "also " if favor[0] in supplying else ""
+            clauses.append(f"{_ch(favor[0])} {also}giving it its biggest edge "
+                           f"over {runner}")
         if deviating:
             c, v = max(deviating, key=lambda cv: abs(cv[1]) if not _is_nan(cv[1]) else -1)
-            lbl = _ch(c)
             direction = "above" if (not _is_nan(v) and float(v) >= 0) else "below"
-            parts.append(f"{lbl[:1].upper() + lbl[1:]} departed furthest from its "
-                         f"usual contribution here, running {direction} it.")
+            clauses.append(f"{_ch(c)} departing furthest from its usual "
+                           f"contribution, running {direction} it")
+
+        text = (f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
+                f"{r.get('duration')} windows) was led by {leader}")
+        if len(clauses) == 2 and any(" and " in c for c in clauses):
+            # _oxford drops the serial comma for two items, which collides with
+            # the "channel 8 and channel 3" inside the first clause and yields
+            # two bare "and"s. The comma is what marks where one clause ends.
+            text += f", with {clauses[0]}, and {clauses[1]}"
+        elif clauses:
+            text += f", with {_oxford(clauses)}"
+        parts = [text + "."]
 
         rid = f"ts.regime.{idx}"
         evidence.append(make_atom(
@@ -1234,19 +1243,20 @@ def _sign_summary_text(members: Sequence[str], signs: Dict[str, str]) -> str:
         return singular if len(group) == 1 else plural
 
     if pos and neg:
-        text = (f"{_oxford(pos)} {_v(pos, 'is', 'are')} positive, while "
-                f"{_oxford(neg)} {_v(neg, 'is', 'are')} negative")
+        # The second clause elides "signs" — the first has just supplied it.
+        text = (f"{_oxford(pos)} had {_v(pos, 'a positive sign', 'positive signs')}, "
+                f"while {_oxford(neg)} had negative")
     elif pos:
-        text = f"{_oxford(pos)} {_v(pos, 'is', 'are')} positive"
+        text = f"{_oxford(pos)} had {_v(pos, 'a positive sign', 'positive signs')}"
     elif neg:
-        text = f"{_oxford(neg)} {_v(neg, 'is', 'are')} negative"
+        text = f"{_oxford(neg)} had {_v(neg, 'a negative sign', 'negative signs')}"
     elif na:
         return (f"No detector has a sign: {_oxford(na)} "
                 f"{_v(na, 'has', 'have')} no net effect.")
     else:
         return ""
     if na:
-        text += f"; {_oxford(na)} {_v(na, 'has', 'have')} no sign"
+        text += f"; {_oxford(na)} had no sign"
     return text + "."
 
 

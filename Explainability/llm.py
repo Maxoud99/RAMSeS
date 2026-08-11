@@ -318,15 +318,23 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
         " Open with the winner and its margin, then how the run divided into "
         "regimes. Then give EVERY regime its own sentence, in the order listed, "
         "keeping each regime's window range, its leader and its channels "
-        "together. Write every regime sentence in the same shape: the regime "
-        "and its window range, then the detector that led it, then its "
+        "together. Begin each of those sentences with the literal words "
+        "'Regime N (windows ...)', then the detector that led it, then its "
         "channels. Name that detector outright — never describe it by reference "
         "to the previous regime. Three different things are said about channels "
         "and they must not be merged or traded for one another: one channel "
         "SUPPLIES a share of a detector's expected reward, one GIVES IT AN EDGE "
         "over the named rival, and one DEPARTS FURTHEST FROM ITS USUAL "
         "contribution. The last is a separate sentence in the facts and must "
-        "stay a separate clause. Keep whichever wording the fact uses. "
+        "stay separate clauses. Keep whichever wording the fact uses. "
+        # Every claim about a regime now arrives in ONE fact sentence carrying
+        # that regime's number, so keeping it in one sentence is what keeps the
+        # page able to file it. Splitting off a trailing clause strands it: it
+        # carries no regime number, matches no atom, and lands in a heap of
+        # context-free sentences at the end of the summary.
+        "Keep each regime to a SINGLE sentence — never split a trailing clause "
+        "off into a sentence of its own, and never refer back with 'in this "
+        "regime' or 'here'. "
         "Finish with the winner's overall channel and the selection-state "
         "percentages."
     ),

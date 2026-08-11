@@ -280,10 +280,10 @@ class TestBuilders(unittest.TestCase):
         # a different quantity — which channel departed furthest from its usual.
         self.assertEqual(
             by_id["ts.regime.0"]["text"],
-            "Regime 0 (windows 0 to 2, 3 windows) was led by A. Channel 0 and "
-            "channel 1 raised its expected reward the most, with channel 0 "
-            "also giving it its biggest edge over B. Channel 0 departed "
-            "furthest from its usual contribution here, running above it.")
+            "Regime 0 (windows 0 to 2, 3 windows) was led by A, with channel 0 "
+            "and channel 1 raising its expected reward the most, channel 0 also "
+            "giving it its biggest edge over B, and channel 0 departing "
+            "furthest from its usual contribution, running above it.")
         # Regime 1 has no SHAP/preference data -> just the span sentence.
         self.assertEqual(
             by_id["ts.regime.1"]["text"],
@@ -333,9 +333,9 @@ class TestBuilders(unittest.TestCase):
         kwargs["regimes"][0]["edge_favor_leader"] = [(7, 0.3)]
         doc = ir.build_thompson_ir("DS", "e1", **kwargs)
         txt = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")["text"]
-        self.assertIn("Channel 2 and channel 5 raised its expected reward the most",
+        self.assertIn("channel 2 and channel 5 raising its expected reward the most",
                       txt)
-        self.assertIn("channel 7 gave it its biggest edge over B", txt)
+        self.assertIn("channel 7 giving it its biggest edge over B", txt)
 
     def test_thompson_edge_never_comes_from_the_deviation_split(self):
         """The edge clause is in expected-reward units. A run whose SHAP
@@ -361,8 +361,8 @@ class TestBuilders(unittest.TestCase):
         kwargs["regimes"][0]["shap_lowering"] = [(3, -0.9)]
         doc = ir.build_thompson_ir("DS", "e1", **kwargs)
         atom = next(a for a in doc["evidence"] if a["id"] == "ts.regime.0")
-        self.assertIn("Channel 3 departed furthest from its usual contribution "
-                      "here, running below it.", atom["text"])
+        self.assertIn("channel 3 departing furthest from its usual "
+                      "contribution, running below it.", atom["text"])
         self.assertEqual(atom["value"]["deviation_lowering"], [[3, -0.9]])
 
     def test_thompson_negative_edge_gap_is_not_dramatised(self):
@@ -391,7 +391,7 @@ class TestBuilders(unittest.TestCase):
             "DS", "e1", channel_names=["Pressure", "Accelerometer1RMS"], **kwargs)
         txt = next(a for a in named["evidence"] if a["id"] == "ts.regime.0")["text"]
         # Name is used verbatim — never lower-cased by a blanket .capitalize().
-        self.assertIn("Accelerometer1RMS raised its expected reward the most", txt)
+        self.assertIn("Accelerometer1RMS raising its expected reward the most", txt)
         self.assertNotIn("channel 1", txt)
         # Out-of-range indices fall back to the numeric form.
         short = ir.build_thompson_ir("DS", "e1", channel_names=["Pressure"], **kwargs)
@@ -599,7 +599,7 @@ class TestBuilders(unittest.TestCase):
         sign = by_id["ga_comb.sign_summary"]
         self.assertEqual(
             sign["text"],
-            "A is positive, while B and C are negative.")
+            "A had a positive sign, while B and C had negative.")
         self.assertEqual(sign["value"]["no_sign"], [])
 
         # The run-dependent caveat fires, names exactly the affected detector,
@@ -874,7 +874,7 @@ class TestBuilders(unittest.TestCase):
         sign = next(a for a in doc["evidence"] if a["id"] == "ga_comb.sign_summary")
         self.assertEqual(
             sign["text"],
-            "A and B are positive, while C is negative.")
+            "A and B had positive signs, while C had negative.")
         # Every detector has a sign here, so no consistency caveat fires.
         self.assertNotIn("ga_comb.caveat.sign_consistency",
                          {x["id"] for x in doc["caveats"]})
