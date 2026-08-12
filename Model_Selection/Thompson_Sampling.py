@@ -2425,7 +2425,15 @@ def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
                                       top_n_channels=n_channels):
         end, leader, runner = fact["end"], fact["leader"], fact["runner_up"]
         at = means_history[end]
-        models = [leader] + ([runner] if runner else [])
+        # Top three by ||mu||^2 at this window, which is the quantity the
+        # regime itself is defined on — so the leader heads the list and the
+        # runner-up follows. Showing a third gives the pair a scale: two bars
+        # alone cannot say whether the runner-up was close to the leader or
+        # merely the best of a distant field.
+        models = _top_k_models_by_norm(at, 3)
+        for m in ([leader] + ([runner] if runner else [])):
+            if m and m in at and m not in models:
+                models.append(m)
         per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
                        for m in models}
         rng = f'{fact["start"]}-{end}'
@@ -2561,6 +2569,14 @@ def explain_thompson_ranking(
             warmup_windows=warmup_used,
             channel_names=payload.get("channel_names"),
             n_channels=n_channels,
+            # Every detector's per-channel shares, so the page can decompose
+            # ANY pair's gap without the run being present: the gap split is
+            # exactly shares(a) - shares(b) (see rank_gap_decomposition), so
+            # this is all the on-demand renderer needs.
+            channel_shares={
+                m: [float(v) for v in aggregate_squared_per_channel(mu, n_channels)]
+                for m, mu in means.items()
+            } if n_channels > 0 else {},
         )
         _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson_ranking")
     except Exception as e:

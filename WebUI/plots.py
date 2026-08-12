@@ -112,34 +112,37 @@ def _variants(directory, patterns, titles) -> List[Dict[str, Any]]:
 # ── Per-stage manifests ──────────────────────────────────────────────────────
 
 def _ga_selection(ds, ent):
+    """One headline figure; the other two are a click away.
+
+    Utility × stability is the figure that answers the stage's question — where
+    a detector sits on the two axes that decided whether it was kept. LOFO and
+    the survival trace are the inputs to that placement, so they browse rather
+    than lead.
+
+    The gallery holds only those two. The injected-anomalies figure is about the
+    DATA, not the selection, and the two Friedman-interaction plots are from a
+    disabled axis, so a run that still has them on disk is showing leftovers.
+    """
     d = _dir_for(TREE_GA, ds, ent)
     headline, gallery = [], []
-    for pattern, title, caption in (
-        ("ga_selection_utility_*.png", "Utility",
-         "Leave-one-out fitness change and mean marginal contribution per detector."),
-        ("ga_selection_archetypes_*.png", "Utility × stability",
-         "Where each detector sits on the two axes that explain its selection."),
-    ):
-        found = _ls(d, pattern)
-        if found:
-            headline.append(_fig(found[0], title, caption))
+    for path in _ls(d, "ga_selection_archetypes_*.png"):
+        headline.append(_fig(
+            path, "Utility × stability",
+            "Where each detector sits on the two axes that explain its "
+            "selection, split at the median of each. Both axes start at zero."))
+        break
+    for path in _ls(d, "ga_selection_utility_*.png"):
+        gallery.append(_fig(
+            path, "LOFO",
+            "Leave-one-out fitness change on the chosen ensemble, and mean "
+            "marginal contribution per detector."))
     survival = _variants(d, ["ga_selection_survival_*[!l].png", "ga_selection_survival_all_*.png"],
                          ["Ensemble highlighted", "All detectors"])
     survival = [f for f in survival if "_all_" not in f["name"]] + \
                [f for f in survival if "_all_" in f["name"]]
-    if survival:
-        headline.append({"title": "Survival across generations",
-                         "caption": "How consistently the algorithm kept each detector.",
-                         "variants": survival, "default": 0})
-    newest = max((p.stat().st_mtime for p in _ls(d)), default=0)
-    for path in _ls(d, "ensemble_scores_*.png"):
-        gallery.append(_fig(path, "Injected anomalies", "The data the run saw."))
-    for path in _ls(d, "ga_selection_*interaction_*.png"):
-        # Friedman's H is disabled in the current pipeline; anything left is
-        # from an older run. Badge it rather than presenting it as current.
-        stale = path.stat().st_mtime < newest - 1
-        gallery.append(_fig(path, "Interaction (disabled axis)",
-                            "Left over from an earlier run.", stale=stale))
+    for figure in survival:
+        gallery.append(dict(figure, caption="How consistently the algorithm "
+                                            "kept each detector."))
     return headline, gallery
 
 
@@ -162,13 +165,7 @@ def _ga_combination(ds, ent):
         headline.append({
             "title": "How each detector moves the meta-learner",
             "caption": "One accumulated-effect curve per detector, over that "
-                       "detector's own score range. Rising means higher scores "
-                       "from it push the ensemble toward flagging an anomaly, "
-                       "falling means toward normal. The sign is where the curve "
-                       "ends; a dashed curve is one whose sign is weakly "
-                       "supported. The second view marks the quantile bins the "
-                       "curve is built from, which is what shows whether a turn "
-                       "is structure or coarse resolution.",
+                       "detector's own score range.",
             "variants": variants, "default": 0})
     return headline, []
 
@@ -188,11 +185,21 @@ def _thompson(ds, ent):
     it = _iteration_tag(d)
     headline, gallery = [], []
     if it:
+        # Smoothed first: it is what regime detection actually reads, so it is
+        # the one the regime prose describes. The raw signal is the same
+        # quantity un-smoothed, which makes it a toggle rather than a figure of
+        # its own.
+        rewards = _variants(d, [f"expected_rewards_smoothed_{it}.png",
+                                f"expected_rewards_{it}.png"],
+                            ["Smoothed", "Raw"])
+        if rewards:
+            headline.append({
+                "title": "Expected rewards",
+                "caption": "Per-window expected reward for every detector. "
+                           "Smoothing is what regime detection reads; the raw "
+                           "signal is the same quantity unsmoothed.",
+                "variants": rewards, "default": 0})
         for pattern, title, caption in (
-            (f"expected_rewards_{it}.png", "Expected rewards",
-             "Per-window expected reward for every detector — the raw signal."),
-            (f"expected_rewards_smoothed_{it}.png", "Expected rewards (smoothed)",
-             "The same signal smoothed, which is what regime detection reads."),
             (f"selection_states_{it}.png", "Selection states",
              "Exploitation, informed exploration and forced random picks over the run."),
         ):
@@ -204,21 +211,17 @@ def _thompson(ds, ent):
         if avg:
             headline.append({"title": "Mean channel contribution across all windows",
                              "caption": "Each channel's own share of a detector's expected "
-                                        "reward, averaged over every window. The bars sum "
-                                        "to the detector's expected reward on a typical "
-                                        "window. " + CHANNEL_RULE,
+                                        "reward, averaged over every window.",
                              "variants": avg, "default": 0})
+        # Only the two mean|SHAP| figures browse. The posterior history, the
+        # per-model panels and the two channel comparisons all restate what the
+        # headline reward figures and the per-regime disclosure already show.
         for pattern, title, caption in (
-            (f"history_plot_{it}.png", "Posterior history", ""),
-            (f"shap_per_model_{it}.png", "Per-model channel attribution",
-             "One panel per detector, each showing its own 10 largest "
-             "contributions; a detector's other channels are not drawn."),
-            (f"shap_comparison_{it}.png", "Channel comparison (top 3)", CHANNEL_RULE),
-            (f"shap_comparison_all_{it}.png", "Channel comparison (all)", CHANNEL_RULE),
-            # Demoted from the headline. mean|SHAP| measures how much a
-            # channel's influence VARIES between windows — the signed average
-            # is zero by construction, which is why it had to take absolute
-            # values — so it is a dispersion measure, not an average share.
+            # Demoted from the headline rather than dropped. mean|SHAP| measures
+            # how much a channel's influence VARIES between windows — the signed
+            # average is zero by construction, which is why it had to take
+            # absolute values — so it is a dispersion measure, not an average
+            # share, and nothing else on the card reports dispersion.
             (f"shap_average_top3_{it}.png", "Channel influence variability (top 3)",
              "Mean |SHAP|: how much each channel's influence varies from window "
              "to window. Not an average contribution. " + CHANNEL_RULE),
@@ -229,6 +232,34 @@ def _thompson(ds, ent):
             for path in _ls(d, pattern):
                 gallery.append(_fig(path, title, caption))
     return headline, gallery
+
+
+def _ranking_pair_picker(ds, ent) -> Optional[Dict[str, Any]]:
+    """The gap decomposition as a PAIR PICKER rather than a fixed figure.
+
+    Every detector's per-channel shares are in the IR, and the gap between any
+    two is exactly the difference of their shares, so the page can ask for a
+    pair and get it drawn. Returns None when the IR predates that block, and
+    the caller then falls back to the pipeline's static winner-vs-runner-up
+    figure — which is this control's default pair anyway.
+
+    `detectors` arrives in the ranking's own order, so the first two are the
+    winner and the runner-up and the initial view matches the static figure.
+    """
+    from WebUI import ondemand
+    shares = ondemand.ranking_channel_shares(ds, ent)
+    if len(shares) < 2:
+        return None
+    order = sorted(shares, key=lambda m: -sum(shares[m]))
+    return {
+        "title": "What decided the top spot",
+        "caption": "The margin between two detectors, split channel by channel; "
+                   "these bars sum to the margin exactly.",
+        "pair_picker": {
+            "detectors": order,
+            "endpoint": f"/api/plots/{ds}/{ent}/ranking-gap",
+        },
+    }
 
 
 def _ts_ranking(ds, ent):
@@ -248,22 +279,24 @@ def _ts_ranking(ds, ent):
     for pattern, title, caption in (
         (f"ranking_final_{it}.png", "Final ranking",
          "The score each detector was ranked by, with how many windows it was tried in."),
-        (f"ranking_gap_{it}.png", "What decided the top spot",
-         "The winner's margin over the runner-up, split channel by channel; "
-         "these bars sum to the margin exactly."),
         (f"ranking_criterion_{it}.png", "Ranking score over the run",
          "Every detector's score window by window, shaded by which one led."),
     ):
         found = _ls(d, pattern)
         if found:
             headline.append(_fig(found[0], title, caption))
+    # Any pair, not just the winner and runner-up. 11 detectors is 55 unordered
+    # pairs and a reader looks at one or two, so the picture is drawn per
+    # request from the IR's per-detector shares; the static ranking_gap_*.png
+    # the pipeline writes is exactly the default pair of this control.
+    pair = _ranking_pair_picker(ds, ent)
+    if pair:
+        headline.append(pair)
     channels = _variants(d, [f"ranking_channels_{it}.png", f"ranking_channels_all_{it}.png"],
                          ["Top 3 detectors", "All detectors"])
     if channels:
         headline.append({"title": "Where each detector's score comes from",
-                         "caption": "Per-channel shares of the final weights. These are "
-                                    "sums of squared weights, so they are never "
-                                    "negative. " + CHANNEL_RULE,
+                         "caption": "Per-channel shares of the final score.",
                          "variants": channels, "default": 0})
     return headline, gallery
 
@@ -354,8 +387,11 @@ def _monte_carlo(ds, ent):
             ("*_MonteCarlo_surrogate_tree_PRAUC.png", "Surrogate tree (PR-AUC)")):
         for path in _ls(d, pattern):
             gallery.append(_fig(path, title))
-    for path in _ls(d, "*_MonteCarloResults.png"):
-        gallery.append(_fig(path, path.name.split("_MonteCarloResults")[0].split("_")[-1]))
+    # The per-detector *_MonteCarloResults.png set is not listed. One figure per
+    # detector repeats what the noise curves already draw together, which is the
+    # comparison that matters here, and its title came out as a bare family
+    # index ("1", "2") because the stem splits on the underscore inside the
+    # detector name.
     return headline, gallery
 
 
@@ -365,12 +401,23 @@ def _off_by(ds, ent):
     for path in _ls(d, "*_off_by_point_importance.png"):
         headline.append(_fig(path, "Which point properties separate the winner",
                              "Feature importance across all pairwise comparisons."))
+    # One tree at a time, chosen by competitor. Every pair is already rendered,
+    # so this is a selector over files rather than anything generated on demand
+    # — but ten trees stacked down the card is ten near-identical figures the
+    # reader has to scroll past to reach anything else.
+    trees = []
     for path in _ls(d, "*_off_by_point_tree_*.png"):
         m = _OFFBY_TREE_RE.search(path.name)
         if m:
-            headline.append(_fig(
-                path, f"{m.group('winner')} vs {m.group('competitor')}",
+            trees.append(_fig(
+                path, m.group("competitor"),
                 f"Where {m.group('winner')} uniquely beat {m.group('competitor')}."))
+    if trees:
+        winner = _OFFBY_TREE_RE.search(trees[0]["name"]).group("winner")
+        headline.append({
+            "title": f"Where {winner} uniquely wins",
+            "variants": trees, "default": 0, "select_label": "Compared against",
+        })
     for entry in dedupe_timestamped(_ls(d, "Data_vs_DataWithAnomalies_*.png")
                                     + _ls(d, "*Misclassified*.png")):
         title = ("Injected borderline points" if "Data_vs" in entry["path"].name

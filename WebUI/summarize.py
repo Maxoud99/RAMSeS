@@ -73,8 +73,18 @@ _STAGE_SUMMARY: Dict[str, Dict[str, Any]] = {
                          "drop": ("support", "regime_summary", "regime"),
                          "extended_drop": ("regime",),
                          "table": "ts_ranking"},
-    "ga_combination": {"mode": "table", "table": "ga_combination"},
-    "rank_aggregation_robust": {"mode": "table", "table": "rank_aggregation"},
+    # The table IS the per-detector ranking, so the sentences restating it row
+    # by row are the one thing the summary holds back. Everything else — which
+    # ensemble was selected, and which way each detector signed — is the answer
+    # and stays in view.
+    "ga_combination": {"mode": "drop", "drop": ("detector_role",),
+                       "table": "ga_combination"},
+    # `lead_first` takes the narrative's opening sentence literally instead of
+    # hunting for the atom type it should convey. This stage's opener merges two
+    # facts (the consensus winner AND the six sources), so attribution can land
+    # it on either one, and the summary would then open mid-walk.
+    "rank_aggregation_robust": {"mode": "table", "table": "rank_aggregation",
+                                "lead_first": True},
     # rank_aggregation_final is deliberately absent: two sources, a couple of
     # sentences, nothing to hold back.
 }
@@ -183,8 +193,22 @@ def strip_caveats(narrative: str, ir_doc: Dict[str, Any]) -> str:
     narrated copy is the same limitation said twice, in looser words, and it
     lands wherever the narrator chose to put it — which on `ga_combination`
     was in front of the findings the caveats qualify.
+
+    A sentence that also conveys an EVIDENCE atom is never stripped, however
+    well it matches. The lexical bar is a similarity score, and a short caveat
+    made of common vocabulary can reach it on a sentence that is really a
+    finding: the robustness consensus's opening line ("The robustness consensus
+    ranking, which LOF_1 tops, is derived from aggregating six source
+    rankings…") scored exactly 0.50 against "The consensus ranking is produced
+    by Markov-chain rank aggregation over the source rankings" on the four
+    tokens they share, and vanished from the page. Losing a finding is the
+    worse error, so carrying one is a veto.
     """
     skip = set(caveat_sentences(narrative, ir_doc))
+    if not skip:
+        return (narrative or "").strip()
+    carries_fact = {s for s, atom in attribute_sentences(narrative, ir_doc) if atom}
+    skip -= carries_fact
     if not skip:
         return (narrative or "").strip()
     kept = [s for s in split_sentences(narrative) if s not in skip]
@@ -212,38 +236,23 @@ def _rank_key(value: Any) -> Any:
     return float("inf") if value is None else value
 
 
-# How a sign's support reads in the table. Its own column rather than a
-# parenthetical on the sign: the sign is the finding, and a reader scanning the
-# column should see the findings line up, not a ragged mix of bare words and
-# qualified ones.
-_SIGN_SUPPORT_LABEL = {"low_consistency": "low consistency",
-                       "weak_influence": "weak influence"}
-
-
 def _ga_combination_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Overall weight rank, the three method ranks, the sign and its support.
+    """Overall weight rank, the three method ranks, and the sign.
 
     The raw Markov score stays out: it is the quantity the rank is derived
     from, its ties are decided at the 16th decimal, and quoting it invites the
     reader to compare values that are not meaningfully different.
 
     The sign is the sign of ALE's net accumulated effect, not of a signed SHAP
-    average. It is reported for every detector that has one; the support column
-    is where a thinly-evidenced sign is marked as such, so a measured negative
-    is never shown as a blank.
+    average, and it is reported for every detector that has one. How well a
+    sign is supported has no column: it is a caveat, the card renders the
+    caveats in a section of their own, and a column repeating them would be the
+    same qualification in two places.
     """
     rows = []
     for atom in _atoms_of(ir_doc, "detector_role"):
         v = atom["value"]
         rank = v.get("final_rank")
-        sign = str(v.get("sign") or "").replace("_", " ")
-        reasons = list(v.get("sign_support") or [])
-        if sign not in ("positive", "negative"):
-            support = "—"
-        elif reasons:
-            support = ", ".join(_SIGN_SUPPORT_LABEL.get(r, str(r)) for r in reasons)
-        else:
-            support = "strong"
         rows.append({
             "_sort": (_rank_key(rank), str(atom.get("subject", ""))),
             "cells": [
@@ -252,8 +261,7 @@ def _ga_combination_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 v.get("mean_abs_shap_rank"),
                 v.get("pfi_rank"),
                 v.get("ale_rank"),
-                sign,
-                support,
+                str(v.get("sign") or "").replace("_", " "),
             ],
         })
     if not rows:
@@ -261,8 +269,8 @@ def _ga_combination_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rows.sort(key=lambda r: r["_sort"])
     return {
         "columns": ["Weight rank", "Detector", "|SHAP| rank", "PFI rank",
-                    "ALE rank", "Sign", "Sign support"],
-        "align": ["num", "name", "num", "num", "num", "text", "text"],
+                    "ALE rank", "Sign"],
+        "align": ["num", "name", "num", "num", "num", "text"],
         "rows": [r["cells"] for r in rows],
     }
 
@@ -422,7 +430,9 @@ def summarize(text: str, *, stage: Optional[str] = None,
         if spec["mode"] == "table":
             table = _TABLE_BUILDERS[spec["table"]](ir_doc)
             if table:
-                lead = _lead_sentence(body, ir_doc, ("stage_output",))
+                lead = (split_sentences(body)[0].strip() if spec.get("lead_first")
+                        and split_sentences(body)
+                        else _lead_sentence(body, ir_doc, ("stage_output",)))
                 return {"summary": lead, "body": body, "is_full": False,
                         "mode": "table", "table": table}
     except Exception:

@@ -18,7 +18,7 @@ from flask import (Flask, Response, abort, jsonify, render_template, request,
 
 from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES, DEFAULT_LLM_BASE_URL,
                                  DEFAULT_LLM_MODEL)
-from WebUI import artifacts, catalog, jobs, markers, paths, plots
+from WebUI import artifacts, catalog, jobs, markers, ondemand, paths, plots
 
 SSE_KEEPALIVE_SECONDS = 15
 SSE_LOG_BATCH = 40           # thousands of lines: one frame per line floods the tab
@@ -310,6 +310,27 @@ def create_app(**overrides) -> Flask:
         offset = max(0, int(request.args.get("offset") or 0))
         limit = max(1, min(int(request.args.get("limit") or 60), 200))
         return jsonify(plots.gallery_page(dataset, entity, gallery_id, offset, limit))
+
+    @app.get("/api/plots/<dataset>/<entity>/ranking-gap")
+    def api_ranking_gap(dataset, entity):
+        """The ranking gap for any detector pair, drawn per request.
+
+        Eleven detectors is 55 unordered pairs per entity and a reader looks at
+        one or two, so these are rendered rather than written by the pipeline.
+        Everything it needs is the IR's `channel_shares` block; nothing is
+        written to myresults/.
+        """
+        a = (request.args.get("a") or "").strip()
+        b = (request.args.get("b") or "").strip()
+        if not a or not b:
+            abort(400)
+        png = ondemand.render_ranking_gap(dataset, entity, a, b)
+        if png is None:
+            abort(404)
+        # No-store: the pair is a query parameter, and a stale cached body would
+        # outlive the run that produced the numbers in it.
+        return Response(png, mimetype="image/png",
+                        headers={"Cache-Control": "no-store"})
 
     @app.get("/media/<path:relpath>")
     def media(relpath):

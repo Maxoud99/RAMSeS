@@ -20,6 +20,7 @@ const dataset = root.dataset.dataset;
 const entity = root.dataset.entity;
 
 function figureNode(fig) {
+  if (fig.pair_picker) return pairPickerFigure(fig);
   if (fig.variants && fig.variants.length) return variantFigure(fig);
   const img = el("img", { src: fig.src, alt: fig.title, loading: "lazy" });
   const caption = el("figcaption", {}, el("strong", { text: fig.title }),
@@ -28,6 +29,59 @@ function figureNode(fig) {
   const figure = el("figure", {}, img, caption);
   img.addEventListener("click", () => openLightbox([fig], 0));
   return figure;
+}
+
+/* Two detector pickers and a figure drawn per request.
+ *
+ * Not a variant toggle: with 11 detectors there are 55 unordered pairs, so the
+ * images cannot be enumerated up front. The server renders one from the IR's
+ * per-detector channel shares. The initial pair is the ranking's first two —
+ * the winner and the runner-up — which reproduces the static figure the
+ * pipeline writes, so the default view is unchanged by this control existing.
+ */
+function pairPickerFigure(spec) {
+  const names = spec.pair_picker.detectors;
+  const url = (a, b) =>
+    `${spec.pair_picker.endpoint}?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`;
+  let a = names[0];
+  let b = names[1];
+
+  const img = el("img", { src: url(a, b), alt: spec.title, loading: "lazy" });
+  const status = el("span", { class: "small muted" });
+  const picker = (initial, onPick) => {
+    const select = el("select", { onchange: (e) => onPick(e.target.value) });
+    names.forEach((n) =>
+      select.append(el("option", { value: n, selected: n === initial }, n)));
+    return select;
+  };
+  const refresh = () => {
+    // A detector compared with itself has an all-zero gap and the server
+    // refuses it, so the pickers never hold the same name: the other side
+    // steps aside rather than the request failing.
+    if (a === b) {
+      const other = names.find((n) => n !== a);
+      if (!other) return;
+      b = other;
+      $$("select", tabs)[1].value = b;
+    }
+    status.textContent = "";
+    img.src = url(a, b);
+  };
+  img.addEventListener("error", () => {
+    status.textContent = "No decomposition available for this pair.";
+  });
+
+  const tabs = el("div", { class: "variant-tabs" },
+    el("label", { class: "small muted", text: "Ahead" }),
+    picker(a, (v) => { a = v; refresh(); }),
+    el("label", { class: "small muted", text: "vs" }),
+    picker(b, (v) => { b = v; refresh(); }),
+    status);
+  const caption = el("figcaption", {}, el("strong", { text: spec.title }),
+    spec.caption ? ` ${spec.caption}` : "");
+  img.addEventListener("click", () =>
+    openLightbox([{ src: img.src, title: `${a} vs ${b}`, caption: spec.caption }], 0));
+  return el("figure", {}, tabs, img, caption);
 }
 
 /* A toggle over alternative renderings of one plot (top-3 vs all detectors,
@@ -49,18 +103,38 @@ function variantFigure(spec) {
   const caption = el("figcaption", {}, el("strong", { text: spec.title }), captionText);
   setCaption();
 
-  spec.variants.forEach((variant, i) => {
-    const button = el("button", {
-      type: "button", "aria-pressed": String(i === index), text: variant.title,
-      onclick: () => {
-        index = i;
-        img.src = variant.src;
+  // Past four options a tab strip wraps onto a second row and stops reading as
+  // a control, so the same choice becomes a <select>. `select_label` opts a
+  // group in explicitly for a named axis of choice (off-by's competitor).
+  const asSelect = spec.select_label || spec.variants.length > 4;
+  if (asSelect) {
+    const select = el("select", {
+      onchange: (e) => {
+        index = Number(e.target.value);
+        img.src = spec.variants[index].src;
         setCaption();
-        $$("button", tabs).forEach((b, j) => b.setAttribute("aria-pressed", String(j === i)));
       },
     });
-    tabs.append(button);
-  });
+    spec.variants.forEach((variant, i) =>
+      select.append(el("option", { value: String(i), selected: i === index },
+                       variant.title)));
+    tabs.append(
+      el("label", { class: "small muted", text: spec.select_label || "Show" }),
+      select);
+  } else {
+    spec.variants.forEach((variant, i) => {
+      const button = el("button", {
+        type: "button", "aria-pressed": String(i === index), text: variant.title,
+        onclick: () => {
+          index = i;
+          img.src = variant.src;
+          setCaption();
+          $$("button", tabs).forEach((b, j) => b.setAttribute("aria-pressed", String(j === i)));
+        },
+      });
+      tabs.append(button);
+    });
+  }
   img.addEventListener("click", () => openLightbox(spec.variants, index));
   return el("figure", {}, tabs, img, caption);
 }
@@ -305,9 +379,23 @@ function consensusStrip(payload) {
     return el("span", { class: cls, title: `${a.source}: ${a.top_pick}` },
       `${glyph} ${a.source.replace(/_/g, " ")}: ${a.top_pick || "—"}`);
   });
+  // The chips carry only each source's winner, which cannot say whether a
+  // disagreeing source put the consensus pick second or last. The orderings
+  // answer that, behind a click so the strip stays a strip.
+  const ranked = payload.agreement.filter((a) => (a.ranking || []).length);
+  const lists = ranked.length ? el("details", { class: "stack" },
+    el("summary", { text: `Full ranking from each of the ${ranked.length} methods` }),
+    el("div", { class: "ranking-grid", style: "margin-top: var(--sp-3);" },
+      ...ranked.map((a) => el("div", {},
+        el("h3", { class: "small", text: a.source.replace(/_/g, " ") }),
+        el("ol", { class: "small mono ranking-list" },
+          ...a.ranking.map((name) => el("li", { text: name })))))),
+  ) : null;
+
   return el("section", { class: "card card-tight stack" },
     el("h2", { class: "small muted", text: "Where the stages agreed" }),
-    el("div", { class: "row" }, chips));
+    el("div", { class: "row" }, chips),
+    lists);
 }
 
 function missingSection(payload) {

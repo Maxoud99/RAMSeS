@@ -1,9 +1,11 @@
+import math
 import os
 import random
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 from loguru import logger
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -1204,6 +1206,45 @@ def _assign_archetype(u_high: bool, s_high: bool, util_nan: bool) -> str:
     return ("H" if u_high else "L") + ("H" if s_high else "L")
 
 
+def _zero_anchored_axis(ax, which: str, values: List[float]) -> None:
+    """Start `which` axis at 0 and tick it in equal, round steps.
+
+    Utility and stability live on unrelated scales (survival is a rate in
+    [0, 1]; marginal contribution is a fitness difference that can be a
+    thousandth of that), so a shared step would flatten one of them — each axis
+    gets its own. What they share is the origin: these are magnitudes, and an
+    axis that starts at 0.0008 makes a negligible spread look like a wide one.
+
+    The step is the 1/2/5 decade multiple that puts roughly five ticks across
+    the data, the same ladder matplotlib's own locator walks; picking it here
+    rather than letting the locator choose is what pins the origin.
+
+    Negative values are respected — a detector can genuinely hurt fitness — so
+    the range is anchored at zero rather than forced non-negative.
+    """
+    finite = [float(v) for v in values if v == v and abs(float(v)) != float("inf")]
+    if not finite:
+        return
+    lo, hi = min(finite + [0.0]), max(finite + [0.0])
+    span = hi - lo
+    if span <= 0:
+        span = abs(hi) or 1.0
+    raw = span / 5.0
+    decade = 10.0 ** math.floor(math.log10(raw)) if raw > 0 else 1.0
+    step = next((m * decade for m in (1, 2, 5) if raw <= m * decade), 10 * decade)
+    start = math.floor(lo / step) * step
+    end = math.ceil(hi / step) * step
+    # Guard against a float-accumulation overrun on the final tick.
+    n = int(round((end - start) / step)) + 1
+    ticks = [start + i * step for i in range(max(n, 2))]
+    if which == "x":
+        ax.set_xlim(start, ticks[-1])
+        ax.set_xticks(ticks)
+    else:
+        ax.set_ylim(start, ticks[-1])
+        ax.set_yticks(ticks)
+
+
 def _finite_median(values: List[float]) -> float:
     """Median over the finite (non-NaN) values; NaN if none are finite."""
     finite = [v for v in values if not np.isnan(v)]
@@ -1327,7 +1368,7 @@ def plot_ga_utility(
         ax_top.axhline(0, color="black", linewidth=0.6)
         ax_top.set_ylabel("fitness(best) − fitness(best \\ detector)")
         ax_top.set_title(
-            f"Axis 1a · LOFO on best ensemble: {best_ensemble}")
+            f"LOFO on best ensemble: {best_ensemble}")
         ax_top.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
     else:
         ax_top.text(0.5, 0.5, "best_ensemble is empty",
@@ -1345,8 +1386,7 @@ def plot_ga_utility(
     ax_bot.set_xticklabels(algorithm_list, rotation=30, ha="right")
     ax_bot.axhline(0, color="black", linewidth=0.6)
     ax_bot.set_ylabel("E[fit | present] − E[fit | absent]")
-    ax_bot.set_title(
-        "Axis 1b · Mean marginal contribution across evaluated subsets")
+    ax_bot.set_title("Mean marginal contribution across evaluated subsets")
     ax_bot.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
 
     plt.tight_layout(pad=1.2)
@@ -1553,12 +1593,21 @@ def plot_ga_archetypes(
     entity: str,
 ) -> None:
     """
-    Two-panel scatter of the axis intersection that drives the archetypes.
-    Left = relative (median-split) scheme, right = absolute (fixed cutoffs).
+    Scatter of the axis intersection that drives the archetypes, on the
+    RELATIVE (median-split) scheme.
 
       x = utility (mean marginal contribution), y = stability (mean survival rate)
       colour       = assigned archetype (shared categorical palette)
-      dashed lines = that scheme's utility / stability thresholds
+      dashed lines = the median utility / stability thresholds
+
+    The absolute (fixed-cutoff) scheme is still computed and still reported in
+    the .txt, but is no longer drawn: its cutoffs (0.0 and 0.5) are not anchored
+    to anything in a given run, so a second panel invited a comparison between a
+    data-driven split and an arbitrary one.
+
+    Both axes start at ZERO and step in equal, round increments. Letting
+    matplotlib choose meant a run whose utilities spanned 0.001 got an axis
+    starting at 0.0008, which reads as a large spread of a small quantity.
 
     (Complementarity / Friedman H axis is currently disabled.) Unclassified
     detectors (NaN utility) are not plotted; they are listed in a caption.
@@ -1578,12 +1627,13 @@ def plot_ga_archetypes(
         "absolute": (0.0, 0.5),
     }
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, ax_one = plt.subplots(1, 1, figsize=(8, 6))
+    axes = [ax_one]
     unclassified = sorted({d for d in algorithm_list
                            if archetypes[d]["relative"]["archetype"] == ARCHETYPE_UNCLASSIFIED})
     seen_labels = set()
 
-    for ax, scheme in zip(axes, ("relative", "absolute")):
+    for ax, scheme in zip(axes, ("relative",)):
         tu, ts = thresholds[scheme]
         for d in algorithm_list:
             u, s = util[d], stab[d]
@@ -1603,10 +1653,40 @@ def plot_ga_archetypes(
             ax.axvline(tu, color="grey", linestyle="--", linewidth=0.8, alpha=0.7)
         if not np.isnan(ts):
             ax.axhline(ts, color="grey", linestyle="--", linewidth=0.8, alpha=0.7)
+        # The two axes CROSS AT (0, 0) rather than at the corner of a box.
+        # Utility is a fitness difference, so a detector that lowers mean
+        # fitness is genuinely negative; when one exists the axis extends left
+        # and the crossing point simply moves right, which is what gives those
+        # detectors somewhere to be drawn. Clipping the range at zero to keep it
+        # as the left edge would push them off a figure whose whole job is
+        # placing every detector.
+        ax.spines["left"].set_position(("data", 0.0))
+        ax.spines["bottom"].set_position(("data", 0.0))
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_linewidth(1.1)
+            ax.spines[spine].set_color("black")
+        # With the vertical spine inside the plot, the two "0" labels land on
+        # top of each other at the crossing. The x axis keeps its own, since
+        # that is the one a reader is checking a sign against.
+        if min(util.values(), default=0.0) < 0:
+            ax.yaxis.set_major_formatter(
+                FuncFormatter(lambda v, _pos: "" if abs(v) < 1e-12 else f"{v:g}"))
+            # The axis LABEL follows its spine, which has just moved into the
+            # middle of the plot. Pinned to the left edge in axes coordinates:
+            # the tick numbers belong on the spine, but "Stability (mean
+            # survival rate)" printed down the centre reads as an annotation.
+            ax.yaxis.set_label_coords(-0.02, 0.5)
         ax.set_xlabel("Utility  (mean marginal contribution)")
         ax.set_ylabel("Stability  (mean survival rate)")
-        ax.set_title(f"{scheme.capitalize()} thresholds")
+        ax.set_title("Relative (median-split) thresholds")
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        # Origin at zero on both axes, with ticks at a round step. Both the
+        # points and the threshold lines have to fit inside the range, or a
+        # median above every plotted point would be drawn off-canvas.
+        _zero_anchored_axis(ax, "x", [util[d] for d in algorithm_list] + [tu])
+        _zero_anchored_axis(ax, "y", [stab[d] for d in algorithm_list] + [ts])
 
     handles, labels = [], []
     for ax in axes:
@@ -1621,8 +1701,7 @@ def plot_ga_archetypes(
         fig.text(0.5, -0.02, "Unclassified (no marginal-contribution data): "
                  + ", ".join(unclassified), ha="center", fontsize=9, alpha=0.8)
 
-    fig.suptitle("Functional Archetypes · utility × stability",
-                 y=1.02)
+    fig.suptitle("Functional Archetypes · utility × stability", y=1.0)
     plt.tight_layout(pad=1.2)
     directory = f"myresults/GA_Ens/{dataset}/{entity}/"
     os.makedirs(directory, exist_ok=True)
@@ -2365,8 +2444,11 @@ def plot_ga_combination_ale(
         reasons = list(support.get(name) or [])
         any_weak = any_weak or bool(reasons)
         if mark_bins:
+            # Navy rather than grey: the grid is already grey dashes, so grey
+            # rules read as part of it instead of as the bin structure.
             for edge in edges:
-                ax.axvline(edge, color="#c8c8c8", linewidth=0.6, zorder=0)
+                ax.axvline(edge, color="#1f3d7a", linewidth=0.7, alpha=0.55,
+                           zorder=0)
         ax.plot(edges, curve, marker="o", markersize=3, linewidth=1.6,
                 color=colour, linestyle="--" if reasons else "-")
         ax.axhline(0, color="black", linewidth=0.7)

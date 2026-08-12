@@ -266,7 +266,11 @@ def save_summary(summary, dataset, entity):
 #  The production ranking (fixed noise) is untouched.
 # ════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_NOISE_LEVELS = np.linspace(0.0, 0.2, 20)
+# 21 points, not 20: `linspace(0, 0.2, 20)` steps by 0.0105 and lands on values
+# like 0.0421 and 0.1789, so every axis label and every reported breakdown point
+# was an artefact of the point count. 21 gives an exact 0.01 step — 0.00, 0.01,
+# … 0.20 — which is readable and quotable.
+DEFAULT_NOISE_LEVELS = np.linspace(0.0, 0.2, 21)
 
 
 def _mc_data_feasible(test_data) -> bool:

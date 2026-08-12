@@ -305,7 +305,17 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
         "direction exactly as the fact states it. Then give the selection "
         "counts, then how leadership divided into regimes, then EVERY regime "
         "its own sentence in the order listed, each naming its window range, "
-        "its leader and its channels. Name that leader outright — never "
+        "its leader and its channels. "
+        # The regime NUMBER is what pairs each sentence with its own figure in
+        # the page's regime disclosure — an ordinal cannot do it, and there is
+        # no error when one is used: the disclosure quietly falls back to the
+        # IR's own wording, so the narrative simply stops being what the reader
+        # sees. Left to itself the narrator wrote "In the first regime (windows
+        # 10 to 12)" for all seven.
+        "Begin each of those sentences with the literal words 'Regime N "
+        "(windows ...)', using the number the fact gives — never 'the first "
+        "regime', 'the second regime', or any other ordinal in place of it. "
+        "Name that leader outright — never "
         "describe it by reference to the previous regime. Do not add a sentence "
         "interpreting what any of this implies."
     ),

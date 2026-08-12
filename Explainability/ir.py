@@ -328,6 +328,31 @@ def _top_of_ranking(value: Any) -> Any:
     return NOT_AVAILABLE
 
 
+def _full_ranking(value: Any) -> List[str]:
+    """The whole detector ordering, from the same shapes `_top_of_ranking` takes.
+
+    The agreement strip shows only each source's winner, which cannot say
+    whether a disagreeing source ranked the consensus pick second or last. The
+    ordering answers that, so it travels beside the pick.
+    """
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return []
+        if (len(value) > 1 and not isinstance(value[0], str)
+                and isinstance(value[1], (list, tuple))):
+            return _full_ranking(value[1])
+        # A list of names, or a list of (name, score) rows.
+        out: List[str] = []
+        for item in value:
+            name = _top_of_ranking(item)
+            if name != NOT_AVAILABLE:
+                out.append(str(name))
+        return out
+    return []
+
+
 # ── Stage builders ───────────────────────────────────────────────────────────
 
 def _ts_channel_label(idx: Any, channel_names: Optional[Sequence[str]]) -> str:
@@ -616,7 +641,9 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
                               regimes: List[Dict[str, Any]],
                               warmup_windows: int,
                               channel_names: Optional[Sequence[str]] = None,
-                              n_channels: Optional[int] = None) -> Dict[str, Any]:
+                              n_channels: Optional[int] = None,
+                              channel_shares: Optional[Dict[str, List[float]]] = None
+                              ) -> Dict[str, Any]:
     """
     The sibling of build_thompson_ir, for the ranking criterion rather than the
     selection dynamics.
@@ -769,8 +796,8 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             for m, c in ordered])
         warm = int(warmup_windows or 0)
         warm_txt = ("" if not warm else
-                    f" The first {warm} windows are left out, because until every "
-                    f"detector has been tried its score is still zero.")
+                    f" The first {warm} windows are left out, because all "
+                    f"detectors start with score zero.")
         if len(regimes) == 1:
             # The count phrasing ("X led 1 regime, spanning N windows") reads as
             # nonsense when there is only one spell to count.
@@ -797,23 +824,25 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
         runner = r.get("runner_up")
 
         dur = r.get("duration")
-        parts = [f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
-                 f"{dur} window{'' if dur == 1 else 's'}) was led by {leader}."]
+        # ONE sentence, opening with the literal "Regime N (windows ...)". The
+        # number is what pairs this sentence with its own figure in the page's
+        # regime disclosure, and a trailing clause split into a sentence of its
+        # own would carry neither the number nor a detector name.
+        #
+        # No "ahead of {runner_up}" tail. The narrator drops that clause from
+        # every regime sentence, and because coverage is conjunctive the atom
+        # then only passes when the runner-up happens to be named elsewhere in
+        # the narrative — true for the NN_* that lead most regimes, false for
+        # the odd early one, so a run's faithfulness turned on which detector
+        # placed second in regime 0. The runner-up stays in `value`, and the
+        # per-regime figure plots it beside the leader, which is where a
+        # comparison belongs anyway.
+        text = (f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
+                f"{dur} window{'' if dur == 1 else 's'}) was led by {leader}")
         if top_channels:
             labels = _oxford([_ch(c) for c, _ in top_channels[:2]])
-            # Uppercase only the first letter — .capitalize() would lowercase
-            # the rest, mangling real channel names like Accelerometer1RMS.
-            labels = labels[:1].upper() + labels[1:]
-            # No "ahead of {runner_up}" tail. The narrator drops that clause
-            # from every regime sentence, and because coverage is conjunctive
-            # the atom then only passes when the runner-up happens to be named
-            # elsewhere in the narrative — true for the NN_* that lead most
-            # regimes, false for the odd early one, so a run's faithfulness
-            # turned on which detector placed second in regime 0. The runner-up
-            # stays in `value`, and the per-regime figure plots it beside the
-            # leader, which is where a comparison belongs anyway.
-            parts.append(f"{labels} supplied most of the score that kept it "
-                         f"there.")
+            text += f", with {labels} raising its score the most"
+        parts = [text + "."]
 
         rid = f"tsr.regime.{idx}"
         evidence.append(make_atom(
@@ -874,9 +903,18 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
         "stochastic sampler, so a different seed can produce a different "
         "trajectory.")
 
-    return _envelope("thompson_ranking", dataset, entity, output, evidence,
-                     caveats, required, question=question,
-                     info_footer=info_footer)
+    env = _envelope("thompson_ranking", dataset, entity, output, evidence,
+                    caveats, required, question=question,
+                    info_footer=info_footer)
+    # Kept OUT of `output` and out of `evidence` on purpose. It is display data,
+    # not a claim: the narrator renders every `output` key into its prompt, and
+    # a detectors x channels matrix there would be a wall of floats the model
+    # must ignore. The page reads it to decompose any pair's gap on demand,
+    # since that split is exactly shares(a) - shares(b).
+    if channel_shares:
+        env["channel_shares"] = {str(m): [_val(v, 6) for v in vals]
+                                 for m, vals in channel_shares.items()}
+    return env
 
 
 # Included-member reason buckets, in narration order. `needed` (a low-profile
@@ -2180,8 +2218,19 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     # of the single-model pick, so asking whether they agree is tautological —
     # it would always report agreement and tell the reader nothing.
     stage_picks["robust_consensus"] = _top_of_ranking(agg.get("robust_agg"))
+    # Each source's WHOLE ordering, not just its winner: a source that disagrees
+    # on first place may still have the consensus pick second, and the strip
+    # alone cannot tell that from having it last.
+    stage_rankings = {
+        "thompson": _full_ranking((results_dict.get("thompson", {}) or {}).get("top_models")),
+        "gan": _full_ranking((results_dict.get("gan_robustness", {}) or {}).get("f1_names")),
+        "borderline": _full_ranking((results_dict.get("borderline", {}) or {}).get("f1_names")),
+        "monte_carlo": _full_ranking((results_dict.get("monte_carlo", {}) or {}).get("f1_names")),
+        "robust_consensus": _full_ranking(agg.get("robust_agg")),
+    }
     agreement = {
         name: {"top_pick": _py(pick),
+               "ranking": stage_rankings.get(name) or [],
                "agrees_with_final_single": (pick == single_pick)
                if pick not in (NOT_AVAILABLE, "N/A") else NOT_AVAILABLE}
         for name, pick in sorted(stage_picks.items())

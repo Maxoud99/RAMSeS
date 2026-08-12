@@ -756,6 +756,29 @@ class TestThompsonRegimeHandling(unittest.TestCase):
         self.assertNotIn("Regime 0", out["summary"])
         self.assertNotIn("Regime 1", out["summary"])
 
+    def test_ordinal_worded_regimes_attach_to_nothing(self):
+        """Why the prompt demands the literal "Regime N".
+
+        A narrative that says "the first regime" pairs with no regime atom, and
+        there is NO error: `narrated` stays empty and the disclosure quietly
+        renders the IR's own wording instead. Every regime on SMD's ranking
+        stage was in that state, and the page looked fine.
+        """
+        ir_doc = self._ir()
+        ordinal = ("Thompson Sampling ranked NN_1 first. In the first regime "
+                   "(windows 0 to 4), NN_3 was in charge. The second regime "
+                   "(windows 5 to 18) was led by NN_1.")
+        regimes = artifacts._regimes_from_ir(ir_doc)
+        artifacts._attach_narrated_regimes(regimes, ordinal, ir_doc)
+        self.assertTrue(all(not r.get("narrated") for r in regimes))
+
+        numbered = ("Thompson Sampling ranked NN_1 first. Regime 0 (windows 0 "
+                    "to 4) was led by NN_3. Regime 1 (windows 5 to 18) was led "
+                    "by NN_1.")
+        regimes = artifacts._regimes_from_ir(ir_doc)
+        artifacts._attach_narrated_regimes(regimes, numbered, ir_doc)
+        self.assertTrue(all(r.get("narrated") for r in regimes))
+
     def test_a_regimes_second_sentence_goes_with_its_regime(self):
         """Resilience, not the primary path: the IR now packs every claim about
         a regime into ONE sentence, so there is normally no second sentence to
@@ -974,25 +997,32 @@ class TestSummaryTables(unittest.TestCase):
                        "pfi_rank": 3, "ale_rank": 2, "sign": "not_available",
                        "sign_support": []},
              "text": "CBLOF_2 carries the third-most weight."},
+            {"id": "sg", "type": "sign_summary", "subject": "sign", "value": {},
+             "text": "LOF_1 had a positive sign, while NN_3 had negative."},
         ])
-        out = summarize.summarize("The combination step selected 2 detectors. "
-                                  "LOF_1 carries the most weight.",
-                                  stage="ga_combination", ir_doc=ir_doc)
-        self.assertEqual(out["mode"], "table")
+        out = summarize.summarize(
+            "The combination step selected 2 detectors. LOF_1 carries the most "
+            "weight. LOF_1 had a positive sign, while NN_3 had negative.",
+            stage="ga_combination", ir_doc=ir_doc)
+        # The per-detector walk is what the table replaces, so only those
+        # sentences leave the default view.
+        self.assertNotIn("carries the most weight", out["summary"])
+        self.assertIn("selected 2 detectors", out["summary"])
+        # The signs are a finding, not a restatement of the table, so they stay.
+        self.assertIn("had a positive sign", out["summary"])
+
         table = out["table"]
         self.assertEqual(table["columns"],
                          ["Weight rank", "Detector", "|SHAP| rank", "PFI rank",
-                          "ALE rank", "Sign", "Sign support"])
-        self.assertEqual(table["rows"][0],
-                         [1, "LOF_1", 2, 1, 1, "positive", "strong"])
-        # A thinly-evidenced sign is still SHOWN — the support column is what
-        # qualifies it. Blanking the sign would read as missing data.
+                          "ALE rank", "Sign"])
+        self.assertEqual(table["rows"][0], [1, "LOF_1", 2, 1, 1, "positive"])
+        # A thinly-evidenced sign is still SHOWN. How well it is supported is a
+        # caveat and lives in the caveats section — never a second column here.
         self.assertEqual(table["rows"][1],
-                         ["2 (tie)", "NN_3", 1, 2, 3, "negative", "low consistency"])
-        # The IR's underscored state renders as words for a reader, and a
-        # detector with no sign has no support to report either.
-        self.assertEqual(table["rows"][2],
-                         [3, "CBLOF_2", 3, 3, 2, "not available", "—"])
+                         ["2 (tie)", "NN_3", 1, 2, 3, "negative"])
+        self.assertNotIn("support", " ".join(table["columns"]).lower())
+        # The IR's underscored state renders as words for a reader.
+        self.assertEqual(table["rows"][2], [3, "CBLOF_2", 3, 3, 2, "not available"])
         # The raw stationary-distribution values never reach the page: their
         # ties are decided at the 16th decimal.
         self.assertNotIn("0.1835", json.dumps(table))
@@ -1190,11 +1220,31 @@ class TestPlots(unittest.TestCase):
 
     def test_glob_escaping_handles_the_bracketed_filename(self):
         """ensemble_scores_..._['spikes'].png would otherwise be read as a
-        glob character class and silently never match."""
-        self._touch("GA_Ens/SKAB/7/ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png")
-        self._touch("GA_Ens/SKAB/7/ga_selection_utility_SKAB_7.png")
+        glob character class and silently never match.
+
+        Asserted on `_ls` itself rather than through a stage manifest: the
+        escaping is _ls's job, and pinning it to whichever manifest happens to
+        list that file made the check disappear the moment one stopped.
+        """
+        bracketed = self._touch(
+            "GA_Ens/SKAB/7/ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png")
+        found = self.plots._ls(bracketed.parent, "ensemble_scores_*.png")
+        self.assertEqual([p.name for p in found], [bracketed.name])
+
+    def test_ga_selection_leads_with_one_figure(self):
+        """Utility x stability answers the stage's question; LOFO and survival
+        are the inputs to it and browse. The injected-anomalies figure is about
+        the data rather than the selection and is not listed at all."""
+        for name in ("ga_selection_archetypes_SKAB_7", "ga_selection_utility_SKAB_7",
+                     "ga_selection_survival_SKAB_7", "ga_selection_survival_all_SKAB_7",
+                     "ensemble_scores_SKAB_7_Data"):
+            self._touch(f"GA_Ens/SKAB/7/{name}.png")
         headline, gallery = self.plots._ga_selection("SKAB", "7")
-        self.assertIn("['spikes']", " ".join(f["name"] for f in gallery))
+        self.assertEqual([f["title"] for f in headline], ["Utility \u00d7 stability"])
+        self.assertEqual(gallery[0]["title"], "LOFO")
+        names = " ".join(f["name"] for f in gallery)
+        self.assertIn("survival", names)
+        self.assertNotIn("ensemble_scores", names)
 
     def test_regime_plots_key_on_the_zero_based_index(self):
         self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
@@ -1230,8 +1280,9 @@ class TestPlots(unittest.TestCase):
         ranking, _ = self.plots._ts_ranking("SKAB", "7")
         names = [f.get("name") for f in ranking if "name" in f]
         self.assertNotIn("expected_rewards_50.png", names)
+        self.assertNotIn("selection_states_50.png", names)
         self.assertIn("ranking_final_50.png", names)
-        self.assertIn("ranking_gap_50.png", names)
+        self.assertIn("ranking_criterion_50.png", names)
         # The all-vs-top-3 toggle is a variant group, not two separate figures.
         variants = [f for f in ranking if "variants" in f]
         self.assertEqual(len(variants), 1)
@@ -1365,17 +1416,21 @@ class TestPlots(unittest.TestCase):
 
     def test_channel_plot_captions_state_the_selection_rule(self):
         """These figures plot a subset — 9 channels on SKAB, 38 on SMD — and the
-        bars cannot say whether a missing channel was small or just not picked."""
+        bars cannot say whether a missing channel was small or just not picked.
+
+        Both mean|SHAP| figures carry the rule. The headline captions were
+        deliberately shortened and no longer repeat it, so this asserts on the
+        gallery pair by name rather than on a count that any caption edit would
+        move.
+        """
         self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
-        for name in ("shap_average_top3_50", "shap_comparison_50",
-                     "ranking_channels_50"):
+        for name in ("shap_average_top3_50", "shap_average_all_50",
+                     "reward_average_top3_50", "ranking_channels_50"):
             self._touch(f"Thomposon/SKAB/7/{name}.png")
-        captions = []
-        for builder in (self.plots._thompson, self.plots._ts_ranking):
-            headline, gallery = builder("SKAB", "7")
-            captions += [f.get("caption", "") for f in headline + gallery]
-        stating = [c for c in captions if "not necessarily zero" in c]
-        self.assertGreaterEqual(len(stating), 3, captions)
+        _headline, gallery = self.plots._thompson("SKAB", "7")
+        by_name = {f["name"]: f.get("caption", "") for f in gallery}
+        for name in ("shap_average_top3_50.png", "shap_average_all_50.png"):
+            self.assertIn("not necessarily zero", by_name.get(name, ""), name)
 
     def test_missing_directories_yield_empty_manifest_not_an_error(self):
         m = self.plots.manifest("NOPE", "999")
@@ -1929,3 +1984,114 @@ class TestRoutes(ArtifactTreeCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOnDemandRankingGap(unittest.TestCase):
+    """The gap between an ARBITRARY detector pair, drawn per request.
+
+    11 detectors is 55 unordered pairs per entity and a reader looks at one or
+    two, so these are not pre-rendered. What makes that safe is that the split
+    is exactly shares(a) - shares(b): the on-demand figure and the pipeline's
+    own winner-vs-runner-up PNG are the same quantity, not a re-derivation.
+    """
+
+    def setUp(self):
+        from WebUI import ondemand
+        self.ondemand = ondemand
+        self._tmp = tempfile.TemporaryDirectory()
+        self.myresults = Path(self._tmp.name) / "myresults"
+        self._saved = paths.MYRESULTS
+        paths.MYRESULTS = self.myresults
+
+    def tearDown(self):
+        paths.MYRESULTS = self._saved
+        self._tmp.cleanup()
+
+    def _write_ir(self, shares):
+        d = self.myresults / "explanations_ir" / "SKAB" / "7"
+        d.mkdir(parents=True, exist_ok=True)
+        doc = {"ir_version": "1.0", "stage": "thompson_ranking", "dataset": "SKAB",
+               "entity": "7", "output": {}, "evidence": [], "caveats": [],
+               "required_atom_ids": [], "confidence": {}}
+        if shares is not None:
+            doc["channel_shares"] = shares
+        (d / "ir_thompson_ranking.json").write_text(json.dumps(doc))
+
+    def test_renders_any_pair_from_the_persisted_shares(self):
+        self._write_ir({"NN_1": [0.4, 0.1, 0.05], "NN_2": [0.1, 0.3, 0.05],
+                        "LOF_1": [0.0, 0.0, 0.2]})
+        png = self.ondemand.render_ranking_gap("SKAB", "7", "NN_1", "LOF_1")
+        self.assertTrue(png.startswith(b"\x89PNG"), "not a PNG")
+        # Order matters: the reversed pair is a different figure, not an error.
+        self.assertIsNotNone(self.ondemand.render_ranking_gap("SKAB", "7", "LOF_1", "NN_1"))
+
+    def test_unavailable_pairs_return_none_rather_than_raising(self):
+        """Every 'cannot draw this' case answers None so the route can 404 and
+        the page keeps its default pair, instead of surfacing a traceback."""
+        self._write_ir({"NN_1": [0.4], "NN_2": [0.1]})
+        self.assertIsNone(self.ondemand.render_ranking_gap("SKAB", "7", "NN_1", "GHOST"))
+        # A detector against itself is an all-zero gap, which is not a finding.
+        self.assertIsNone(self.ondemand.render_ranking_gap("SKAB", "7", "NN_1", "NN_1"))
+        self.assertIsNone(self.ondemand.render_ranking_gap("NOPE", "999", "NN_1", "NN_2"))
+
+    def test_an_ir_without_shares_offers_nothing(self):
+        """Result trees written before the block existed must degrade to the
+        pipeline's static figure, not to a broken control."""
+        self._write_ir(None)
+        self.assertEqual(self.ondemand.ranking_channel_shares("SKAB", "7"), {})
+        from WebUI import plots
+        self.assertIsNone(plots._ranking_pair_picker("SKAB", "7"))
+
+    def test_the_picker_orders_detectors_so_the_default_pair_is_the_top_two(self):
+        """The initial view must reproduce the static winner-vs-runner-up
+        figure, or adding this control would silently change what the card
+        shows on load."""
+        self._write_ir({"MID": [0.2, 0.2], "TOP": [0.9, 0.1], "LOW": [0.01, 0.0]})
+        from WebUI import plots
+        spec = plots._ranking_pair_picker("SKAB", "7")
+        self.assertEqual(spec["pair_picker"]["detectors"][:2], ["TOP", "MID"])
+        self.assertIn("/api/plots/SKAB/7/ranking-gap", spec["pair_picker"]["endpoint"])
+
+
+class TestOffByTreeSelector(unittest.TestCase):
+    """One surrogate tree at a time, chosen by competitor.
+
+    Every pair is already on disk, so this is a selector over files — but ten
+    near-identical trees stacked down the card is ten figures to scroll past.
+    """
+
+    def setUp(self):
+        from WebUI import plots
+        self.plots = plots
+        self._tmp = tempfile.TemporaryDirectory()
+        self.myresults = Path(self._tmp.name) / "myresults"
+        self._saved = paths.MYRESULTS
+        paths.MYRESULTS = self.myresults
+
+    def tearDown(self):
+        paths.MYRESULTS = self._saved
+        self._tmp.cleanup()
+
+    def _touch(self, rel):
+        p = self.myresults / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x89PNG")
+
+    def test_trees_collapse_into_one_selector_named_by_competitor(self):
+        base = "robustness/off_by/SKAB/7"
+        self._touch(f"{base}/SKAB_7_off_by_point_importance.png")
+        for competitor in ("NN_1", "NN_3", "CBLOF_2"):
+            self._touch(f"{base}/SKAB_7_off_by_point_tree_LOF_1_vs_{competitor}.png")
+        headline, _ = self.plots._off_by("SKAB", "7")
+        picker = next(f for f in headline if "variants" in f)
+        self.assertEqual(picker["title"], "Where LOF_1 uniquely wins")
+        # Titled by the competitor alone — the winner is in the group title, so
+        # repeating it in every option makes the choice harder to scan.
+        self.assertEqual(sorted(v["title"] for v in picker["variants"]),
+                         ["CBLOF_2", "NN_1", "NN_3"])
+        # Past four options the frontend switches to a <select>; the named axis
+        # of choice says so explicitly rather than relying on the count.
+        self.assertEqual(picker["select_label"], "Compared against")
+        self.assertEqual(picker["default"], 0)
+        # The importance figure is a separate finding and keeps its own slot.
+        self.assertEqual(sum(1 for f in headline if "variants" not in f), 1)

@@ -29,8 +29,9 @@ function currentBody(extra = {}) {
     stages: selectedStages(),
     detectors: Array.from(selectedDetectors),
     explain: $("#explain").checked,
-    parallel: $("#parallel").checked,
-    enable_online: $("#enable_online").checked,
+    // `parallel` and `enable_online` are no longer offered: runs go sequential
+    // and offline. build_argv still honours both, so a caller that sets them
+    // programmatically keeps working.
     overwrite: $("#overwrite").checked,
     iteration: Number($("#iteration").value) || 5,
     timeout: Number($("#timeout").value) || 7200,
@@ -167,7 +168,7 @@ function renderPartialBanner() {
   const children = [
     el("strong", { text: "Partial run." }),
     el("span", { text: " Rank aggregation, the final ensemble-vs-single decision and the " +
-      "comprehensive report are skipped, and the run goes sequential (parallel is ignored)." }),
+      "comprehensive report are skipped." }),
   ];
   if ($("#explain").checked) {
     children.push(el("p", { class: "small", style: "margin: var(--sp-2) 0 0;", text:

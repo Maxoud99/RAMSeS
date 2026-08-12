@@ -474,8 +474,8 @@ class TestBuilders(unittest.TestCase):
             "Leadership on this score changed hands over the run: it splits "
             "into 2 regimes led by 2 different detectors: A led 1 regime, "
             "spanning 15 windows and B led 1 regime, spanning 15 windows. "
-            "The first 10 windows are left out, because until every detector "
-            "has been tried its score is still zero.")
+            "The first 10 windows are left out, because all detectors start "
+            "with score zero.")
         self.assertEqual(by_id["tsr.regimes.summary"]["value"]["windows_led"],
                          {"A": 15, "B": 15})
         # No runner-up in the regime sentence. Coverage is conjunctive, the
@@ -484,8 +484,8 @@ class TestBuilders(unittest.TestCase):
         # on which detector placed second. It stays in `value` and on the plot.
         self.assertEqual(
             by_id["tsr.regime.0"]["text"],
-            "Regime 0 (windows 10 to 24, 15 windows) was led by B. Channel 2 "
-            "and channel 0 supplied most of the score that kept it there.")
+            "Regime 0 (windows 10 to 24, 15 windows) was led by B, with "
+            "channel 2 and channel 0 raising its score the most.")
         self.assertEqual(by_id["tsr.regime.0"]["value"]["runner_up"], "A")
         for atom in doc["evidence"]:
             if atom["type"] != "regime":

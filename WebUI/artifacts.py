@@ -403,6 +403,9 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
     agreement = [
         {"source": name,
          "top_pick": info.get("top_pick"),
+         # Absent on result trees written before rankings were carried; the
+         # frontend simply renders no disclosure for those.
+         "ranking": list(info.get("ranking") or []),
          "agrees": info.get("agrees_with_final_single")}
         for name, info in sorted(((global_ir or {}).get("stage_agreement") or {}).items())
         if name != "final_consensus"

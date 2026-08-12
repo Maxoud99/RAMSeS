@@ -305,6 +305,14 @@ details.info .info-body {
 /* ── Figures ──────────────────────────────────────────────────────────────── */
 
 .figures { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+/* Reserve the control row on figures that have none, so every image in a grid
+   row starts at the same height. Giving `.variant-tabs` a fixed height only
+   lines up figures that HAVE controls — the neighbours of a picker are usually
+   plain figures with no control element at all, and those still began at the
+   top of the row while the picker's image sat a control-row lower. Scoped to
+   `.figures` because it is the only place figures sit side by side; a regime
+   figure is alone on its row and would just gain blank space. */
+.figures > figure > img:first-child { margin-top: calc(1.75rem + var(--sp-2)); }
 figure { margin: 0; }
 figure img {
   width: 100%; height: auto; display: block;
@@ -315,11 +323,25 @@ figure img {
 figcaption { font-size: var(--fs-xs); color: var(--text-muted); margin-top: var(--sp-2); }
 figcaption strong { color: var(--text); font-weight: 550; }
 
-.variant-tabs { display: flex; gap: var(--sp-1); margin-bottom: var(--sp-2); flex-wrap: wrap; }
+/* One fixed height for every control row. Figures sit in a grid, so a taller
+   control on one of them pushes its image down while its neighbours' start at
+   the top of the row — the selects are taller than the pill buttons, which was
+   enough to knock the pair-picker figure out of line. `align-items: center`
+   keeps whichever control is shorter vertically centred in that fixed band. */
+.variant-tabs {
+  display: flex; gap: var(--sp-1); margin-bottom: var(--sp-2); flex-wrap: wrap;
+  align-items: center; min-height: 1.75rem;
+}
 .variant-tabs button {
   padding: 2px var(--sp-2); font-size: var(--fs-xs);
   border-radius: 999px; border: 1px solid var(--border);
 }
+.variant-tabs select {
+  padding: 1px var(--sp-1); font-size: var(--fs-xs); max-width: 12ch;
+  border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--surface); color: var(--text);
+}
+.variant-tabs label { white-space: nowrap; }
 .variant-tabs button[aria-pressed="true"] {
   background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
 }
@@ -473,6 +495,9 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
           --text: #000; --text-muted: #333; --border: #bbb; --border-strong: #999; }
   .site-header, .console, .run-layout, .lightbox, .no-print,
   .variant-tabs, button, .gallery-controls { display: none !important; }
+  /* The controls are gone on paper, so the space reserved to line them up is
+     just a gap above every figure. */
+  .figures > figure > img:first-child { margin-top: 0 !important; }
   /* Every disclosure opens, so a printout is the whole document. */
   details > summary { display: none; }
   details, details.info { display: block !important; }
@@ -491,3 +516,15 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
   a[href^="http"]::after { content: " (" attr(href) ")"; font-size: .8em; color: #555; }
   .prose { max-width: none; }
 }
+
+/* Per-source orderings under the agreement strip. Laid out in columns so five
+   detector lists read side by side instead of as one long scroll. */
+.ranking-list { margin: var(--sp-2) 0 0; padding-left: 3ch; }
+.ranking-list li { line-height: 1.5; }
+/* Narrow enough that five sources fit on one line — detector names are short,
+   so the old 14rem minimum was reserving space nothing used and wrapping the
+   fifth column onto a row of its own. The left padding is what keeps the first
+   column's list markers off the card edge. */
+.ranking-grid { display: grid; gap: var(--sp-3);
+                padding-left: var(--sp-2);
+                grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); }
