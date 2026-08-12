@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import random
 import traceback
@@ -795,8 +796,16 @@ def fit_linear_thompson_sampling(dataset,
 
             logger.info(
                 f"Window {iteration + 1}: Model {chosen_model_name} - F1 Score = {f1}, PR AUC = {pr_auc}, Reward = {reward}")
-            logger.info(f"Means: {means}")
-            logger.info(f"Covariances: {covariances}")
+            # Norms, not the arrays. Printing every mu and every d-by-d Sigma
+            # here cost 628 lines PER WINDOW — 95% of a run's log, and enough to
+            # push every stage banner out of the WebUI's 20,000-line ring buffer
+            # before the run finished. ||mu||^2 is the ranking criterion itself,
+            # so this line still tracks what the arrays were being read for.
+            # logger.info(f"Means: {means}")
+            # logger.info(f"Covariances: {covariances}")
+            logger.info("Posterior norms: " + ", ".join(
+                f"{_m}: ||mu||^2={float(np.dot(_mu.flatten(), _mu.flatten())):.6g}"
+                for _m, _mu in means.items()))
 
         except Exception as e:
             logger.error(f"Error evaluating model {chosen_model_name}: {e}")
@@ -2406,6 +2415,155 @@ def plot_ranking_per_window(means_history: List[Dict[str, np.ndarray]],
         )
 
 
+# ── Per-window channel aggregates, for on-demand rendering ──────────────────
+# The three per-window families above (shap_, reward_, ranking_) each wrote one
+# PNG per window in three scopes — nine folders, ~1,100 frames and 167 MB for a
+# single 173-window entity — of which a reader opens a handful. What every one
+# of those frames draws is a per-model per-channel vector, and that is three
+# orders of magnitude smaller than its own rendering: 173x11x9x3 floats is half
+# a megabyte against 167 MB of PNG.
+#
+# So the run persists the numbers and the WebUI draws the frame that is asked
+# for (WebUI/ondemand.render_per_window). Same trade as the ranking-gap pair
+# picker, and it makes the `_all` and `_every10` sets free: they were never
+# different figures, only a different top-k and a different stride, which are
+# arguments to a renderer rather than folders on disk.
+#
+# The plot_*_per_window functions above are kept — they are the reference
+# rendering, and a thesis figure can still be minted from one directly — but the
+# pipeline no longer calls them.
+
+PER_WINDOW_SCHEMA = 1
+
+# Carried in the file itself so the on-demand renderer cannot drift from the
+# producer: these are the titles, axis labels and footnotes the eager functions
+# above passed to _render_shap_comparison, with {t} for the window index and {k}
+# for the top-k. `rank_by` names the quantity each set's top-k is chosen on —
+# every one of them is an exact sum of a stored row, so the selection is
+# reproducible from this file alone and cannot disagree with the bars.
+_PER_WINDOW_KINDS: Dict[str, Dict[str, Any]] = {
+    "reward": {
+        "label": "Reward contribution",
+        "ylabel": _REWARD_YLABEL,
+        "title_top": "Expected-reward contribution — window {t} (top {k} by E[R] in window)",
+        "title_all": "Expected-reward contribution — window {t} (all models)",
+        "note": ("Each detector's bars sum to its expected reward at window {t}; "
+                 "no baseline is subtracted."),
+        "rank_by": "reward",
+        "all_by": "final",
+    },
+    "shap": {
+        "label": "Deviation from a typical window",
+        "ylabel": "Per-channel SHAP contribution",
+        "title_top": "SHAP — window {t} (top {k} by E[R] in window)",
+        "title_all": "SHAP — window {t} (all models)",
+        "note": None,
+        # The SHAP set's top-k was chosen on expected reward, not on SHAP, so
+        # the frame shows the same detectors as its reward sibling.
+        "rank_by": "reward",
+        "all_by": "final",
+    },
+    "ranking": {
+        "label": "Ranking score",
+        "ylabel": r"Contribution to $\|\mu_k\|^2$",
+        "title_top": "Ranking score by channel — window {t} (top {k} by score at this window)",
+        "title_all": "Ranking score by channel — window {t} (all detectors)",
+        "note": ("Weights as they stood at window {t}. The score is cumulative, "
+                 "so these bars are the total accumulated up to this window."),
+        "rank_by": "ranking",
+        "all_by": "ranking",
+    },
+}
+
+
+def _json_row(values: np.ndarray) -> List[Optional[float]]:
+    """One channel vector at 6 significant digits; non-finite becomes null.
+
+    Six digits is far beyond what a bar chart can show and keeps the file an
+    order of magnitude smaller than full repr. `null` rather than NaN because
+    NaN is not valid JSON, and a window only produces one after the run logged
+    an error for it.
+    """
+    return [None if not np.isfinite(v) else float(f"{float(v):.6g}")
+            for v in np.asarray(values, dtype=float).ravel()]
+
+
+def save_per_window_channels(
+    means: Dict[str, np.ndarray],
+    shap_payload: Optional[Dict],
+    dataset: str,
+    entity: str,
+    iterations: int,
+) -> Optional[str]:
+    """Persist every per-window frame's numbers as one JSON file.
+
+    Returns the path written, or None when the run carries nothing to write
+    (no explain payload, no channels, no windows) — the same conditions under
+    which the plot functions returned without drawing anything.
+    """
+    if not shap_payload or not means:
+        return None
+    n_channels = int(shap_payload.get("n_channels") or 0)
+    contexts = shap_payload.get("all_contexts") or []
+    mu_hist = shap_payload.get("means_history") or []
+    baseline = shap_payload.get("baseline_context")
+    if n_channels <= 0 or not contexts or baseline is None:
+        return None
+
+    # Appended in the same block of the bandit loop, so these are index-aligned
+    # by construction; min() is belt and braces for a run that errored out of
+    # one of them.
+    n_windows = min(len(contexts), len(mu_hist)) if mu_hist else len(contexts)
+    if n_windows <= 0:
+        return None
+
+    # Registry order, matching the dict the top-k selectors iterate, so a tie
+    # breaks the same way here as it did in the eager plots.
+    models = list(means.keys())
+    sets: Dict[str, List[List[List[Optional[float]]]]] = {"reward": [], "shap": [], "ranking": []}
+    for t in range(n_windows):
+        ctx = contexts[t]
+        at = mu_hist[t] if t < len(mu_hist) else {m: means[m] for m in models}
+        reward_frame, shap_frame, ranking_frame = [], [], []
+        for m in models:
+            mu = np.asarray(at[m]).flatten() if m in at else np.asarray(means[m]).flatten()
+            reward_frame.append(_json_row(
+                reward_contribution_per_channel(mu, ctx, n_channels)))
+            shap_frame.append(_json_row(aggregate_shap_per_channel(
+                compute_shap_values(mu, ctx, baseline), n_channels)))
+            ranking_frame.append(_json_row(
+                aggregate_squared_per_channel(mu, n_channels)))
+        sets["reward"].append(reward_frame)
+        sets["shap"].append(shap_frame)
+        sets["ranking"].append(ranking_frame)
+
+    document = {
+        "schema": PER_WINDOW_SCHEMA,
+        "dataset": dataset,
+        "entity": entity,
+        "iterations": iterations,
+        "n_channels": n_channels,
+        "n_windows": n_windows,
+        "top_k_models": 3,
+        "top_n_channels": 9,
+        "models": models,
+        # The order the `_all` frames of the reward and SHAP sets used: final
+        # ||mu||^2, fixed for the whole run. The ranking set re-sorts per window.
+        "models_by_final_norm": _top_k_models_by_norm(means, len(means)),
+        "kinds": _PER_WINDOW_KINDS,
+        "sets": sets,
+    }
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f'per_window_channels_{iterations}.json')
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+    logger.info(f"Per-window channel aggregates written to {path} "
+                f"({n_windows} windows x {len(models)} detectors x {n_channels} channels)")
+    return path
+
+
 def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
                             segments: List[Tuple[int, int, str, int]],
                             n_channels: int, dataset: str, entity: str,
@@ -2732,6 +2890,11 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         # evaluated — a self-selection bump of up to r/2 on a detector's first
         # pick, largest exactly where the early regimes form.
         regime_shifts, blip_windows = detect_regime_shifts(pre_exp_rewards_hist)
+        # Written once for all three stages: the reward, SHAP and ranking frames
+        # are all per-model per-channel vectors over the same windows, and the
+        # WebUI draws whichever one is asked for rather than the pipeline
+        # writing every one of them.
+        save_per_window_channels(means, shap_payload, dataset, entity, iterations)
         plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
                               dataset, entity, iterations, smooth=False)
         plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
@@ -2741,9 +2904,6 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         # Each SHAP comparison plot is produced in both a top-k and an all-models variant.
         plot_shap_comparison(means, shap_payload, dataset, entity, iterations)
         plot_shap_comparison(means, shap_payload, dataset, entity, iterations, all_models=True)
-        plot_shap_per_window(means, shap_payload, dataset, entity, iterations)
-        plot_shap_per_window(means, shap_payload, dataset, entity, iterations, all_models=True)
-        plot_shap_per_window(means, shap_payload, dataset, entity, iterations, sample_stride=10)
         plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations)
         plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations,
                              all_models=True)
@@ -2757,11 +2917,6 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         # Full parity with the SHAP sets above so the two can be read frame for
         # frame. These are the ones whose bars sum to the prediction; the SHAP
         # ones answer the narrower question of deviation from a typical window.
-        plot_reward_per_window(means, shap_payload, dataset, entity, iterations)
-        plot_reward_per_window(means, shap_payload, dataset, entity, iterations,
-                               all_models=True)
-        plot_reward_per_window(means, shap_payload, dataset, entity, iterations,
-                               sample_stride=10)
         plot_reward_per_regime(means, shap_payload, regime_shifts, dataset, entity,
                                iterations)
         plot_reward_per_regime(means, shap_payload, regime_shifts, dataset, entity,
@@ -2792,15 +2947,6 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         plot_ranking_gap(means, n_channels_ranking, dataset, entity, iterations)
         plot_ranking_per_regime(means_history, regime_segments, n_channels_ranking,
                                 dataset, entity, iterations)
-        # Per-window frames, mirroring the SHAP stage's three sets: a regime is
-        # many windows and the score is cumulative, so the per-regime figure can
-        # only ever be one moment of it. These name the moment on every frame.
-        plot_ranking_per_window(means_history, n_channels_ranking,
-                                dataset, entity, iterations)
-        plot_ranking_per_window(means_history, n_channels_ranking,
-                                dataset, entity, iterations, all_models=True)
-        plot_ranking_per_window(means_history, n_channels_ranking,
-                                dataset, entity, iterations, sample_stride=10)
         explain_thompson_ranking(means, list_of_chosen_models, shap_payload,
                                  regime_segments, warmup_used,
                                  dataset, entity, iterations)

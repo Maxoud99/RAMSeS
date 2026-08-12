@@ -2053,6 +2053,149 @@ class TestOnDemandRankingGap(unittest.TestCase):
         self.assertIn("/api/plots/SKAB/7/ranking-gap", spec["pair_picker"]["endpoint"])
 
 
+class TestOnDemandPerWindowFrames(unittest.TestCase):
+    """The nine per-window sets, drawn per request from persisted aggregates.
+
+    These were nine folders of PNGs — over a thousand frames and 167 MB for one
+    173-window entity — of which a reader opens a handful. The numbers behind
+    them are three orders of magnitude smaller, so the pipeline saves those and
+    the frame is rendered on demand. `_all` and `_every10` were never different
+    figures, only a different top-k and stride, which is why they collapse into
+    arguments here.
+    """
+
+    MODELS = ["A", "B", "C"]
+    N_WINDOWS = 25
+    N_CHANNELS = 4
+
+    def setUp(self):
+        from WebUI import ondemand, plots
+        self.ondemand, self.plots = ondemand, plots
+        self.ondemand._PW_CACHE.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.myresults = Path(self._tmp.name) / "myresults"
+        self._saved = paths.MYRESULTS
+        paths.MYRESULTS = self.myresults
+
+    def tearDown(self):
+        paths.MYRESULTS = self._saved
+        self.ondemand._PW_CACHE.clear()
+        self._tmp.cleanup()
+
+    def _write_doc(self, **overrides):
+        """A per-window document whose rows are distinct per (window, model)."""
+        def frame(t, scale):
+            return [[float(scale * (t + 1) * (i + 1) * (c + 1))
+                     for c in range(self.N_CHANNELS)]
+                    for i in range(len(self.MODELS))]
+        doc = {
+            "schema": 1, "n_channels": self.N_CHANNELS,
+            "n_windows": self.N_WINDOWS, "top_k_models": 2, "top_n_channels": 3,
+            "models": list(self.MODELS),
+            "models_by_final_norm": list(reversed(self.MODELS)),
+            "kinds": {
+                "reward": {"ylabel": "y", "title_top": "R {t} top {k}",
+                           "title_all": "R {t} all", "note": "note {t}",
+                           "rank_by": "reward", "all_by": "final"},
+                "ranking": {"ylabel": "y", "title_top": "S {t} top {k}",
+                            "title_all": "S {t} all", "note": None,
+                            "rank_by": "ranking", "all_by": "ranking"},
+            },
+            "sets": {"reward": [frame(t, 1.0) for t in range(self.N_WINDOWS)],
+                     "ranking": [frame(t, 2.0) for t in range(self.N_WINDOWS)]},
+        }
+        doc.update(overrides)
+        d = self.myresults / "Thomposon" / "SKAB" / "7"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "per_window_channels_50.json").write_text(json.dumps(doc))
+        (d / "expected_rewards_50.png").write_bytes(b"\x89PNG")
+        return d
+
+    def test_descriptors_come_from_the_document_not_the_disk(self):
+        self._write_doc()
+        by_id = {d["id"]: d for d in self.plots.gallery_descriptors("SKAB", "7")}
+        self.assertIn("thompson/pw:reward:top:1", by_id)
+        self.assertIn("ts_ranking/pw:ranking:all:1", by_id)
+        self.assertEqual(by_id["thompson/pw:reward:top:1"]["count"], self.N_WINDOWS)
+        # 25 windows at stride 10 is windows 0, 10 and 20 — a count, not a
+        # folder listing, so it cannot disagree with what the pages return.
+        self.assertEqual(by_id["thompson/pw:reward:top:10"]["count"], 3)
+        # The SHAP set is absent from this document, so it is not offered.
+        self.assertNotIn("thompson/pw:shap:top:1", by_id)
+
+    def test_pages_carry_render_urls_and_honour_the_stride(self):
+        self._write_doc()
+        page = self.plots.gallery_page("SKAB", "7", "thompson/pw:reward:top:1", 0, 10)
+        self.assertEqual(page["total"], self.N_WINDOWS)
+        self.assertEqual(len(page["items"]), 10)
+        self.assertEqual(page["items"][3]["src"],
+                         "/api/plots/SKAB/7/per-window?kind=reward&scope=top&t=3")
+        strided = self.plots.gallery_page("SKAB", "7", "ts_ranking/pw:ranking:all:10")
+        self.assertEqual([i["src"].rsplit("t=", 1)[1] for i in strided["items"]],
+                         ["0", "10", "20"])
+
+    def test_top_k_and_all_are_the_same_data_read_two_ways(self):
+        """The scopes differ only in how many detectors are kept and in what
+        order — the rows behind them are one stored frame."""
+        self._write_doc()
+        doc = self.ondemand.per_window_document("SKAB", "7")
+        top = self.ondemand._select_models(doc, "reward", 4, "top")
+        every = self.ondemand._select_models(doc, "reward", 4, "all")
+        self.assertEqual(top[1], ["C", "B"])          # top 2 by row sum
+        self.assertEqual(every[1], ["C", "B", "A"])   # final-norm order
+        # The ranking set re-sorts per window instead of using the fixed order.
+        self.assertEqual(
+            self.ondemand._select_models(doc, "ranking", 4, "all")[1], ["C", "B", "A"])
+
+    def test_a_stale_folder_cannot_shadow_the_persisted_numbers(self):
+        """A re-run stops writing the folders but does not delete the ones an
+        earlier run left, so the document has to win."""
+        d = self._write_doc()
+        for i in range(99):
+            frame = d / "reward_per_window_50" / f"window_{i:03d}.png"
+            frame.parent.mkdir(parents=True, exist_ok=True)
+            frame.write_bytes(b"\x89PNG")
+        ids = {x["id"]: x["count"] for x in self.plots.gallery_descriptors("SKAB", "7")}
+        self.assertNotIn("thompson/reward_per_window_50", ids)
+        self.assertEqual(ids["thompson/pw:reward:top:1"], self.N_WINDOWS)
+
+    def test_older_runs_still_list_their_folders(self):
+        """No document means a tree written before this existed; those frames
+        are still PNGs on disk and are listed the way they always were."""
+        d = self.myresults / "Thomposon" / "SKAB" / "7"
+        (d / "shap_per_window_50").mkdir(parents=True)
+        (d / "expected_rewards_50.png").write_bytes(b"\x89PNG")
+        for i in range(5):
+            (d / "shap_per_window_50" / f"window_{i:03d}.png").write_bytes(b"\x89PNG")
+        ids = {x["id"]: x["count"] for x in self.plots.gallery_descriptors("SKAB", "7")}
+        self.assertEqual(ids.get("thompson/shap_per_window_50"), 5)
+
+    def test_unavailable_frames_return_none_rather_than_raising(self):
+        self._write_doc()
+        for kind, t, scope in (("reward", self.N_WINDOWS, "top"),
+                               ("reward", -1, "top"),
+                               ("shap", 0, "top")):
+            self.assertIsNone(
+                self.ondemand.render_per_window("SKAB", "7", kind, t, scope))
+        self.assertIsNone(self.ondemand.render_per_window("SKAB", "9", "reward", 0))
+
+    def test_a_frame_renders_to_a_png(self):
+        self._write_doc()
+        png = self.ondemand.render_per_window("SKAB", "7", "reward", 2, "top")
+        self.assertTrue(png and png.startswith(b"\x89PNG"))
+
+    def test_nothing_is_written_to_the_result_tree(self):
+        """Same guarantee the ranking-gap figure carries: a browsing session
+        cannot litter myresults/ or race a run writing into it."""
+        self._write_doc()
+        before = sorted(p.name for p in
+                        (self.myresults / "Thomposon" / "SKAB" / "7").iterdir())
+        self.ondemand.render_per_window("SKAB", "7", "ranking", 1, "all")
+        after = sorted(p.name for p in
+                       (self.myresults / "Thomposon" / "SKAB" / "7").iterdir())
+        self.assertEqual(before, after)
+
+
 class TestOffByTreeSelector(unittest.TestCase):
     """One surrogate tree at a time, chosen by competitor.
 

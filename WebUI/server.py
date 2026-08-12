@@ -332,6 +332,29 @@ def create_app(**overrides) -> Flask:
         return Response(png, mimetype="image/png",
                         headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/plots/<dataset>/<entity>/per-window")
+    def api_per_window(dataset, entity):
+        """One per-window frame of a Thompson set, drawn per request.
+
+        These were nine folders of PNGs — over a thousand frames per entity, of
+        which a reader opens a handful — so the pipeline persists the per-channel
+        numbers and the frame is rendered here. `scope` and the gallery's stride
+        are arguments rather than separate sets.
+        """
+        kind = (request.args.get("kind") or "").strip()
+        scope = (request.args.get("scope") or "top").strip()
+        try:
+            t = int(request.args.get("t") or 0)
+        except ValueError:
+            abort(400)
+        if not kind or scope not in ("top", "all") or t < 0:
+            abort(400)
+        png = ondemand.render_per_window(dataset, entity, kind, t, scope)
+        if png is None:
+            abort(404)
+        return Response(png, mimetype="image/png",
+                        headers={"Cache-Control": "no-store"})
+
     @app.get("/media/<path:relpath>")
     def media(relpath):
         target = plots.safe_media_path(relpath)

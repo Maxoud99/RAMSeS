@@ -482,7 +482,19 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
 }
 .lightbox-bar button:hover:not(:disabled) { background: rgba(255,255,255,.18); }
 .lightbox-bar button:disabled { opacity: .35; }
-#lightbox-count { font-family: var(--font-mono); }
+#lightbox-count { font-family: var(--font-mono); display: flex; align-items: center; }
+/* The counter is the control: reading "95 / 173" and typing into it are the
+   same field, so it is styled to sit in the dark bar rather than to announce
+   itself as a form. */
+#lightbox-index {
+  font: inherit; color: #EDEBE6; text-align: right;
+  background: rgba(255, 255, 255, .08);
+  border: 1px solid rgba(255, 255, 255, .3);
+  border-radius: var(--radius-sm);
+  padding: .15rem .3rem;
+}
+#lightbox-index:hover { background: rgba(255, 255, 255, .18); }
+#lightbox-index:focus-visible { outline: 2px solid #EDEBE6; outline-offset: 1px; }
 
 /* ── Motion & print ───────────────────────────────────────────────────────── */
 

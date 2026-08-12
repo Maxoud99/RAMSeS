@@ -496,44 +496,124 @@ def manifest(dataset: str, entity: str) -> Dict[str, Any]:
 _GALLERY_TREES = {"thompson": TREE_THOMPSON, "ts_ranking": TREE_THOMPSON}
 
 
+# The per-window sets, in the order they are offered. `kind` and `scope` are
+# the two arguments the on-demand renderer takes; `stride` is the third and the
+# only reason `every10` was ever a separate folder.
+_PER_WINDOW_SETS = (
+    ("thompson", "reward", "top", 1,
+     "Reward contribution per window (top 3)",
+     "One frame per window; each detector's bars sum to its expected reward."),
+    ("thompson", "reward", "all", 1,
+     "Reward contribution per window (all detectors)", ""),
+    ("thompson", "reward", "top", 10,
+     "Reward contribution, every 10th window", ""),
+    ("thompson", "shap", "top", 1,
+     "Deviation per window (top 3)",
+     "Departure from a typical window — not a share of the reward."),
+    ("thompson", "shap", "all", 1,
+     "Deviation per window (all detectors)", ""),
+    ("thompson", "shap", "top", 10,
+     "Deviation, every 10th window", ""),
+    ("ts_ranking", "ranking", "top", 1,
+     "Ranking score per window (top 3)",
+     "One frame per window, each showing the score as it stood then."),
+    ("ts_ranking", "ranking", "all", 1,
+     "Ranking score per window (all detectors)", ""),
+    ("ts_ranking", "ranking", "top", 10,
+     "Every 10th window", ""),
+)
+
+# Per-regime sets that are still written as folders. Unlike the per-window ones
+# these are read inline beside every regime sentence, so they stay on disk.
+_REGIME_GALLERY_SETS = (
+    ("thompson", "reward_per_regime_all",
+     "Reward contribution per regime (all detectors)"),
+    ("thompson", "shap_per_regime_all",
+     "Deviation per regime (all detectors)"),
+)
+
+_PW_ID = re.compile(r"^pw:(?P<kind>[a-z]+):(?P<scope>top|all):(?P<stride>\d+)$")
+
+
+def _per_window_descriptors(dataset: str, entity: str) -> List[Dict[str, Any]]:
+    """The nine per-window sets, backed by the persisted aggregates.
+
+    Empty when the run predates them, and the caller then falls back to whatever
+    `*_per_window_*` folders that run left on disk.
+    """
+    from WebUI import ondemand
+    doc = ondemand.per_window_document(dataset, entity)
+    if not doc:
+        return []
+    total = int(doc.get("n_windows") or 0)
+    available = doc.get("sets") or {}
+    out = []
+    for group, kind, scope, stride, title, caption in _PER_WINDOW_SETS:
+        if kind not in available or total <= 0:
+            continue
+        count = (total + stride - 1) // stride
+        out.append({"id": f"{group}/pw:{kind}:{scope}:{stride}",
+                    "title": title, "caption": caption, "count": count})
+    return out
+
+
 def gallery_descriptors(dataset: str, entity: str) -> List[Dict[str, Any]]:
     """Large per-window sets, described but never listed eagerly."""
     d = _dir_for(TREE_THOMPSON, dataset, entity)
     it = _iteration_tag(d)
-    out = []
+    out = _per_window_descriptors(dataset, entity)
     if it and d is not None:
-        for group, sub, title, caption in (
-            ("thompson", f"reward_per_window_{it}",
-             "Reward contribution per window (top 3)",
-             "One frame per window; each detector's bars sum to its expected reward."),
-            ("thompson", f"reward_per_window_all_{it}",
-             "Reward contribution per window (all detectors)", ""),
-            ("thompson", f"reward_per_window_every10_{it}",
-             "Reward contribution, every 10th window", ""),
-            ("thompson", f"reward_per_regime_all_{it}",
-             "Reward contribution per regime (all detectors)", ""),
-            ("thompson", f"shap_per_window_{it}",
-             "Deviation per window (top 3)",
-             "Departure from a typical window — not a share of the reward."),
-            ("thompson", f"shap_per_window_all_{it}",
-             "Deviation per window (all detectors)", ""),
-            ("thompson", f"shap_per_window_every10_{it}",
-             "Deviation, every 10th window", ""),
-            ("thompson", f"shap_per_regime_all_{it}",
-             "Deviation per regime (all detectors)", ""),
-            ("ts_ranking", f"ranking_per_window_{it}",
-             "Ranking score per window (top 3)",
-             "One frame per window, each showing the score as it stood then."),
-            ("ts_ranking", f"ranking_per_window_all_{it}",
-             "Ranking score per window (all detectors)", ""),
-            ("ts_ranking", f"ranking_per_window_every10_{it}",
-             "Every 10th window", ""),
-        ):
+        if not out:
+            # A tree written before the aggregates existed: the frames are still
+            # folders of PNGs, so list them the way they were listed then.
+            for group, kind, scope, stride, title, caption in _PER_WINDOW_SETS:
+                stem = {"reward": "reward_per_window", "shap": "shap_per_window",
+                        "ranking": "ranking_per_window"}[kind]
+                if scope == "all":
+                    stem += "_all"
+                if stride > 1:
+                    stem += f"_every{stride}"
+                sub = f"{stem}_{it}"
+                count = len(_ls(d / sub))
+                if count:
+                    out.append({"id": f"{group}/{sub}", "title": title,
+                                "caption": caption, "count": count})
+        for group, stem, title in _REGIME_GALLERY_SETS:
+            sub = f"{stem}_{it}"
             count = len(_ls(d / sub))
             if count:
                 out.append({"id": f"{group}/{sub}", "title": title,
-                            "caption": caption, "count": count})
+                            "caption": "", "count": count})
     return out
+
+
+def _per_window_page(dataset: str, entity: str, sub: str,
+                     offset: int, limit: int) -> Optional[Dict[str, Any]]:
+    """One page of on-demand frames, or None if `sub` is not a per-window id.
+
+    The items carry a render URL instead of a `/media/` path; everything else
+    about them is what the lightbox already expects, so the page needs no
+    special case for these.
+    """
+    m = _PW_ID.match(sub)
+    if not m:
+        return None
+    from WebUI import ondemand
+    doc = ondemand.per_window_document(dataset, entity)
+    if not doc:
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+    kind, scope = m.group("kind"), m.group("scope")
+    stride = max(1, int(m.group("stride")))
+    windows = list(range(0, int(doc.get("n_windows") or 0), stride))
+    page = windows[max(0, offset): max(0, offset) + max(1, min(limit, 200))]
+    endpoint = f"/api/plots/{dataset}/{entity}/per-window"
+    return {
+        "items": [{"title": f"window {t:03d}", "caption": "",
+                   "name": f"{kind}_{scope}_window_{t:03d}.png",
+                   "src": f"{endpoint}?kind={kind}&scope={scope}&t={t}"}
+                  for t in page],
+        "total": len(windows), "offset": offset, "limit": limit,
+    }
 
 
 def gallery_page(dataset: str, entity: str, gallery_id: str,
@@ -541,6 +621,9 @@ def gallery_page(dataset: str, entity: str, gallery_id: str,
     group, _, sub = gallery_id.partition("/")
     if group not in _GALLERY_TREES or not sub or "/" in sub or sub.startswith("."):
         return {"items": [], "total": 0, "offset": offset, "limit": limit}
+    rendered = _per_window_page(dataset, entity, sub, offset, limit)
+    if rendered is not None:
+        return rendered
     d = _dir_for(_GALLERY_TREES[group], dataset, entity)
     if d is None:
         return {"items": [], "total": 0, "offset": offset, "limit": limit}

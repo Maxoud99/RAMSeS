@@ -147,8 +147,12 @@ def run_monte_carlo_simulation(test_data, trained_models, model_names, dataset, 
     # Save summary
     save_summary(summary, dataset, entity)
 
-    # Plot results
-    plot_monte_carlo_results(results, summary, model_names, dataset, entity)
+    # One F1/PR-AUC histogram pair per detector, no longer drawn. Eleven figures
+    # per entity that say separately what the noise curves say together, and the
+    # comparison between detectors is the whole point of this stage — which is
+    # why the WebUI stopped listing them. plot_monte_carlo_results is kept below
+    # so a single detector's distribution can still be minted by hand.
+    # plot_monte_carlo_results(results, summary, model_names, dataset, entity)
 
     # Explainability (separate, explain-only noise sweep; production ranking above is unchanged)
     if explain:

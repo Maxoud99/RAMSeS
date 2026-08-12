@@ -9,6 +9,7 @@ from loguru import logger
 from tensorflow.keras import layers, models
 
 from Metrics.metrics import range_based_precision_recall_f1_auc, prauc, f1_score
+from Model_Selection.Sensitivity_robustness.plot_retention import prune_timestamped
 from Utils.model_selection_utils import evaluate_model
 
 
@@ -303,6 +304,7 @@ def run_Gan(test_data, trained_models, model_names, dataset, entity):
 
     # Save the figure
     plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
+    prune_timestamped(directory)
 
     # plt.show()
 
@@ -354,5 +356,6 @@ def plot_data_with_injected_points(original_data, augmented_data, injected_norma
 
     # Save the figure
     plt.savefig(full_path, dpi=300)  # Save as PNG file with high resolution
+    prune_timestamped(directory)
 
     # plt.show()

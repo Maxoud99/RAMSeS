@@ -21,7 +21,11 @@
   <div class="lightbox-stage"><img id="lightbox-img" alt=""></div>
   <div class="lightbox-bar">
     <button type="button" id="lightbox-prev">← Previous</button>
-    <span id="lightbox-count" class="small"></span>
+    <span id="lightbox-count" class="small">
+      <input type="number" id="lightbox-index" min="1" step="1"
+             aria-label="Go to figure number" inputmode="numeric">
+      <span id="lightbox-total"></span>
+    </span>
     <button type="button" id="lightbox-next">Next →</button>
   </div>
 </div>
