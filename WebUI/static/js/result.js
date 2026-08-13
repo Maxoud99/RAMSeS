@@ -174,11 +174,38 @@ async function openGallery(descriptor) {
   });
 }
 
-function infoDisclosure(info) {
-  if (!info) return null;
-  return el("details", { class: "info" },
-    el("summary", { text: "ⓘ What these terms mean" }),
-    el("div", { class: "info-body" }, proseNode(info, "")));
+/* One line per term, in the space the glossary used to fill.
+ *
+ * A definition list rather than prose: these are lookups, not something to be
+ * read through, and the two-column grid lets a reader find the term they came
+ * for without reading the ones they did not. */
+function termsNode(stage) {
+  const terms = stage.terms || [];
+  if (!terms.length) return null;
+  // flatMap, not map: el() flattens its children exactly one level, so a list
+  // of [dt, dd] pairs would reach it as arrays and be stringified.
+  return el("dl", { class: "terms" },
+    terms.flatMap(([term, definition]) => [
+      el("dt", { text: `${term}:` }),
+      el("dd", { text: definition }),
+    ]));
+}
+
+/* The link to this stage's section of the documentation.
+ *
+ * The glossaries used to open every card, ahead of its finding, and they run
+ * long enough to be the first thing a reader had to get past. They now live on
+ * their own page; this is the pointer to the section holding this stage's.
+ *
+ * A new tab, because a reader looking a term up is in the middle of reading the
+ * card and wants to come back to it. `rel=noopener` because target=_blank hands
+ * the opened page a reference to this one otherwise. */
+function docsLink(stage) {
+  if (!stage.doc_section || !stage.info) return null;
+  return el("a", { class: "button no-print stage-docs-link",
+                   href: `/docs/${dataset}/${entity}#${stage.doc_section}`,
+                   target: "_blank", rel: "noopener",
+                   text: "Stage description for the interested ↗" });
 }
 
 /* What the extended view adds, per stage — the reader should know what a click
@@ -291,7 +318,11 @@ function stageCard(stage, payload) {
       el("h3", { id: `stage-${stage.key}`, text: stage.title }),
       stage.top_pick ? el("span", { class: familyClass(stage.top_pick) },
                             `first: ${stage.top_pick}`) : null,
-      stage.words ? el("span", { class: "muted small", text: `${stage.words} words` }) : null),
+      stage.words ? el("span", { class: "muted small", text: `${stage.words} words` }) : null,
+      // Beside the word count and pushed to the right edge: it is a way out of
+      // the card, not part of its finding, so it sits with the metadata rather
+      // than in the reading order of the prose.
+      docsLink(stage)),
     stage.question ? el("p", { class: "muted small", text: stage.question }) : null);
 
   const body = el("div", { class: "stack" });
@@ -303,7 +334,7 @@ function stageCard(stage, payload) {
       "⚠ This explanation is older than the results it describes: the stage was "
       + "re-run without re-generating its narrative. Re-run the narrator to refresh it." }));
   }
-  body.append(infoDisclosure(stage.info));
+  body.append(termsNode(stage));
   body.append(proseNode(stage.summary));
   if (stage.summary_table) body.append(summaryTable(stage.summary_table));
   // `extended_in` means another section of this card already shows what the
@@ -460,21 +491,10 @@ function appendix(payload) {
                             text: "Download the full report (.txt)" }))));
 }
 
+/* The "ⓘ Definitions" bulk toggle is gone with the glossaries it opened: they
+ * are a page of their own now, so there is nothing on this one left to expand. */
 function bulkToggles() {
-  const infoButton = $("#toggle-all-info");
   const fullButton = $("#toggle-all-full");
-  let infoOpen = false;
-  try { infoOpen = localStorage.getItem("ramses-info-open") === "1"; } catch (e) {}
-
-  const applyInfo = () => {
-    $$("details.info").forEach((d) => { d.open = infoOpen; });
-    infoButton.setAttribute("aria-pressed", String(infoOpen));
-    try { localStorage.setItem("ramses-info-open", infoOpen ? "1" : "0"); } catch (e) {}
-  };
-  applyInfo();   // a reader who wants definitions wants them everywhere
-
-  infoButton.addEventListener("click", () => { infoOpen = !infoOpen; applyInfo(); });
-
   let allOpen = false;
   fullButton.addEventListener("click", () => {
     allOpen = !allOpen;

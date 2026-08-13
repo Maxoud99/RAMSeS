@@ -116,6 +116,17 @@ def create_app(**overrides) -> Flask:
         """
         return render_template("report.html", dataset=dataset, entity=entity)
 
+    @app.get("/docs/<dataset>/<entity>")
+    def page_docs(dataset, entity):
+        """Stage documentation, one section per pipeline stage.
+
+        Its own page because it is reference material: the glossaries were long
+        enough that every card opened with a wall of definitions before its
+        finding. The stage cards link here with a fragment, so a reader arrives
+        at the section for the stage they were reading.
+        """
+        return render_template("docs.html", dataset=dataset, entity=entity)
+
     # ── Catalog and health ──────────────────────────────────────────────────
 
     @app.get("/api/catalog")
@@ -242,6 +253,14 @@ def create_app(**overrides) -> Flask:
                     regime["plots"] = figures
                     regime["plot"] = figures[0]["src"]
                     regime["plot_caption"] = figures[0].get("caption")
+        return jsonify(payload)
+
+    @app.get("/api/docs/<dataset>/<entity>")
+    def api_docs(dataset, entity):
+        payload = artifacts.documentation(dataset, entity)
+        if payload is None:
+            return jsonify({"error": "no_artifacts",
+                            "hint": "Run this dataset/entity with explanations enabled."}), 404
         return jsonify(payload)
 
     @app.get("/api/explanations/<dataset>/<entity>/download")

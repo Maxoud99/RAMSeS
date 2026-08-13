@@ -285,6 +285,112 @@ class TestBuildPayload(ArtifactTreeCase):
         by = {s["key"]: s for s in p["stages"]}
         self.assertFalse(by["thompson_sampling"]["stale"])
 
+    def test_every_stage_points_at_its_documentation_section(self):
+        """The glossaries left the cards for a page of their own, so each card
+        carries the section holding its own — and the two halves of one pipeline
+        stage share it. A reader looking up ALE should not have to know whether
+        it came from the selection card or the weighting one."""
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        by = {s["key"]: s["doc_section"] for s in p["stages"]}
+        self.assertEqual(by["thompson_ranking"], "lints")
+        self.assertEqual(by["thompson_sampling"], "lints")
+        self.assertEqual(by["monte_carlo"], "monte-carlo")
+        # Every stage the page can render has somewhere to send the reader.
+        self.assertTrue(all(s["doc_section"] for s in p["stages"]), by)
+
+    def test_every_stage_carries_its_one_line_definitions(self):
+        """The strip that fills the space the glossary left. Ordered pairs, in
+        the order the card's prose uses them, so a reader meets a term where it
+        first matters rather than alphabetically."""
+        p = artifacts.build_payload(self.DATASET, self.ENTITY)
+        by = {s["key"]: s["terms"] for s in p["stages"]}
+        self.assertEqual([t for t, _d in by["thompson_ranking"]],
+                         ["Score", "Share", "Contribution", "Margin", "Regime"])
+        self.assertEqual([t for t, _d in by["monte_carlo"]], ["Noise level"])
+        self.assertTrue(all(t and d for stage in by.values() for t, d in stage), by)
+
+    def test_both_consensus_cards_define_the_same_vocabulary(self):
+        """They are one stage split across two cards, so the terms are the
+        stage's. A two-source run reports no influence, and the card's own prose
+        is what says so — the definition being present is not a claim that it
+        applied."""
+        self.assertEqual(artifacts.STAGE_TERMS["rank_aggregation_final"],
+                         artifacts.STAGE_TERMS["rank_aggregation_robust"])
+
+    def test_explained_stages_all_have_definitions(self):
+        """A stage added later without a strip would leave the gap the glossary
+        used to fill simply empty."""
+        missing = [s["key"] for s in artifacts.STAGES
+                   if not artifacts.STAGE_TERMS.get(s["key"])]
+        self.assertEqual(missing, [])
+
+    def test_documentation_is_the_whole_pipeline_in_order(self):
+        """The text describes RAMSeS, not a run, so every section is present
+        whichever stages this entity happened to execute — including the two
+        that no card points at, the overview and the GAN test."""
+        p = artifacts.documentation(self.DATASET, self.ENTITY)
+        self.assertEqual([s["id"] for s in p["sections"]],
+                         ["overview", "ga", "lints", "gan", "off-by",
+                          "monte-carlo", "rank-aggregation"])
+
+    def test_documentation_blocks_are_renderable(self):
+        """docs.js knows four block shapes and nothing else; a fifth would be
+        silently dropped from the page."""
+        p = artifacts.documentation(self.DATASET, self.ENTITY)
+        for section in p["sections"]:
+            self.assertTrue(section["blocks"], section["id"])
+            groups = [(section["id"], section["blocks"])] + [
+                (sub["id"], sub["blocks"]) for sub in section["subsections"]]
+            for where, blocks in groups:
+                self.assertTrue(blocks, where)
+                for block in blocks:
+                    self.assertTrue(
+                        ("list" in block) or ("formula" in block) or ("text" in block),
+                        (where, block))
+                    if "lead" in block:
+                        self.assertIn("text", block, where)
+
+    def test_documentation_subsection_ids_are_unique_and_addressable(self):
+        """Every subsection is a fragment the sidebar links to and the page
+        scrolls to, so a duplicate id would silently send two entries to one
+        place."""
+        p = artifacts.documentation(self.DATASET, self.ENTITY)
+        ids = [s["id"] for s in p["sections"]]
+        ids += [sub["id"] for s in p["sections"] for sub in s["subsections"]]
+        self.assertEqual(len(ids), len(set(ids)), sorted(ids))
+        self.assertTrue(all(i and " " not in i and "#" not in i for i in ids), ids)
+
+    def test_documentation_opens_with_the_architecture(self):
+        """The overview precedes the stages: a reader who has never seen the
+        framework needs the two branches before any one of them."""
+        p = artifacts.documentation(self.DATASET, self.ENTITY)
+        first = p["sections"][0]
+        self.assertEqual(first["id"], "overview")
+        self.assertIn("overview-branches", [s["id"] for s in first["subsections"]])
+
+    def test_every_stage_section_explains_its_explainability(self):
+        """Each stage documents how RAMSeS works and then how that is explained.
+
+        Keyed on the id, not the title: the titles describe their own content
+        rather than announcing which half of the section they belong to, so the
+        `-explained` suffix is the only durable marker of that boundary. GAN is
+        the exception on purpose — it has no explainability layer.
+        """
+        p = artifacts.documentation(self.DATASET, self.ENTITY)
+        for section in p["sections"]:
+            ids = [s["id"] for s in section["subsections"]]
+            if section["id"] == "gan":
+                self.assertEqual(ids, [])
+                continue
+            self.assertTrue(any(i.endswith("-explained") for i in ids),
+                            (section["id"], ids))
+
+    def test_documentation_sections_cover_every_stage_that_can_carry_one(self):
+        """A stage missing from DOC_SECTIONS would render a card whose button
+        led nowhere, which is worse than having no button."""
+        covered = set(artifacts.DOC_SECTION_BY_STAGE)
+        self.assertEqual(covered, {s["key"] for s in artifacts.STAGES})
+
     def test_assembles_stages_in_pipeline_order(self):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
         # The ranking criterion precedes the selection dynamics: it explains the
@@ -1861,7 +1967,7 @@ class TestRoutes(ArtifactTreeCase):
         """Every entry script imports "./dom.js". A second, stamped <script> tag
         for it would be a different URL, so the module would evaluate twice and
         bind the theme toggle twice — one click, two theme changes."""
-        for path in ("/", "/result/SKAB/7", "/report/SKAB/7"):
+        for path in ("/", "/result/SKAB/7", "/report/SKAB/7", "/docs/SKAB/7"):
             html = self.client.get(path).get_data(as_text=True)
             self.assertEqual(html.count("js/dom.js"), 0, path)
 
@@ -1869,7 +1975,17 @@ class TestRoutes(ArtifactTreeCase):
         self.assertEqual(self.client.get("/").status_code, 200)
         self.assertEqual(self.client.get("/result/SKAB/7").status_code, 200)
         self.assertEqual(self.client.get("/report/SKAB/7").status_code, 200)
+        self.assertEqual(self.client.get("/docs/SKAB/7").status_code, 200)
         self.assertEqual(self.client.get("/run/nope").status_code, 404)
+
+    def test_documentation_is_served_and_missing_entities_404(self):
+        body = self.client.get("/api/docs/SKAB/7").get_json()
+        self.assertEqual([s["id"] for s in body["sections"]],
+                         ["overview", "ga", "lints", "gan", "off-by",
+                          "monte-carlo", "rank-aggregation"])
+        # Still per-entity, and still 404 for one that has nothing: the page
+        # carries a link back to the entity the reader came from.
+        self.assertEqual(self.client.get("/api/docs/SKAB/999").status_code, 404)
 
     def test_comprehensive_report_is_served_and_downloadable(self):
         r = self.client.get("/api/comprehensive/SKAB/7")

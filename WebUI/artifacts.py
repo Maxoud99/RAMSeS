@@ -70,6 +70,657 @@ STAGES: Tuple[Dict[str, Any], ...] = (
 
 STAGE_BY_KEY = {s["key"]: s for s in STAGES}
 
+# WebUI/static/js/docs.js: {"text"} is a paragraph, {"lead", "text"} a paragraph
+# opening with a bold label, {"list", "ordered"} a list, {"formula"} a block of
+# notation set in the monospace face.
+#
+# A section's own `blocks` are its opening, before the first subsection. The
+# subsections are what the sidebar navigates to and what the N.M numbering is
+# built from; their titles were the bold labels the prose used to open those
+# paragraphs with, moved up into a heading now that a section is long enough to
+# need navigating inside. Numbering lives in the frontend, not here, so a
+# section inserted later renumbers everything after it without an edit.
+#
+# `gan` has no subsections: three paragraphs and no internal structure to point
+# at.
+DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
+    {"id": "overview", "title": "Overview", "stages": (), "blocks": (
+        {"text": "RAMSeS selects a detection strategy for one time series rather "
+                 "than assuming one detector fits all of them. What counts as an "
+                 "anomaly is context-dependent, and a detector that wins on one "
+                 "series degrades on another, so the framework runs a pool of "
+                 "pre-trained base detectors and decides, per series, how to use "
+                 "them."},
+    ), "subsections": (
+        {"id": "overview-pool", "title": "The base detector pool", "blocks": (
+            {"text": "By default different base detectors compete such as: "
+                     "LOF_1..LOF_4, NN_1..NN_3, CBLOF_1..CBLOF_4. Each is "
+                     "trained beforehand and, for every window of the series, "
+                     "emits an anomaly score. Every stage below consumes those "
+                     "scores; none of them retrains a base detector."},
+        )},
+        {"id": "overview-branches", "title": "The ensemble and single-model branches", "blocks": (
+            {"text": "From the shared pool the framework runs two branches with "
+                     "different aims."},
+            {"list": (
+                "The ensemble branch searches for a subset of detectors whose "
+                "scores, stacked and fed to a meta-learner, detect better "
+                "together than any of them alone.",
+                "The single-model branch searches for the one detector that "
+                "holds up best, combining an adaptive bandit with three "
+                "independent robustness tests.",
+            )},
+        )},
+        {"id": "overview-pipeline", "title": "The six offline sub-stages", "blocks": (
+            {"text": "The offline stage runs six sub-stages: 6.1 genetic "
+                     "algorithm, 6.2 Thompson sampling, 6.3 GAN perturbation, "
+                     "6.4 off-by-threshold, 6.5 Monte Carlo, 6.6 rank "
+                     "aggregation. The three robustness tests are independent of "
+                     "one another and each works on its own copy of the data, so "
+                     "no test can see another's perturbations."},
+        )},
+        {"id": "overview-decision",
+         "title": "Two aggregations and the final decision", "blocks": (
+            {"text": "Rank aggregation runs twice. First it merges the six "
+                     "rankings the robustness tests produce (three tests, each "
+                     "ranking by F1 and by PR-AUC) into a robustness consensus. "
+                     "Then it merges that consensus with the Thompson ranking "
+                     "into the final single-model order. Finally the framework "
+                     "evaluates the winning ensemble and the winning single "
+                     "detector on the same data and deploys whichever scores "
+                     "higher on F1."},
+        )},
+        {"id": "overview-online", "title": "Online phase and re-optimisation", "blocks": (
+            {"text": "The series is split 80% offline / 20% online. The online "
+                     "portion is processed in overlapping windows, and every N "
+                     "windows (default 5) the framework re-optimises, "
+                     "concatenating the most recent online windows while "
+                     "dropping an equal number of the oldest offline samples so "
+                     "the training size stays constant. This adapts to "
+                     "distribution shift without forgetting earlier behaviour. "
+                     "Three strategies are available: adaptive (re-optimise "
+                     "periodically), fixed-best (keep the offline winner), and "
+                     "fixed-random (a baseline)."},
+        )},
+        {"id": "overview-explained", "title": "How the explanations are produced",
+         "blocks": (
+            {"text": "Every stage below can be run with an explainability layer "
+                     "on top of it, disabled by default and enabled with "
+                     "--explain. The layers never change what the stage decides: "
+                     "they observe a run as it happens without altering it, and "
+                     "each one writes a report, generates a set of figures, and "
+                     "a structured record of its findings."},
+            {"text": "That record is what a local language model turns into the "
+                     "prose on each stage's card. It is given canonical "
+                     "sentences with the numbers already computed and rounded, "
+                     "never raw output, so it composes and compresses rather "
+                     "than calculating or inferring. Every narrative is then "
+                     "scored mechanically against that record for two things: "
+                     "claims that match nothing in it, and required facts it "
+                     "failed to state. Those two rates are reported per stage. "
+                     "Limitations are listed separately and verbatim, never left "
+                     "to the model to paraphrase."},
+        )},
+    )},
+    {"id": "ga", "title": "Genetic algorithm",
+     "stages": ("ga_selection", "ga_combination"), "blocks": (
+        {"text": "The ensemble branch builds a stacking ensemble: the base "
+                 "detectors are level-0 learners, and their scores become the "
+                 "input features of a level-1 meta-learner that makes the final "
+                 "call. The question is which subset of detectors to stack."},
+    ), "subsections": (
+        {"id": "ga-meta-learner",
+         "title": "Why the meta-learner is fixed", "blocks": (
+            {"text": "RAMSeS uses a Random Forest, chosen for F1 comparable to "
+                     "an SVM at lower cost; logistic regression, gradient "
+                     "boosting and SVM are also supported. It is not searched "
+                     "over per subset, because doing so would raise the risk of "
+                     "overfitting, destabilise the optimisation, and make "
+                     "convergence harder to read. Fixing it restricts the search "
+                     "to the subsets themselves."},
+        )},
+        {"id": "ga-loop", "title": "The search loop and its fitness", "blocks": (
+            {"text": "The algorithm initialises a population of 20 randomly "
+                     "drawn distinct subsets and runs for 20 generations at a "
+                     "mutation rate of 0.1. In each generation it:"},
+            {"ordered": True, "list": (
+                "Trains the meta-learner on the stacked outputs of each "
+                "candidate subset",
+                "Scores each subset on a held-out validation fold",
+                "Keeps the top performers as the elite pool",
+                "Crosses pairs of parents drawn from that pool into new subsets",
+                "Mutates some of the resulting new subsets, adding, removing or "
+                "replacing a detector.",
+            )},
+            {"text": "Fitness is the ensemble's best-threshold F1 score, the "
+                     "objective the search maximises. After the last generation "
+                     "the highest-scoring subset across all generations is the "
+                     "chosen ensemble, and the meta-learner trained on it is "
+                     "what runs in deployment."},
+        )},
+        {"id": "ga-meta-use",
+         "title": "From detector scores to one prediction", "blocks": (
+            {"text": "For a point in time-series, each detector has a score "
+                     "between 0 and 1 as output, which is the predicted "
+                     "probability that the point is an anomaly. Meta-learner "
+                     "gets the output of all of the level-0 detectors that are "
+                     "in the subset as input and produces its own predicted "
+                     "probability that the point is an anomaly. It must be "
+                     "trained first, so that it learns how much to trust each "
+                     "detector and in what direction. It does not average them "
+                     "and it does not weight them by any external notion of "
+                     "quality; the weighting is whatever fitting the training "
+                     "data produced."},
+        )},
+        {"id": "ga-explained", "title": "What the explanation answers", "blocks": (
+            {"text": "The search evaluates hundreds of subsets and reports one. "
+                     "Two questions survive that: why each detector ended up in "
+                     "the chosen ensemble, and how the meta-learner uses them "
+                     "once it has selected them."},
+        )},
+        {"id": "ga-why-chosen", "title": "Utility, stability and LOFO", "blocks": (
+            {"text": "Two properties are measured after the search, from the "
+                     "subsets the search itself evaluated. Utility is a "
+                     "detector's mean marginal contribution: the average change "
+                     "in fitness between the subsets that contained the detector "
+                     "and those that did not. Stability is its survival rate, "
+                     "the share of evaluated subsets that detector appeared in. "
+                     "Each detector is placed on both axes at once and labelled "
+                     "high or low on each, split at the median of the detector "
+                     "pool, so \"high utility\" means above the other detectors "
+                     "here rather than good in absolute terms. A third quantity, "
+                     "LOFO, is reported for members of the final ensemble only: "
+                     "the ensemble's F1 score loss when that one detector is "
+                     "removed from it. Utility is a global average over the "
+                     "whole search, LOFO is local to the one ensemble that was "
+                     "chosen, and the two can disagree in sign."},
+            {"formula": "utility(d)   = mean{ F1(S) : d ∈ S } − mean{ F1(S) : d ∉ S }\n"
+                        "stability(d) = (1/G) · Σ_g |{ individuals in generation g containing d }| / P\n"
+                        "LOFO(d)      = F1(Ŝ) − F1(Ŝ \\ {d}),    d ∈ Ŝ"},
+            {"text": "where S ranges over the distinct subsets the GA evaluated, "
+                     "Ŝ is the chosen ensemble, G is the number of generations "
+                     "and P the size of the population in each generation."},
+        )},
+        {"id": "ga-meta-explained",
+         "title": "SHAP, PFI and ALE", "blocks": (
+            {"text": "Three measures each rank the chosen detectors by how much "
+                     "weight they carry, and each answers a different question. "
+                     "SHAP measures how much the meta-learner's anomaly "
+                     "probability moves when a detector's actual output is "
+                     "revealed in place of its average output, averaged over "
+                     "every combination of the other detectors being revealed or "
+                     "held at their averages. Because the ensemble is small, "
+                     "every combination is enumerated exactly rather than "
+                     "sampled. PFI measures how far F1 falls when a detector's "
+                     "score column is shuffled, so unlike SHAP it uses the "
+                     "labels and reports reliance on the detector rather than "
+                     "influence on the output. ALE sweeps a detector across its "
+                     "own observed score range in narrow bands and accumulates "
+                     "how far the meta-learner's output moves, using only the "
+                     "rows that fall in each band."},
+            {"text": "The three measures are magnitudes. Because they might "
+                     "disagree, they are merged by the same kind of Markov rank "
+                     "aggregation the single-model branch uses, giving one "
+                     "overall weight ranking."},
+        )},
+        {"id": "ga-direction", "title": "The sign and how well it is supported",
+         "blocks": (
+            {"text": "A detector's sign is the direction of ALE's total "
+                     "accumulated effect: positive if a rising score pushes the "
+                     "meta-learner toward flagging the point as an anomaly, "
+                     "negative if towards flagging normal. How well that sign is "
+                     "supported is reported separately, because two things can "
+                     "undermine it: an effect that changes direction across the "
+                     "score range, or a detector that barely moves the "
+                     "meta-learner at all. Both are named rather than allowed to "
+                     "suppress the sign, since a blank reads as missing data "
+                     "when the measurement was actually made."},
+        )},
+    )},
+    {"id": "lints", "title": "Linear Thompson Sampling",
+     "stages": ("thompson_ranking", "thompson_sampling"), "blocks": (
+        {"text": "LinTS treats detector choice as a contextual bandit. Each "
+                 "detector is an arm; each window of the series is a round; "
+                 "pulling an arm means running that detector on that window and "
+                 "observing how well it did. The time-series is split into "
+                 "windows in the beginning."},
+    ), "subsections": (
+        {"id": "lints-bayesian", "title": "The context vector and the posterior", "blocks": (
+            {"text": "Every window is turned into a context vector x (its "
+                     "channel readings over the window's timesteps). Each "
+                     "detector holds a Bayesian linear model of its own reward, "
+                     "E[r | x] = θᵀx, with a Gaussian posterior over θ "
+                     "summarised by a mean vector μ and covariance Σ. The "
+                     "posterior starts at μ = 0 and Σ = I, a ridge prior that "
+                     "keeps early updates stable."},
+        )},
+        {"id": "lints-round", "title": "Choosing a detector for a window", "blocks": (
+            {"text": "With probability ε the framework picks a detector "
+                     "uniformly at random. Otherwise it draws one sample θ̃ from "
+                     "every detector's posterior and picks the detector "
+                     "maximising θ̃ᵀx. Sampling rather than taking the mean is "
+                     "what makes the choice uncertainty-aware: a detector that "
+                     "has rarely been tried has a wide posterior and can win on "
+                     "a favourable draw, so the run keeps testing plausible "
+                     "alternatives instead of locking onto an early leader."},
+        )},
+        {"id": "lints-reward", "title": "The reward and the posterior update", "blocks": (
+            {"text": "The chosen detector is evaluated on that window based on "
+                     "injected timesteps and rewarded with a weighted "
+                     "combination of F1 and PR-AUC (default 0.5 each). Only the "
+                     "chosen detector's posterior is updated, by Bayesian linear "
+                     "regression on the pair (x, r): the covariance absorbs xxᵀ "
+                     "and the mean moves toward the observed reward."},
+        )},
+        {"id": "lints-epsilon", "title": "How exploration decays", "blocks": (
+            {"text": "ε starts at 0.2 and is annealed after every window, so the "
+                     "run begins broad and narrows toward exploiting what it has "
+                     "learned."},
+        )},
+        {"id": "lints-output", "title": "The final ranking by ‖μ‖²", "blocks": (
+            {"text": "The offline phase runs until every window is processed. "
+                     "Afterwards the detectors are ranked by the overall size of "
+                     "their learned weights, ‖μ‖². This ranking is the branch's "
+                     "output and is what goes into the final aggregation."},
+        )},
+        {"id": "lints-two-views", "title": "μᵀx versus ‖μ‖²", "blocks": (
+            {"text": "The branch produces two different numbers, which is why it "
+                     "has two cards. μᵀx is the expected reward at a given "
+                     "window and is what drove the choice made there; it moves "
+                     "as the series moves. ‖μ‖² is the accumulated ranking score "
+                     "and only grows when a detector is picked and rewarded. A "
+                     "detector can therefore lead the expected-reward view for "
+                     "much of the run and still not finish first in the "
+                     "ranking."},
+        )},
+        {"id": "lints-note", "title": "Why contexts are normalised", "blocks": (
+            {"text": "Context vectors are normalised to unit length before use. "
+                     "Without it, a series with large sensor values or many "
+                     "channels (SMD carries 38) makes xxᵀ dominate the "
+                     "covariance update and collapse Σ."},
+        )},
+        {"id": "lints-explained", "title": "What the two cards explain",
+         "blocks": (
+            {"text": "The branch produces two quantities and both are explained, "
+                     "which is why it has two cards."},
+        )},
+        {"id": "lints-criterion", "title": "Splitting the score across channels", "blocks": (
+            {"text": "The score ‖μ‖² is a sum of squared weights, so it splits "
+                     "exactly into one number per channel with no approximation: "
+                     "a channel's contribution to a detector is the sum of the "
+                     "squares of that detector's mean-vector weights for that "
+                     "channel, and the contributions add up to the whole score. "
+                     "Its share is that contribution as a fraction of the score. "
+                     "Because these are squares they are never negative, so a "
+                     "small share means a channel added little, not that it "
+                     "worked against the detector. Comparing two detectors does "
+                     "have direction: the difference of their contributions "
+                     "channel by channel sums exactly to the margin (difference) "
+                     "between their scores, and a negative term marks a channel "
+                     "the rival was stronger on. The stage also reports how "
+                     "often each detector was actually selected, because μ only "
+                     "moves in windows where the arm was pulled, so the score "
+                     "reflects exposure as well as quality. Regimes here are "
+                     "stretches where one detector held the highest score, read "
+                     "straight off the leader at each window after a short "
+                     "warm-up in which every score is still zero."},
+            {"formula":
+                "contribution(k, c)     = Σ_{i ∈ channel c} μ_k[i]²\n"
+                "Σ_c contribution(k, c) = ‖μ_k‖²\n"
+                "margin(a, b, c)        = contribution(a, c) − contribution(b, c)\n"
+                "Σ_c margin(a, b, c)    = ‖μ_a‖² − ‖μ_b‖²"},
+            {"text": "where k, a and b are detectors, c is a channel, and i runs "
+                     "over the entries of that detector's mean vector μ that "
+                     "belong to channel c."},
+        )},
+        {"id": "lints-dynamics", "title": "The reward split and the selection states", "blocks": (
+            {"text": "The expected reward μᵀx splits per channel the same way, "
+                     "and those contributions sum to the prediction exactly. A "
+                     "second and narrower measure is also reported: SHAP, how "
+                     "far a channel's contribution departs from what that "
+                     "channel on average contributes, measured against the "
+                     "average window of the run. The two answer different "
+                     "questions, and a channel can supply most of a detector's "
+                     "reward while departing from its own norm not at all. "
+                     "Regimes here are stretches of at least three consecutive "
+                     "windows in which one detector held the highest expected "
+                     "reward, computed on the beliefs held before each window's "
+                     "update so a regime describes the decision that was made "
+                     "rather than its aftermath. Shorter changes of lead are "
+                     "recorded as blips and not treated as regimes. This regime "
+                     "is different from the previous one, so the both need not "
+                     "line up. Every choice the sampler made is also classified "
+                     "as exploitation, informed exploration or random "
+                     "exploration, so the run can be read as behaviour and not "
+                     "only as an outcome. Exploitation: The sampler picked the "
+                     "detector with the highest μᵀx. Informed exploration: The "
+                     "sample drawn from the posterior led to a different "
+                     "detector than the one with the highest μᵀx. Random "
+                     "exploration: A forced exploration step fired, so the pick "
+                     "was random rather than informed. A run that is mostly "
+                     "random exploration is one where ε had not yet decayed; one "
+                     "that is mostly informed exploration is one where the "
+                     "detectors stayed closely matched and the posteriors "
+                     "uncertain."},
+            {"formula":
+                "contribution(k, c)     = Σ_{i ∈ channel c} μ_k[i] · x[i]\n"
+                "Σ_c contribution(k, c) = μ_kᵀx"},
+            {"text": "where k is a detector, c is a channel, x is the window's "
+                     "context vector, and i runs over the entries belonging to "
+                     "channel c."},
+        )},
+    )},
+    {"id": "gan", "title": "GAN perturbation test", "stages": (), "blocks": (
+        {"text": "GAN test asks whether a detector has learned the structure of "
+                 "normality or merely memorised its training data. A generator "
+                 "and a discriminator, each a two-layer MLP with 256 hidden "
+                 "units, ReLU activations and dropout, are trained adversarially "
+                 "on the clean, un-augmented split, with label smoothing and "
+                 "added noise for stability. Training on clean data only is what "
+                 "keeps the test from leaking into the detectors it later "
+                 "judges."},
+        {"text": "Once trained, the generator produces a pool of candidate "
+                 "points, the discriminator scores them, and the framework keeps "
+                 "the most ambiguous ones: those closest to the discriminator's "
+                 "decision threshold. These are the borderline cases, plausible "
+                 "enough to belong to the series but sitting where \"normal\" "
+                 "and \"anomalous\" are hardest to separate. The discriminator's "
+                 "own verdict supplies each injected point's label."},
+        {"text": "The selected points are interleaved into the stream at regular "
+                 "intervals so chronology is preserved, at an injection budget "
+                 "of about 10% of the original samples. Every detector is then "
+                 "re-evaluated on the augmented series and ranked by F1 and by "
+                 "PR-AUC. Those two rankings are among the six that feed the "
+                 "robustness consensus."},
+    ), "subsections": ()},
+    {"id": "off-by", "title": "Off-by-threshold test",
+     "stages": ("off_by_threshold",), "blocks": (
+        {"text": "Off-by-threshold tests ask where a detector draws the line "
+                 "between \"just unusual\" and \"anomalous\", by manufacturing "
+                 "points that sit almost exactly on the decision threshold."},
+    ), "subsections": (
+        {"id": "off-by-idea", "title": "Why borderline points are the hard case", "blocks": (
+            {"text": "A point far outside the normal range is easier to detect. "
+                     "A point barely outside of the usual series behaviour is "
+                     "the hard case, and it is also the common case. This test "
+                     "builds those points deliberately, with known labels, and "
+                     "checks which detectors classify them correctly."},
+        )},
+        {"id": "off-by-build", "title": "Building a point from local variation", "blocks": (
+            {"text": "About one point is inserted for every ten already in the "
+                     "series, at evenly spaced positions. To build the point at "
+                     "a given position, the framework looks at a short stretch "
+                     "of the series around it and measures how much each channel "
+                     "varies there, its local standard deviation. That number is "
+                     "the series' own account of how much variation is ordinary "
+                     "at this spot, and the injected point is drawn at roughly "
+                     "that size, multiplied by a random factor drawn just above "
+                     "or just below one."},
+            {"text": "Scaling by local variation rather than by a fixed amount "
+                     "is what makes this a boundary test. A fixed absolute "
+                     "deviation would be unremarkable in a noisy stretch and "
+                     "glaring in a quiet one, so a fixed perturbation would be "
+                     "trivial to detect in some places and invisible in others. "
+                     "Using the local variation puts every injected point at the "
+                     "same relative distance from normal, independent from the "
+                     "position in time-series."},
+        )},
+        {"id": "off-by-label", "title": "How the random factor sets the label", "blocks": (
+            {"text": "The random factor decides. At or below 1, the point varies "
+                     "no more than its neighbourhood does and is labelled "
+                     "normal. Above 1, it exceeds the local norm and is labelled "
+                     "a statistical border anomaly. Because the factor only ever "
+                     "lands slightly either side of one, both classes sit right "
+                     "at the boundary, which is the whole point of the test."},
+        )},
+        {"id": "off-by-measured", "title": "Re-ranking on the augmented series", "blocks": (
+            {"text": "Every detector is re-evaluated on the augmented series and "
+                     "ranked by F1 and by PR-AUC, contributing two of the six "
+                     "rankings. The augmented data is used nowhere else in the "
+                     "framework. The test needs at least 100 points and both "
+                     "classes present in the original labels, and is skipped "
+                     "rather than run on data that cannot support it."},
+        )},
+        {"id": "off-by-explained", "title": "Exclusive wins and the surrogate trees",
+         "blocks": (
+            {"text": "The perturbation here happens at the level of individual "
+                     "points, so the explanation does too. Rather than "
+                     "re-running the test under different settings, it reuses "
+                     "the single production run and asks, per injected point, "
+                     "what kind of borderline point the winner handles that a "
+                     "given rival does not."},
+            {"text": "For the winning detector and each other detector in turn, "
+                     "an exclusive win is an injected point the winner "
+                     "classified correctly and that rival did not. A small "
+                     "decision tree is fitted to predict those exclusive wins "
+                     "from four properties of the point, none of which depends "
+                     "on any detector: its boundary distance, how far the random "
+                     "factor landed from 1 and therefore how far off the "
+                     "threshold the point sits; whether it was injected as an "
+                     "anomaly or as normal; its local volatility, the local "
+                     "standard deviation at the injection site; and its position "
+                     "in the series, from 0 at the start to 1 at the end. The "
+                     "tree's splits become plain rules, and the average "
+                     "importance across all the rival trees shows which property "
+                     "best explains the winner's edge."},
+            {"text": "Each tree also reports a held-out, cross-validated "
+                     "accuracy alongside the accuracy on the points it was "
+                     "fitted to, because the second can look strong purely from "
+                     "memorising a small set of wins. A comparison resting on "
+                     "fewer exclusive wins than there are cross-validation folds "
+                     "is flagged, since the held-out estimate is not stable "
+                     "there. Only the prediction side is explained: correctness "
+                     "is defined by thresholded predictions, and PR-AUC has no "
+                     "per-point notion of right or wrong."},
+        )},
+    )},
+    {"id": "monte-carlo", "title": "Monte Carlo simulation",
+     "stages": ("monte_carlo",), "blocks": (
+        {"text": "In Monte Carlo, zero mean Gaussian noise is added to every "
+                 "channel at every timestep, and every detector is re-evaluated "
+                 "on an independent draw of that noise. The labels do not "
+                 "change, the ground truth stays exactly as it was and only the "
+                 "signal degrades, so this measures whether a detector's "
+                 "standing survives a dirtier version of the same series. Scores "
+                 "are averaged across trials, so a detector that happens to win "
+                 "one trial does not carry the ranking. The averaged F1 and "
+                 "PR-AUC orderings are the last two of the six rankings entering "
+                 "the robustness consensus."},
+        {"text": "The noise level is the standard deviation of the injected "
+                 "Gaussian noise, fixed for the production ranking."},
+    ), "subsections": (
+        {"id": "mc-explained", "title": "The noise sweep and its two views", "blocks": (
+            {"text": "The production test holds the noise level fixed, and at "
+                     "one fixed level independent trials carry no structure to "
+                     "explain. The explainability layer therefore sweeps that "
+                     "one parameter, running the same noise injection across a "
+                     "range of levels and repeating each several times, to show "
+                     "which detector wins under how much noise. This sweep is "
+                     "entirely separate: the production ranking that feeds rank "
+                     "aggregation is untouched."},
+            {"text": "Two views are produced over that sweep. The first is the "
+                     "score of every detector as noise grows, marking the "
+                     "crossovers where the lead changes hands. The second is a "
+                     "small decision tree fitted from noise level to winning "
+                     "detector, which turns those crossovers into explicit "
+                     "thresholds, together with per-detector trends summarising "
+                     "how steeply each degrades."},
+        )},
+        {"id": "mc-f1", "title": "Adaptive versus frozen thresholds", "blocks": (
+            {"text": "Re-choosing each detector's best threshold at every noise "
+                     "level measures the best it could possibly do, which hides "
+                     "the degradation a deployed detector would actually suffer, "
+                     "because in production one threshold is committed to. So "
+                     "the sweep also freezes each detector's threshold at the "
+                     "lowest noise level and holds it across the sweep. The gap "
+                     "between the two at high noise is the erosion the first "
+                     "view conceals."},
+        )},
+        {"id": "mc-not", "title": "Limits of the sweep", "blocks": (
+            {"text": "It scores with a fast point-wise metric rather than the "
+                     "range-based one the production ranking uses, so its "
+                     "numbers are not directly comparable to production values, "
+                     "and it exists to show shape rather than to rank. And the "
+                     "surrogates report a held-out, cross-validated fidelity "
+                     "next to their fit on the sweep itself; on flat curves cut "
+                     "into small folds the held-out figure can legitimately be "
+                     "worse than predicting the mean, and where most folds are "
+                     "degenerate the estimate is marked unavailable rather than "
+                     "reported as a number."},
+        )},
+    )},
+    {"id": "rank-aggregation", "title": "Rank aggregation",
+     "stages": ("rank_aggregation_robust", "rank_aggregation_final"), "blocks": (
+        {"text": "The single-model branch produces seven orderings of the same "
+                 "detectors: six from the robustness tests and one from Thompson "
+                 "sampling. They may disagree, and each is about a different "
+                 "thing, so none can simply be preferred. Aggregation turns them "
+                 "into one consensus."},
+    ), "subsections": (
+        {"id": "agg-method", "title": "From pairwise counts to a consensus", "blocks": (
+            {"text": "For every pair of detectors, count how many of the input "
+                     "rankings put i ahead of j. Normalise those counts into a "
+                     "row-stochastic transition matrix, giving a random walk "
+                     "over detectors that is more likely to move toward a "
+                     "detector that beats the current one more often. Compute "
+                     "the stationary distribution of that walk by power "
+                     "iteration, and sort the detectors by it. A detector scores "
+                     "highly when the detectors that beat it are themselves "
+                     "rarely preferred, so the result reflects the whole "
+                     "structure of agreement rather than a count of first "
+                     "places."},
+        )},
+        {"id": "agg-twice", "title": "The two aggregation stages", "blocks": (
+            {"text": "First to the six robustness rankings, producing the "
+                     "robustness consensus. Then to that consensus together with "
+                     "the Thompson ranking, producing the final single-model "
+                     "order. The two-stage shape is deliberate: it keeps the "
+                     "three robustness tests from outvoting the adaptive branch "
+                     "six to one."},
+        )},
+        {"id": "agg-explained", "title": "Influence, agreement and Borda", "blocks": (
+            {"text": "The consensus is one ordering built from several possibly "
+                     "disagreeing ones, and the question the explanation answers "
+                     "is which sources shaped it the most."},
+            {"text": "Each source gets two scores. Its influence is how far the "
+                     "consensus moves when that source is dropped and the "
+                     "aggregation is re-run without it. Its agreement is how "
+                     "closely the source's own ranking matches the consensus "
+                     "that was produced. The two are independent, and the "
+                     "interesting cases are where they diverge."},
+            {"formula": "influence(s)  = (1 − τ(R, R₋ₛ)) / 2        ∈ [0, 1]\n"
+                        "agreement(s)  = τ(rₛ, R)                    ∈ [−1, 1]"},
+            {"text": "where R is the consensus, R₋ₛ the consensus re-aggregated "
+                     "without source s, rₛ that source's own ranking, and τ is "
+                     "Kendall's tau."},
+            {"text": "Each score induces its own ranking of the sources, and "
+                     "those two rankings are then treated as two voters and "
+                     "merged by Borda count into a single standing. That "
+                     "standing is the verdict, and it is what \"shaped the "
+                     "consensus most, second most, and so on\" reports. "
+                     "Comparing a source's two ranks also gives it a pattern: an "
+                     "influential disagreer moved the consensus a long way while "
+                     "agreeing with it poorly, meaning it pulled the result away "
+                     "from its own view and was partly counteracted; a redundant "
+                     "agreer agrees closely but changed nothing, its view "
+                     "already covered by others; a consistent source ranks "
+                     "similarly on both."},
+            {"formula": "borda(s) = (N − rank_influence(s)) + (N − rank_agreement(s))"},
+            {"text": "where N is the number of ranking sources being merged."},
+        )},
+        {"id": "agg-two-source", "title": "Why the final stage uses agreement alone",
+         "blocks": (
+            {"text": "Where only two rankings are merged, for example in the "
+                     "final aggregation, leave-one-out is degenerate, since "
+                     "dropping one leaves the other unchanged, and Borda voting "
+                     "over two sources says nothing. The final aggregation is "
+                     "therefore explained by agreement alone: which of the two "
+                     "the consensus leans toward, and by how much."},
+        )},
+    )},
+)
+
+DOC_SECTION_BY_STAGE = {key: section["id"]
+                        for section in DOC_SECTIONS for key in section["stages"]}
+
+# One line per term, shown on the stage card in the space the glossary used to
+# fill. Ordered pairs rather than a dict so the reader meets the terms in the
+# order the card's prose uses them, not alphabetically.
+#
+# These define the stage's vocabulary and are the same for every run, which is
+# why they live here rather than in the IR: nothing about them depends on what a
+# run found. The long-form glossary on /docs stays where it is, written by
+# `Explainability.ir` into each stage's artifacts.
+STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "ga_selection": (
+        ("Utility", "The average change in an ensemble's F1 score when the "
+                    "detector is added to it."),
+        ("Stability", "The share of the subsets the algorithm evaluated that "
+                      "included the detector."),
+    ),
+    "ga_combination": (
+        ("SHAP", "How much the meta-learner's anomaly probability moves when a "
+                 "detector's actual output is revealed in place of its average "
+                 "output."),
+        ("PFI", "How far F1 drops when that detector's scores are shuffled; "
+                "label-based."),
+        ("ALE", "The change in the meta-learner's anomaly probability as the "
+                "detector's own score is gradually increased."),
+        ("Sign", "The direction of that change: positive means the probability "
+                 "rises, negative means it falls."),
+    ),
+    "thompson_ranking": (
+        ("Score", "The overall size ‖μ‖² of a detector's learned mean vector μ."),
+        ("Share", "The fraction of that score that came from a single channel."),
+        ("Contribution", "The exact amount a single channel added to that score."),
+        ("Margin", "The gap between two detectors' scores; it traces back to each "
+                   "channel, whose contributions sum to it exactly."),
+        ("Regime", "A stretch of windows in which one detector held the highest "
+                   "score ‖μ‖²."),
+    ),
+    "thompson_sampling": (
+        ("Expected reward", "A detector's predicted reward μᵀx for a window, its "
+                            "weights applied to that window's data."),
+        ("Regime", "At least three consecutive windows in which one detector held "
+                   "the highest expected reward."),
+        ("Exploitation", "The sampler picked the detector with the highest μᵀx."),
+        ("Informed exploration", "The sample drawn from the posterior led to a "
+                                 "different detector than the one with the "
+                                 "highest μᵀx."),
+        ("Random exploration", "A forced exploration step fired, so the pick was "
+                               "random rather than informed."),
+        ("SHAP", "How far a channel's contribution to the expected reward "
+                 "departed from its average contribution over the run."),
+    ),
+    "monte_carlo": (
+        ("Noise level", "The standard deviation of the Gaussian noise injected "
+                        "into the data."),
+    ),
+    "off_by_threshold": (
+        ("Exclusive win", "A point the top-ranked detector classified correctly "
+                          "and the named rival did not."),
+        ("Boundary distance", "How far the point was scaled away from the "
+                              "decision boundary; 0 sits exactly on it."),
+        ("Local volatility", "The standard deviation of the series around the "
+                             "injection site; how noisy that neighbourhood is."),
+        ("Position", "Where the point falls in the series, from 0 at the start "
+                     "to 1 at the end."),
+    ),
+    # Both consensus cards get all three: they are one stage, and the vocabulary
+    # is the stage's. A two-source aggregation reports no influence — leave-one-
+    # out is undefined there — but defining the word costs nothing and the card's
+    # own prose is what says whether it applied.
+    "rank_aggregation_robust": (
+        ("Influence", "How much the aggregated ranking changes when that source "
+                      "is left out."),
+        ("Agreement", "How similar the source's own ranking is to the aggregated "
+                      "ranking."),
+        ("Pattern", "The two read together: influential disagreer, redundant "
+                    "agreer, or consistent."),
+    ),
+}
+STAGE_TERMS["rank_aggregation_final"] = STAGE_TERMS["rank_aggregation_robust"]
+
 # The GAN test runs but has no explainability layer; the global IR records that
 # explicitly. Surfacing it as a stage with a reason beats an unexplained gap.
 GAN_STAGE = {"key": "gan", "title": "Robustness: GAN perturbations",
@@ -363,7 +1014,12 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             # not be a second, looser copy of them.
             "full": summary.get("extended") or summary.get("body") or narrative,
             "words": len(narrative.split()) if narrative else 0,
+            # The glossary itself now lives on the documentation page; the card
+            # keeps the one-line definitions and a pointer to the section
+            # holding the long form.
             "info": info,
+            "terms": [list(pair) for pair in STAGE_TERMS.get(stage["key"], ())],
+            "doc_section": DOC_SECTION_BY_STAGE.get(stage["key"]),
             "question": (ir_doc or {}).get("question"),
             "output": output,
             "caveats": [c.get("text") for c in ((ir_doc or {}).get("caveats") or [])],
@@ -434,6 +1090,41 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
         # the pipeline's own record of what happened, in its own numbers.
         "comprehensive": comprehensive_info(dataset, entity),
     }
+
+
+def documentation(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
+    """The stage documentation: one section per pipeline stage.
+
+    The text describes RAMSeS itself and is the same for every run, so it is
+    served straight from DOC_SECTIONS. The route stays per-entity because the
+    page carries a link back to the entity the reader came from, and because
+    the stage cards address it that way.
+
+    Returns None when the entity has no explanations at all, which is the one
+    thing that would make that back-link point at nothing.
+    """
+    ir_dir = paths.resolve_entity_dir(paths.EXPLANATIONS_IR, dataset, entity)
+    nl_dir = paths.resolve_entity_dir(paths.EXPLANATIONS_NL, dataset, entity)
+    if ir_dir is None and nl_dir is None:
+        return None
+    def _blocks(source):
+        # Lists and formulas are tuples in the registry; JSON wants arrays, and
+        # a copy keeps a caller from mutating the module-level text.
+        out = []
+        for block in source:
+            item = dict(block)
+            if "list" in item:
+                item["list"] = list(item["list"])
+            out.append(item)
+        return out
+
+    sections = [{"id": s["id"], "title": s["title"],
+                 "blocks": _blocks(s["blocks"]),
+                 "subsections": [{"id": sub["id"], "title": sub["title"],
+                                  "blocks": _blocks(sub["blocks"])}
+                                 for sub in s.get("subsections", ())]}
+                for s in DOC_SECTIONS]
+    return {"dataset": dataset, "entity": entity, "sections": sections}
 
 
 def entity_summary(dataset: str, entity: str) -> Optional[Dict[str, Any]]:

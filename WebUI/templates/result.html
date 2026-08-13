@@ -4,7 +4,8 @@
 {% block headeractions %}
 <a class="button" id="open-report" href="#" hidden
    title="The pipeline's own numeric report">Comprehensive results</a>
-<button id="toggle-all-info" type="button" title="Show or hide every glossary">ⓘ Definitions</button>
+<a class="button" id="open-docs" href="/docs/{{ dataset }}/{{ entity }}" target="_blank"
+   rel="noopener" title="What the terms on each stage mean">ⓘ Documentation</a>
 <button id="toggle-all-full" type="button" title="Expand or collapse every explanation">Expand all</button>
 {% endblock %}
 
