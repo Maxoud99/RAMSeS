@@ -245,6 +245,11 @@ a.button.primary:hover { filter: brightness(1.08); background: var(--accent); }
 .toggle input { margin: 0; accent-color: var(--accent); }
 .toggle:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .toggle:has(input:disabled) { opacity: .45; cursor: not-allowed; }
+/* Selectable, but nothing is on disk for it yet: picking it adds a training
+   phase to the run, so it is marked rather than dimmed like a dead control. */
+.toggle.untrained { border-style: dashed; }
+.toggle.untrained .detector { color: var(--text-muted); }
+.toggle.untrained:has(input:checked) .detector { color: var(--text); }
 .toggle .hint { font-size: var(--fs-xs); color: var(--text-muted); font-family: var(--font-mono); }
 .toggle .detector { font-family: var(--font-detector); letter-spacing: -0.02em; }
 

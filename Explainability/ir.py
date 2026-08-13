@@ -375,6 +375,7 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
                       blip_count: int,
                       state_fractions: Dict[str, float],
                       final_state: str,
+                      state_counts: Optional[Dict[str, int]] = None,
                       channel_names: Optional[Sequence[str]] = None,
                       n_channels: Optional[int] = None) -> Dict[str, Any]:
     """
@@ -451,10 +452,24 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     leaders = [str(r.get("leader")) for r in regimes if r.get("leader")]
     if regimes:
         counts: Dict[str, int] = {}
-        for lname in leaders:
+        spans: Dict[str, int] = {}
+        for r in regimes:
+            if not r.get("leader"):
+                continue
+            lname = str(r.get("leader"))
             counts[lname] = counts.get(lname, 0) + 1
-        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        led = _oxford([f"{m} led {c}" for m, c in ordered])
+            try:
+                spans[lname] = spans.get(lname, 0) + int(r.get("duration") or 0)
+            except (TypeError, ValueError):
+                spans.setdefault(lname, 0)
+        # Windows held, not regime count, and sorted by it — the same reasoning
+        # as the ranking stage's summary: four short spells are not more of the
+        # run than one long one, and a bare count reads as though they were.
+        ordered = sorted(counts.items(), key=lambda kv: (-spans.get(kv[0], 0), kv[0]))
+        led = _oxford([
+            f"{m} led {c} regime{'' if c == 1 else 's'}, spanning "
+            f"{spans.get(m, 0)} window{'' if spans.get(m, 0) == 1 else 's'}"
+            for m, c in ordered])
         blips = int(blip_count or 0)
         blip_txt = ("" if not blips else
                     f" {blips} brief blip window{'' if blips == 1 else 's'} "
@@ -463,7 +478,7 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
             "ts.regimes.summary", "regime_summary", "regimes",
             {"n_regimes": len(regimes), "n_windows": int(n_windows),
              "n_leaders": len(counts), "regimes_led": counts,
-             "blip_count": blips},
+             "windows_led": spans, "blip_count": blips},
             f"The {int(n_windows)} windows split into {len(regimes)} regimes led "
             f"by {len(counts)} different detectors: {led}.{blip_txt}", order=3))
         required.append("ts.regimes.summary")
@@ -577,11 +592,32 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     # ── How the run was spent ──
     if state_fractions:
         ordered_states = sorted(state_fractions.items(), key=lambda kv: -kv[1])
-        frac_txt = _oxford([f"{s.replace('_', ' ')} {_fmt(100.0 * f, 1)}% of the time"
-                            for s, f in ordered_states])
+
+        # Window counts only when the sampler's own tallies were passed. They
+        # could be derived from the shares, but a share times a window count is
+        # a rounded number, and a rounded number stated as a fact is exactly
+        # what this layer exists to avoid. Without them the sentence falls back
+        # to shares alone.
+        have_counts = bool(state_counts) and all(
+            s in state_counts for s, _f in ordered_states)
+        parts = []
+        for i, (s, f) in enumerate(ordered_states):
+            name, share = s.replace("_", " "), _fmt(100.0 * f, 1)
+            if not have_counts:
+                parts.append(f"{name} {share}% of the time")
+                continue
+            n = int(state_counts[s])
+            # "windows" on the first item only; after that the unit is carried,
+            # and repeating it turns a three-item list into a stutter.
+            unit = (f" window{'' if n == 1 else 's'}" if i == 0 else "")
+            parts.append(f"{name} for {n}{unit} ({share}%)")
+        frac_txt = _oxford(parts)
+        value: Dict[str, Any] = dict(state_fractions)
+        if have_counts:
+            value = {"fractions": dict(state_fractions),
+                     "windows": {s: int(state_counts[s]) for s, _f in ordered_states}}
         evidence.append(make_atom(
-            "ts.states.summary", "behavior_summary", "selection_states",
-            state_fractions,
+            "ts.states.summary", "behavior_summary", "selection_states", value,
             f"Over the {int(n_windows)} windows the sampler was in {frac_txt}.",
             order=200))
         required.append("ts.states.summary")

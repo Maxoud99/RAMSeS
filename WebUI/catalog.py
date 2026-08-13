@@ -235,11 +235,10 @@ def warnings() -> List[Dict[str, str]]:
     elif not Path(cfg["trained_model_path"]).is_dir():
         out.append({"code": "model_path_missing",
                     "text": f"trained_model_path does not exist: {cfg['trained_model_path']}"})
-    if cfg.get("overwrite"):
-        out.append({"code": "overwrite_on",
-                    "text": "Configs/config.yml sets overwrite: True, so every run retrains all "
-                            "base detectors from scratch. That is most of the runtime — set it to "
-                            "False to reuse existing checkpoints."})
+    # No warning for `overwrite: True` in the config file. The run form owns that
+    # choice — `build_argv` always passes --overwrite explicitly from the
+    # checkbox, so the config value never reaches a run started here, and the
+    # Options section already says what the checkbox costs.
     return out
 
 

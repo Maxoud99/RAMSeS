@@ -14,6 +14,9 @@ const ALL_STAGES = Object.keys(STAGE_LABELS);
 
 let catalog = null;
 let selectedDetectors = new Set();
+// name -> {available, family}, so the training banner can tell a picked
+// detector that exists on disk from one that has to be fitted first.
+let detectorInfo = new Map();
 
 function datasetOf() { return $("#dataset").value; }
 function entityOf() { return $("#entity").value; }
@@ -96,7 +99,12 @@ async function refreshDetectors() {
       (name) => ({ name, available: true, params: null }));
   }
 
+  // Only what is already on disk is selected by default. An untrained detector
+  // is still selectable — picking it trains its family first — but a run should
+  // not silently grow a training phase nobody asked for.
   selectedDetectors = new Set(detectors.filter((d) => d.available).map((d) => d.name));
+  detectorInfo = new Map(detectors.map(
+    (d) => [d.name, { available: !!d.available, family: d.family || d.name.split("_")[0] }]));
 
   const byFamily = {};
   detectors.forEach((d) => {
@@ -106,7 +114,6 @@ async function refreshDetectors() {
 
   box.replaceChildren(...Object.entries(byFamily).map(([family, members]) => {
     const inputs = [];
-    const selectable = members.filter((d) => d.available);
 
     // Clicking the family name toggles the whole family: if any member is
     // unchecked it selects them all, otherwise it clears them.
@@ -115,9 +122,8 @@ async function refreshDetectors() {
       style: "width: 6em; text-align: left; font-family: var(--font-detector);",
       title: `Select or clear every ${family} detector`,
       onclick: () => {
-        const turnOn = selectable.some((d) => !selectedDetectors.has(d.name));
+        const turnOn = members.some((d) => !selectedDetectors.has(d.name));
         inputs.forEach((input) => {
-          if (input.disabled) return;
           input.checked = turnOn;
           if (turnOn) selectedDetectors.add(input.value);
           else selectedDetectors.delete(input.value);
@@ -128,8 +134,7 @@ async function refreshDetectors() {
 
     const chips = members.map((d) => {
       const input = el("input", {
-        type: "checkbox", value: d.name,
-        checked: d.available, disabled: !d.available,
+        type: "checkbox", value: d.name, checked: d.available,
         onchange: () => {
           if (input.checked) selectedDetectors.add(d.name);
           else selectedDetectors.delete(d.name);
@@ -138,8 +143,10 @@ async function refreshDetectors() {
       });
       inputs.push(input);
       return el("label", {
-        class: "toggle",
-        title: d.available ? "" : "No trained model for this entity",
+        class: d.available ? "toggle" : "toggle untrained",
+        title: d.available ? ""
+          : `${d.name} has no trained model for this entity — selecting it trains `
+            + `the ${d.family || d.name.split("_")[0]} family first.`,
       }, input, el("span", { class: "detector", text: d.name }),
          d.params && d.params.label
            ? el("span", { class: "hint", text: d.params.label }) : null);
@@ -148,6 +155,37 @@ async function refreshDetectors() {
     return el("div", { class: "row" }, familyButton, ...chips);
   }));
   onChange();
+}
+
+/* What a run would have to train before it could start.
+ *
+ * Training is per FAMILY, not per detector (Utils/pipeline_spec.families_for),
+ * so ticking one untrained detector trains its whole hyperparameter grid. That
+ * is the difference between a two-minute run and a long one, so it is stated
+ * before the click rather than discovered in the log. */
+function renderTrainingBanner() {
+  const banner = $("#training-banner");
+  if (!banner) return;
+  const families = [];
+  for (const name of selectedDetectors) {
+    const info = detectorInfo.get(name);
+    if (info && !info.available && !families.includes(info.family)) families.push(info.family);
+  }
+  banner.hidden = !families.length;
+  if (!families.length) return;
+
+  // Every member of a trained family, not just the ones ticked: the trainer
+  // fits the whole grid either way.
+  const willTrain = [...detectorInfo.entries()]
+    .filter(([, info]) => families.includes(info.family))
+    .map(([name]) => name);
+  const plural = families.length === 1 ? "family" : "families";
+  banner.replaceChildren(
+    el("strong", { text: "Training first." }),
+    el("span", { text: ` This run trains the ${families.join(" and ")} ${plural} `
+      + `before it starts the selection, because you picked at least one detector `
+      + `that wasn't trained for this entity yet. Training is per family, so all of `
+      + `${willTrain.join(", ")} are fitted.` }));
 }
 
 function renderStages() {
@@ -225,6 +263,7 @@ function onChange() {
   if (tooFew) $("#detector-error").textContent = "Select at least two detectors.";
   $("#start").disabled = tooFew || !selectedStages().length || !entityOf();
 
+  renderTrainingBanner();
   renderPartialBanner();
   clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 150);

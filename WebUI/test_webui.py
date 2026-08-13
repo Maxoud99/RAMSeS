@@ -1266,8 +1266,11 @@ class TestCatalog(unittest.TestCase):
     def test_case_insensitive_entity_lookup(self):
         self.assertTrue(any(d["available"] for d in catalog.detectors_for("skab", "7")))
 
-    def test_overwrite_warning_is_surfaced(self):
-        self.assertIn("overwrite_on", [w["code"] for w in catalog.warnings()])
+    def test_config_overwrite_is_not_warned_about(self):
+        """`overwrite: True` in the config file never reaches a run started from
+        the form — build_argv always passes --overwrite from the checkbox — so
+        warning about it described a state the UI cannot produce."""
+        self.assertNotIn("overwrite_on", [w["code"] for w in catalog.warnings()])
 
     def test_valid_datasets_matches_the_loader(self):
         """The list is copied rather than imported (importing Datasets.load
@@ -1441,14 +1444,20 @@ class TestPlots(unittest.TestCase):
 
     def test_aggregation_is_glob_driven(self):
         """_kendall_only only exists for two-source aggregations, so the set is
-        whatever is on disk rather than a fixed list."""
+        whatever is on disk rather than a fixed list.
+
+        The final stage shows only its agreement-only figure: it merges two
+        sources, where leave-one-out and Borda are degenerate, so the standard
+        figure's influence bars carry no information there. The robust stage has
+        six sources and keeps its own.
+        """
         self._touch("robust_aggregated/SKAB/7/aggregation_explainability_final_0.png")
         self._touch("robust_aggregated/SKAB/7/aggregation_explainability_final_kendall_only_0.png")
         self._touch("robust_aggregated/SKAB/7/aggregation_explainability_robust_0.png")
         final, _ = self.plots._aggregation("SKAB", "7", "final")
         robust, _ = self.plots._aggregation("SKAB", "7", "robust")
-        self.assertEqual(len(final), 2)
-        self.assertEqual(len(robust), 1)
+        self.assertEqual([f["title"] for f in final], ["Agreement only (two sources)"])
+        self.assertEqual([f["title"] for f in robust], ["Robust aggregation"])
 
     def test_large_galleries_are_described_not_listed(self):
         self._touch("Thomposon/SKAB/7/expected_rewards_50.png")
@@ -1970,6 +1979,14 @@ class TestRoutes(ArtifactTreeCase):
         for path in ("/", "/result/SKAB/7", "/report/SKAB/7", "/docs/SKAB/7"):
             html = self.client.get(path).get_data(as_text=True)
             self.assertEqual(html.count("js/dom.js"), 0, path)
+
+    def test_configure_page_has_the_training_banner_slot(self):
+        """configure.js writes the "this run trains first" warning into
+        #training-banner and returns silently when it is missing, so the element
+        drifting out of the template would remove the warning without failing
+        anything."""
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertIn('id="training-banner"', html)
 
     def test_pages_render(self):
         self.assertEqual(self.client.get("/").status_code, 200)

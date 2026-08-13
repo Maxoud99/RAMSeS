@@ -38,10 +38,12 @@
         </div>
       </div>
       <p class="muted small" style="margin:0;">
-        Only the families you pick are trained. At least two are required — with one there
-        is nothing to select between.
+        Pick the detector pool for the run. A dashed outline means the detector is not
+        trained for this entity yet; picking it trains its family before the run starts.
+        At least two are required.
       </p>
       <div id="detectors" class="stack"></div>
+      <p id="training-banner" class="banner banner-warn" hidden></p>
       <p id="detector-error" class="banner banner-error" hidden></p>
     </section>
 

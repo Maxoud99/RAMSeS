@@ -2105,6 +2105,9 @@ def explain_thompson_sampling(
             shifts=regime_shifts,
             blip_count=len(blip_windows),
             state_fractions={s: state_counts[s] / state_total for s in state_counts},
+            # The tallies as well as the shares: the IR states both, and a share
+            # rounded back to a window count can be one out on a long run.
+            state_counts={s: int(state_counts[s]) for s in state_counts},
             final_state=selection_states[-1] if selection_states else "not_available",
             # Channel names when the loader supplied them; the IR falls back to
             # "channel N" for datasets whose sources have no column headers.

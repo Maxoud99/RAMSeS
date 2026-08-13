@@ -161,6 +161,7 @@ def _thompson_kwargs():
                  "reward_delta": 0.2, "regime_length": 3}],
         blip_count=1,
         state_fractions={"random": 0.2, "exploitation": 0.6, "informed_exploration": 0.2},
+        state_counts={"random": 1, "exploitation": 3, "informed_exploration": 1},
         final_state="exploitation",
     )
 
@@ -297,10 +298,41 @@ class TestBuilders(unittest.TestCase):
                       by_id["ts.regimes.summary"]["text"])
         self.assertIn("blip window", by_id["ts.regimes.summary"]["text"])
 
-        # States are narrated as shares, best-first; no final-state atom.
-        self.assertIn("exploitation 60.0% of the time",
-                      by_id["ts.states.summary"]["text"])
+        # States are narrated best-first as a window count and a share; no
+        # final-state atom. The unit is written once and then carried.
+        self.assertEqual(
+            by_id["ts.states.summary"]["text"],
+            "Over the 6 windows the sampler was in exploitation for 3 windows "
+            "(60.0%), random for 1 (20.0%), and informed exploration for 1 "
+            "(20.0%).")
         self.assertNotIn("ts.states.final", by_id)
+
+    def test_thompson_states_fall_back_to_shares_without_counts(self):
+        """A count derived from a share is a rounded number, and rounding is
+        what this layer exists to keep out of the prose — 60% of 6 windows is
+        3.6, not 4. Without the sampler's own tallies the sentence stays a
+        share."""
+        kwargs = _thompson_kwargs()
+        kwargs.pop("state_counts")
+        doc = ir.build_thompson_ir("DS", "e1", **kwargs)
+        by_id = {a["id"]: a for a in doc["evidence"]}
+        self.assertEqual(
+            by_id["ts.states.summary"]["text"],
+            "Over the 6 windows the sampler was in exploitation 60.0% of the "
+            "time, random 20.0% of the time, and informed exploration 20.0% of "
+            "the time.")
+
+    def test_thompson_regime_summary_states_windows_held(self):
+        """Regime count alone reads as though four short spells were more of the
+        run than one long one, so each leader carries the windows it held and
+        the list is ordered by them — the same rule the ranking stage uses."""
+        doc = ir.build_thompson_ir("DS", "e1", **_thompson_kwargs())
+        by_id = {a["id"]: a for a in doc["evidence"]}
+        text = by_id["ts.regimes.summary"]["text"]
+        self.assertIn("A led 1 regime, spanning 3 windows", text)
+        self.assertIn("B led 1 regime, spanning 3 windows", text)
+        self.assertEqual(by_id["ts.regimes.summary"]["value"]["windows_led"],
+                         {"A": 3, "B": 3})
 
         # The per-regime split, the shift atoms and the blip atom are gone.
         for stale in ("ts.regime.0.span", "ts.regime.0.shap", "ts.regime.0.pref",

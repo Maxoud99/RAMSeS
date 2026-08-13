@@ -145,21 +145,27 @@ class TrainModels(object):
 
 
 
-        files_list = []
-
-        for root, dirs, files in os.walk(self.img_dir):
-            files_list = files
-            break
-
-        # Check existing models (based on .png files)
-        exist_model_list = list(set([i.split('_')[0] for i in files_list if i.endswith('png') and not i.startswith('data')]))
-        logger.info(f'exist_model_list is {exist_model_list}')
-        
-        # If overwrite=True, ignore existing models and retrain everything
+        # No family-level skip list any more.
+        #
+        # This used to read the .png files in the directory, take everything
+        # before the first underscore, and skip that whole family. Two problems.
+        # It was a DIFFERENT signal from the one everything else uses — the web
+        # UI, and `Logger.check_file_exists` below, both read `.pth` — so a
+        # detector could be reported as untrained and then skipped by the
+        # trainer. And it was all-or-nothing per family: one LOF checkpoint on
+        # disk meant LOF_2..LOF_4 were never trained, which is the state five of
+        # the entities here are actually in.
+        #
+        # Every train_* method already checks `check_file_exists` per instance
+        # before fitting, on `.pth`, and honours `self.overwrite` while doing it.
+        # So the coarse gate was redundant with a correct check that sits one
+        # level down; dropping it lets a partially trained family fill itself in,
+        # and costs an already-complete family only the call that then skips
+        # every instance.
         if self.overwrite:
             logger.info('Overwrite=True: Retraining all models regardless of existing files')
-            exist_model_list = []  # Empty list = train everything
-        
+        exist_model_list = []
+
         for model_name in model_architectures:
             # if no cache train model
             if ('DGHL' == model_name) & (model_name not in exist_model_list):

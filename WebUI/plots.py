@@ -450,6 +450,13 @@ def _aggregation(ds, ent, which):
     headline = []
     for path in _ls(d, f"aggregation_explainability_{which}_*.png"):
         kendall = "kendall_only" in path.name
+        # The final stage merges exactly two sources, where leave-one-out and
+        # Borda are degenerate — dropping one leaves the other unchanged. Its
+        # standard figure therefore plots influence bars that mean nothing, so
+        # only the agreement-only companion is shown there. The robust stage has
+        # six sources and keeps both.
+        if which == "final" and not kendall:
+            continue
         headline.append(_fig(
             path,
             "Agreement only (two sources)" if kendall else f"{which.capitalize()} aggregation",
