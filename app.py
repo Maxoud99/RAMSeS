@@ -349,7 +349,22 @@ def load_trained_models(model_names, models_dir):
             logger.warning(f"Model {name} not found in {models_dir}, skipping")
             continue
         with open(path, 'rb') as fh:
-            model = t.load(fh, weights_only=False)
+            # map_location: checkpoints trained on a GPU box carry CUDA storages
+            # and fail to unpickle at all on a CPU-only machine.
+            model = t.load(fh, weights_only=False, map_location='cpu')
+            # …and that is only half of it. MD, LSTMVAE and DGHL also pickle
+            # `device = cuda` as plain state, so their forward passes went on
+            # allocating CUDA tensors after map_location had moved every weight
+            # to the CPU, and every one of them died on "Torch not compiled with
+            # CUDA enabled". Redirecting the attribute (and any submodule that
+            # came with it) is what actually makes a GPU-trained checkpoint
+            # runnable here; it is a no-op when CUDA is present or the model
+            # never carried a device.
+            if not t.cuda.is_available() and str(getattr(model, 'device', 'cpu')) != 'cpu':
+                model.device = t.device('cpu')
+                for attribute in vars(model).values():
+                    if isinstance(attribute, t.nn.Module):
+                        attribute.to('cpu')
             try:
                 model.eval()
             except AttributeError:

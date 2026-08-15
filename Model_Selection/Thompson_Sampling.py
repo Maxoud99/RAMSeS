@@ -15,7 +15,7 @@ from scipy.stats import multivariate_normal
 
 from Metrics.Ensemble_GA import evaluate_individual_models
 from Metrics.Ensemble_GA import evaluate_model_consistently
-from Metrics.metrics import prauc, f1_score
+from Metrics.metrics import prauc, range_based_precision_recall_f1_auc
 
 
 def _ir_module():
@@ -763,10 +763,37 @@ def fit_linear_thompson_sampling(dataset,
             y_true, y_scores, y_true_dict, y_scores_dict = evaluate_model_consistently(dataset, chosen_model,
                                                                                        chosen_model_name)
 
-            # _, _, f1, pr_auc, *_ = range_based_precision_recall_f1_auc(y_true, y_scores)
-            f1, precision, recall, TP, TN, FP, FN = f1_score(y_scores, y_true)
-            # f1, precision, recall, TP, TN, FP, FN = f1_soft_score(y_scores, y_true)
-            # f1 = get_composite_fscore_raw(y_scores, y_true)
+            # `f1_score` counts TP as `sum(predict * actual)`, so it is an F1 only
+            # when `predict` is 0/1. This line used to hand it raw `entity_scores`,
+            # and the arithmetic still ran — it just stopped measuring anything:
+            # `1 - predict` became `1 - 0.83`, and `precision` reduced to
+            # `sum(s*y) / sum(s)`, which has no bound once a score can be negative.
+            #
+            # LSTMVAE is the one detector that makes it negative. Its score is a
+            # Gaussian NLL, 0.5*(log(var) + (y-mu)^2/var), and the log term goes
+            # below zero whenever the predicted sigma is under 1 — measured on
+            # skab/1, sigma stays in [0.127, 0.657], so 71.9% of timesteps score
+            # negative. That drove sum(s) toward zero and the ratio through it:
+            # the "F1" reached 8.52 and the reward 4.32, where both belong in
+            # [0, 1]. LinTS absorbed the inflated reward, and `rank_models` scores
+            # by ||mu||^2, which squares it — LSTMVAE took the top four ranking
+            # slots on an entity where it is the worst of the twelve by every
+            # honest metric (full-series reward 0.023-0.029 vs RNN's 0.060-0.066).
+            #
+            # The range-based metric thresholds internally over its own sweep, so
+            # it never sees a raw score as a prediction, and it is what the other
+            # seven call sites use (Monte_Carlo_Simulation:99, off_by:200,
+            # GAN_test:251, Adversarial_testing:74, model_stress_testing:177,
+            # Ensemble_GA:269, ranking_metrics:83). Thompson was the only stage
+            # that did not. Cost is linear in window length and it runs once per
+            # window, for the chosen detector only: 44 ms/call on skab's 4-step
+            # windows (~5 s per run) and 488 ms on SMD's 47-step windows (~49 s).
+            #
+            # pr_auc is left on `prauc` — it was never affected by this, and it is
+            # a different (point-adjusted) metric, so moving it would shift results
+            # for a reason unrelated to the defect. Taking both from the one call
+            # would match the other stages exactly and save a sweep.
+            _, _, f1, _range_pr_auc, _ = range_based_precision_recall_f1_auc(y_true, y_scores)
 
             pr_auc = prauc(y_true, y_scores)
             reward = calculate_reward(f1, pr_auc, f1_weight, pr_auc_weight)

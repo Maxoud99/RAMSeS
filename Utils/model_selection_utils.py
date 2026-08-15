@@ -16,6 +16,7 @@ from Loaders.loader import Loader
 from Datasets.dataset import Dataset, Entity
 from Algorithms.base_model import PyMADModel
 from Model_Selection.inject_anomalies import InjectAnomalies
+from Utils.pipeline_spec import TRANSDUCTIVE_FAMILIES, TSBAD_FAMILIES
 from Utils.utils import de_unfold
 from Model_Training.hyperparameter_grids import *
 from Model_Selection.anomaly_parameters import ANOMALY_PARAM_GRID
@@ -76,6 +77,40 @@ def predict(batch: dict, model_name: str,
 # Functions to compute observations necessary to compute
 # ranking metrics
 ######################################################
+
+
+# Detector families whose scoring code asserts a batch of exactly one window.
+_SINGLE_WINDOW_MODELS = frozenset({"RNN", "RM"})
+
+# The opposite constraint: families that cut their own subsequences out of what
+# they are handed, so a batch shorter than their internal window has nothing to
+# cut. LSTMAD builds (window, next-step) pairs and raises "negative dimensions
+# are not allowed" on a batch of 10 when its window is 25. It is inductive — the
+# same row scores identically whatever it travels with — so handing it the whole
+# series in one batch changes no result, it only removes the boundary.
+#
+# Every TSB-AD family except POLY is here for that same reason: each takes the
+# whole series and cuts `detector__win_size` subsequences from it internally
+# (KMeansAD via `sliding_window_view`, the six neural networks via
+# `ReconstructDataset`). All of them store fit state — cluster centroids, network
+# weights — so they too are inductive and one batch only removes the boundary.
+# POLY is excluded because it belongs in the set below instead: it does not
+# merely prefer one call, its score is DEFINED by the call's rows.
+_WHOLE_SERIES_MODELS = frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - TRANSDUCTIVE_FAMILIES)
+
+# A third reason to hand over the whole series, and the only one where doing so
+# CHANGES the answer rather than merely tidying it. COF, SOS and
+# SpectralResidual score each row against the other rows of the same call, so
+# batching would make a score depend on where `eval_batch_size` happened to cut
+# — the same window scored 1.003744 and 0.966958 under COF in two batches. One
+# call per entity is what makes the score a deterministic function of
+# (entity, row), which is the condition on which they were admitted.
+#
+# Kept separate from _WHOLE_SERIES_MODELS on purpose: that set's justification
+# is "one batch changes no result, it only removes the boundary", and for these
+# three that sentence is false. Same expression, different reason, and merging
+# them would lose the reason.
+_TRANSDUCTIVE_MODELS = TRANSDUCTIVE_FAMILIES
 
 
 def evaluate_model(data: Union[Dataset, Entity],
@@ -139,9 +174,25 @@ def evaluate_model(data: Union[Dataset, Entity],
 
     # CRITICAL FIX: Use model-specific batch size for models like RNN that require batch_size=1
     model_type = model_name.split('_')[0]
-    if model_type == 'RNN':
-        # RNN has a hardcoded assertion: batch_size must be 1
+    if model_type in _SINGLE_WINDOW_MODELS:
+        # Both assert it in their own scoring code — `assert batch_size == 1` in
+        # Algorithms/rnn.py, `assert n_batches == 1` in running_mean.py — and
+        # both ship `eval_batch_size: [1]` in their training grids. RM was
+        # missing from this list, so it raised on every evaluation.
         eval_batch_size = 1
+    elif model_type in _WHOLE_SERIES_MODELS or model_type in _TRANSDUCTIVE_MODELS:
+        # One batch covering everything. `data_length` alone is not enough: the
+        # loader right-pads before cutting, so a 219-timestep series at window 1
+        # yields 220 windows and a batch size of 219 leaves a trailing batch of
+        # one — which is exactly the case LSTMAD cannot score. The padding adds
+        # at most one window's worth.
+        #
+        # For the transductive three this is not a convenience but the
+        # definition of their score: batching them would make a row's score
+        # depend on which other rows shared its batch. This assignment is
+        # unconditional and happens before the Loader, so a caller passing
+        # `eval_batch_size=128` from `get_eval_batchsizes` cannot undo it.
+        eval_batch_size = max(1, data_length + model_window_size)
     
     dataloader = Loader(dataset=data,
                         batch_size=eval_batch_size,
@@ -192,15 +243,34 @@ def evaluate_model(data: Union[Dataset, Entity],
         step += batch_size
 
     # Final Anomaly Scores and forecasts
-    entity_scores = model.final_anomaly_score(
-        input=entity_scores, return_detail=False
-    )  # return_detail = False averages the anomaly scores across features.
-    entity_scores = entity_scores.detach().cpu().numpy()
+    #
+    # De-unfolding has to use the step the LOADER cut the windows with, which is
+    # `model_window_step` — not the raw `model.window_step`. The two differ for a
+    # whole-series model: RNN and RM ship `window_size = window_step = -1`,
+    # meaning "one window over everything", and the resolution above turns that
+    # into (len(series), len(series)//4). `final_anomaly_score` then read the raw
+    # -1 off the model and reassembled 2 windows of 3000 into 6000 timesteps,
+    # which after padding removal came out as 5250 scores against 3000 labels —
+    # the ValueError that made RNN unusable.
+    #
+    # The attribute is swapped rather than the call bypassed because each model
+    # overrides `final_anomaly_score` (NN re-wraps its input), and restored
+    # because the same model object is evaluated again later on data of a
+    # different length, where -1 has to resolve afresh.
+    saved_window_step = model.window_step
+    model.window_step = model_window_step
+    try:
+        entity_scores = model.final_anomaly_score(
+            input=entity_scores, return_detail=False
+        )  # return_detail = False averages the anomaly scores across features.
+        entity_scores = entity_scores.detach().cpu().numpy()
 
-    Y_hat = de_unfold(windows=Y_hat, window_step=model.window_step)
-    Y = de_unfold(windows=Y, window_step=model.window_step)
-    Y_sigma = de_unfold(windows=Y_sigma, window_step=model.window_step)
-    mask = de_unfold(windows=mask, window_step=model.window_step)
+        Y_hat = de_unfold(windows=Y_hat, window_step=model_window_step)
+        Y = de_unfold(windows=Y, window_step=model_window_step)
+        Y_sigma = de_unfold(windows=Y_sigma, window_step=model_window_step)
+        mask = de_unfold(windows=mask, window_step=model_window_step)
+    finally:
+        model.window_step = saved_window_step
 
     # Remove extra padding from Anomaly Scores and forecasts
     entity_scores = _adjust_scores_with_padding(

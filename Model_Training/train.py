@@ -17,6 +17,7 @@ import numpy as np
 import torch as t
 from Algorithms.alad import TsadALAD
 from Algorithms.pyod_model import PyodModel
+from Algorithms.tsbad_model import TSBADModel
 from .hyperparameter_grids import *  # DGHL_TRAIN_PARAM_GRID, DGHL_PARAM_GRID, MD_TRAIN_PARAM_GRID, MD_PARAM_GRID, RM_PARAM_GRID, RM_TRAIN_PARAM_GRID, NN_PARAM_GRID, NN_TRAIN_PARAM_GRID, LSTMVAE_TRAIN_PARAM_GRID, LSTMVAE_PARAM_GRID, RNN_TRAIN_PARAM_GRID, RNN_PARAM_GRID
 from Model_Training.training_args import TrainingArguments
 from Model_Training.trainer import Trainer
@@ -24,6 +25,7 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 from Utils.logger import Logger
+from Utils.pipeline_spec import TRANSDUCTIVE_FAMILIES, TSBAD_FAMILIES
 from Datasets.load import load_data
 from Loaders.loader import Loader
 # Import all the algorithm here!
@@ -127,6 +129,30 @@ class TrainModels(object):
         self._VALID_MODEL_ARCHITECTURES = algorithm_list
         self.batch_size=8
 
+    def _diagnostic_batch_size(self, family: str, window_size: int) -> int:
+        """Batch size for the post-fit `.png` loop, which runs `model.forward`.
+
+        `self.batch_size` is 8, and for the transductive families that is not
+        merely suboptimal but fatal: COF raises IndexError on any call holding
+        fewer rows than its `n_neighbors` (20), and SpectralResidual raises on a
+        batch of exactly 2 and returns three scores for a batch of 1. The loop
+        runs BEFORE `logging_obj.save`, so the raise means no checkpoint is
+        written at all — these families could not be trained.
+
+        The TSB-AD families need it for the same practical reason and a
+        different cause: each cuts `detector__win_size` subsequences (30-100
+        timesteps) out of whatever call it is given, and eight rows contain no
+        such subsequence.
+
+        Handing them the whole series in one batch fixes it and matches how
+        `Utils.model_selection_utils.evaluate_model` scores them, so the picture
+        the plot shows is the scoring the pipeline will actually do. Same `+
+        window_size` slack as there, for the loader's right-padding.
+        """
+        if family.upper() not in TRANSDUCTIVE_FAMILIES | TSBAD_FAMILIES:
+            return self.batch_size
+        n_time = max(e.Y.shape[1] for e in self.test_data.entities)
+        return max(1, n_time + max(1, int(window_size)))
 
     def train_models(self, model_architectures: List[str] = 'all'):
         """Function to selected algorithm.
@@ -200,6 +226,8 @@ class TrainModels(object):
                 self.train_sos()
             elif ('ALAD' == model_name) & (model_name not in exist_model_list):
                 self.train_alad()
+            elif (model_name.upper() in TSBAD_FAMILIES) & (model_name not in exist_model_list):
+                self.train_tsbad(model_name)
             elif (model_name not in exist_model_list):
                 self.train_pyod(model_name)
 
@@ -554,7 +582,8 @@ class TrainModels(object):
 
                 test_dataloader = Loader(
                     dataset=self.test_data,
-                    batch_size=self.batch_size,
+                    batch_size=self._diagnostic_batch_size(
+                        'COF', model_hyper_params['window_size']),
                     window_size=model_hyper_params['window_size'],
                     window_step=model_hyper_params['window_step'],
                     shuffle=False,
@@ -1088,7 +1117,8 @@ class TrainModels(object):
 
                 test_dataloader = Loader(
                     dataset=self.test_data,
-                    batch_size=self.batch_size,
+                    batch_size=self._diagnostic_batch_size(
+                        'SOS', model_hyper_params['window_size']),
                     window_size=model_hyper_params['window_size'],
                     window_step=model_hyper_params['window_step'],
                     shuffle=False,
@@ -1199,15 +1229,51 @@ class TrainModels(object):
                                       },
                                       obj_class=self.logging_hierarchy)
 
-    def train_pyod(self,model_name:str,batch_size=32):
+    def train_pyod(self, model_name: str, batch_size=32):
+        # A family may bring its own grid: the PyOD 3 time-series detectors need
+        # a different subsequence length and a lower epoch count than the shared
+        # contamination sweep, and AutoEncoder varies its architecture.
+        # Everything else keeps PYOD_PARAM_GRID.
+        grid = PYOD_MODEL_GRIDS.get(model_name.upper(), PYOD_PARAM_GRID)
+        self._train_wrapped(PyodModel, model_name, grid, batch_size)
+
+    def train_tsbad(self, model_name: str, batch_size=32):
+        """The TSB-AD families, over the vendored code in `Algorithms/tsb_ad`.
+
+        Identical to `train_pyod` but for the wrapper class and the grid table:
+        `TSBADModel` takes the same constructor arguments as `PyodModel` exactly
+        so one loop can train both. Every TSB-AD family must have its own grid —
+        no two of these detectors take the same parameters, so there is no
+        shared default to fall back to.
+        """
+        grid = TSBAD_MODEL_GRIDS.get(model_name.upper())
+        if grid is None:
+            raise ValueError(
+                f"No hyperparameter grid for TSB-AD family {model_name}. "
+                f"Known: {', '.join(sorted(TSBAD_MODEL_GRIDS))}")
+        self._train_wrapped(TSBADModel, model_name, grid, batch_size)
+
+    def _train_wrapped(self, model_cls, model_name: str, grid: dict, batch_size=32):
+        """Train every instance of a family whose detector lives behind a wrapper.
+
+        Shared by `train_pyod` and `train_tsbad`, which differ only in which
+        wrapper class they build and where they look the grid up. Both wrappers
+        take `(model_name, **framework_params, detector_kwargs=...)`.
+        """
         MODEL_ID = 0
-        model_hyper_param_configurations = list(ParameterGrid(PYOD_PARAM_GRID))
+        upper_model_name = model_name.upper()
+        model_hyper_param_configurations = list(ParameterGrid(grid))
         train_hyper_param_configurations = list(
             ParameterGrid(PYOD_TRAIN_PARAM_GRID))
-        upper_model_name = model_name.upper()
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
-                model = PyodModel(model_name,**model_hyper_params)
+                # `detector__x` is the PyOD estimator's own parameter x; the rest
+                # are the framework's. Both spell some of them the same way.
+                framework = {k: v for k, v in model_hyper_params.items()
+                             if not k.startswith('detector__')}
+                detector = {k[len('detector__'):]: v for k, v in model_hyper_params.items()
+                            if k.startswith('detector__')}
+                model = model_cls(model_name, **framework, detector_kwargs=detector)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
@@ -1235,7 +1301,8 @@ class TrainModels(object):
 
                 test_dataloader = Loader(
                     dataset=self.test_data,
-                    batch_size=self.batch_size,
+                    batch_size=self._diagnostic_batch_size(
+                        model_name, model_hyper_params['window_size']),
                     window_size=model_hyper_params['window_size'],
                     window_step=model_hyper_params['window_step'],
                     shuffle=False,

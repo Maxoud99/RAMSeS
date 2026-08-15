@@ -200,9 +200,9 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         )},
         {"id": "ga-meta-use",
          "title": "From detector scores to one prediction", "blocks": (
-            {"text": "For a point in time-series, each detector has a score "
-                     "between 0 and 1 as output, which is the predicted "
-                     "probability that the point is an anomaly. Meta-learner "
+            {"text": "For a point in time-series, every detector has an "
+                     "anomaly score as output, which is in different units for "
+                     "each detector. Meta-learner "
                      "gets the output of all of the level-0 detectors that are "
                      "in the subset as input and produces its own predicted "
                      "probability that the point is an anomaly. It must be "

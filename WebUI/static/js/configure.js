@@ -83,6 +83,126 @@ function renderEntities() {
   select.size = 1;
 }
 
+/* Paper Table I group -> css suffix. Unknown or missing becomes "none", which
+ * has no colour rule, so a family added without a group degrades to the plain
+ * chip rather than to a broken class name. */
+function groupClass(group) {
+  return String(group || "none").toLowerCase();
+}
+
+/* Group -> the detector names in it, rebuilt whenever the entity changes.
+ * `syncGroupButtons` reads it on every selection change to decide which buttons
+ * are lit, so it has to outlive the render that created the buttons. */
+let groupMembers = new Map();
+
+/* One select-all button per group, built from what the API reports rather than
+ * from a list here, so a group added to DETECTOR_GROUPS appears with no change
+ * to this file. A group with no detectors in the pool (FM today) is rendered
+ * disabled rather than hidden: the taxonomy is the paper's, and showing where
+ * a future foundation model would land is more use than silently omitting it.
+ *
+ * The buttons are toggles, not one-way selects: a second click clears the group
+ * again. They carry aria-pressed rather than a checkbox because they act on a
+ * set of chips that each have their own checkbox — a fourth checkbox governing
+ * the other twelve reads as a member of the same list rather than a control
+ * over it. */
+function renderGroupButtons(detectors) {
+  const box = $("#detector-groups");
+  if (!box) return;
+  const order = [];
+  groupMembers = new Map();
+  detectors.forEach((d) => {
+    const group = d.group;
+    if (!group) return;
+    if (!groupMembers.has(group)) { groupMembers.set(group, []); order.push(group); }
+    groupMembers.get(group).push(d.name);
+  });
+  for (const group of (catalog.detector_groups || [])) {
+    if (!groupMembers.has(group)) { groupMembers.set(group, []); order.push(group); }
+  }
+  const labels = (catalog && catalog.group_labels) || {};
+  box.replaceChildren(...order.map((group) => {
+    const names = groupMembers.get(group);
+    const label = labels[group] || group;
+    return el("button", {
+      type: "button",
+      class: `small grp-${groupClass(group)}`,
+      "data-group": group,
+      "aria-pressed": "false",
+      disabled: names.length === 0,
+      title: names.length
+        ? `Select or clear all ${names.length} ${label} detectors`
+        : `No ${label} detectors in the pool yet`,
+      onclick: () => {
+        // Same rule as the family button: if any member is unselected, select
+        // the whole group; if they are all selected, clear it.
+        const turnOn = names.some((n) => !selectedDetectors.has(n));
+        $$("#detectors input").forEach((input) => {
+          if (input.disabled || !names.includes(input.value)) return;
+          input.checked = turnOn;
+          if (turnOn) selectedDetectors.add(input.value);
+          else selectedDetectors.delete(input.value);
+        });
+        onChange();
+      },
+    }, label);
+  }));
+  syncGroupButtons();
+}
+
+/* A group reads as chosen only when every one of its detectors is. Anything
+ * less is "partial", which is not the same claim and gets its own state — a
+ * button that lit up on one chip out of fifteen would be telling the reader
+ * the group is selected when it is not. */
+function syncGroupButtons() {
+  $$("#detector-groups button").forEach((button) => {
+    const names = groupMembers.get(button.dataset.group) || [];
+    const chosen = names.filter((n) => selectedDetectors.has(n)).length;
+    const all = names.length > 0 && chosen === names.length;
+    button.setAttribute("aria-pressed", all ? "true" : "false");
+    button.classList.toggle("is-on", all);
+    button.classList.toggle("is-partial", chosen > 0 && !all);
+  });
+}
+
+/* One info circle per family, listing every instance's hyperparameters.
+ *
+ * These used to sit on the chips themselves, which spent a line of the row on
+ * four near-identical strings ("contamination 0.1", "0.15", "0.2", "0.25") to
+ * make a distinction the reader almost never acts on. Per family they are one
+ * hover away and, grouped together, they answer the question the reader
+ * actually has — what separates LOF_1 from LOF_4 — which four scattered chips
+ * never did.
+ *
+ * The circle sits beside the family button rather than inside a chip's <label>,
+ * so hovering or clicking it cannot toggle a checkbox.
+ */
+function familyParams(family, members) {
+  const lines = members.map((d) => {
+    // An untrained instance still has hyperparameters — the grid defines them
+    // whether or not a checkpoint exists — so it is named like the rest and
+    // only marked as not yet on disk.
+    const suffix = d.available ? "" : "  (untrained)";
+    if (!d.params) return `${d.name}: no parameters recorded${suffix}`;
+    const parts = [];
+    if (d.params.label) parts.push(d.params.label);
+    if (d.params.window_size !== null && d.params.window_size !== undefined) {
+      parts.push(`window ${d.params.window_size}`);
+    }
+    if (d.params.window_step !== null && d.params.window_step !== undefined) {
+      parts.push(`step ${d.params.window_step}`);
+    }
+    return `${d.name}: ${parts.length ? parts.join(", ") : "no varying parameter"}${suffix}`;
+  });
+  return el("span", {
+    class: "paraminfo",
+    tabindex: "0",                     // reachable without a mouse
+    role: "note",
+    "aria-label": `Hyperparameters of the ${family} instances: ${lines.join("; ")}`,
+    "data-tip": lines.join("\n"),
+  }, "i");
+}
+
 async function refreshDetectors() {
   const dataset = datasetOf(), entity = entityOf();
   const box = $("#detectors");
@@ -99,12 +219,15 @@ async function refreshDetectors() {
       (name) => ({ name, available: true, params: null }));
   }
 
-  // Only what is already on disk is selected by default. An untrained detector
-  // is still selectable — picking it trains its family first — but a run should
-  // not silently grow a training phase nobody asked for.
-  selectedDetectors = new Set(detectors.filter((d) => d.available).map((d) => d.name));
+  // Nothing is selected by default. What is on disk used to be pre-ticked,
+  // which quietly decided the pool for anyone who did not read it — and with 69
+  // detectors that is a large decision to make on someone's behalf. An empty
+  // start means the run is whatever was deliberately picked.
+  selectedDetectors = new Set();
   detectorInfo = new Map(detectors.map(
     (d) => [d.name, { available: !!d.available, family: d.family || d.name.split("_")[0] }]));
+
+  renderGroupButtons(detectors);
 
   const byFamily = {};
   detectors.forEach((d) => {
@@ -118,8 +241,9 @@ async function refreshDetectors() {
     // Clicking the family name toggles the whole family: if any member is
     // unchecked it selects them all, otherwise it clears them.
     const familyButton = el("button", {
-      type: "button", class: "small",
-      style: "width: 6em; text-align: left; font-family: var(--font-detector);",
+      type: "button", class: `small grp-${groupClass(members[0].group)}`,
+      style: "width: 7.5em; text-align: left; font-family: var(--font-detector);",
+      // Always the full name here, since the label may be abbreviated.
       title: `Select or clear every ${family} detector`,
       onclick: () => {
         const turnOn = members.some((d) => !selectedDetectors.has(d.name));
@@ -134,7 +258,7 @@ async function refreshDetectors() {
 
     const chips = members.map((d) => {
       const input = el("input", {
-        type: "checkbox", value: d.name, checked: d.available,
+        type: "checkbox", value: d.name, checked: false,
         onchange: () => {
           if (input.checked) selectedDetectors.add(d.name);
           else selectedDetectors.delete(d.name);
@@ -142,17 +266,17 @@ async function refreshDetectors() {
         },
       });
       inputs.push(input);
+      const group = groupClass(d.group);
       return el("label", {
-        class: d.available ? "toggle" : "toggle untrained",
+        class: `toggle grp-${group}${d.available ? "" : " untrained"}`,
         title: d.available ? ""
           : `${d.name} has no trained model for this entity — selecting it trains `
             + `the ${d.family || d.name.split("_")[0]} family first.`,
-      }, input, el("span", { class: "detector", text: d.name }),
-         d.params && d.params.label
-           ? el("span", { class: "hint", text: d.params.label }) : null);
+      }, input, el("span", { class: "detector", text: d.name }));
     });
 
-    return el("div", { class: "row" }, familyButton, ...chips);
+    return el("div", { class: "row" },
+              familyButton, familyParams(family, members), ...chips);
   }));
   onChange();
 }
@@ -257,12 +381,14 @@ let previewTimer = null;
 
 function onChange() {
   const count = selectedDetectors.size;
-  $("#detector-count").textContent = `${count} of 11 selected`;
+  $("#detector-count").textContent =
+    `${count} of ${detectorInfo.size || (catalog && catalog.all_detectors || []).length} selected`;
   const tooFew = count < 2;
   $("#detector-error").hidden = !tooFew;
   if (tooFew) $("#detector-error").textContent = "Select at least two detectors.";
   $("#start").disabled = tooFew || !selectedStages().length || !entityOf();
 
+  syncGroupButtons();
   renderTrainingBanner();
   renderPartialBanner();
   clearTimeout(previewTimer);

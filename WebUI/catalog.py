@@ -15,7 +15,13 @@ from typing import Any, Dict, List, Optional
 
 # Utils/__init__.py is empty and pipeline_spec is stdlib-only, so this import
 # stays cheap — it does not drag torch/matplotlib in the way Utils.utils would.
-from Utils.pipeline_spec import ALL_DETECTORS, DETECTOR_FAMILIES, family_of
+from Utils.pipeline_spec import (ALL_DETECTORS, DETECTOR_FAMILIES, DETECTOR_GROUPS,
+                                 GROUP_LABELS, family_of, group_of)
+# hyperparameter_grids.py is plain dict literals with no imports at all, and
+# Model_Training/__init__.py is empty, so this reaches the grids without
+# pulling torch or sklearn into the Flask process.
+from Model_Training.hyperparameter_grids import (FAMILY_GRIDS, grid_combinations,
+                                                 varying_keys)
 from WebUI import paths
 
 # Copied from Datasets/load.py VALID_DATASETS. Importing that module would pull
@@ -63,40 +69,99 @@ _CACHE: Dict[str, Any] = {"at": 0.0, "value": None}
 _TTL_SECONDS = 30.0
 
 
-# What actually distinguishes the instances within a family: LOF/CBLOF vary
-# contamination, NN varies k. Everything else in the sidecar is shared.
-_DISTINGUISHING = (("contamination", "contamination"), ("n_neighbors", "k"))
+# Grid keys whose own name reads badly in a tooltip. Anything absent is shown
+# under the name it has in the grid, which is what a reader would grep for.
+_SHOWN_AS = {
+    "n_neighbors": "k",
+    "detector__window_size": "subsequence",
+    "running_window_size": "running window",
+    # The TSB-AD and AutoEncoder keys. Without these a tooltip would read
+    # "detector__win_size 30", which shows the plumbing rather than the
+    # parameter; `detector__` only exists to keep the estimator's names apart
+    # from the framework's, and a reader does not need to see that.
+    "detector__win_size": "subsequence",
+    "detector__window": "window",
+    "detector__k": "clusters",
+    "detector__stride": "stride",
+    "detector__power": "degree",
+    "detector__cut_freq": "frequencies",
+    "detector__hidden_neuron_list": "hidden layers",
+    "detector__lr": "learning rate",
+    "detector__epoch_num": "epochs",
+    "detector__num_epochs": "epochs",
+    "detector__epochs": "epochs",
+}
 
 
-def _read_meta(pth: Path) -> Optional[dict]:
+def _fmt(value: Any) -> str:
+    return f"{value:g}" if isinstance(value, (int, float)) and not isinstance(value, bool) \
+        else str(value)
+
+
+def _label_from(source: Dict[str, Any], keys: List[str]) -> Optional[str]:
+    """"contamination 0.15" / "input_size 64, state_hsize 256" — the values of
+    the varying keys, in grid order, or None when none of them are present."""
+    parts = [f"{_SHOWN_AS.get(k, k)} {_fmt(source[k])}" for k in keys if k in source]
+    return ", ".join(parts) if parts else None
+
+
+def _grid_params(name: str) -> Optional[dict]:
+    """What this instance WOULD be trained as, read from its family's grid.
+
+    Nothing is on disk for an untrained detector, so the sidecar cannot answer;
+    the grid can, because `TrainModels` names the i-th combination of it
+    `{FAMILY}_{i+1}`. This is what lets an untrained chip still say what it is
+    rather than only that it is missing.
+    """
+    grid = FAMILY_GRIDS.get(family_of(name))
+    if not grid:
+        return None
+    try:
+        index = int(name.rsplit("_", 1)[1]) - 1
+    except (IndexError, ValueError):
+        return None
+    combinations = grid_combinations(grid)
+    if not 0 <= index < len(combinations):
+        return None
+    combination = combinations[index]
+    return {"label": _label_from(combination, varying_keys(grid)),
+            "window_size": combination.get("window_size"),
+            "window_step": combination.get("window_step")}
+
+
+def _read_meta(pth: Path, name: str) -> Optional[dict]:
     """Hyperparameters recorded beside a checkpoint, reduced to what a chip needs.
 
     The sidecar nests `{train_hyperparameters, model_hyperparameters}`; only the
-    model side is interesting, and within it only the value that separates
-    LOF_1 from LOF_2. A corrupt or unreadable sidecar degrades to "no parameters
-    shown" rather than breaking the catalog.
+    model side is interesting, and within it only the values that separate
+    LOF_1 from LOF_2 — which the family's grid defines, so the keys to show come
+    from there rather than from a hardcoded pair.
+
+    The sidecar wins over the grid for a trained detector even when the two
+    disagree, because it describes the checkpoint that will actually run. They
+    do disagree: the w=64 LOF and CBLOF checkpoints predate the move to
+    window_size 1, and a chip claiming "window 1" for a file trained at 64 would
+    hide exactly the staleness worth seeing.
+
+    A corrupt or unreadable sidecar degrades to the grid's answer rather than
+    breaking the catalog.
     """
     meta_path = pth.with_suffix(".meta")
     if not meta_path.is_file():
-        return None
+        return _grid_params(name)
     try:
         with open(meta_path, "rb") as f:
             data = pickle.load(f)
     except Exception:
-        return None
+        return _grid_params(name)
     if not isinstance(data, dict):
-        return None
+        return _grid_params(name)
     model = data.get("model_hyperparameters")
     if not isinstance(model, dict):
-        return None
-    label = None
-    for key, shown_as in _DISTINGUISHING:
-        if key in model:
-            value = model[key]
-            label = f"{shown_as} {value:g}" if isinstance(value, (int, float)) \
-                else f"{shown_as} {value}"
-            break
-    return {"label": label,
+        return _grid_params(name)
+    grid = FAMILY_GRIDS.get(family_of(name))
+    keys = varying_keys(grid) if grid else []
+    return {"label": _label_from(model, keys),
             "window_size": model.get("window_size"),
             "window_step": model.get("window_step")}
 
@@ -120,8 +185,14 @@ def detectors_for(dataset: str, entity: str) -> List[Dict[str, Any]]:
         out.append({
             "name": name,
             "family": family_of(name),
+            # The paper's Table I group, so the run page can colour a chip and
+            # build its select-all buttons without a second copy of the taxonomy.
+            "group": group_of(family_of(name)),
             "available": available,
-            "params": _read_meta(pth) if available else None,
+            # Untrained detectors get their grid's answer, not nothing: the run
+            # page lists what a family WOULD train, so the reader can tell
+            # LOF_1 from LOF_4 before deciding to train either.
+            "params": _read_meta(pth, name) if available else _grid_params(name),
         })
     return out
 
@@ -256,6 +327,14 @@ def catalog(refresh: bool = False) -> Dict[str, Any]:
             for d in datasets()
         ],
         "detector_families": list(DETECTOR_FAMILIES),
+        # The paper's Table I group names, in order. Sent even when a group has
+        # no detectors in the pool (FM today) so the run page can still show it,
+        # which it cannot infer from the per-entity detector list alone.
+        "detector_groups": list(DETECTOR_GROUPS),
+        # Spelled out for display. The keys stay short because they are the
+        # identifier (API value, CSS suffix); "NN" as a label sat next to a
+        # detector family also called NN and read as the same thing.
+        "group_labels": dict(GROUP_LABELS),
         "all_detectors": list(ALL_DETECTORS),
         "stages": [
             {"token": "ga", "label": "Genetic algorithm (ensemble)"},

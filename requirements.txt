@@ -1,3 +1,9 @@
+# arch and torchinfo are required by the vendored TSB-AD subset in
+# Algorithms/tsb_ad: POLY reaches `Fourier` in models/distance.py, which imports
+# arch, and Donut/FITS/TimesNet import torchinfo. Both install against the
+# numpy 2.0.0 pinned below, which is why that subset is vendored rather than
+# installed from the TSB-AD wheel (it pins numpy<2.0).
+arch==8.0.0
 cvxpy==1.6.6
 evaluation==0.0.2
 Flask==3.1.2
@@ -21,5 +27,6 @@ statsmodels==0.14.4
 templates==0.0.5
 tensorflow==2.18.1
 torch==2.5.1
+torchinfo==1.8.0
 tqdm==4.67.1
 tsfresh==0.21.1

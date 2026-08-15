@@ -31,6 +31,11 @@ sys.modules["Metrics.Ensemble_GA"].evaluate_individual_models   = lambda *a, **k
 sys.modules["Metrics.Ensemble_GA"].evaluate_model_consistently  = lambda *a, **kw: None
 sys.modules["Metrics.metrics"].prauc    = lambda *a, **kw: 0.5
 sys.modules["Metrics.metrics"].f1_score = lambda *a, **kw: (0.5, 0.5, 0.5, 0, 0, 0, 0)
+# The reward's F1 half comes from the range-based metric, as in every other
+# stage; the module imports it at file scope, so the stub has to exist before
+# Thompson_Sampling is imported. Signature: (precision, recall, f1, prauc, pred).
+sys.modules["Metrics.metrics"].range_based_precision_recall_f1_auc = \
+    lambda *a, **kw: (0.5, 0.5, 0.5, 0.5, None)
 
 # ── Now import the module under test ────────────────────────────────────────
 from Thompson_Sampling import (

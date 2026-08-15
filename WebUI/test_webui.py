@@ -1251,17 +1251,85 @@ class TestCatalog(unittest.TestCase):
                          ["001_UCR_Anomaly_DISTORTED1sddb40"])
 
     def test_detector_availability_and_labels(self):
+        """Always the whole canonical pool, flagged available or not — a
+        detector with no checkpoint is now selectable (it trains first), so it
+        has to be listed rather than dropped."""
         dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
-        self.assertEqual(len(dets), 11)      # always the canonical eleven
+        self.assertEqual(len(dets), len(catalog.ALL_DETECTORS))
         self.assertTrue(dets["LOF_1"]["available"])
         self.assertFalse(dets["CBLOF_4"]["available"])
         self.assertEqual(dets["LOF_1"]["params"]["label"], "contamination 0.1")
-        self.assertNotIn("RNN_1", dets)      # stale checkpoints are not selectable
+        # Availability comes from disk, the LIST never does. GMM has checkpoints
+        # on some entities and no implementation in the repo, so it must not
+        # appear however many .pth files are lying around.
+        self.assertNotIn("GMM_1", dets)
+        # The families added beyond LOF/NN/CBLOF are in the pool and, on this
+        # fixture, untrained.
+        for name in ("ABOD_1", "KDE_1", "IFOREST_1", "HBOS_1", "OCSVM_1"):
+            self.assertIn(name, dets)
+            self.assertFalse(dets[name]["available"], name)
 
-    def test_corrupt_meta_degrades_to_no_params(self):
+    def test_every_detector_carries_its_paper_group(self):
+        """The run page colours chips and builds its select-all buttons from
+        this, so a detector without a group would render uncoloured and be
+        unreachable from any group button."""
+        dets = catalog.detectors_for("SKAB", "7")
+        self.assertTrue(all(d["group"] for d in dets),
+                        [d["name"] for d in dets if not d["group"]])
+        by_name = {d["name"]: d for d in dets}
+        self.assertEqual(by_name["RNN_1"]["group"], "NN")
+        self.assertEqual(by_name["LOF_1"]["group"], "Stat")
+        # k-Nearest Neighbors is Statistical; the group called NN is Neural
+        # Networks. Pinned here too because this is the payload the UI reads.
+        self.assertEqual(by_name["NN_1"]["group"], "Stat")
+
+    def test_catalog_lists_groups_including_the_empty_one(self):
+        """FM has no detectors in the pool, so it cannot be inferred from the
+        detector list — the run page needs it from here to show the button."""
+        self.assertEqual(catalog.catalog(refresh=True)["detector_groups"],
+                         ["NN", "Stat", "FM"])
+
+    def test_every_family_has_a_chip_colour(self):
+        """`familyClass` emits chip-{family}; a family with no rule falls back
+        to grey, which is the state all sixteen non-original families were in."""
+        css = (Path(__file__).parent / "static" / "css" / "ramses.css").read_text()
+        for family in catalog.DETECTOR_FAMILIES:
+            with self.subTest(family=family):
+                self.assertIn(f".chip-{family.lower()} ", css)
+                self.assertIn(f"--fam-{family.lower()}:", css)
+
+    def test_corrupt_meta_degrades_to_the_grid_not_to_nothing(self):
+        """A sidecar that cannot be unpickled used to leave the chip with no
+        parameters at all. The family's grid still knows what NN_2 is — the
+        instance number indexes it — so the fallback answers from there and
+        only a family missing from FAMILY_GRIDS yields None."""
         dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
         self.assertTrue(dets["NN_2"]["available"])
-        self.assertIsNone(dets["NN_2"]["params"])
+        self.assertEqual(dets["NN_2"]["params"]["label"], "k 3")
+
+    def test_untrained_detectors_still_report_their_hyperparameters(self):
+        """Nothing is on disk for them, so the sidecar cannot answer; the grid
+        can, and the run page needs it to tell LOF_1 from LOF_4 BEFORE deciding
+        whether to train the family."""
+        dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
+        self.assertFalse(dets["CBLOF_4"]["available"])
+        self.assertEqual(dets["CBLOF_4"]["params"]["label"], "contamination 0.25")
+
+    def test_every_family_names_something_that_varies(self):
+        """The point of the change: RNN, LSTMVAE, DGHL and RM were blank
+        because the old lookup only knew contamination and n_neighbors."""
+        dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
+        expected = {
+            "RNN_1": "input_size 32, state_hsize 128",
+            "LSTMVAE_1": "hidden_size 512, latent_size 256",
+            "DGHL_1": "z_iters 25, z_size 25",
+            "RM_3": "running window 64",
+            "LSTMAD_2": "subsequence 50",
+        }
+        for name, label in expected.items():
+            self.assertEqual(dets[name]["params"]["label"], label, name)
+        # MD is a single instance: nothing varies, so there is nothing to name.
+        self.assertIsNone(dets["MD_1"]["params"]["label"])
 
     def test_case_insensitive_entity_lookup(self):
         self.assertTrue(any(d["available"] for d in catalog.detectors_for("skab", "7")))

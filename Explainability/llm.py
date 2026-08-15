@@ -71,7 +71,16 @@ class LLMClient:
     """
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, model: str = DEFAULT_MODEL,
-                 temperature: float = 0.0, seed: int = 0, timeout: int = 120,
+                 # 600s, not 120: a 14B model narrating the Thompson stage
+                 # exceeds two minutes. ir_thompson.json is 35.9 KB and 19 atoms
+                 # on skab/1 — nearly double the next-largest IR and eight times
+                 # the smallest — so it is the one stage that reliably times out
+                 # while the other ten finish in 14-46s. The failure is quiet:
+                 # narrate_entity records a per-stage error and carries on, the
+                 # run still reports "LLM narratives written" with a clean
+                 # faithfulness score (a stage with no prose cannot hallucinate),
+                 # and the staleness warning on the result page is the only sign.
+                 temperature: float = 0.0, seed: int = 0, timeout: int = 600,
                  transport: Optional[Callable[[Dict[str, Any]], str]] = None):
         self.base_url = base_url.rstrip("/")
         self.model = model

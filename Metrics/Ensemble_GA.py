@@ -1680,7 +1680,9 @@ def plot_ga_archetypes(
             ax.yaxis.set_label_coords(-0.02, 0.5)
         ax.set_xlabel("Utility  (mean marginal contribution)")
         ax.set_ylabel("Stability  (mean survival rate)")
-        ax.set_title("Relative (median-split) thresholds")
+        # No title: the median-split scheme is stated in the caption and in the
+        # stage's own explanation, and repeating it on the axes says it a third
+        # time to a reader who has already been told twice.
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
         # Origin at zero on both axes, with ticks at a round step. Both the
         # points and the threshold lines have to fit inside the range, or a

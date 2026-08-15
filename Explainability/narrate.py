@@ -39,7 +39,7 @@ def main(argv=None) -> int:
     parser.add_argument("--iteration", required=True, type=int)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--base-dir", default="myresults/explanations_ir")
     parser.add_argument("--out-dir", default="myresults/explanations_nl")
     parser.add_argument("--stages", default=None,
