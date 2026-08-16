@@ -25,7 +25,8 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 from Utils.logger import Logger
-from Utils.pipeline_spec import TRANSDUCTIVE_FAMILIES, TSBAD_FAMILIES
+from Utils.pipeline_spec import (TRANSDUCTIVE_FAMILIES, TSBAD_FAMILIES,
+                                 WHOLE_SERIES_FAMILIES)
 from Datasets.load import load_data
 from Loaders.loader import Loader
 # Import all the algorithm here!
@@ -149,7 +150,7 @@ class TrainModels(object):
         the plot shows is the scoring the pipeline will actually do. Same `+
         window_size` slack as there, for the loader's right-padding.
         """
-        if family.upper() not in TRANSDUCTIVE_FAMILIES | TSBAD_FAMILIES:
+        if family.upper() not in TRANSDUCTIVE_FAMILIES | WHOLE_SERIES_FAMILIES:
             return self.batch_size
         n_time = max(e.Y.shape[1] for e in self.test_data.entities)
         return max(1, n_time + max(1, int(window_size)))

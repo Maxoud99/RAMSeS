@@ -198,10 +198,20 @@ LOF_TRAIN_PARAM_GRID = {
 # NN keeps 64 on purpose: it is the pool's subsequence detector, and its own
 # grid picks n_neighbors 1/3/5, which stays feasible on few windows.
 # Raising this back to 64 is a one-line change per grid.
+#
+# `n_neighbors` from TSB-AD's LOF sweep [10, 20, 30, 40, 50], keeping the 50 it
+# reports as the tuned multivariate optimum; `metric` held at that optimum's
+# 'euclidean'. `contamination` is now FIXED rather than swept, here and in the
+# six grids below that changed with it: it sets `threshold_` and `labels_` and
+# never reaches `decision_function`, so four contaminations were four
+# byte-identical detectors — measured 0.000e+00 apart on both SKAB and SMD —
+# because the pipeline scores with its own threshold sweep.
 LOF_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
-    'contamination':[0.1,0.15,0.2,0.25],
+    'contamination': [0.1],
+    'n_neighbors': [10, 20, 30, 50],
+    'metric': ['euclidean'],
     'device': [None]
 }
 
@@ -218,10 +228,16 @@ KDE_TRAIN_PARAM_GRID = {
     'eval_batch_size': [128],
 }
 
+# `bandwidth` is the kernel width, so it decides how peaked the estimated
+# density is and therefore every point's score. TSB-AD has no KDE entry to copy,
+# so the four values are PyOD's default (1.0) bracketed by half and by two
+# multiplicative steps either side — the spacing a bandwidth is normally swept
+# on, since it acts as a scale rather than a count.
 KDE_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
-    'contamination':[0.1,0.15,0.2,0.25],
+    'contamination': [0.1],
+    'bandwidth': [0.5, 1.0, 2.0, 5.0],
     'device': [None]
 }
 
@@ -238,10 +254,16 @@ ABOD_TRAIN_PARAM_GRID = {
     'eval_batch_size': [128],
 }
 
+# `n_neighbors` is the only parameter that reaches an ABOD score: `method`
+# 'fast' takes the variance of the angles a point subtends with its k nearest
+# neighbours. PyOD's default is 5 and it is the low end here, since ABOD's cost
+# grows with k. TSB-AD ships no ABOD at all — the name appears nowhere in the
+# package — so these values are PyOD's own range rather than a copied sweep.
 ABOD_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
-    'contamination':[0.1,0.15,0.2,0.25],
+    'contamination': [0.1],
+    'n_neighbors': [5, 10, 15, 20],
     'device': [None]
 }
 
@@ -261,10 +283,17 @@ SOS_TRAIN_PARAM_GRID = {
 # window_size 1 for the same reason as LOF above: SOS judges a sample on its own
 # values, so a 64-step window bought it nothing but the flattening that costs
 # everything else.
+# `perplexity` is SOS's smooth neighbour count — the analogue of k in kNN — and
+# `Algorithms/sos.py` already forwarded it to the estimator while never
+# forwarding `contamination` at all, so this family's instances differed by
+# nothing whatsoever until now. PyOD's default 4.5 stays as the low end. The
+# range must remain below the number of rows in a call: perplexity is defined
+# between 1 and n-1.
 SOS_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
-    'contamination':[0.1,0.15,0.2,0.25],
+    'contamination': [0.1],
+    'perplexity': [4.5, 10.0, 20.0, 30.0],
     'device': [None]
 }
 
@@ -320,10 +349,16 @@ CBLOF_TRAIN_PARAM_GRID = {
     'eval_batch_size': [128],
 }
 
+# `n_clusters` and `alpha` are TSB-AD's CBLOF sweep, [4, 8, 16, 32] and
+# [0.6, 0.7, 0.8, 0.9]; the pair (4, 0.6) is its tuned optimum. Four instances
+# rather than sixteen: the cluster count is what moves the score, so alpha is
+# held at the optimum.
 CBLOF_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
-    'contamination':[0.1,0.15,0.2,0.25],
+    'contamination': [0.1],
+    'n_clusters': [4, 8, 16, 32],
+    'alpha': [0.6],
     'device': [None]
 }
 
@@ -347,7 +382,8 @@ COF_TRAIN_PARAM_GRID = {
 COF_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
-    'contamination':[0.1,0.15,0.2,0.25],
+    'contamination': [0.1],
+    'n_neighbors': [10, 20, 30, 40],
     'device': [None]
 }
 
@@ -383,12 +419,92 @@ LSTMAD_TRAIN_PARAM_GRID = {
     'eval_batch_size': [128],
 }
 
+# Subsequence lengths are TSB-AD's LSTMAD sweep [50, 100, 150] in full, which
+# includes the 150 it reports as its tuned multivariate optimum. The old
+# [25, 50] had 25 outside that range.
 LSTMAD_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
     'contamination': [0.1],
     'device': [None],
-    'detector__window_size': [25, 50],
+    'detector__window_size': [50, 100, 150],
+}
+
+#######################################
+# The PyOD families that used to sweep contamination
+#######################################
+#
+# IFOREST, HBOS, PCA, OCSVM and MCD reach PyOD through the generic `train_pyod`
+# path and used to share PYOD_PARAM_GRID, whose only varying key was
+# `contamination`. That made each family four names for one detector:
+# contamination sets `threshold_` and `labels_` and never reaches
+# `decision_function`, and this pipeline scores with its own threshold sweep, so
+# the four instances measured 0.000e+00 apart on both SKAB and SMD.
+#
+# Each now varies the parameter TSB-AD varies for it, taking four values from
+# its sweep and keeping the tuned multivariate optimum among them. Where a
+# family has two swept parameters the second is pinned at that optimum rather
+# than multiplied out, so the instance count stays at four.
+#
+# ABOD, KDE, COF, SOS and SR keep the contamination sweep: TSB-AD has no entry
+# for any of them, so there is nothing upstream to copy, and a value invented
+# here would be exactly what this alignment exists to avoid.
+IFOREST_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__n_estimators': [25, 50, 100, 200],
+    'detector__max_features': [0.8],
+}
+
+HBOS_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__n_bins': [5, 10, 20, 30],
+    'detector__tol': [0.5],
+}
+
+# The one family whose four instances are TSB-AD's sweep entire.
+PCA_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__n_components': [0.25, 0.5, 0.75, None],
+}
+
+OCSVM_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
+    'detector__nu': [0.1],
+}
+
+MCD_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__support_fraction': [0.2, 0.4, 0.6, 0.8],
+}
+
+# `score_window` is the width of the averaging kernel SpectralResidual convolves
+# its saliency map with, so it sets how locally a spike has to stand out. It is
+# also a MINIMUM on every call: the estimator returns `max(len(X), score_window)`
+# scores, which is why a single row used to come back with three. TSB-AD's only
+# SR entry is a univariate `periodicity`, which does not apply to this pool, so
+# these are PyOD's own parameter with its default (3) as the low end.
+SR_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__score_window': [3, 5, 10, 20],
 }
 
 #######################################
@@ -411,7 +527,7 @@ LSTMAD_PARAM_GRID = {
 # What varies is the architecture, not `contamination`: the encoder shape and
 # the epoch budget both change the reconstruction and therefore the score, which
 # `contamination` — a threshold the pipeline never reads — does not.
-AUTOENCODER_TRAIN_PARAM_GRID = {
+AE_TRAIN_PARAM_GRID = {
     'output_dir': [r'/output'],
     'overwrite_output_dir': [True],
     'seed': [1],
@@ -422,7 +538,7 @@ AUTOENCODER_TRAIN_PARAM_GRID = {
 # (`HP_list.Multi_algo_HP_dict['AutoEncoder']['hidden_neurons']`), including the
 # [128, 64] it reports as the tuned multivariate optimum. `epoch_num` stays at
 # PyOD's default.
-AUTOENCODER_PARAM_GRID = {
+AE_PARAM_GRID = {
     'window_size': [64],
     'window_step': [64],
     'contamination': [0.1],
@@ -531,11 +647,11 @@ DONUT_PARAM_GRID = {
     'window_step': [1],
     'contamination': [0.1],
     'device': [None],
-    'detector__win_size': [60, 90],
+    'detector__win_size': [30, 60, 90],
     'detector__num_epochs': [50],
 }
 
-OMNIANOMALY_PARAM_GRID = {
+OA_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
     'contamination': [0.1],
@@ -614,11 +730,74 @@ TIMESNET_PARAM_GRID = {
     'detector__epochs': [10],
 }
 
+#######################################
+# Foundation models
+#######################################
+#
+# Table I's FM group, and the first entries the pool has had in it. The paper
+# excludes foundation models from the RAMSeS candidate pool for inconsistent
+# performance and reports them only in the TSB-AutoAD setting, so selecting
+# these makes the pool a SUPERSET of the paper's rather than a match — a
+# deliberate divergence, not a gap being closed.
+#
+# Windows are the two lowest of each model's own TSB-AD sweep, the same rule
+# the six neural networks follow, so one instance per family stays under
+# Thompson's window on a long entity.
+#
+# All three are pretrained and frozen: `fit` learns nothing, and training is a
+# formality that exists so they save and load like every other detector. That is
+# a property of foundation models, and it is why nothing here varies an epoch
+# count or a learning rate.
+OFA_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    # TSB-AD sweeps [50, 100, 150] and reports 50 as the optimum for both the
+    # univariate and multivariate settings. OFA is the one FM Table I marks
+    # U&M: it embeds `enc_in * patch_size` directly rather than looping.
+    'detector__win_size': [50, 100],
+}
+
+TIMESFM_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    # TSB-AD sweeps [32, 64, 96]. Its optimum, 96, is the value left out by the
+    # two-lowest rule — the same trade the neural networks make, and the reason
+    # the low end is taken is that Thompson cannot score a window shorter than
+    # the subsequence.
+    'detector__win_size': [32, 64],
+}
+
+CHRONOS_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    # TSB-AD sweeps [50, 100, 150] and reports 100 as its univariate optimum.
+    'detector__win_size': [50, 100],
+    # Chronos-BOLT at `tiny`. Bolt rather than T5 because T5 samples its
+    # forecast and is not reproducible — two calls on identical input measured
+    # 1.7e-01 apart, which is the exact property `TimeSeriesOD` and
+    # `AnomalyTransformer` were kept out of this pool for. Bolt measures
+    # 0.000e+00. `tiny` because it is the only size sensible on CPU: ~180
+    # forecasts/second, so SKAB scores in ~11s where `base` is ten times that.
+    'detector__model_size': ['tiny'],
+}
+
 # Family -> its own grid, for the generic `train_pyod` path. Anything absent
 # uses PYOD_PARAM_GRID.
 PYOD_MODEL_GRIDS = {
     'LSTMAD': LSTMAD_PARAM_GRID,
-    'AUTOENCODER': AUTOENCODER_PARAM_GRID,
+    'AE': AE_PARAM_GRID,
+    'IFOREST': IFOREST_PARAM_GRID,
+    'HBOS': HBOS_PARAM_GRID,
+    'PCA': PCA_PARAM_GRID,
+    'OCSVM': OCSVM_PARAM_GRID,
+    'MCD': MCD_PARAM_GRID,
+    'SR': SR_PARAM_GRID,
 }
 
 # Family -> its grid, for the `train_tsbad` path. Every TSB-AD family needs an
@@ -628,11 +807,14 @@ TSBAD_MODEL_GRIDS = {
     'KMEANSAD': KMEANSAD_PARAM_GRID,
     'POLY': POLY_PARAM_GRID,
     'DONUT': DONUT_PARAM_GRID,
-    'OMNIANOMALY': OMNIANOMALY_PARAM_GRID,
+    'OA': OA_PARAM_GRID,
     'USAD': USAD_PARAM_GRID,
     'TRANAD': TRANAD_PARAM_GRID,
     'FITS': FITS_PARAM_GRID,
     'TIMESNET': TIMESNET_PARAM_GRID,
+    'OFA': OFA_PARAM_GRID,
+    'TIMESFM': TIMESFM_PARAM_GRID,
+    'CHRONOS': CHRONOS_PARAM_GRID,
 }
 
 #######################################
@@ -658,21 +840,24 @@ FAMILY_GRIDS = {
     'LSTMAD': LSTMAD_PARAM_GRID,
     'COF': COF_PARAM_GRID,
     'SOS': SOS_PARAM_GRID,
-    'IFOREST': PYOD_PARAM_GRID,
-    'HBOS': PYOD_PARAM_GRID,
-    'PCA': PYOD_PARAM_GRID,
-    'OCSVM': PYOD_PARAM_GRID,
-    'MCD': PYOD_PARAM_GRID,
-    'SR': PYOD_PARAM_GRID,
+    'IFOREST': IFOREST_PARAM_GRID,
+    'HBOS': HBOS_PARAM_GRID,
+    'PCA': PCA_PARAM_GRID,
+    'OCSVM': OCSVM_PARAM_GRID,
+    'MCD': MCD_PARAM_GRID,
+    'SR': SR_PARAM_GRID,
     'KMEANSAD': KMEANSAD_PARAM_GRID,
     'POLY': POLY_PARAM_GRID,
-    'AUTOENCODER': AUTOENCODER_PARAM_GRID,
+    'AE': AE_PARAM_GRID,
     'DONUT': DONUT_PARAM_GRID,
-    'OMNIANOMALY': OMNIANOMALY_PARAM_GRID,
+    'OA': OA_PARAM_GRID,
     'USAD': USAD_PARAM_GRID,
     'TRANAD': TRANAD_PARAM_GRID,
     'FITS': FITS_PARAM_GRID,
     'TIMESNET': TIMESNET_PARAM_GRID,
+    'OFA': OFA_PARAM_GRID,
+    'TIMESFM': TIMESFM_PARAM_GRID,
+    'CHRONOS': CHRONOS_PARAM_GRID,
 }
 
 

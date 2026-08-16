@@ -1258,7 +1258,10 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual(len(dets), len(catalog.ALL_DETECTORS))
         self.assertTrue(dets["LOF_1"]["available"])
         self.assertFalse(dets["CBLOF_4"]["available"])
-        self.assertEqual(dets["LOF_1"]["params"]["label"], "contamination 0.1")
+        # LOF's checkpoint here predates the move off the contamination sweep,
+        # so its sidecar holds no `n_neighbors` and the label falls back to the
+        # grid — what a retrain will give it. See `catalog._read_meta`.
+        self.assertEqual(dets["LOF_1"]["params"]["label"], "k 10")
         # Availability comes from disk, the LIST never does. GMM has checkpoints
         # on some entities and no implementation in the repo, so it must not
         # appear however many .pth files are lying around.
@@ -1313,7 +1316,7 @@ class TestCatalog(unittest.TestCase):
         whether to train the family."""
         dets = {d["name"]: d for d in catalog.detectors_for("SKAB", "7")}
         self.assertFalse(dets["CBLOF_4"]["available"])
-        self.assertEqual(dets["CBLOF_4"]["params"]["label"], "contamination 0.25")
+        self.assertEqual(dets["CBLOF_4"]["params"]["label"], "clusters 32")
 
     def test_every_family_names_something_that_varies(self):
         """The point of the change: RNN, LSTMVAE, DGHL and RM were blank
@@ -1324,7 +1327,14 @@ class TestCatalog(unittest.TestCase):
             "LSTMVAE_1": "hidden_size 512, latent_size 256",
             "DGHL_1": "z_iters 25, z_size 25",
             "RM_3": "running window 64",
-            "LSTMAD_2": "subsequence 50",
+            "LSTMAD_2": "subsequence 100",
+            # The families that stopped sweeping contamination now name the
+            # parameter TSB-AD varies for them.
+            "IFOREST_1": "trees 25",
+            "HBOS_4": "bins 30",
+            "PCA_1": "components 0.25",
+            "OCSVM_3": "kernel rbf",
+            "MCD_4": "support fraction 0.8",
         }
         for name, label in expected.items():
             self.assertEqual(dets[name]["params"]["label"], label, name)
@@ -2048,6 +2058,37 @@ class TestRoutes(ArtifactTreeCase):
             html = self.client.get(path).get_data(as_text=True)
             self.assertEqual(html.count("js/dom.js"), 0, path)
 
+    def test_the_detector_pool_has_no_checkboxes(self):
+        """Detector, family and group all say "chosen" the same way.
+
+        The chips used to be a <label> wrapping a checkbox while the group
+        buttons filled and the family buttons showed nothing, so one screen had
+        three notations for one idea. They are all buttons with aria-pressed
+        now. `selectedDetectors` was always the only thing `currentBody` reads,
+        so the DOM is purely a reflection of it — but a reintroduced checkbox
+        would still be a second source of truth waiting to disagree.
+        """
+        js = (Path(__file__).parent / "static" / "js" / "configure.js").read_text()
+        pool = js.split("function renderDetectors")[1].split("function renderTrainingBanner")[0]
+        self.assertNotIn("checkbox", pool,
+                         "detector chips must be buttons, not checkboxes")
+        self.assertIn('"data-detector"', pool)
+        self.assertIn('"aria-pressed"', pool)
+        # Nothing may drive the selection through input elements any more.
+        self.assertNotIn('$$("#detectors input")', js)
+        # The stage chips keep theirs: those are an ordinary multi-select.
+        self.assertIn('$$("#stages input:checked")', js)
+
+    def test_chosen_chips_and_group_buttons_share_one_style(self):
+        """`.is-on` is what fills a group button; the chips must use the same
+        class or "chosen" would look different one row down."""
+        css = (Path(__file__).parent / "static" / "css" / "ramses.css").read_text()
+        self.assertIn(".toggle.is-on", css)
+        self.assertIn("button.grp-nn.is-on", css)
+        # Buttons do not inherit the page font, so without this the pool would
+        # render in the browser's default control face.
+        self.assertIn("button.toggle { font: inherit", css)
+
     def test_configure_page_has_the_training_banner_slot(self):
         """configure.js writes the "this run trains first" warning into
         #training-banner and returns silently when it is missing, so the element
@@ -2437,5 +2478,45 @@ class TestOffByTreeSelector(unittest.TestCase):
         # of choice says so explicitly rather than relying on the count.
         self.assertEqual(picker["select_label"], "Compared against")
         self.assertEqual(picker["default"], 0)
-        # The importance figure is a separate finding and keeps its own slot.
-        self.assertEqual(sum(1 for f in headline if "variants" not in f), 1)
+        # The picker is the whole headline now: the importance figure moved to
+        # the browse gallery, since it describes the comparison in general
+        # rather than this entity's decision.
+        self.assertEqual(sum(1 for f in headline if "variants" not in f), 0)
+        _, gallery = self.plots._off_by("SKAB", "7")
+        self.assertIn("Which point properties separate the winner",
+                      [f["title"] for f in gallery])
+
+    def test_only_the_latest_run_s_trees_are_offered(self):
+        """Tree filenames carry the winner, not a timestamp, so a run that picks
+        a different winner writes a whole new set beside the old one instead of
+        overwriting it. Listing both put a previous run's competitors in the
+        picker and titled the card with the OLD winner — SKAB/7 really did show
+        "Where LOF_1 uniquely wins" while the run being read had chosen
+        CBLOF_4."""
+        import os
+        base = "robustness/off_by/SKAB/7"
+        for competitor in ("NN_1", "NN_2"):
+            self._touch(f"{base}/SKAB_7_off_by_point_tree_LOF_1_vs_{competitor}.png")
+        for competitor in ("LOF_1", "NN_1", "NN_3"):
+            self._touch(f"{base}/skab_7_off_by_point_tree_CBLOF_4_vs_{competitor}.png")
+        # Make the CBLOF_4 set unambiguously the newer one.
+        for competitor in ("LOF_1", "NN_1", "NN_3"):
+            p = self.myresults / base / f"skab_7_off_by_point_tree_CBLOF_4_vs_{competitor}.png"
+            os.utime(p, (p.stat().st_atime + 60, p.stat().st_mtime + 60))
+        headline, _ = self.plots._off_by("SKAB", "7")
+        picker = next(f for f in headline if "variants" in f)
+        self.assertEqual(picker["title"], "Where CBLOF_4 uniquely wins")
+        self.assertEqual(sorted(v["title"] for v in picker["variants"]),
+                         ["LOF_1", "NN_1", "NN_3"])
+
+    def test_misclassified_points_are_written_but_not_listed(self):
+        """Still produced by the stage on every run — the GAN card already shows
+        the same figure under the same title, so listing it here twice made the
+        off-by gallery say nothing specific to off-by."""
+        base = "robustness/off_by/SKAB/7"
+        self._touch(f"{base}/SKAB_7_Misclassified Anomalies_2026-08-16_13-07-59.png")
+        self._touch(f"{base}/Data_vs_DataWithAnomalies_2026-08-16_13-07-31_.png")
+        _, gallery = self.plots._off_by("SKAB", "7")
+        titles = [f["title"] for f in gallery]
+        self.assertNotIn("Misclassified points", titles)
+        self.assertIn("Injected borderline points", titles)

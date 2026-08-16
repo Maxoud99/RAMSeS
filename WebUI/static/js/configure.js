@@ -102,10 +102,9 @@ let groupMembers = new Map();
  * a future foundation model would land is more use than silently omitting it.
  *
  * The buttons are toggles, not one-way selects: a second click clears the group
- * again. They carry aria-pressed rather than a checkbox because they act on a
- * set of chips that each have their own checkbox — a fourth checkbox governing
- * the other twelve reads as a member of the same list rather than a control
- * over it. */
+ * again. Nothing in the detector pool is a checkbox any more — group, family
+ * and detector all say "chosen" the same way, with aria-pressed and a filled
+ * button — so one glance answers what is selected at every level. */
 function renderGroupButtons(detectors) {
   const box = $("#detector-groups");
   if (!box) return;
@@ -137,11 +136,9 @@ function renderGroupButtons(detectors) {
         // Same rule as the family button: if any member is unselected, select
         // the whole group; if they are all selected, clear it.
         const turnOn = names.some((n) => !selectedDetectors.has(n));
-        $$("#detectors input").forEach((input) => {
-          if (input.disabled || !names.includes(input.value)) return;
-          input.checked = turnOn;
-          if (turnOn) selectedDetectors.add(input.value);
-          else selectedDetectors.delete(input.value);
+        names.forEach((n) => {
+          if (turnOn) selectedDetectors.add(n);
+          else selectedDetectors.delete(n);
         });
         onChange();
       },
@@ -157,6 +154,35 @@ function renderGroupButtons(detectors) {
 function syncGroupButtons() {
   $$("#detector-groups button").forEach((button) => {
     const names = groupMembers.get(button.dataset.group) || [];
+    const chosen = names.filter((n) => selectedDetectors.has(n)).length;
+    const all = names.length > 0 && chosen === names.length;
+    button.setAttribute("aria-pressed", all ? "true" : "false");
+    button.classList.toggle("is-on", all);
+    button.classList.toggle("is-partial", chosen > 0 && !all);
+  });
+}
+
+/* The same treatment one level down, for the chips and the family buttons.
+ *
+ * Chips used to be a <label> wrapping a checkbox, which meant the pool had
+ * three different ways of saying "chosen" on one screen: a tick for a
+ * detector, a filled button for a group, and nothing at all for a family. They
+ * are all buttons now and all say it the same way, so `selectedDetectors` —
+ * which has always been the only thing `build_argv` reads — is the single
+ * source of truth and the DOM is purely its reflection.
+ *
+ * A family gets `is-partial` for the same reason a group does: some of LOF
+ * picked is not LOF picked. */
+function syncDetectorButtons() {
+  $$("#detectors button[data-detector]").forEach((button) => {
+    const on = selectedDetectors.has(button.dataset.detector);
+    button.setAttribute("aria-pressed", on ? "true" : "false");
+    button.classList.toggle("is-on", on);
+  });
+  $$("#detectors button[data-family]").forEach((button) => {
+    const names = $$(`#detectors button[data-detector^="${button.dataset.family}_"]`)
+      .map((chip) => chip.dataset.detector)
+      .filter((name) => name.slice(0, name.lastIndexOf("_")) === button.dataset.family);
     const chosen = names.filter((n) => selectedDetectors.has(n)).length;
     const all = names.length > 0 && chosen === names.length;
     button.setAttribute("aria-pressed", all ? "true" : "false");
@@ -236,43 +262,42 @@ async function refreshDetectors() {
   });
 
   box.replaceChildren(...Object.entries(byFamily).map(([family, members]) => {
-    const inputs = [];
-
     // Clicking the family name toggles the whole family: if any member is
-    // unchecked it selects them all, otherwise it clears them.
+    // unselected it selects them all, otherwise it clears them.
     const familyButton = el("button", {
       type: "button", class: `small grp-${groupClass(members[0].group)}`,
+      "data-family": family,
+      "aria-pressed": "false",
       style: "width: 7.5em; text-align: left; font-family: var(--font-detector);",
       // Always the full name here, since the label may be abbreviated.
       title: `Select or clear every ${family} detector`,
       onclick: () => {
         const turnOn = members.some((d) => !selectedDetectors.has(d.name));
-        inputs.forEach((input) => {
-          input.checked = turnOn;
-          if (turnOn) selectedDetectors.add(input.value);
-          else selectedDetectors.delete(input.value);
+        members.forEach((d) => {
+          if (turnOn) selectedDetectors.add(d.name);
+          else selectedDetectors.delete(d.name);
         });
         onChange();
       },
     }, family);
 
     const chips = members.map((d) => {
-      const input = el("input", {
-        type: "checkbox", value: d.name, checked: false,
-        onchange: () => {
-          if (input.checked) selectedDetectors.add(d.name);
-          else selectedDetectors.delete(d.name);
-          onChange();
-        },
-      });
-      inputs.push(input);
       const group = groupClass(d.group);
-      return el("label", {
+      const chip = el("button", {
+        type: "button",
         class: `toggle grp-${group}${d.available ? "" : " untrained"}`,
+        "data-detector": d.name,
+        "aria-pressed": "false",
         title: d.available ? ""
           : `${d.name} has no trained model for this entity — selecting it trains `
             + `the ${d.family || d.name.split("_")[0]} family first.`,
-      }, input, el("span", { class: "detector", text: d.name }));
+        onclick: () => {
+          if (selectedDetectors.has(d.name)) selectedDetectors.delete(d.name);
+          else selectedDetectors.add(d.name);
+          onChange();
+        },
+      }, el("span", { class: "detector", text: d.name }));
+      return chip;
     });
 
     return el("div", { class: "row" },
@@ -353,7 +378,7 @@ function renderResults() {
     style: "text-decoration: none; color: inherit;",
   },
     el("div", {},
-      el("strong", { text: `${r.dataset} · ${r.entity}` }),
+      el("strong", { text: `${r.dataset_label || r.dataset} · ${r.entity}` }),
       el("div", { class: "small muted", text:
         `${r.framework_choice ? r.framework_choice.replace(/_/g, " ") : "no decision"} · ${r.n_stages} stages explained` })),
     el("div", { class: "small muted mono", text:
@@ -389,6 +414,7 @@ function onChange() {
   $("#start").disabled = tooFew || !selectedStages().length || !entityOf();
 
   syncGroupButtons();
+  syncDetectorButtons();
   renderTrainingBanner();
   renderPartialBanner();
   clearTimeout(previewTimer);
@@ -437,10 +463,9 @@ async function init() {
 
   $$("[data-select]").forEach((button) => button.addEventListener("click", () => {
     const all = button.dataset.select === "all";
-    $$("#detectors input").forEach((input) => {
-      if (input.disabled) return;
-      input.checked = all;
-      if (all) selectedDetectors.add(input.value); else selectedDetectors.delete(input.value);
+    $$("#detectors button[data-detector]").forEach((chip) => {
+      const name = chip.dataset.detector;
+      if (all) selectedDetectors.add(name); else selectedDetectors.delete(name);
     });
     onChange();
   }));

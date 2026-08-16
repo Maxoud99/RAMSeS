@@ -4,7 +4,22 @@
 # numpy 2.0.0 pinned below, which is why that subset is vendored rather than
 # installed from the TSB-AD wheel (it pins numpy<2.0).
 arch==8.0.0
+# The Foundation Model group. transformers+einops carry OFA (it runs GPT-2 over
+# patched windows); chronos-forecasting is the 17-package route to Chronos that
+# TSB-AD reaches through autogluon's 69. All install against numpy 2.0.0.
+#
+# timesfm is pinned to 1.x deliberately: 2.x replaced `TimesFm`/`TimesFmHparams`
+# with `TimesFM_2p5_200M_torch`, and the vendored TSB-AD wrapper targets the 1.x
+# API. Unpinning it breaks TIMESFM with "module 'timesfm' has no attribute
+# 'TimesFm'".
+chronos-forecasting==2.3.1
 cvxpy==1.6.6
+einops==0.8.2
+# dill, not stdlib pickle, is what Utils/logger.py serialises checkpoints with:
+# PyOD 3 defines LSTMAD's network as a class inside a function, which pickle
+# cannot serialise at all. See Utils/model_io.py — every load site reads through
+# it so the pickler always matches the save.
+dill==0.4.1
 evaluation==0.0.2
 Flask==3.1.2
 hurst==0.0.5
@@ -26,7 +41,9 @@ services==0.1.1
 statsmodels==0.14.4
 templates==0.0.5
 tensorflow==2.18.1
+timesfm==1.3.0
 torch==2.5.1
 torchinfo==1.8.0
 tqdm==4.67.1
+transformers==5.15.0
 tsfresh==0.21.1

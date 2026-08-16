@@ -10,6 +10,7 @@ from typing import Tuple, Union, List
 import numpy as np
 import pandas as pd
 import torch as t
+from Utils.model_io import load_checkpoint
 from tqdm import tqdm
 
 from Datasets.load import load_data
@@ -115,7 +116,7 @@ class RankModels(object):
             with open(
                     os.path.join(self.TRAINED_MODELS_PATH,
                                  f'{model_name}.pth'), 'rb') as f:
-                model = t.load(f)
+                model = load_checkpoint(f, map_location='cpu')
             model.eval()  # Set model in evaluation mode
 
             eval_batch_size = get_eval_batchsizes(model_name=model_name)

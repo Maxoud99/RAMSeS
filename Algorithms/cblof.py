@@ -9,12 +9,23 @@ from Utils.utils import de_unfold
 import random
 class TsadCblof(PyMADModel):
 
-    def __init__(self, window_size=1, window_step=1,contamination = 0.1, device=None):
+    def __init__(self, window_size=1, window_step=1, contamination=0.1,
+                 n_clusters=8, alpha=0.9, device=None):
+        """`n_clusters` and `alpha` are what separate this family's instances.
+
+        Same reason as `Algorithms/lof.py`: varying only `contamination` made
+        the four CBLOF instances one detector, because contamination sets a
+        threshold this pipeline replaces with its own sweep. Both names and
+        their values come from TSB-AD's CBLOF sweep.
+        """
         super(TsadCblof, self).__init__()
 
 
         self.contamination = contamination
-        self.model = CBLOF(contamination=self.contamination)
+        self.n_clusters = n_clusters
+        self.alpha = alpha
+        self.model = CBLOF(contamination=self.contamination,
+                           n_clusters=self.n_clusters, alpha=self.alpha)
         self.window_size = window_size
         self.window_step = window_step
         self.device =device

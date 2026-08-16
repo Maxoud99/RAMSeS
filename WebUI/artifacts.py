@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from Utils.pipeline_spec import dataset_label
 from WebUI import paths
 from WebUI.summarize import attribute_sentences, summarize
 
@@ -881,7 +882,8 @@ def comprehensive_report(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
     if info is None:
         return None
     path = comprehensive_path(dataset, entity)
-    return {**info, "text": _read_text(path) or ""}
+    return {**info, "text": _read_text(path) or "",
+            "dataset_label": dataset_label(dataset)}
 
 
 # Matches both Thompson stages' regime atoms — `ts.regime.N` (expected-reward
@@ -1072,6 +1074,9 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
 
     return {
         "dataset": dataset,
+        # The page header shows this rather than the directory name: the run
+        # tree is keyed "Anomaly_Archive" where every reader calls it UCR.
+        "dataset_label": dataset_label(dataset),
         "entity": entity,
         "iteration": (global_ir or {}).get("iteration"),
         # No global IR but a global .txt on disk means an older result tree:
@@ -1137,6 +1142,7 @@ def entity_summary(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
     decision = (global_ir or {}).get("decision") or {}
     return {
         "dataset": dataset,
+        "dataset_label": dataset_label(dataset),
         "entity": entity,
         "framework_choice": decision.get("framework_choice"),
         "chosen": decision.get("chosen"),

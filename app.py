@@ -37,8 +37,10 @@ from Model_Selection.rank_aggregation import (
     explain_rank_aggregation,
 )
 from Model_Training.train import TrainModels
+from Utils.model_io import load_checkpoint
 from Utils.pipeline_spec import (
     ALL_DETECTORS,
+    dataset_label,
     DETECTOR_FAMILIES,
     MIN_DETECTORS,
     families_for,
@@ -126,7 +128,7 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
     with open(output_file, 'w') as f:
         f.write("="*80 + "\n")
         f.write(f"RAMSeS Framework - Comprehensive Results\n")
-        f.write(f"Dataset: {dataset} | Entity: {entity} | Iteration: {iteration}\n")
+        f.write(f"Dataset: {dataset_label(dataset)} | Entity: {entity} | Iteration: {iteration}\n")
         f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("="*80 + "\n\n")
         
@@ -351,7 +353,7 @@ def load_trained_models(model_names, models_dir):
         with open(path, 'rb') as fh:
             # map_location: checkpoints trained on a GPU box carry CUDA storages
             # and fail to unpickle at all on a CPU-only machine.
-            model = t.load(fh, weights_only=False, map_location='cpu')
+            model = load_checkpoint(fh, map_location='cpu')
             # …and that is only half of it. MD, LSTMVAE and DGHL also pickle
             # `device = cuda` as plain state, so their forward passes went on
             # allocating CUDA tensors after map_location had moved every weight
@@ -1874,7 +1876,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                 f.write("="*80 + "\n")
                 f.write("RAMSeS Online Phase Timing Summary\n")
                 f.write("="*80 + "\n")
-                f.write(f"Dataset: {dataset}\n")
+                f.write(f"Dataset: {dataset_label(dataset)}\n")
                 f.write(f"Entity: {entity}\n")
                 f.write(f"Iteration: {iteration}\n")
                 f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")

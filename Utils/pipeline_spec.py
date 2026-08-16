@@ -79,7 +79,7 @@ ALL_DETECTORS = (
     # the pool's fourth subsequence detector (window_size 64), which is what
     # Table I's AE means. Three instances, one per encoder shape in TSB-AD's own
     # AutoEncoder sweep.
-    "AUTOENCODER_1", "AUTOENCODER_2", "AUTOENCODER_3",
+    "AE_1", "AE_2", "AE_3",
     "RNN_1", "RNN_2", "RNN_3", "RNN_4",
     "LSTMVAE_1", "LSTMVAE_2", "LSTMVAE_3", "LSTMVAE_4",
     "DGHL_1", "DGHL_2", "DGHL_3", "DGHL_4",
@@ -98,7 +98,7 @@ ALL_DETECTORS = (
     # transductivity check too: at 200 rows both companion sets scored 0.000000
     # and looked identical, and the dependence only showed at finer resolution
     # (0.000001 vs 0.000702).
-    "LSTMAD_1", "LSTMAD_2",
+    "LSTMAD_1", "LSTMAD_2", "LSTMAD_3",
     # The six Neural Network rows of Table I that PyOD does not ship, from the
     # vendored TSB-AD subset through `Algorithms.tsbad_model`. Like LSTMAD they
     # cut their own subsequences, so the framework hands them one row per
@@ -111,29 +111,65 @@ ALL_DETECTORS = (
     # TIMESNET is Table I's "TimeNet [87] — temporal-variation features". The
     # description is TimesNet's own and TSB-AD ships TimesNet.py with no
     # TimeNet.py, so the table's spelling is taken to be a typo.
-    "DONUT_1", "DONUT_2",
-    "OMNIANOMALY_1", "OMNIANOMALY_2",
+    # Three instances, not two: DONUT's upstream sweep is [60, 90, 120], whose
+    # every value exceeds SMD's 37-row Thompson window, so on that entity the
+    # family scored nothing at all (posterior norm 0.000000, measured). DONUT_1
+    # is a 30-step instance added to give the family one arm Thompson can
+    # actually pull; 60 and 90 remain upstream's.
+    "DONUT_1", "DONUT_2", "DONUT_3",
+    "OA_1", "OA_2",
     "USAD_1", "USAD_2",
     "TRANAD_1", "TRANAD_2",
     "FITS_1", "FITS_2",
     "TIMESNET_1", "TIMESNET_2",
+    # Table I's Foundation Models, and the first members the FM group has had.
+    # The paper excludes FMs from the RAMSeS candidate pool ("they showed
+    # inconsistent performance") and reports them only in the TSB-AutoAD
+    # setting, so these make the pool a superset of the paper's rather than a
+    # match. Deliberate, and worth knowing when comparing numbers.
+    #
+    # All three are pretrained and frozen: fitting learns nothing, and training
+    # exists only so they checkpoint like every other detector. OFA runs GPT-2
+    # over patched windows; TIMESFM and CHRONOS forecast one step ahead and
+    # score the squared error. CHRONOS comes from `chronos-forecasting` rather
+    # than TSB-AD's autogluon route — 17 packages against 69 for the same model.
+    "OFA_1", "OFA_2",
+    "TIMESFM_1", "TIMESFM_2",
+    "CHRONOS_1", "CHRONOS_2",
 )
 
 DETECTOR_FAMILIES = ("LOF", "NN", "CBLOF", "ABOD", "KDE",
                      "IFOREST", "HBOS", "PCA", "OCSVM", "MCD",
                      "COF", "SOS", "SR", "RM", "MD", "KMEANSAD", "POLY",
-                     "AUTOENCODER", "RNN", "LSTMVAE", "DGHL", "LSTMAD",
-                     "DONUT", "OMNIANOMALY", "USAD", "TRANAD", "FITS",
-                     "TIMESNET")
+                     "AE", "RNN", "LSTMVAE", "DGHL", "LSTMAD",
+                     "DONUT", "OA", "USAD", "TRANAD", "FITS",
+                     "TIMESNET", "OFA", "TIMESFM", "CHRONOS")
 
 # Families reached through `Algorithms.tsbad_model.TSBADModel` over the vendored
 # code in `Algorithms/tsb_ad`, rather than through PyOD. Single owner of the
 # fact, so `TrainModels.train_models` can route them and the tests can check
-# that every one has a grid. AUTOENCODER is deliberately NOT here: PyOD ships it,
+# that every one has a grid. AE is deliberately NOT here: PyOD ships it,
 # and taking TSB-AD's fork instead would add a second copy of the same idea.
 TSBAD_FAMILIES: FrozenSet[str] = frozenset({
-    "KMEANSAD", "POLY", "DONUT", "OMNIANOMALY", "USAD", "TRANAD", "FITS",
-    "TIMESNET"})
+    "KMEANSAD", "POLY", "DONUT", "OA", "USAD", "TRANAD", "FITS",
+    "TIMESNET", "OFA", "TIMESFM", "CHRONOS"})
+
+# Families that cut their own subsequences out of whatever call they are given,
+# so a call shorter than that subsequence has nothing to cut. They are all
+# INDUCTIVE — the same row scores identically whatever it travels with — so
+# handing them the whole series in one batch changes no result, it only removes
+# the boundary. (Contrast TRANSDUCTIVE_FAMILIES, where one call is the
+# definition of the score rather than a convenience.)
+#
+# Owned here because TWO places need the same answer and drifted apart when only
+# one of them knew it: `model_selection_utils` sizes the scoring batch, and
+# `TrainModels._diagnostic_batch_size` sizes the post-fit plotting loop. The
+# second knew about the transductive and TSB-AD families but not about LSTMAD,
+# whose plot loop therefore ran at batch_size 8 against a 50-150 step window and
+# raised "negative dimensions are not allowed" — before `logging_obj.save`, so
+# LSTMAD could not be trained on any entity at all.
+WHOLE_SERIES_FAMILIES: FrozenSet[str] = (
+    frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - frozenset({"POLY"})))
 
 # Families that cannot see more than one channel. POLY fits `np.polyfit` to the
 # raw series and raises "Polynomial must be 1d only" on anything wider, which is
@@ -197,12 +233,12 @@ TRANSDUCTIVE_FAMILIES: FrozenSet[str] = frozenset({"COF", "SOS", "SR", "POLY"})
 # MOMENT) are none of them in this pool. It is listed anyway so the taxonomy is
 # visible and a future FM detector has an obvious home.
 DETECTOR_GROUPS: Dict[str, tuple] = {
-    "NN": ("AUTOENCODER", "RNN", "LSTMVAE", "DGHL", "LSTMAD", "DONUT",
-           "OMNIANOMALY", "USAD", "TRANAD", "FITS", "TIMESNET"),
+    "NN": ("AE", "RNN", "LSTMVAE", "DGHL", "LSTMAD", "DONUT",
+           "OA", "USAD", "TRANAD", "FITS", "TIMESNET"),
     "Stat": ("LOF", "NN", "CBLOF", "ABOD", "KDE", "IFOREST", "HBOS", "PCA",
              "OCSVM", "MCD", "COF", "SOS", "SR", "RM", "MD", "KMEANSAD",
              "POLY"),
-    "FM": (),
+    "FM": ("OFA", "TIMESFM", "CHRONOS"),
 }
 
 
@@ -211,7 +247,7 @@ DETECTOR_GROUPS: Dict[str, tuple] = {
 GROUP_LABELS: Dict[str, str] = {
     "NN": "Neural Networks",
     "Stat": "Statistical",
-    "FM": "Foundational",
+    "FM": "Foundation",
 }
 
 
@@ -246,6 +282,25 @@ MIN_DETECTORS = 2
 # the reader their narratives came from a model that never saw them.
 DEFAULT_LLM_MODEL = "qwen2.5:14b-instruct"
 DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
+
+
+# How a dataset is SHOWN. The CLI, the directory names and every path keep the
+# real key; this is presentation only.
+#
+# Owned here rather than in `WebUI/catalog.py` because two sides need the same
+# answer and disagreed: the pipeline writes "Dataset: skab" into the
+# comprehensive report from the raw `--dataset` argument, while the web UI
+# showed "SKAB" from the directory name — the same run named two ways on two
+# pages. `anomaly_archive` is why this is a table and not `.upper()`.
+DATASET_LABELS: Dict[str, str] = {
+    "skab": "SKAB", "smd": "SMD", "anomaly_archive": "UCR",
+    "msl": "MSL", "smap": "SMAP", "apple": "Apple",
+}
+
+
+def dataset_label(key: str) -> str:
+    """'skab' -> 'SKAB', 'anomaly_archive' -> 'UCR'. Unknown keys upper-case."""
+    return DATASET_LABELS.get(str(key).lower(), str(key).upper())
 
 
 def family_of(detector: str) -> str:

@@ -15,8 +15,9 @@ from typing import Any, Dict, List, Optional
 
 # Utils/__init__.py is empty and pipeline_spec is stdlib-only, so this import
 # stays cheap — it does not drag torch/matplotlib in the way Utils.utils would.
-from Utils.pipeline_spec import (ALL_DETECTORS, DETECTOR_FAMILIES, DETECTOR_GROUPS,
-                                 GROUP_LABELS, family_of, group_of)
+from Utils.pipeline_spec import (ALL_DETECTORS, DATASET_LABELS, DETECTOR_FAMILIES,
+                                 DETECTOR_GROUPS, GROUP_LABELS, dataset_label,
+                                 family_of, group_of)
 # hyperparameter_grids.py is plain dict literals with no imports at all, and
 # Model_Training/__init__.py is empty, so this reaches the grids without
 # pulling torch or sklearn into the Flask process.
@@ -38,15 +39,17 @@ UNRUNNABLE = frozenset({"swat", "synthetic"})
 DIRECTORY_ALIASES = {"servermachinedataset": "smd"}
 
 # How each dataset is shown. The CLI still receives the real directory name.
-DISPLAY_NAMES = {"skab": "SKAB", "smd": "SMD", "anomaly_archive": "UCR",
-                 "msl": "MSL", "smap": "SMAP", "apple": "Apple"}
+# Defined in `Utils.pipeline_spec` so the pipeline's own report header and this
+# page cannot disagree about what to call a run; re-exported under the old name
+# because that is what this module's callers import.
+DISPLAY_NAMES = DATASET_LABELS
 
 # Files that hold one entity each, per dataset layout.
 _ENTITY_SUFFIXES = (".csv", ".txt")
 
 
 def display_name(key: str) -> str:
-    return DISPLAY_NAMES.get(str(key).lower(), str(key).upper())
+    return dataset_label(key)
 
 
 def _entity_from_filename(name: str, dataset_key: str) -> Optional[str]:
@@ -87,6 +90,14 @@ _SHOWN_AS = {
     "detector__cut_freq": "frequencies",
     "detector__hidden_neuron_list": "hidden layers",
     "detector__lr": "learning rate",
+    # The families that stopped sweeping contamination.
+    "n_clusters": "clusters",
+    "detector__n_estimators": "trees",
+    "detector__max_features": "max features",
+    "detector__n_bins": "bins",
+    "detector__n_components": "components",
+    "detector__kernel": "kernel",
+    "detector__support_fraction": "support fraction",
     "detector__epoch_num": "epochs",
     "detector__num_epochs": "epochs",
     "detector__epochs": "epochs",
@@ -144,7 +155,13 @@ def _read_meta(pth: Path, name: str) -> Optional[dict]:
     hide exactly the staleness worth seeing.
 
     A corrupt or unreadable sidecar degrades to the grid's answer rather than
-    breaking the catalog.
+    breaking the catalog. So does a sidecar that holds NONE of the keys the
+    grid currently varies — which is every checkpoint written before a family
+    stopped sweeping `contamination`, since those sidecars record a
+    contamination and no `n_neighbors`, `n_clusters` or `n_estimators`. Taking
+    the sidecar literally there produces an empty label, and a chip that names
+    no hyperparameter at all is less use than one naming what a retrain will
+    give it. Retraining makes the two agree again.
     """
     meta_path = pth.with_suffix(".meta")
     if not meta_path.is_file():
@@ -161,7 +178,10 @@ def _read_meta(pth: Path, name: str) -> Optional[dict]:
         return _grid_params(name)
     grid = FAMILY_GRIDS.get(family_of(name))
     keys = varying_keys(grid) if grid else []
-    return {"label": _label_from(model, keys),
+    label = _label_from(model, keys)
+    if label is None:
+        return _grid_params(name)
+    return {"label": label,
             "window_size": model.get("window_size"),
             "window_step": model.get("window_step")}
 

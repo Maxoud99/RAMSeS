@@ -79,7 +79,7 @@ function header(report, sections) {
 
   return el("section", { class: "stack" },
     el("div", { class: "row-between" },
-      el("h1", { text: `${dataset} · entity ${entity}` }),
+      el("h1", { text: `${report.dataset_label || dataset} · entity ${entity}` }),
       el("a", { class: "button no-print", href: report.download_url, text: "Download .txt" })),
     el("p", { class: "muted", style: "max-width: 68ch;" },
       "The pipeline's comprehensive results — measured timings, memory, the ranking each " +

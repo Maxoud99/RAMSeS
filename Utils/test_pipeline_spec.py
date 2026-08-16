@@ -395,7 +395,7 @@ class TestTSBADFamilies(unittest.TestCase):
     _KWARGS = {
         "KMEANSAD": {"k": 4, "window_size": 20, "stride": 1},
         "DONUT": {"win_size": 20, "num_epochs": 1},
-        "OMNIANOMALY": {"win_size": 20, "epochs": 1},
+        "OA": {"win_size": 20, "epochs": 1},
         "USAD": {"win_size": 20, "epochs": 1},
         "TRANAD": {"win_size": 20, "epochs": 1},
         # FITS is the one whose two parameters are coupled: it keeps `cut_freq`
@@ -446,13 +446,68 @@ class TestTSBADFamilies(unittest.TestCase):
         class _Loader:
             Y_windows = train
 
-        for family in sorted(spec.TSBAD_FAMILIES - spec.UNIVARIATE_FAMILIES):
+        # The foundation models are excluded here and covered by
+        # `test_foundation_models_resolve_and_are_routed` instead. They download
+        # pretrained weights from the HuggingFace hub on first use and take
+        # 13-15s per fit, which would turn an offline seven-second suite into a
+        # network-dependent minute. Their one-score-per-row behaviour was
+        # measured directly instead: OFA, TIMESFM and CHRONOS each returned
+        # (300,) finite scores for a 300-row multivariate call.
+        skip = spec.UNIVARIATE_FAMILIES | set(spec.DETECTOR_GROUPS["FM"])
+        for family in sorted(spec.TSBAD_FAMILIES - skip):
             with self.subTest(family=family):
                 model = self.estimator(family, 0.1, self._KWARGS[family])
                 self.windowed.fit_windows(model, _Loader())
                 scores = self.windowed.score_windows(model, probe)
                 self.assertEqual(scores.shape, (len(probe),))
                 self.assertTrue(self.np.isfinite(scores).all())
+
+    def test_foundation_models_resolve_and_are_routed(self):
+        """What can be asserted about the FMs without a network round-trip.
+
+        The pool's first Foundation Models. Everything here is structural: that
+        the class resolves, that the grid exists and keeps window_size 1, and
+        that scoring never hands them a partial batch. Actually fitting them
+        needs weights from the hub, so it is not done in this suite.
+        """
+        from Model_Training.hyperparameter_grids import FAMILY_GRIDS
+        from Utils import model_selection_utils as msu
+        families = spec.DETECTOR_GROUPS["FM"]
+        self.assertEqual(sorted(families), ["CHRONOS", "OFA", "TIMESFM"])
+        for family in families:
+            with self.subTest(family=family):
+                cls, channel_arg, scorer = self.class_for(family)
+                self.assertTrue(callable(cls))
+                # Each takes the channel count, which is what lets the two
+                # univariate-marked ones run their per-channel loop.
+                self.assertIn(channel_arg, ("enc_in", "input_c"))
+                self.assertEqual(FAMILY_GRIDS[family]["window_size"], [1])
+                self.assertIn(family, msu._WHOLE_SERIES_MODELS)
+        # CHRONOS is ours over `chronos-forecasting`, not TSB-AD's autogluon
+        # route; the dotted path in the spec is what makes that reachable.
+        self.assertEqual(self.class_for("CHRONOS")[0].__module__,
+                         "Algorithms.chronos_detector")
+
+    def test_chronos_asks_for_the_reproducible_variant(self):
+        """Bolt, not T5, and the difference is not cosmetic.
+
+        Chronos-T5 forecasts by sampling: two calls on identical input measured
+        1.7e-01 apart on one pipeline and 4.9e-01 across a scoring call. That is
+        the same property PyOD's TimeSeriesOD and AnomalyTransformer are kept
+        out of this pool for, so a T5 checkpoint would make a detector whose
+        rank changes between two reads of the same run. Bolt does direct
+        quantile regression with no sampling and measures 0.000e+00.
+
+        Asserted against the source rather than by loading weights, so the guard
+        costs nothing and needs no network.
+        """
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, os.pardir, "Algorithms",
+                               "chronos_detector.py")) as f:
+            source = f.read()
+        self.assertIn("amazon/chronos-bolt-", source)
+        self.assertNotIn("amazon/chronos-t5-", source)
 
     def test_they_are_routed_to_a_single_batch(self):
         """Exempting them from the batch-independence test is only safe because
@@ -480,6 +535,61 @@ class TestTSBADFamilies(unittest.TestCase):
             self.windowed.fit_windows(model, _Loader())
         self.assertIn("POLY", str(caught.exception))
         self.assertIn("univariate", str(caught.exception))
+
+    def test_every_checkpoint_load_goes_through_one_loader(self):
+        """A save and a load must use the same pickler.
+
+        `Logger.save_torch_model` writes with `dill`, because PyOD 3 defines
+        LSTMAD's network as a class inside a function and stdlib pickle cannot
+        serialise that — it raised after `fit`, leaving a truncated .pth that
+        read as a trained model, which is why no LSTMAD checkpoint has ever
+        existed. A `torch.load` that forgets `pickle_module` would then fail
+        only on whichever of the three load sites a given user happens to hit.
+        This is the same "two places must know one rule" defect that cost
+        LSTMAD its training in the first place, so it gets the same treatment:
+        one owner, asserted.
+        """
+        import re
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.join(here, os.pardir)
+        targets = ["app.py",
+                   os.path.join("Model_Selection", "model_selection.py"),
+                   os.path.join("Services", "mmodel", "__init__.py")]
+        raw = re.compile(r"\b(?:t|torch)\.load\s*\(")
+        for rel in targets:
+            with open(os.path.join(root, rel)) as f:
+                source = f.read()
+            with self.subTest(file=rel):
+                self.assertFalse(
+                    raw.search(source),
+                    f"{rel} calls torch.load directly; use "
+                    f"Utils.model_io.load_checkpoint so the pickler matches "
+                    f"what Logger.save_torch_model wrote")
+                self.assertIn("load_checkpoint", source, rel)
+
+    def test_the_trainer_and_the_scorer_agree_on_who_needs_one_batch(self):
+        """Both places that size a batch must read the same set.
+
+        They did not, and it cost LSTMAD entirely. `evaluate_model` knew to give
+        it the whole series, but `TrainModels._diagnostic_batch_size` only knew
+        about the transductive and TSB-AD families — so the post-fit plotting
+        loop ran at batch_size 8 against a 50-150 step window and raised
+        "negative dimensions are not allowed". That raise happens BEFORE
+        `logging_obj.save`, so no checkpoint was written and LSTMAD could not be
+        trained on any entity. One owner, read by both, is the fix.
+        """
+        import os
+        from Utils import model_selection_utils as msu
+        self.assertEqual(msu._WHOLE_SERIES_MODELS, spec.WHOLE_SERIES_FAMILIES)
+        self.assertFalse(spec.WHOLE_SERIES_FAMILIES & spec.TRANSDUCTIVE_FAMILIES,
+                         "a family cannot need one batch for both reasons")
+        self.assertIn("LSTMAD", spec.WHOLE_SERIES_FAMILIES)
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, os.pardir, "Model_Training", "train.py")) as f:
+            trainer = f.read()
+        self.assertIn("WHOLE_SERIES_FAMILIES", trainer,
+                      "_diagnostic_batch_size must size from the shared set, "
+                      "not from a list of its own")
 
     def test_poly_refuses_a_call_shorter_than_one_window(self):
         """POLY computes `N = floor(n_rows / window)` and then takes
@@ -584,21 +694,30 @@ class TestGridReadback(unittest.TestCase):
                     if len(values) == 1:
                         self.assertNotIn(key, varying)
 
-    def test_contamination_only_families_are_recorded_as_such(self):
-        """Nine families vary contamination alone, which does not enter
-        decision_function — so their instances are identical to the pipeline.
-        This pins the current state so the fix is a deliberate, visible change
-        rather than something that quietly drifts."""
+    def test_no_family_varies_contamination_alone(self):
+        """Not one family may distinguish its instances by contamination.
+
+        It sets `threshold_` and `labels_` and never reaches
+        `decision_function`, and this pipeline scores with its own threshold
+        sweep — so a family sweeping it alone is one detector wearing four
+        names. Measured before the fix: every instance of all twelve such
+        families scored 0.000e+00 apart on both SKAB and SMD.
+
+        Twelve families are now on a real parameter. Seven took TSB-AD's own
+        sweep (LOF, CBLOF, IFOREST, HBOS, PCA, OCSVM, MCD), separating by
+        3.1e-01, 1.5e+00, 6.6e-02, 2.4e+00, 1.2e+02, 2.5e+00 and 2.7e+00. The
+        other five have no TSB-AD entry to copy — the name ABOD does not occur
+        anywhere in that package, and its only SR entry is a univariate
+        `periodicity` — so they took the parameter PyOD's own estimator exposes:
+        ABOD `n_neighbors`, KDE `bandwidth`, COF `n_neighbors`, SOS
+        `perplexity`, SR `score_window`.
+
+        Written as "none" rather than as a shrinking allow-list so a NEW family
+        cannot be added on a contamination sweep without this failing.
+        """
         contamination_only = {f for f, g in self.FAMILY_GRIDS.items()
                               if self.varying_keys(g) == ["contamination"]}
-        self.assertEqual(contamination_only,
-                         {"LOF", "CBLOF", "ABOD", "KDE",
-                          "IFOREST", "HBOS", "PCA", "OCSVM", "MCD",
-                          # Added knowing it: these three join the same pending
-                          # fix rather than getting a different one first.
-                          # SOS is the extreme case — Algorithms/sos.py does not
-                          # even pass contamination to the estimator.
-                          "COF", "SOS", "SR"})
+        self.assertEqual(contamination_only, set())
 
 
 if __name__ == "__main__":

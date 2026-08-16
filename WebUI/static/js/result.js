@@ -387,7 +387,7 @@ function decisionHero(payload) {
 
   return el("section", { class: "decision-hero stack" },
     el("div", { class: "row-between" },
-      el("h1", { text: `${payload.dataset} · entity ${payload.entity}` }),
+      el("h1", { text: `${payload.dataset_label || payload.dataset} · entity ${payload.entity}` }),
       payload.generated_at
         ? el("span", { class: "muted small", text: timeAgo(payload.generated_at) }) : null),
     // Verbatim from the grounded decision atom — the page invents nothing.

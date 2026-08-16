@@ -23,6 +23,11 @@ def get_all_module_names(library):
 # of seven entries beats importing all sixty-nine modules to search for a class,
 # and `Utils/test_pipeline_spec` fails if one of these ever stops resolving.
 _TS_MODULES = {
+    # Not a time-series detector, but here for the same reason: the pool spells
+    # it AE and no amount of case- or underscale-folding gets from "AE" to
+    # "auto_encoder". `AUTOENCODER` used to reach it through the fallback below;
+    # the abbreviation cannot.
+    "AE": "pyod.models.auto_encoder",
     "LSTMAD": "pyod.models.ts_lstm",
     "ANOMALYTRANSFORMER": "pyod.models.ts_anomaly_transformer",
     "MATRIXPROFILE": "pyod.models.ts_matrix_profile",
@@ -39,6 +44,7 @@ _TS_MODULES = {
 # one would start guessing.
 _TS_CLASSES = {
     "SR": "SpectralResidual",
+    "AE": "AutoEncoder",
 }
 
 

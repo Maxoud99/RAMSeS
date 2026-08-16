@@ -16,7 +16,7 @@ from Loaders.loader import Loader
 from Datasets.dataset import Dataset, Entity
 from Algorithms.base_model import PyMADModel
 from Model_Selection.inject_anomalies import InjectAnomalies
-from Utils.pipeline_spec import TRANSDUCTIVE_FAMILIES, TSBAD_FAMILIES
+from Utils.pipeline_spec import TRANSDUCTIVE_FAMILIES, WHOLE_SERIES_FAMILIES
 from Utils.utils import de_unfold
 from Model_Training.hyperparameter_grids import *
 from Model_Selection.anomaly_parameters import ANOMALY_PARAM_GRID
@@ -96,7 +96,7 @@ _SINGLE_WINDOW_MODELS = frozenset({"RNN", "RM"})
 # weights — so they too are inductive and one batch only removes the boundary.
 # POLY is excluded because it belongs in the set below instead: it does not
 # merely prefer one call, its score is DEFINED by the call's rows.
-_WHOLE_SERIES_MODELS = frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - TRANSDUCTIVE_FAMILIES)
+_WHOLE_SERIES_MODELS = WHOLE_SERIES_FAMILIES
 
 # A third reason to hand over the whole series, and the only one where doing so
 # CHANGES the answer rather than merely tidying it. COF, SOS and

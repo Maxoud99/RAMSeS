@@ -81,13 +81,18 @@
      cue rather than the identifier. */
   --fam-kmeansad: #4D7C0F;    /* lime      */
   --fam-poly: #86198F;        /* fuchsia   */
-  --fam-autoencoder: #BE123C; /* rose      */
+  --fam-ae: #BE123C; /* rose      */
   --fam-donut: #065F46;       /* emerald   */
-  --fam-omnianomaly: #7E22CE; /* purple    */
+  --fam-oa: #7E22CE; /* purple    */
   --fam-usad: #A16207;        /* dark gold */
   --fam-tranad: #1D4ED8;      /* royal blue*/
   --fam-fits: #155E75;        /* dark cyan */
   --fam-timesnet: #831843;    /* wine      */
+  /* Table I's Foundation Models. Kept in the teal-to-slate end the group
+     colour already occupies, so an FM chip reads as one before its name is. */
+  --fam-ofa: #0F766E;         /* deep teal */
+  --fam-timesfm: #3F6212;     /* moss      */
+  --fam-chronos: #6D28D9;     /* indigo-violet */
 
   /* Paper Table I groups: Neural Networks, Statistical, Foundation Models.
      Used on the run page, where the question is which KIND a detector is, not
@@ -116,10 +121,11 @@
     --fam-lstmvae: #7BD8A4; --fam-dghl: #E9A87C; --fam-rm: #C3CBD6;
     --fam-md: #E3C15E; --fam-lstmad: #B794F4;
     --fam-kmeansad: #BEF264; --fam-poly: #F0ABFC;
-    --fam-autoencoder: #FDA4AF; --fam-donut: #6EE7B7;
-    --fam-omnianomaly: #D8B4FE; --fam-usad: #FCD34D;
+    --fam-ae: #FDA4AF; --fam-donut: #6EE7B7;
+    --fam-oa: #D8B4FE; --fam-usad: #FCD34D;
     --fam-tranad: #93C5FD; --fam-fits: #67E8F9;
     --fam-timesnet: #F9A8D4;
+    --fam-ofa: #5EEAD4; --fam-timesfm: #BEF264; --fam-chronos: #C4B5FD;
     --grp-nn: #C4A7F7; --grp-stat: #F0A0C8; --grp-fm: #81E6D9;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 1px 8px rgba(0,0,0,.2);
   }
@@ -140,10 +146,11 @@
   --fam-lstmvae: #7BD8A4; --fam-dghl: #E9A87C; --fam-rm: #C3CBD6;
   --fam-md: #E3C15E; --fam-lstmad: #B794F4;
   --fam-kmeansad: #BEF264; --fam-poly: #F0ABFC;
-  --fam-autoencoder: #FDA4AF; --fam-donut: #6EE7B7;
-  --fam-omnianomaly: #D8B4FE; --fam-usad: #FCD34D;
+  --fam-ae: #FDA4AF; --fam-donut: #6EE7B7;
+  --fam-oa: #D8B4FE; --fam-usad: #FCD34D;
   --fam-tranad: #93C5FD; --fam-fits: #67E8F9;
   --fam-timesnet: #F9A8D4;
+  --fam-ofa: #5EEAD4; --fam-timesfm: #BEF264; --fam-chronos: #C4B5FD;
   --grp-nn: #C4A7F7; --grp-stat: #F0A0C8; --grp-fm: #81E6D9;
   --shadow: 0 1px 2px rgba(0,0,0,.3), 0 1px 8px rgba(0,0,0,.2);
 }
@@ -262,24 +269,27 @@ h3 { font-size: var(--fs-lg); }
 .chip-lstmad { color: var(--fam-lstmad); border-color: color-mix(in srgb, var(--fam-lstmad) 40%, var(--border)); }
 .chip-kmeansad { color: var(--fam-kmeansad); border-color: color-mix(in srgb, var(--fam-kmeansad) 40%, var(--border)); }
 .chip-poly { color: var(--fam-poly); border-color: color-mix(in srgb, var(--fam-poly) 40%, var(--border)); }
-.chip-autoencoder { color: var(--fam-autoencoder); border-color: color-mix(in srgb, var(--fam-autoencoder) 40%, var(--border)); }
+.chip-ae { color: var(--fam-ae); border-color: color-mix(in srgb, var(--fam-ae) 40%, var(--border)); }
 .chip-donut { color: var(--fam-donut); border-color: color-mix(in srgb, var(--fam-donut) 40%, var(--border)); }
-.chip-omnianomaly { color: var(--fam-omnianomaly); border-color: color-mix(in srgb, var(--fam-omnianomaly) 40%, var(--border)); }
+.chip-oa { color: var(--fam-oa); border-color: color-mix(in srgb, var(--fam-oa) 40%, var(--border)); }
 .chip-usad { color: var(--fam-usad); border-color: color-mix(in srgb, var(--fam-usad) 40%, var(--border)); }
 .chip-tranad { color: var(--fam-tranad); border-color: color-mix(in srgb, var(--fam-tranad) 40%, var(--border)); }
 .chip-fits { color: var(--fam-fits); border-color: color-mix(in srgb, var(--fam-fits) 40%, var(--border)); }
 .chip-timesnet { color: var(--fam-timesnet); border-color: color-mix(in srgb, var(--fam-timesnet) 40%, var(--border)); }
+.chip-ofa { color: var(--fam-ofa); border-color: color-mix(in srgb, var(--fam-ofa) 40%, var(--border)); }
+.chip-timesfm { color: var(--fam-timesfm); border-color: color-mix(in srgb, var(--fam-timesfm) 40%, var(--border)); }
+.chip-chronos { color: var(--fam-chronos); border-color: color-mix(in srgb, var(--fam-chronos) 40%, var(--border)); }
 
 /* Paper Table I groups, on the run page only: the family select-all button, the
    group select-all buttons, and the detector chips. Tinted rather than filled,
-   so a checked chip still reads as checked (.toggle:has(input:checked) sets the
-   accent background) and the group is a secondary signal on top of it. */
+   so a chosen chip still reads as chosen (.toggle.is-on sets the accent
+   background) and the group is a secondary signal on top of it. */
 .grp-nn { --grp: var(--grp-nn); }
 .grp-stat { --grp: var(--grp-stat); }
 .grp-fm { --grp: var(--grp-fm); }
 .toggle[class*="grp-"] { border-color: color-mix(in srgb, var(--grp) 35%, var(--border)); }
 .toggle[class*="grp-"] .detector { color: var(--grp); }
-.toggle[class*="grp-"]:has(input:checked) { border-color: var(--grp); }
+.toggle[class*="grp-"].is-on { border-color: var(--grp); }
 button.grp-nn, button.grp-stat, button.grp-fm {
   color: var(--grp);
   border-color: color-mix(in srgb, var(--grp) 35%, var(--border));
@@ -369,12 +379,23 @@ a.button.primary:hover { filter: brightness(1.08); background: var(--accent); }
 }
 .toggle:hover { background: var(--surface-sunken); }
 .toggle input { margin: 0; accent-color: var(--accent); }
+/* Two selectors, two kinds of chip. Detector chips are <button aria-pressed>
+   and carry `.is-on`; the stage chips are still a <label> around a checkbox,
+   because those are an ordinary multi-select and a tick is the right idiom for
+   one. A detector chip is not: it sits beside family and group buttons that say
+   "chosen" by filling, and three notations for one idea on one screen is what
+   this collapses. */
+.toggle.is-on,
 .toggle:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .toggle:has(input:disabled) { opacity: .45; cursor: not-allowed; }
+/* A <button> does not inherit the page font or the label's text alignment. */
+button.toggle { font: inherit; color: inherit; text-align: left; }
+button.toggle[aria-pressed="true"] { font-weight: 600; }
 /* Selectable, but nothing is on disk for it yet: picking it adds a training
    phase to the run, so it is marked rather than dimmed like a dead control. */
 .toggle.untrained { border-style: dashed; }
 .toggle.untrained .detector { color: var(--text-muted); }
+.toggle.untrained.is-on .detector,
 .toggle.untrained:has(input:checked) .detector { color: var(--text); }
 .toggle .hint { font-size: var(--fs-xs); color: var(--text-muted); font-family: var(--font-mono); }
 .toggle .detector { font-family: var(--font-detector); letter-spacing: -0.02em; }

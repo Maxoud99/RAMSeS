@@ -398,31 +398,47 @@ def _monte_carlo(ds, ent):
 def _off_by(ds, ent):
     d = _dir_for(TREE_OFFBY, ds, ent)
     headline, gallery = [], []
-    for path in _ls(d, "*_off_by_point_importance.png"):
-        headline.append(_fig(path, "Which point properties separate the winner",
-                             "Feature importance across all pairwise comparisons."))
     # One tree at a time, chosen by competitor. Every pair is already rendered,
     # so this is a selector over files rather than anything generated on demand
     # — but ten trees stacked down the card is ten near-identical figures the
     # reader has to scroll past to reach anything else.
-    trees = []
+    #
+    # ONLY THE LATEST RUN'S TREES. These filenames carry the winner, not a
+    # timestamp, so a run that picks a different winner writes a whole new set
+    # beside the old one instead of overwriting it: SKAB/7 holds seven
+    # `LOF_1_vs_*` from one run and ten `CBLOF_4_vs_*` from the next. Listing
+    # both put stale competitors in the picker and — because the group is
+    # chosen by filename order, not recency — titled the card with the OLD
+    # winner while the run being read had chosen another. Grouping by winner
+    # and keeping whichever group holds the newest file fixes both, and needs
+    # no timestamp in the name. Same-winner reruns overwrite by name already.
+    by_winner = {}
     for path in _ls(d, "*_off_by_point_tree_*.png"):
         m = _OFFBY_TREE_RE.search(path.name)
         if m:
-            trees.append(_fig(
-                path, m.group("competitor"),
-                f"Where {m.group('winner')} uniquely beat {m.group('competitor')}."))
-    if trees:
-        winner = _OFFBY_TREE_RE.search(trees[0]["name"]).group("winner")
+            by_winner.setdefault(m.group("winner"), []).append((path, m.group("competitor")))
+    if by_winner:
+        winner = max(by_winner,
+                     key=lambda w: max(p.stat().st_mtime for p, _ in by_winner[w]))
+        trees = [_fig(path, competitor,
+                      f"Where {winner} uniquely beat {competitor}.")
+                 for path, competitor in sorted(by_winner[winner], key=lambda t: t[1])]
         headline.append({
             "title": f"Where {winner} uniquely wins",
             "variants": trees, "default": 0, "select_label": "Compared against",
         })
-    for entry in dedupe_timestamped(_ls(d, "Data_vs_DataWithAnomalies_*.png")
-                                    + _ls(d, "*Misclassified*.png")):
-        title = ("Injected borderline points" if "Data_vs" in entry["path"].name
-                 else "Misclassified points")
-        gallery.append(_fig(entry["path"], title,
+    # Browse-only. The importance plot answers a question about the whole
+    # comparison rather than about this entity's decision, so it reads as
+    # background to the trees above rather than as a headline of its own.
+    for path in _ls(d, "*_off_by_point_importance.png"):
+        gallery.append(_fig(path, "Which point properties separate the winner",
+                            "Feature importance across all pairwise comparisons."))
+    # `*Misclassified*.png` is still written by the off-by stage on every run —
+    # it is simply not listed. It duplicates what the GAN card already shows
+    # under the same title, and the injected-points figure beside it is the one
+    # that says something specific to this stage.
+    for entry in dedupe_timestamped(_ls(d, "Data_vs_DataWithAnomalies_*.png")):
+        gallery.append(_fig(entry["path"], "Injected borderline points",
                             timestamp=entry["timestamp"], n_older=entry["n_older"]))
     return headline, gallery
 

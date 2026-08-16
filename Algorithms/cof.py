@@ -9,12 +9,21 @@ from Utils.utils import de_unfold
 import random
 class TsadCof(PyMADModel):
 
-    def __init__(self, window_size=1, window_step=1, contamination = 0.1,device=None):
+    def __init__(self, window_size=1, window_step=1, contamination=0.1,
+                 n_neighbors=20, device=None):
         super(TsadCof, self).__init__()
 
 
         self.contamination = contamination
-        self.model = COF(contamination=self.contamination)
+        # `n_neighbors` is what separates this family's instances: COF scores a
+        # point by comparing its chaining distance to that of its k neighbours,
+        # so k is the score. It also sets a HARD MINIMUM on every call — COF
+        # raises IndexError when handed fewer than k+1 rows — which is why the
+        # grid sweeps downward from the default as well as up: the k=10 instance
+        # can score short Thompson windows the k=40 one cannot.
+        self.n_neighbors = n_neighbors
+        self.model = COF(contamination=self.contamination,
+                         n_neighbors=self.n_neighbors)
         self.window_size = window_size
         self.window_step = window_step
         self.device =device

@@ -54,9 +54,12 @@ from Algorithms import windowed
 from Utils.utils import de_unfold
 
 
-# family -> (module under Algorithms.tsb_ad.models, class, channel-count kwarg,
-#            how to score). None as the channel kwarg means the constructor
-# infers the width from the data.
+# family -> (module, class, channel-count kwarg, how to score). A bare name is
+# a module under `Algorithms.tsb_ad.models`; a dotted path is taken as-is,
+# which is how CHRONOS reaches `Algorithms.chronos_detector` — that one is
+# written here rather than vendored, because TSB-AD's Chronos.py goes through
+# autogluon's 69 packages to reach a model Amazon publishes in 17. None as the
+# channel kwarg means the constructor infers the width from the data.
 #
 # The scorers:
 #   'decision_function' — the PyOD-shaped default.
@@ -69,17 +72,50 @@ _TSBAD_SPECS = {
     "KMEANSAD":    ("KMeansAD",    "KMeansAD",    None,      "predict"),
     "POLY":        ("POLY",        "POLY",        None,      "refit"),
     "DONUT":       ("Donut",       "Donut",       "input_c", "decision_function"),
-    "OMNIANOMALY": ("OmniAnomaly", "OmniAnomaly", "feats",   "decision_function"),
+    "OA": ("OmniAnomaly", "OmniAnomaly", "feats",   "decision_function"),
     "USAD":        ("USAD",        "USAD",        "feats",   "decision_function"),
     "TRANAD":      ("TranAD",      "TranAD",      "feats",   "decision_function"),
     "FITS":        ("FITS",        "FITS",        "input_c", "decision_function"),
     "TIMESNET":    ("TimesNet",    "TimesNet",    "enc_in",  "decision_function"),
+    # Table I's Foundation Models. OFA embeds the channel count natively
+    # (`enc_in`), which is why Table I marks it U&M; TIMESFM and CHRONOS score
+    # one channel at a time and average, which is upstream's own loop.
+    "OFA":         ("OFA",         "OFA",         "enc_in",  "decision_function"),
+    # 'refit', not 'decision_function': TSB-AD's TimesFM computes its scores in
+    # `fit` and leaves `decision_function` as a bare `pass` returning None —
+    # the same fit-and-read-`decision_scores_` shape POLY has. Being a frozen
+    # pretrained model, refitting learns nothing; it only recomputes forecasts.
+    "TIMESFM":     ("TimesFM",     "TimesFM",     "input_c", "refit"),
+    "CHRONOS":     ("Algorithms.chronos_detector", "Chronos", "input_c",
+                    "decision_function"),
 }
 
 # Families that cannot see more than one channel. Checked in `fit` so the
 # failure names the detector and the dataset shape instead of surfacing as
 # numpy's "Polynomial must be 1d only" from four frames down.
 UNIVARIATE_ONLY = frozenset({"POLY"})
+
+# For the 'refit' scorers, the constructor key that sets the minimum rows per
+# call, and its default. They spell it differently — POLY fits one polynomial
+# per `window`, TimesFM forecasts one step from each `win_size` context — and a
+# check reading the wrong key would compare against a number the detector never
+# uses.
+_MIN_LENGTH_KEYS = {
+    "POLY": ("window", 200),
+    "TIMESFM": ("win_size", 96),
+}
+
+# Attributes these models keep for TRAINING only, dropped once `fit` returns.
+#
+# Not an optimisation — a checkpoint cannot be written otherwise. OFA's
+# `model_optim` holds a reference reaching a torch config module, and neither
+# pickle nor dill can serialise one: `TypeError: cannot pickle
+# 'ConfigModuleInstance' object`, raised from `logging_obj.save` after training
+# had already finished. Verified across the vendored models that every one of
+# these names is touched only inside `fit` — `zero_grad`, `step`,
+# `adjust_learning_rate` — and never by `decision_function`, so dropping them
+# costs nothing at scoring time and makes the checkpoints smaller besides.
+_TRAINING_ONLY_ATTRS = ("model_optim", "optimizer", "scheduler")
 
 
 def _class_for(family: str):
@@ -90,7 +126,9 @@ def _class_for(family: str):
             f"{family} is not a TSB-AD family. Known: "
             f"{', '.join(sorted(_TSBAD_SPECS))}")
     module_name, class_name, channel_arg, scorer = _TSBAD_SPECS[key]
-    module = importlib.import_module(f"Algorithms.tsb_ad.models.{module_name}")
+    if "." not in module_name:
+        module_name = f"Algorithms.tsb_ad.models.{module_name}"
+    module = importlib.import_module(module_name)
     return getattr(module, class_name), channel_arg, scorer
 
 
@@ -150,10 +188,11 @@ class _TSBADEstimator:
         """
         if self._scorer != "refit":
             return
-        window = int(self.detector_kwargs.get("window", 200))
+        key, default = _MIN_LENGTH_KEYS.get(self.family, ("window", 200))
+        window = int(self.detector_kwargs.get(key, default))
         if n_rows < window:
             raise ValueError(
-                f"{self.family} needs at least `window` ({window}) rows per "
+                f"{self.family} needs at least `{key}` ({window}) rows per "
                 f"call and was handed {n_rows}. Thompson cuts windows of "
                 f"n_timesteps * 0.8 / iterations, so a short entity or a high "
                 f"iteration count puts it below this; every other stage scores "
@@ -180,7 +219,14 @@ class _TSBADEstimator:
             # writes to stderr, so real progress bars still reach the terminal.
             self._model = self._build(self.n_channels_)
             self._model.fit(Y)
+        self._release_training_state()
         return self
+
+    def _release_training_state(self):
+        """Drop optimiser and scheduler state so the fitted model can pickle."""
+        for attr in _TRAINING_ONLY_ATTRS:
+            if getattr(self._model, attr, None) is not None:
+                setattr(self._model, attr, None)
 
     def decision_function(self, X):
         """One score per row of `X`."""

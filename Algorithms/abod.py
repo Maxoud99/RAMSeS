@@ -9,12 +9,21 @@ from Utils.utils import de_unfold
 import random
 class TsadABOD(PyMADModel):
 
-    def __init__(self, window_size=1, window_step=1,contamination  = 0.1, device=None):
+    def __init__(self, window_size=1, window_step=1, contamination=0.1,
+                 n_neighbors=5, device=None):
         super(TsadABOD, self).__init__()
 
 
         self.contamination = contamination
-        self.model = ABOD()
+        # `n_neighbors` is what separates this family's instances. It is also
+        # the only parameter that reaches the score at all: `method='fast'`
+        # computes the angle variance over the k nearest neighbours. Note the
+        # old line was `ABOD()` with no arguments whatsoever — not even the
+        # contamination the grid was sweeping — so the four ABOD instances were
+        # identical by construction rather than merely equivalent in effect.
+        self.n_neighbors = n_neighbors
+        self.model = ABOD(contamination=self.contamination,
+                          n_neighbors=self.n_neighbors)
         self.window_size = window_size
         self.window_step = window_step
         self.device =device

@@ -7,11 +7,24 @@ from Utils.utils import de_unfold
 
 class TsadLof(PyMADModel):
 
-    def __init__(self, window_size=1, window_step=1, contamination=0.1, device=None):
+    def __init__(self, window_size=1, window_step=1, contamination=0.1,
+                 n_neighbors=20, metric='minkowski', device=None):
+        """`n_neighbors` and `metric` are what separate this family's instances.
+
+        They used to be PyOD's defaults with only `contamination` varying, which
+        made the four LOF instances one detector wearing four names: it sets
+        `threshold_`/`labels_` and never reaches `decision_function`, and the
+        pipeline scores with its own threshold sweep. Both names and their
+        values come from TSB-AD's LOF sweep, so the pool's instances are the
+        ones the baseline framework tunes over.
+        """
         super(TsadLof, self).__init__()
 
         self.contamination = contamination
-        self.model = LOF(contamination=self.contamination)
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.model = LOF(contamination=self.contamination,
+                         n_neighbors=self.n_neighbors, metric=self.metric)
         self.window_size = window_size
         self.window_step = window_step
         self.device = device

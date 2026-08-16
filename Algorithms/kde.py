@@ -7,12 +7,19 @@ from pyod.models.kde import KDE
 from Utils.utils import de_unfold
 class TsadKde(PyMADModel):
 
-    def __init__(self, window_size=1, window_step=1,contamination=0.1, device=None):
+    def __init__(self, window_size=1, window_step=1, contamination=0.1,
+                 bandwidth=1.0, device=None):
         super(TsadKde, self).__init__()
 
 
         self.contamination = contamination
-        self.model = KDE(contamination=self.contamination)
+        # `bandwidth` is what separates this family's instances: it is the
+        # kernel width, so it decides how peaked the estimated density is and
+        # therefore the score of every point. `contamination` only moved a
+        # threshold this pipeline replaces with its own sweep.
+        self.bandwidth = bandwidth
+        self.model = KDE(contamination=self.contamination,
+                         bandwidth=self.bandwidth)
         self.window_size = window_size
         self.window_step = window_step
         self.device =device
