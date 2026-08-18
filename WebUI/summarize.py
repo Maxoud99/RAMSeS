@@ -49,9 +49,16 @@ _REGIME_RE = re.compile(r"\bregime\s+(\d+)\b", re.IGNORECASE)
 _STAGE_SUMMARY: Dict[str, Dict[str, Any]] = {
     "ga_selection": {"mode": "drop", "drop": ("excluded_detector", "excluded_group")},
     "monte_carlo": {"mode": "drop", "drop": ("win_region",)},
-    # Both importance families: the per-competitor "Against X …" atoms and the
-    # "Across all competitors …" roll-up.
-    "off_by_threshold": {"mode": "drop", "drop": ("feature_importance", "summary")},
+    # One sentence per rival, all of the same atom type, so there is nothing to
+    # drop BY TYPE that would not take every rival with it — dropping the two
+    # importance families (which is what these did) left eleven near-identical
+    # rival sentences in the default view. The cut is by position instead: the
+    # winner and its three closest competitors open the card, and the rest —
+    # the weaker rivals, the per-rival importances and the roll-up — are what
+    # the click buys. The IR orders the rivals hardest-first, so the four kept
+    # here are the four that matter.
+    "off_by_threshold": {"mode": "lead", "sentences": 4},
+    "gan": {"mode": "lead", "sentences": 4},
     # The per-regime walk is the bulk of this narrative, and it already has a
     # disclosure of its own where each regime sits beside its SHAP plot.
     # `extended_in` says the dropped sentences are rendered there, so the card
@@ -426,6 +433,25 @@ def summarize(text: str, *, stage: Optional[str] = None,
                         "extended": extended}
             return {"summary": body, "body": body, "is_full": True,
                     "mode": "full", "table": table}
+
+        if spec["mode"] == "lead":
+            # The first N sentences, and the rest behind the disclosure.
+            #
+            # Attribution-based dropping cannot serve these two stages: their
+            # narrative is one sentence per rival, all of the same atom type, so
+            # there is no type to drop that would not take every rival with it.
+            # What makes them long is the NUMBER of rivals — eleven on a
+            # twelve-detector pool — and the card only needs to open with the
+            # winner and its closest competition. Position, not type, is the cut.
+            sentences = split_sentences(body)
+            n = int(spec.get("sentences", 4))
+            if len(sentences) > n:
+                short = " ".join(s.strip() for s in sentences[:n]).strip()
+                if short:
+                    return {"summary": short, "body": body, "is_full": False,
+                            "mode": "lead", "table": None}
+            return {"summary": body, "body": body, "is_full": True,
+                    "mode": "full", "table": None}
 
         if spec["mode"] == "table":
             table = _TABLE_BUILDERS[spec["table"]](ir_doc)

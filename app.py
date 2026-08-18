@@ -44,6 +44,8 @@ from Utils.pipeline_spec import (
     DETECTOR_FAMILIES,
     MIN_DETECTORS,
     families_for,
+    family_of,
+    UNIVARIATE_FAMILIES,
 )
 from Utils.pipeline_spec import ALL_STAGES as _SPEC_ALL_STAGES
 from Utils.pipeline_spec import OFFLINE_ITERATION as _SPEC_OFFLINE_ITERATION
@@ -514,7 +516,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         # GAN creates its own perturbations internally
         test_data_for_gan = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
         gan_results = run_Gan(
-            test_data_for_gan, trained_models, models_to_use, dataset, entity
+            test_data_for_gan, trained_models, models_to_use, dataset, entity,
+            explain=explain
         )
         timing_dict['3_GAN_Robustness'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -793,7 +796,7 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             gan_future = executor.submit(
                 run_Gan,
                 test_data_gan_copy, trained_models, models_to_use,
-                dataset, entity
+                dataset, entity, explain=explain
             )
         
         borderline_future = executor.submit(
@@ -1225,9 +1228,33 @@ def run_app(algorithm_list, algorithm_list_instances):
     if not train_data.entities:
         logger.error("Failed to load training data. Check dataset and paths.")
         return
-    if not test_data.entities:
-        logger.error("Failed to load test data. Check dataset and paths.")
-        return
+    # Univariate-only families are dropped from the pool HERE, the first point
+    # at which the channel count is known.
+    #
+    # Declaring the restriction is not enough on its own: nothing else consumed
+    # UNIVARIATE_FAMILIES, so selecting one of these on a multivariate entity
+    # reached `_TSBADEstimator._check_width`, whose ValueError is raised from
+    # inside `TrainModels.train_models` — a loop with no per-family recovery, so
+    # one unusable detector aborted training for every family after it. Dropping
+    # them up front turns that into a warning naming the detectors, and leaves
+    # the rest of the pool intact.
+    n_channels = test_data.entities[0].Y.shape[0]
+    if n_channels > 1:
+        dropped = [d for d in detectors_to_load
+                   if family_of(d) in UNIVARIATE_FAMILIES]
+        if dropped:
+            detectors_to_load = [d for d in detectors_to_load if d not in dropped]
+            families_to_train = families_for(detectors_to_load)
+            logger.warning(
+                f"⚠ Skipping {len(dropped)} univariate-only detector(s) on a "
+                f"{n_channels}-channel entity: {', '.join(dropped)}. "
+                f"Table I marks these 'U'; they run on UCR.")
+            if not detectors_to_load:
+                logger.error(
+                    "Every requested detector is univariate-only and this "
+                    f"entity has {n_channels} channels — nothing left to run. "
+                    "Select a multivariate detector, or run on UCR.")
+                return
 
     logger.info("🔧 STAGE 3/7: Training/Loading Models...")
     model_trainer = TrainModels(

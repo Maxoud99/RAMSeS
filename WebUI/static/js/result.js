@@ -214,6 +214,7 @@ const EXTENDED_LABEL = {
   ga_selection: "Read the full explanation, including the detectors left out",
   monte_carlo: "Read the full explanation, including the winning noise ranges",
   off_by_threshold: "Read the full explanation, including property importances",
+  gan: "Read the full explanation, including property importances",
   thompson_ranking: "Read the full explanation, including how leadership changed hands",
 };
 

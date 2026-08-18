@@ -96,6 +96,31 @@ class TestFamilies(unittest.TestCase):
         self.assertEqual(spec.family_of("CBLOF_2"), "CBLOF")
         self.assertEqual(spec.family_of("NN_3"), "NN")
 
+    def test_ae_cuts_enough_windows_for_pyods_dropped_last_batch(self):
+        """AE is the only pool detector on PyOD's deep base class.
+
+        `base_dl.fit` builds `DataLoader(batch_size=32, drop_last=True)`, so the
+        window COUNT has to clear 32 or the loader yields no batches, the
+        training loop body never runs, and PyOD raises `UnboundLocalError` on an
+        unassigned `loss` — having trained on nothing. The count is set here, by
+        `window_step`, not by anything PyOD can see: at the 64/64 the framework
+        models use, SKAB's 917-step entity gave 14 windows and crashed.
+
+        The entity lengths are the real ones after downsampling: SKAB 917,
+        SMD 2848. A grid change that stopped clearing 32 on the shorter of them
+        would put the crash back.
+        """
+        from Model_Training.hyperparameter_grids import AE_PARAM_GRID
+        window = AE_PARAM_GRID["window_size"][0]
+        step = AE_PARAM_GRID["window_step"][0]
+        for n_time, name in ((917, "SKAB"), (2848, "SMD")):
+            with self.subTest(entity=name):
+                n_windows = (n_time - window) // step + 1
+                self.assertGreaterEqual(
+                    n_windows, 32,
+                    f"{name}: window={window} step={step} yields {n_windows} "
+                    f"windows, under PyOD's batch_size 32 with drop_last=True")
+
     def test_families_for_is_ordered_and_deduped(self):
         self.assertEqual(spec.families_for(["NN_1", "LOF_2", "NN_3"]), ["LOF", "NN"])
         self.assertEqual(spec.families_for(spec.ALL_DETECTORS),
@@ -369,6 +394,75 @@ class TestTransductiveFamilies(unittest.TestCase):
         self.assertFalse(spec.TRANSDUCTIVE_FAMILIES & msu._SINGLE_WINDOW_MODELS)
 
 
+    def test_too_few_windows_names_the_detector_instead_of_unbinding_loss(self):
+        """The guard that turns PyOD's `UnboundLocalError` into an explanation.
+
+        Whatever the grid says today, a shorter entity or a wider window can put
+        the count back under `batch_size`. PyOD's own failure names neither the
+        detector nor the requirement and arrives four frames down, after it has
+        silently trained on nothing.
+        """
+        model = self.create_model("AE", self.modules, contamination=0.1,
+                                  hidden_neuron_list=[64, 32], epoch_num=10)
+        rows = self.t.tensor(self.rng.normal(size=(8, 9, 64)),
+                             dtype=self.t.float32)   # 8 windows, batch_size 32
+
+        class _Loader:
+            Y_windows = rows
+
+        with self.assertRaises(ValueError) as caught:
+            self.windowed.fit_windows(model, _Loader())
+        message = str(caught.exception)
+        self.assertIn("AutoEncoder", message)
+        self.assertIn("8 window", message)
+        self.assertIn("32", message)
+        self.assertIn("window_step", message)
+
+    def test_a_fitted_deep_detector_can_be_checkpointed(self):
+        """AE must survive `logging_obj.save`, which is dill through torch.save.
+
+        PyOD's deep base leaves `self.optimizer` on the detector, and a torch
+        optimiser reaches a `torch._dynamo` config module: `TypeError: cannot
+        pickle 'ConfigModuleInstance' object`, raised AFTER training finished,
+        so the work was done and then discarded. Dropping the training-only
+        state is what makes the checkpoint writable — and it must not change a
+        single score, which is the other half of this test.
+        """
+        import io
+        import dill
+        model = self.create_model("AE", self.modules, contamination=0.1,
+                                  hidden_neuron_list=[64, 32], epoch_num=2)
+        rows = self.t.tensor(self.rng.normal(size=(40, 3, 8)),
+                             dtype=self.t.float32)
+
+        class _Loader:
+            Y_windows = rows
+
+        self.windowed.fit_windows(model, _Loader())
+        # fit_windows released it; nothing that scores may have been touched.
+        self.assertIsNone(getattr(model, "optimizer", None))
+        scores = self.windowed.score_windows(model, rows)
+
+        buffer = io.BytesIO()
+        self.t.save(model, buffer, pickle_module=dill)
+        buffer.seek(0)
+        reloaded = self.t.load(buffer, pickle_module=dill, weights_only=False)
+        self.assertTrue(self.np.array_equal(
+            scores, self.windowed.score_windows(reloaded, rows)))
+
+    def test_the_guard_ignores_detectors_that_do_not_batch(self):
+        """LOF and friends have no `batch_size`, and a guard that fired on them
+        would break every point-wise family in the pool."""
+        model = self.create_model("LOF", self.modules, contamination=0.1)
+        rows = self.t.tensor(self.rng.normal(size=(8, 9, 64)),
+                             dtype=self.t.float32)
+
+        class _Loader:
+            Y_windows = rows
+
+        self.windowed.fit_windows(model, _Loader())      # must not raise
+
+
 class TestTSBADFamilies(unittest.TestCase):
     """The eight families reached through the vendored TSB-AD subset.
 
@@ -615,7 +709,64 @@ class TestTSBADFamilies(unittest.TestCase):
         rather than after. A restriction enforced only in the adapter would be
         invisible until stage 3."""
         self.assertIn("POLY", spec.UNIVARIATE_FAMILIES)
+        self.assertIn("TIMESFM", spec.UNIVARIATE_FAMILIES)
         self.assertTrue(spec.UNIVARIATE_FAMILIES <= set(spec.DETECTOR_FAMILIES))
+
+    def test_the_two_vocabularies_of_the_restriction_agree(self):
+        """The UI reads `pipeline_spec`, the adapter enforces `tsbad_model`.
+
+        Two independent lists, so a family added to one and not the other either
+        fails at stage 3 with no warning, or warns about a run that would have
+        worked. Only TSB-AD families can appear in the adapter's dict, which is
+        the whole of what it can refuse.
+        """
+        from Algorithms import tsbad_model
+        self.assertEqual(set(tsbad_model.UNIVARIATE_ONLY),
+                         set(spec.UNIVARIATE_FAMILIES) & set(spec.TSBAD_FAMILIES))
+        # Every entry carries its own reason: the two are restricted for
+        # different causes and one shared sentence would misdescribe one of them.
+        for family, reason in tsbad_model.UNIVARIATE_ONLY.items():
+            with self.subTest(family=family):
+                self.assertTrue(reason and reason[0].islower(),
+                                "reason is spliced mid-sentence after a colon")
+
+    def test_the_restriction_is_enforced_by_dropping_not_only_by_raising(self):
+        """`app.py` must FILTER the pool, not rely on the adapter's ValueError.
+
+        The adapter raises from inside `TrainModels.train_models`, whose family
+        loop has no per-family recovery — so one univariate-only detector on a
+        multivariate entity aborted training for every family after it. The
+        declaration alone was inert: nothing read UNIVARIATE_FAMILIES.
+        """
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, os.pardir, "app.py")) as f:
+            source = f.read()
+        self.assertIn("UNIVARIATE_FAMILIES", source)
+        self.assertIn("family_of", source)
+        # The channel count is what the decision turns on, and it is only known
+        # after the test entity loads.
+        self.assertIn("n_channels", source)
+
+    def test_timesfm_refuses_a_multivariate_call_by_name(self):
+        """A cost refusal, not a capability one — TimesFM's per-channel loop
+        runs fine, it just costs ~13 min per scoring call on 38 channels. The
+        message has to say so without claiming the model cannot do it, and it
+        must name the detector rather than surface as a timeout an hour later.
+        """
+        model = self.estimator("TIMESFM", 0.1, {"win_size": 64})
+        probe = self.np.zeros((200, 4))
+        with self.assertRaises(ValueError) as caught:
+            model.fit(probe)
+        message = str(caught.exception)
+        self.assertIn("TIMESFM", message)
+        self.assertIn("univariate only", message)
+        self.assertIn("4 channels", message)
+        # Refused on the way in, before any weights are fetched from the hub.
+        self.assertIsNone(model._model)
+        # Univariate still passes the width guard (it stops before any forecast
+        # here only because fit() on a refit scorer merely constructs).
+        self.assertIsNone(model._check_width(1))
 
 
 class TestDetectorGroups(unittest.TestCase):

@@ -183,6 +183,9 @@ def _content_words(ir_doc: Dict[str, Any]) -> int:
 _BUDGET_FLOOR_RATIO = 0.9
 _BUDGET_CEILING_RATIO = 2.2
 _BUDGET_MIN_FLOOR = 40
+# The default ceiling, and now also what the floor is clamped against so the two
+# can never cross. Was an inline literal in two places.
+_BUDGET_HARD_CAP = 400
 
 
 def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220,
@@ -202,10 +205,23 @@ def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220,
     """
     if content_words:
         floor = max(_BUDGET_MIN_FLOOR, int(content_words * _BUDGET_FLOOR_RATIO))
-        return floor, min(400, max(floor + 40, int(content_words * _BUDGET_CEILING_RATIO)))
+        ceiling = max(floor + 40, int(content_words * _BUDGET_CEILING_RATIO))
+        # The cap is applied to BOTH ends, not to the ceiling alone. Capping only
+        # the ceiling inverted the range once a stage carried more than ~445
+        # words of facts: the GAN stage, at 711, was told to write "between 639
+        # and 400 words". A model handed a contradictory range compresses, and
+        # what it drops is the numbers — 4 of 29 rule thresholds survived, the
+        # rest becoming "under specific conditions related to ...".
+        #
+        # Clamping the floor keeps the global ceiling meaningful. A stage that
+        # genuinely needs to exceed it says so in _STAGE_WORD_BUDGETS below,
+        # which is the mechanism for exactly that and guards its own range.
+        if floor > _BUDGET_HARD_CAP - 40:
+            floor = _BUDGET_HARD_CAP - 40
+        return floor, min(_BUDGET_HARD_CAP, max(ceiling, floor + 40))
     if n_atoms <= 3:
         return 65, 120
-    return lo, min(400, hi + 8 * max(0, n_atoms - 12))
+    return lo, min(_BUDGET_HARD_CAP, hi + 8 * max(0, n_atoms - 12))
 
 
 # Stages where the narrative must carry one statement per atom rather than a
@@ -220,6 +236,33 @@ _STAGE_WORD_BUDGETS: Dict[str, tuple] = {
     # needs a lower ceiling than the stage above.
     "thompson_ranking": (20, 40, 500),
 }
+# NEITHER point-injection stage gets an entry, and that is deliberate.
+#
+# GAN had one — (30, 40, 900), sized so its rules would fit — and it backfired:
+# asked for 640-900 words it wrote 325, dropped 36% of its required atoms
+# INCLUDING the winner, opened on the feature importances and broke into five
+# paragraphs. Off-by, carrying MORE material (827 content words against GAN's
+# 771) but left on the generic budget, wrote 818 words in one paragraph with
+# zero omissions. A floor far above what the model wants to write is not a
+# nudge to write more; it makes it reorganise.
+#
+# The inverted range that first motivated the entry is fixed at source in
+# `_word_budget` above, and that fix — not the entry — is what recovered the
+# thresholds: on SKAB/3, the entity where they were first lost, the same IR goes
+# from 4 of 29 reproduced under the inverted range to 29 of 29 on the generic
+# budget with no entry at all.
+#
+# Both stages now run the generic path, and their prompts were diffed to confirm
+# nothing else drifted: identical but for the stage name, the question's wording,
+# and one sentence of task hint (gan's spells out that thresholds must be copied
+# with their numbers, which off-by does not need). The IRs match on envelope
+# keys, atom-type set and order bands, and their edge atoms are the same size —
+# 53 words and 3.7 thresholds each on SKAB/4 against off-by's 52 and 3.4.
+#
+# Note what does NOT bind: the 400 ceiling. Both stages routinely write past it
+# — 641 and 818 words on SKAB/4 — with zero omissions, across repeat runs. The
+# ceiling is advisory; it is a FLOOR above what the model wants to write that
+# breaks it.
 
 
 def _stage_word_budget(stage: Any, n_atoms: int) -> Optional[tuple]:
@@ -375,6 +418,29 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
         "it is worded in the facts. If a fact says the highest-ranked model "
         "never exclusively beat some models, state that too."
     ),
+    # The same shape as off_by_threshold: both stages narrate a winner's
+    # exclusive wins over injected points, and the degenerate clause is
+    # load-bearing here for the same reason (see the note below).
+    #
+    # The threshold sentence is NOT boilerplate. Squeezed by an inverted word
+    # budget, this stage wrote "under specific conditions related to generated
+    # point magnitude, gap from the surrounding series, and spread across
+    # channels" — a list of property names with every number dropped, which is
+    # unfalsifiable and tells a reader nothing about where the edge was. The
+    # budget is fixed above; this forbids the phrasing directly, because the
+    # verifier scores an atom as covered from its subject and win count alone
+    # and cannot see a missing threshold.
+    "gan": (
+        " Open with one short sentence naming the highest-ranked model, then "
+        "give each fact about the models it beat as its OWN separate sentence, "
+        "then the importance figures. The rival models named in a sentence must "
+        "be EXACTLY the models that fact lists. State every condition WITH ITS "
+        "NUMBERS, copied exactly as the fact writes them: never replace a "
+        "threshold with 'specific ranges', 'certain conditions', 'specific "
+        "values' or a bare list of property names. A sentence that names a "
+        "property without its number is wrong. If a fact says the "
+        "highest-ranked model never exclusively beat some models, state that too."
+    ),
 }
 # The hyphenated-range ban in monte_carlo and the degenerate clause in
 # off_by_threshold are NOT model-capability patches and must survive any future
@@ -481,7 +547,12 @@ _GLOBAL_STAGE_ORDER = (
     # to consume, and the selection dynamics then account for how the run got
     # there. WebUI.artifacts.STAGES must stay in this order.
     "thompson_ranking", "thompson_sampling",
-    "monte_carlo", "off_by_threshold",
+    # GAN leads the robustness block: it is sub-stage 6.3, ahead of off-by at
+    # 6.4 and Monte Carlo at 6.5. The existing monte_carlo/off_by_threshold
+    # order is left as it stands rather than reshuffled here.
+    # NOTE: no parentheses in this comment — WebUI.test_webui parses this tuple
+    # with a non-greedy regex that would stop at the first closing bracket.
+    "gan", "monte_carlo", "off_by_threshold",
     "rank_aggregation_robust", "rank_aggregation_final",
 )
 
@@ -493,6 +564,7 @@ _GLOBAL_STAGE_TITLES = {
     # WebUI.artifacts.STAGES.
     "thompson_ranking": "Thompson Sampling: ranking criterion",
     "thompson_sampling": "Thompson Sampling: selection dynamics",
+    "gan": "Robustness: GAN perturbations",
     "monte_carlo": "Robustness: Monte Carlo noise sweep",
     "off_by_threshold": "Sensitivity: off-by-threshold test",
     "rank_aggregation_robust": "Robustness consensus",
@@ -653,6 +725,7 @@ def _stage_file_map(iteration: int) -> Dict[str, str]:
         "ga_combination": "ir_ga_combination",
         "rank_aggregation_robust": f"ir_rank_aggregation_robust_{iteration}",
         "rank_aggregation_final": f"ir_rank_aggregation_final_{iteration}",
+        "gan": "ir_gan",
         "monte_carlo": "ir_monte_carlo",
         "off_by_threshold": "ir_off_by",
     }

@@ -130,6 +130,16 @@ def _off_by_result(n_wins=8):
     }
 
 
+def _gan_result(n_wins=8):
+    """The GAN stage's result has off-by's shape with GAN's features — the two
+    stages share one surrogate implementation and one IR builder."""
+    result = _off_by_result(n_wins=n_wins)
+    result["surrogates"]["feature_names"] = ["ambiguity", "local_volatility"]
+    pc = result["surrogates"]["per_competitor"]
+    pc["B"]["feature_importances"] = {"ambiguity": 0.9, "local_volatility": 0.1}
+    return result
+
+
 def _thompson_kwargs():
     return dict(
         n_windows=6,
@@ -1117,24 +1127,43 @@ class TestBuilders(unittest.TestCase):
                            max(a["order"] for a in ok["evidence"]
                                if a["id"] != "ob.degenerate"))
 
-    def test_off_by_edges_grouped_by_identical_counts(self):
-        # Distinct win counts → one atom each, ordered best-first and all
-        # required (grouping keeps the atom count low enough to require them).
-        result = _off_by_result(n_wins=10)
-        pc = result["surrogates"]["per_competitor"]
-        for name, wins in (("D", 8), ("E", 6), ("F", 1)):
-            pc[name] = dict(pc["B"], n_exclusive_wins=wins,
-                            exclusive_win_rate=wins / 40.0)
-        doc = ir.build_off_by_ir("DS", "e1", result, ["A", "B"])
-        _check_envelope(self, doc, "off_by_threshold")
-        req = set(doc["required_atom_ids"])
-        for wid in ("ob.edge.0", "ob.edge.1", "ob.edge.2", "ob.edge.3"):
-            self.assertIn(wid, req)
-        wins = {a["id"]: a for a in doc["evidence"] if a["type"] == "exclusive_wins"}
-        self.assertEqual(wins["ob.edge.0"]["value"]["competitors"], ["B"])  # 10
-        self.assertEqual(wins["ob.edge.3"]["value"]["competitors"], ["F"])  # 1
-        self.assertIn("10 injected points", wins["ob.edge.0"]["text"])
-        self.assertIn("1 injected point ", wins["ob.edge.3"]["text"])  # singular
+    def test_edges_are_ordered_biggest_margin_first(self):
+        """Distinct win counts -> one atom each, LARGEST count first.
+
+        This is the order the narrator follows, and both stages show only their
+        opening sentences by default (WebUI.summarize._STAGE_SUMMARY), so it
+        decides which rivals a reader sees without clicking.
+
+        The opposite order was tried and rejected: smallest-first, on the reading
+        that a rival the winner rarely beat outright is the one that ran it
+        closest. Asserted for BOTH stages here, since they share one builder and
+        the ordering is a property of that shared code.
+        """
+        for name, build, prefix in (("off_by_threshold", ir.build_off_by_ir, "ob"),
+                                    ("gan", ir.build_gan_ir, "gn")):
+            with self.subTest(stage=name):
+                result = (_off_by_result if prefix == "ob" else _gan_result)(n_wins=10)
+                pc = result["surrogates"]["per_competitor"]
+                for rival, wins in (("D", 8), ("E", 6), ("F", 1)):
+                    pc[rival] = dict(pc["B"], n_exclusive_wins=wins,
+                                     exclusive_win_rate=wins / 40.0)
+                doc = build("DS", "e1", result, ["A", "B"])
+                _check_envelope(self, doc, name)
+                req = set(doc["required_atom_ids"])
+                for i in range(4):
+                    self.assertIn(f"{prefix}.edge.{i}", req)
+                wins = {a["id"]: a for a in doc["evidence"]
+                        if a["type"] == "exclusive_wins"}
+                self.assertEqual(wins[f"{prefix}.edge.0"]["value"]["competitors"], ["B"])
+                self.assertEqual(wins[f"{prefix}.edge.3"]["value"]["competitors"], ["F"])
+                self.assertIn("10 injected points", wins[f"{prefix}.edge.0"]["text"])
+                self.assertIn("1 injected point ", wins[f"{prefix}.edge.3"]["text"])
+                # Counts descend across the family, and `order` follows them.
+                edges = sorted((a for a in doc["evidence"]
+                                if a["type"] == "exclusive_wins"),
+                               key=lambda a: a["order"])
+                counts = [a["value"]["count"] for a in edges]
+                self.assertEqual(counts, sorted(counts, reverse=True))
 
     def test_off_by_edges_merge_when_counts_identical(self):
         # Rivals sharing the same (count, rate) collapse into ONE atom naming
@@ -1182,6 +1211,81 @@ class TestBuilders(unittest.TestCase):
         # No separate rule atom family survives to be cross-contaminated.
         self.assertEqual(
             [a for a in doc["evidence"] if a["type"] == "surrogate_rule"], [])
+
+    # ── GAN: the same builder, a different vocabulary ───────────────────────
+    #
+    # build_gan_ir and build_off_by_ir share one implementation, so these do not
+    # re-test the grouping, dedup and ordering above. They pin the three things
+    # that are genuinely the GAN stage's own: its atom prefix, its feature prose,
+    # and that the sibling's structure survives the parameterisation.
+
+    def test_gan_ir_mirrors_off_by_with_its_own_prefix(self):
+        doc = ir.build_gan_ir("DS", "e1", _gan_result(n_wins=8), ["A", "B"])
+        _check_envelope(self, doc, "gan")
+        ids = {a["id"] for a in doc["evidence"]}
+        self.assertIn("gn.output.winner", ids)
+        self.assertIn("gn.points", ids)
+        self.assertIn("gn.degenerate", ids)
+        # The off-by prefix must not leak through the shared builder.
+        self.assertFalse([i for i in ids if i.startswith("ob.")])
+        self.assertIn("gn.output.winner", doc["required_atom_ids"])
+        self.assertIn("gn.degenerate", doc["required_atom_ids"])
+        # Stated LAST, for the same reason it is in off-by: it is the only place
+        # these names appear as a group.
+        deg = next(a for a in doc["evidence"] if a["id"] == "gn.degenerate")
+        self.assertGreater(deg["order"],
+                           max(a["order"] for a in doc["evidence"]
+                               if a["id"] != "gn.degenerate"))
+        self.assertIn("generated points were injected near the discriminator",
+                      next(a for a in doc["evidence"] if a["id"] == "gn.points")["text"])
+
+    def test_gan_support_gate_names_the_gan_stage(self):
+        low = ir.build_gan_ir("DS", "e1", _gan_result(n_wins=2), ["A", "B"])
+        self.assertEqual(low["confidence"]["surrogate_vs_B"]["support"], "low")
+        sup = next(c for c in low["caveats"] if c["id"] == "gn.caveat.support")
+        self.assertIn("The rule for B rests on only 2 exclusive-win points", sup["text"])
+        ok = ir.build_gan_ir("DS", "e1", _gan_result(n_wins=8), ["A", "B"])
+        self.assertNotIn("gn.caveat.support", {c["id"] for c in ok["caveats"]})
+
+    def test_gan_conditions_read_as_gan_prose(self):
+        """The features differ from off-by's, so the rendered clauses must too —
+        a shared builder that reused off-by's labels would silently describe a
+        generated point as if it had been scaled away from a threshold."""
+        try:
+            from sklearn.tree import DecisionTreeClassifier
+        except ImportError:
+            self.skipTest("scikit-learn not installed")
+        def _doc_for(X, y):
+            clf = DecisionTreeClassifier(max_depth=2, random_state=0).fit(X, y)
+            result = _gan_result(n_wins=8)
+            result["surrogates"]["feature_names"] = ["ambiguity", "is_anomaly"]
+            pc = result["surrogates"]["per_competitor"]
+            pc["B"] = dict(pc["B"], clf=clf,
+                           feature_importances={"ambiguity": 0.9, "is_anomaly": 0.1})
+            return ir.build_gan_ir("DS", "e1", result, ["A", "B"])
+
+        # is_anomaly alternates, so it separates nothing and ambiguity is the
+        # only split available.
+        doc = _doc_for(np.array([[0.01, 0.0], [0.02, 1.0], [0.04, 0.0], [0.05, 1.0]]),
+                       np.array([1, 1, 0, 0]))
+        edge = next(a for a in doc["evidence"] if a["type"] == "exclusive_wins")
+        self.assertIn("its distance from the discriminator's threshold is at most",
+                      edge["text"])
+        # Never a raw comparison, and never off-by's wording for the same slot.
+        self.assertNotIn("ambiguity <=", edge["text"])
+        self.assertNotIn("the distance from the boundary", edge["text"])
+        top = next(a for a in doc["evidence"] if a["id"] == "gn.summary.top_feature")
+        self.assertIn("the point's distance from the discriminator's threshold",
+                      top["text"])
+
+        # is_anomaly is a 0/1 label, so its 0.5 split becomes a statement rather
+        # than a comparison — and the statement is the GAN's, not off-by's: these
+        # points are labelled by the discriminator, not known to be real anomalies.
+        doc = _doc_for(np.array([[0.01, 0.0], [0.02, 0.0], [0.04, 1.0], [0.05, 1.0]]),
+                       np.array([1, 1, 0, 0]))
+        edge = next(a for a in doc["evidence"] if a["type"] == "exclusive_wins")
+        self.assertIn("the point was labelled normal", edge["text"])
+        self.assertNotIn("real anomaly", edge["text"])
 
     def test_mc_win_rates_account_for_the_detectors_the_cut_drops(self):
         """The shares are of the same trials, so they sum to 100% across ALL

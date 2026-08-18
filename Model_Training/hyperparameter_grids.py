@@ -540,7 +540,20 @@ AE_TRAIN_PARAM_GRID = {
 # PyOD's default.
 AE_PARAM_GRID = {
     'window_size': [64],
-    'window_step': [64],
+    # Overlapping, unlike the 64/64 that NN, LSTMVAE and DGHL use. AE is the
+    # pool's only detector on PyOD's deep base class, whose `fit` builds
+    # `DataLoader(batch_size=32, drop_last=True)` — so the window COUNT, not
+    # just the window content, has to clear 32 or the loader yields no batches
+    # at all and PyOD raises `UnboundLocalError: local variable 'loss'` from
+    # `base_dl.train`, having silently trained on nothing.
+    #
+    # At stride 64 a 917-step SKAB entity gives 14 windows and crashes; SMD's
+    # 2848 gives 44, which is one batch of 32 with 12 dropped — running, but not
+    # meaningfully trained. Stride 8 gives 107 and 349, clearing the batch on
+    # every entity in use while staying nearer the non-overlapping intent than
+    # a stride of 1 would. The framework models keep 64/64: they have their own
+    # trainers and never meet this loader.
+    'window_step': [8],
     'contamination': [0.1],
     'device': [None],
     'detector__hidden_neuron_list': [[64, 32], [32, 16], [128, 64]],

@@ -188,7 +188,8 @@ class ArtifactTreeCase(unittest.TestCase):
                        "thompson_ranking": {"status": "ok"},
                        "monte_carlo": {"status": "ok"},
                        "gan": {"status": "not_available",
-                               "note": "no explainability layer implemented for the GAN test"}},
+                               "note": "no explanation was written for this stage — the run "
+                                       "either skipped it or did not use --explain"}},
             "evidence": [{"id": "global.decision", "type": "decision", "subject": "d",
                           "value": None, "text": "The final decision is the ensemble {A, B}."}],
             "caveats": [], "required_atom_ids": []})
@@ -373,15 +374,12 @@ class TestBuildPayload(ArtifactTreeCase):
 
         Keyed on the id, not the title: the titles describe their own content
         rather than announcing which half of the section they belong to, so the
-        `-explained` suffix is the only durable marker of that boundary. GAN is
-        the exception on purpose — it has no explainability layer.
+        `-explained` suffix is the only durable marker of that boundary. Every
+        section carries one — GAN was the last exception and gained its layer.
         """
         p = artifacts.documentation(self.DATASET, self.ENTITY)
         for section in p["sections"]:
             ids = [s["id"] for s in section["subsections"]]
-            if section["id"] == "gan":
-                self.assertEqual(ids, [])
-                continue
             self.assertTrue(any(i.endswith("-explained") for i in ids),
                             (section["id"], ids))
 
@@ -398,7 +396,9 @@ class TestBuildPayload(ArtifactTreeCase):
         self.assertEqual([s["key"] for s in p["stages"]],
                          ["thompson_ranking", "thompson_sampling", "monte_carlo",
                           "rank_aggregation_robust"])
-        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 5, 7])
+        # GAN took order 5 when it gained an explainability layer, shifting the
+        # robustness block and both consensus stages down by one.
+        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 6, 8])
 
     def test_stage_order_matches_the_narrator(self):
         """The merged .txt and the page must present the stages in one order.
@@ -466,10 +466,18 @@ class TestBuildPayload(ArtifactTreeCase):
         self.assertEqual(ra["top_pick"], "LOF_1")
 
     def test_missing_stage_carries_its_reason(self):
+        """A stage the run never explained is listed WITH a reason.
+
+        GAN used to be permanently in this list; now it is a full stage and
+        lands here only when its IR file is absent, like any other. The title
+        still comes from STAGES, so the entry names the stage rather than its
+        key.
+        """
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
         gan = next(m for m in p["missing_stages"] if m["key"] == "gan")
         self.assertEqual(gan["status"], "not_available")
-        self.assertIn("no explainability layer", gan["note"])
+        self.assertEqual(gan["title"], "Robustness: GAN perturbations")
+        self.assertIn("--explain", gan["note"])
 
     def test_decision_and_agreement_come_from_the_global_ir(self):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
@@ -676,25 +684,48 @@ class TestSummaryDropsAtomClasses(unittest.TestCase):
         self.assertNotIn("0.042", out["summary"])
         self.assertIn("39.0%", out["summary"])
 
-    def test_off_by_moves_both_importance_families(self):
-        ir_doc = _stage_ir("off_by_threshold", [
-            {"id": "w", "type": "stage_output", "subject": "LOF_1", "value": {},
-             "text": "LOF_1 was the highest-ranked model of the stage."},
-            {"id": "v", "type": "feature_importance", "subject": "NN_3",
-             "value": {}, "text": "Against NN_3, the property that best "
-                                  "separates those points is position (importance 0.71)."},
-            {"id": "s", "type": "summary", "subject": "position", "value": {},
-             "text": "Across all competitors, LOF_1's edge is best explained "
-                     "by position (mean importance 0.87)."},
+    def test_off_by_and_gan_keep_only_their_opening_sentences(self):
+        """These two stages summarise by POSITION, not by atom type.
+
+        Their narrative is one sentence per rival, all `exclusive_wins`, so
+        there is no type to drop that would not take every rival with it. The
+        card opens with the winner and its three closest competitors; the weaker
+        rivals, the per-rival importances and the roll-up are what the click
+        buys. The IR orders rivals hardest-first, so the four kept are the four
+        that matter.
+        """
+        for stage in ("off_by_threshold", "gan"):
+            with self.subTest(stage=stage):
+                ir_doc = _stage_ir(stage, [
+                    {"id": "w", "type": "stage_output", "subject": "LOF_1",
+                     "value": {}, "text": "LOF_1 was the highest-ranked model."},
+                ])
+                narrative = ("LOF_1 was the highest-ranked model. It beat A on 1 point. "
+                             "It beat B on 2 points. It beat C on 3 points. "
+                             "It beat D on 9 points. "
+                             "Across all competitors the edge is position (0.87).")
+                out = summarize.summarize(narrative, stage=stage, ir_doc=ir_doc)
+                self.assertEqual(out["mode"], "lead")
+                self.assertFalse(out["is_full"])
+                # Exactly the first four sentences.
+                self.assertIn("highest-ranked", out["summary"])
+                self.assertIn("beat C on 3 points", out["summary"])
+                self.assertNotIn("beat D on 9 points", out["summary"])
+                self.assertNotIn("0.87", out["summary"])
+                # The full text is still available behind the disclosure.
+                self.assertIn("0.87", out["body"])
+
+    def test_a_short_narrative_is_not_cut(self):
+        """Under the limit the summary IS the narrative, so the card renders it
+        open and labelled 'Full text' rather than offering an empty expand."""
+        ir_doc = _stage_ir("gan", [
+            {"id": "w", "type": "stage_output", "subject": "LOF_1",
+             "value": {}, "text": "LOF_1 was the highest-ranked model."},
         ])
-        narrative = ("LOF_1 was the highest-ranked model of the stage. Against "
-                     "NN_3, the best separator is position (importance 0.71). "
-                     "Across all competitors, LOF_1's edge is best explained by "
-                     "position (mean importance 0.87).")
-        out = summarize.summarize(narrative, stage="off_by_threshold", ir_doc=ir_doc)
-        self.assertNotIn("0.71", out["summary"])
-        self.assertNotIn("0.87", out["summary"])
-        self.assertIn("highest-ranked", out["summary"])
+        narrative = "LOF_1 was the highest-ranked model. It beat A on 1 point."
+        out = summarize.summarize(narrative, stage="gan", ir_doc=ir_doc)
+        self.assertTrue(out["is_full"])
+        self.assertEqual(out["summary"], out["body"])
 
     def test_an_unattributable_sentence_is_kept(self):
         """Dropping happens only on positive evidence: a sentence that matches
@@ -2520,3 +2551,108 @@ class TestOffByTreeSelector(unittest.TestCase):
         titles = [f["title"] for f in gallery]
         self.assertNotIn("Misclassified points", titles)
         self.assertIn("Injected borderline points", titles)
+
+
+class TestGanPlotSelector(unittest.TestCase):
+    """The GAN card is off-by's sibling: same selector, its own filenames.
+
+    Both stages explain a winner's exclusive wins over injected points, so the
+    trees are the headline and everything else is one click away.
+    """
+
+    def setUp(self):
+        from WebUI import plots
+        self.plots = plots
+        self._tmp = tempfile.TemporaryDirectory()
+        self.myresults = Path(self._tmp.name) / "myresults"
+        self._saved = paths.MYRESULTS
+        paths.MYRESULTS = self.myresults
+
+    def tearDown(self):
+        paths.MYRESULTS = self._saved
+        self._tmp.cleanup()
+
+    def _touch(self, rel):
+        p = self.myresults / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x89PNG")
+        return p
+
+    def test_trees_collapse_into_one_selector_named_by_competitor(self):
+        base = "robustness/GAN/SKAB/7"
+        for competitor in ("CBLOF_1", "LOF_1", "NN_2"):
+            self._touch(f"{base}/skab_7_gan_point_tree_CBLOF_4_vs_{competitor}.png")
+        self._touch(f"{base}/skab_7_gan_point_importance.png")
+        headline, gallery = self.plots._gan("SKAB", "7")
+        picker = next(f for f in headline if "variants" in f)
+        self.assertEqual(picker["title"], "Where CBLOF_4 uniquely wins")
+        self.assertEqual([v["title"] for v in picker["variants"]],
+                         ["CBLOF_1", "LOF_1", "NN_2"])
+        self.assertEqual(picker["select_label"], "Compared against")
+        self.assertEqual(picker["default"], 0)
+        # The picker IS the headline — nothing else competes with it there.
+        self.assertEqual(sum(1 for f in headline if "variants" not in f), 0)
+        self.assertIn("Which point properties separate the winner",
+                      [f["title"] for f in gallery])
+
+    def test_only_the_latest_run_s_trees_are_offered(self):
+        """Tree filenames carry the winner, not a timestamp, so a run that picks
+        a different winner writes a whole new set beside the old one."""
+        base = "robustness/GAN/SKAB/7"
+        for competitor in ("CBLOF_1", "NN_1"):
+            self._touch(f"{base}/skab_7_gan_point_tree_LOF_1_vs_{competitor}.png")
+        for competitor in ("LOF_1", "NN_1", "NN_3"):
+            self._touch(f"{base}/skab_7_gan_point_tree_CBLOF_4_vs_{competitor}.png")
+        for competitor in ("LOF_1", "NN_1", "NN_3"):
+            p = self.myresults / base / f"skab_7_gan_point_tree_CBLOF_4_vs_{competitor}.png"
+            os.utime(p, (p.stat().st_atime + 60, p.stat().st_mtime + 60))
+        headline, _ = self.plots._gan("SKAB", "7")
+        picker = next(f for f in headline if "variants" in f)
+        self.assertEqual(picker["title"], "Where CBLOF_4 uniquely wins")
+        self.assertEqual(sorted(v["title"] for v in picker["variants"]),
+                         ["LOF_1", "NN_1", "NN_3"])
+
+    def test_the_misclassified_figure_is_written_but_listed_nowhere(self):
+        """Both point-injection cards drop it, so it appears on neither.
+
+        The stage still writes it every run — it plots true against predicted
+        labels for the winner alone, which says nothing about the per-rival
+        comparison either card is for. off-by's copy is dropped for the same
+        reason, so a reader never meets it twice under one title.
+        """
+        base = "robustness/GAN/SKAB/7"
+        self._touch(f"{base}/skab_7_Misclassified_Anomalies_2026-08-16_13-07-05_.png")
+        self._touch(f"{base}/skab_7_Data_vs_DataWithAnomalies_2026-08-16_13-07-05.png")
+        _, gallery = self.plots._gan("SKAB", "7")
+        titles = [f["title"] for f in gallery]
+        self.assertNotIn("Misclassified points", titles)
+        self.assertIn("Injected borderline points", titles)
+
+    def test_only_the_newest_injected_points_figure_is_listed(self):
+        """One entry, whichever stem it came from.
+
+        These filenames begin with the dataset as it was typed on the command
+        line, and both cases run, so an entity worked on as `--dataset SKAB` and
+        again as `--dataset skab` leaves two stems. `dedupe_timestamped` keeps
+        the newest of EACH stem, which listed the same figure twice; the card
+        wants the newest overall, and the hidden count has to cover both stems.
+        """
+        base = "robustness/GAN/SKAB/7"
+        self._touch(f"{base}/SKAB_7_Data_vs_DataWithAnomalies_2026-05-17_12-35-34.png")
+        self._touch(f"{base}/SKAB_7_Data_vs_DataWithAnomalies_2026-05-18_09-00-00.png")
+        self._touch(f"{base}/skab_7_Data_vs_DataWithAnomalies_2026-08-17_20-29-26.png")
+        _, gallery = self.plots._gan("SKAB", "7")
+        injected = [f for f in gallery if f["title"] == "Injected borderline points"]
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(injected[0]["name"],
+                         "skab_7_Data_vs_DataWithAnomalies_2026-08-17_20-29-26.png")
+        self.assertEqual(injected[0]["n_older"], 2)
+
+    def test_a_run_without_explain_still_renders(self):
+        """No trees on disk — the headline is empty and the figures the stage
+        always writes are still reachable, exactly as _off_by degrades."""
+        base = "robustness/GAN/SKAB/7"
+        self._touch(f"{base}/skab_7_Data_vs_DataWithAnomalies_2026-08-16_13-07-05.png")
+        headline, gallery = self.plots._gan("SKAB", "7")
+        self.assertEqual(headline, [])
+        self.assertEqual([f["title"] for f in gallery], ["Injected borderline points"])

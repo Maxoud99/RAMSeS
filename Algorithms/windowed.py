@@ -49,9 +49,72 @@ def windows_as_rows(Y_windows):
     return Y_windows.reshape(len(Y_windows), -1)
 
 
+# Attributes a deep PyOD detector keeps for TRAINING only, dropped once `fit`
+# returns. The same list, for the same reason, as
+# `Algorithms.tsbad_model._TRAINING_ONLY_ATTRS` — the two adapters meet the same
+# problem from opposite directions and should be recognisable as one fix.
+_TRAINING_ONLY_ATTRS = ("model_optim", "optimizer", "scheduler")
+
+
 def fit_windows(model, train_dataloader):
     """Fit `model` on one row per window."""
-    model.fit(X=windows_as_rows(train_dataloader.Y_windows))
+    rows = windows_as_rows(train_dataloader.Y_windows)
+    _check_enough_windows(model, len(rows))
+    model.fit(X=rows)
+    _release_training_state(model)
+
+
+def _release_training_state(model) -> None:
+    """Drop optimiser/scheduler state so the fitted detector can be pickled.
+
+    Not an optimisation — a checkpoint cannot be written otherwise. PyOD's deep
+    base class leaves `self.optimizer` on the detector after `fit`, and a torch
+    optimiser reaches a `torch._dynamo` config module through its reference
+    graph: `TypeError: cannot pickle 'ConfigModuleInstance' object`, raised from
+    `logging_obj.save` AFTER training has already finished, so the work is done
+    and then thrown away.
+
+    Verified on AE, the pool's only such detector: scores before and after the
+    drop are bit-identical (max |diff| 0.0), the checkpoint then writes, and a
+    reloaded model scores the same again. Nothing here is read by
+    `decision_function`; PyOD rebuilds the optimiser in `training_prepare` on
+    any later `fit`, so refitting a reloaded detector still works.
+    """
+    for attr in _TRAINING_ONLY_ATTRS:
+        if getattr(model, attr, None) is not None:
+            setattr(model, attr, None)
+
+
+def _check_enough_windows(model, n_rows: int) -> None:
+    """A deep PyOD detector must get at least `batch_size` windows.
+
+    `pyod.models.base_dl.BaseDeepLearningDetector.fit` builds its loader with
+    `drop_last=True`, so a call holding fewer windows than `batch_size` yields
+    ZERO batches: the training loop body never runs, `loss` is never assigned,
+    and the next line reads it — `UnboundLocalError: cannot access local
+    variable 'loss'`, four frames inside PyOD, naming neither the detector nor
+    the requirement, after silently training on nothing.
+
+    AE is the pool's only such detector, and the window COUNT is set by the
+    grid's `window_step`: at the 64/64 its neighbours use, a 917-step SKAB
+    entity produced 14 windows. Same role as the minimum-length notes
+    `score_windows` carries for COF and SpectralResidual, and as
+    `_TSBADEstimator._check_length` — say which detector, what it got, and what
+    it needed, at the call that can still name them.
+    """
+    batch_size = getattr(model, "batch_size", None)
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        return                      # not a batching detector — nothing to check
+    if n_rows >= batch_size:
+        return
+    name = (getattr(model, "detector_name", None)
+            or type(model).__name__)
+    raise ValueError(
+        f"{name} was fitted on {n_rows} window(s) but its batch_size is "
+        f"{batch_size}, and PyOD drops the last partial batch — so it would "
+        f"train on nothing and fail inside PyOD with an unbound 'loss'. The "
+        f"window count comes from the grid: lower `window_step` (or "
+        f"`window_size`) for this family, or raise the entity length.")
 
 
 def score_windows(model, Y, clip=None):

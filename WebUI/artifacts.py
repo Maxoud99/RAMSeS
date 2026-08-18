@@ -55,18 +55,24 @@ STAGES: Tuple[Dict[str, Any], ...] = (
      "cli": "thompson", "ir": "ir_thompson", "nl": "nl_thompson",
      "plot_group": "thompson", "order": 4,
      "regimes": ["reward_per_regime", "shap_per_regime"]},
+    # `plot_group` is "gan", which is prefix-free against "ga_selection" and
+    # "ga_combination" — the lazy-gallery matcher joins on startswith, so a
+    # group that prefixed another would let one card claim the other's galleries.
+    {"key": "gan", "title": "Robustness: GAN perturbations",
+     "cli": "gan", "ir": "ir_gan", "nl": "nl_gan",
+     "plot_group": "gan", "order": 5},
     {"key": "monte_carlo", "title": "Robustness: Monte Carlo noise sweep",
      "cli": "montecarlo", "ir": "ir_monte_carlo", "nl": "nl_monte_carlo",
-     "plot_group": "monte_carlo", "order": 5},
+     "plot_group": "monte_carlo", "order": 6},
     {"key": "off_by_threshold", "title": "Sensitivity: off-by-threshold test",
      "cli": "offby", "ir": "ir_off_by", "nl": "nl_off_by",
-     "plot_group": "off_by", "order": 6},
+     "plot_group": "off_by", "order": 7},
     {"key": "rank_aggregation_robust", "title": "Robustness consensus",
      "cli": None, "ir": "ir_rank_aggregation_robust", "nl": "nl_rank_aggregation_robust",
-     "plot_group": "rank_aggregation_robust", "order": 7, "iterated": True},
+     "plot_group": "rank_aggregation_robust", "order": 8, "iterated": True},
     {"key": "rank_aggregation_final", "title": "Final consensus",
      "cli": None, "ir": "ir_rank_aggregation_final", "nl": "nl_rank_aggregation_final",
-     "plot_group": "rank_aggregation_final", "order": 8, "iterated": True},
+     "plot_group": "rank_aggregation_final", "order": 9, "iterated": True},
 )
 
 STAGE_BY_KEY = {s["key"]: s for s in STAGES}
@@ -81,9 +87,6 @@ STAGE_BY_KEY = {s["key"]: s for s in STAGES}
 # paragraphs with, moved up into a heading now that a section is long enough to
 # need navigating inside. Numbering lives in the frontend, not here, so a
 # section inserted later renumbers everything after it without an edit.
-#
-# `gan` has no subsections: three paragraphs and no internal structure to point
-# at.
 DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
     {"id": "overview", "title": "Overview", "stages": (), "blocks": (
         {"text": "RAMSeS selects a detection strategy for one time series rather "
@@ -411,29 +414,126 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "channel c."},
         )},
     )},
-    {"id": "gan", "title": "GAN perturbation test", "stages": (), "blocks": (
-        {"text": "GAN test asks whether a detector has learned the structure of "
-                 "normality or merely memorised its training data. A generator "
-                 "and a discriminator, each a two-layer MLP with 256 hidden "
-                 "units, ReLU activations and dropout, are trained adversarially "
-                 "on the clean, un-augmented split, with label smoothing and "
-                 "added noise for stability. Training on clean data only is what "
+    {"id": "gan", "title": "GAN perturbation test", "stages": ("gan",), "blocks": (
+        {"text": "The GAN test asks whether a detector has learned the structure "
+                 "of normality or merely memorised its training data. It builds "
+                 "anomalies that mimic realistic drifts while preserving "
+                 "temporal structure, and a detector that only recognises the "
+                 "patterns it was trained on fails on them."},
+        {"lead": "Architecture and training.",
+         "text": "A generator G and a discriminator D are instantiated as "
+                 "two-layer multi-layer perceptrons with 256 hidden units, ReLU "
+                 "activations and dropout for regularisation. The generator maps "
+                 "G: R^d -> R^d with a tanh output layer, while the "
+                 "discriminator maps D: R^d -> [0,1]. Both are optimised with "
+                 "binary cross-entropy losses and Adam at a learning rate of "
+                 "1e-4, for 100 epochs in mini-batches. Label smoothing on the "
+                 "real and fake targets, and Gaussian noise added to both, keep "
+                 "the training stable."},
+        {"lead": "Data preparation.",
+         "text": "Training runs on the clean, non-augmented split, which is what "
                  "keeps the test from leaking into the detectors it later "
-                 "judges."},
-        {"text": "Once trained, the generator produces a pool of candidate "
-                 "points, the discriminator scores them, and the framework keeps "
-                 "the most ambiguous ones: those closest to the discriminator's "
-                 "decision threshold. These are the borderline cases, plausible "
-                 "enough to belong to the series but sitting where \"normal\" "
-                 "and \"anomalous\" are hardest to separate. The discriminator's "
-                 "own verdict supplies each injected point's label."},
-        {"text": "The selected points are interleaved into the stream at regular "
-                 "intervals so chronology is preserved, at an injection budget "
-                 "of about 10% of the original samples. Every detector is then "
-                 "re-evaluated on the augmented series and ranked by F1 and by "
-                 "PR-AUC. Those two rankings are among the six that feed the "
-                 "robustness consensus."},
-    ), "subsections": ()},
+                 "judges: augmentation happens afterwards, during robustness "
+                 "testing. To match the generator's tanh output layer, inputs "
+                 "are linearly rescaled to [-1,1] and the generated points are "
+                 "mapped back before they enter the series."},
+        {"lead": "Injection.",
+         "text": "After training, a candidate pool is drawn from the generator, "
+                 "each candidate scored by the discriminator, and each one's "
+                 "ambiguity measured as its distance from the decision "
+                 "threshold tau that separates normal from anomalous:"},
+        {"formula":
+            "C          = { x_k = G(z_k) }, k = 1..K,   z_k ~ N(0, I)\n"
+            "delta_k    = | D(x_k) - tau |\n"
+            "X*_B       = the B candidates minimising delta_k"},
+        {"text": "The B most ambiguous candidates are kept. These are the "
+                 "borderline cases: plausible enough to belong to the series, "
+                 "but sitting where \"normal\" and \"anomalous\" are hardest to "
+                 "separate. The same boundary supplies each kept point's label, "
+                 "so the injected set contains both near-normal and "
+                 "near-anomalous behaviour:"},
+        {"formula": "y(x) = 1 [ D(x) >= tau ]"},
+        {"lead": "Temporal integration.",
+         "text": "To respect chronology the selected points are interleaved into "
+                 "the stream at regular intervals within sliding windows, at an "
+                 "injection budget rho of about 10% of the original number of "
+                 "samples. Integration preserves ordering, updates the label "
+                 "mask, and records the injection indices for traceability and "
+                 "for the figures."},
+        {"lead": "Evaluation and ranking.",
+         "text": "Every detector is then re-evaluated on the GAN-augmented "
+                 "series and ranked by F1 and by PR-AUC. Those two rankings are "
+                 "among the six that feed the robustness consensus."},
+    ), "subsections": (
+        {"id": "gan-explained", "title": "Exclusive wins and the surrogate trees",
+         "blocks": (
+            {"text": "The perturbation here happens at the level of individual "
+                     "points, so the explanation does too, and it is built the "
+                     "same way the off-by-threshold explanation is. Rather than "
+                     "re-running the test under different settings, it reuses "
+                     "the single production run and asks, per injected point, "
+                     "what kind of generated point the winner handles that a "
+                     "given rival does not."},
+            {"text": "For the winning detector and each other detector in turn, "
+                     "an exclusive win is an injected point the winner "
+                     "classified correctly and that rival did not. A small "
+                     "decision tree is fitted to predict those exclusive wins "
+                     "from seven properties of the point, none of which depends "
+                     "on any detector. Writing x for the generated point, x_c "
+                     "for its value in channel c over d channels, W for the "
+                     "window of the real series around the injection site, i for "
+                     "the index the point was injected at and N for the length "
+                     "of the augmented series:"},
+            {"lead": "ambiguity.",
+             "text": "How far the discriminator's score for the point sits from "
+                     "the threshold tau. It is the same quantity the injection "
+                     "step minimised, so 0 marks a point the discriminator "
+                     "found maximally hard to place."},
+            {"formula": "ambiguity(x) = | D(x) - tau |"},
+            {"lead": "is_anomaly.",
+             "text": "The label the discriminator's verdict gave the point: 1 "
+                     "anomalous, 0 normal. The same boundary that selected it."},
+            {"formula": "is_anomaly(x) = 1 [ D(x) >= tau ]"},
+            {"lead": "signal_magnitude.",
+             "text": "The average size of the generated values across channels — "
+                     "how large the injected reading is, irrespective of sign."},
+            {"formula": "signal_magnitude(x) = (1/d) * sum_c | x_c |"},
+            {"lead": "signal_spread.",
+             "text": "How much those values differ from one another across "
+                     "channels. A low spread is a point that moved every channel "
+                     "together; a high one is a point that moved them apart."},
+            {"formula": "signal_spread(x) = std_c ( x_c )"},
+            {"lead": "context_gap.",
+             "text": "How far the generated point sits from the average of the "
+                     "real series around it, averaged over channels."},
+            {"formula": "context_gap(x) = (1/d) * sum_c | x_c - mean(W_c) |"},
+            {"lead": "local_volatility.",
+             "text": "The standard deviation of the real series in that same "
+                     "neighbourhood, averaged over channels — how noisy the "
+                     "stretch the point landed in already was."},
+            {"formula": "local_volatility = (1/d) * sum_c std( W_c )"},
+            {"lead": "position.",
+             "text": "Where the point falls in the series, from 0 at the start "
+                     "to 1 at the end."},
+            {"formula": "position = i / N"},
+            {"text": "The discriminator's raw score is deliberately not an "
+                     "eighth property. The ambiguity and the label already "
+                     "determine it between them, so carrying it as well would "
+                     "split the importance across three descriptions of one "
+                     "fact. The tree's splits become plain rules, and the "
+                     "average importance across all the rival trees shows which "
+                     "property best explains the winner's edge."},
+            {"text": "Each tree also reports a held-out, cross-validated "
+                     "accuracy alongside the accuracy on the points it was "
+                     "fitted to, because the second can look strong purely from "
+                     "memorising a small set of wins. A comparison resting on "
+                     "fewer exclusive wins than there are cross-validation folds "
+                     "is flagged, since the held-out estimate is not stable "
+                     "there. Only the prediction side is explained: correctness "
+                     "is defined by thresholded predictions, and PR-AUC has no "
+                     "per-point notion of right or wrong."},
+        )},
+    )},
     {"id": "off-by", "title": "Off-by-threshold test",
      "stages": ("off_by_threshold",), "blocks": (
         {"text": "Off-by-threshold tests ask where a detector draws the line "
@@ -693,6 +793,23 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("SHAP", "How far a channel's contribution to the expected reward "
                  "departed from its average contribution over the run."),
     ),
+    "gan": (
+        ("Exclusive win", "A point the top-ranked detector classified correctly "
+                          "and the named rival did not."),
+        ("Ambiguity", "How far the discriminator's score for the generated point "
+                      "sits from the threshold separating normal from anomalous; "
+                      "0 is the hardest point to place."),
+        ("Signal magnitude", "The average size of the generated point's values "
+                             "across channels."),
+        ("Signal spread", "How much the generated point's values differ from one "
+                          "another across channels."),
+        ("Context gap", "How far the generated point sits from the average of the "
+                        "real series around it."),
+        ("Local volatility", "The standard deviation of the series around the "
+                             "injection site; how noisy that neighbourhood is."),
+        ("Position", "Where the point falls in the series, from 0 at the start "
+                     "to 1 at the end."),
+    ),
     "monte_carlo": (
         ("Noise level", "The standard deviation of the Gaussian noise injected "
                         "into the data."),
@@ -721,12 +838,6 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
     ),
 }
 STAGE_TERMS["rank_aggregation_final"] = STAGE_TERMS["rank_aggregation_robust"]
-
-# The GAN test runs but has no explainability layer; the global IR records that
-# explicitly. Surfacing it as a stage with a reason beats an unexplained gap.
-GAN_STAGE = {"key": "gan", "title": "Robustness: GAN perturbations",
-             "cli": "gan", "plot_group": "gan", "order": 9}
-
 
 def split_info(raw: str) -> Tuple[Optional[str], str]:
     """`"INFO: glossary\\n\\nnarrative"` -> `("glossary", "narrative")`.
@@ -1038,14 +1149,14 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             _attach_narrated_regimes(entry["regimes"], narrative, ir_doc)
         stages_out.append(entry)
 
-    # Stages the global IR knows about but that produced no narrative — GAN
-    # always, plus anything a partial run skipped. Carry the IR's own note so
-    # the UI states a reason instead of showing an unexplained gap.
+    # Stages the global IR knows about but that produced no narrative — anything
+    # a partial run skipped, or a run without --explain. Carry the IR's own note
+    # so the UI states a reason instead of showing an unexplained gap.
     present = {s["key"] for s in stages_out}
     for key, info_block in sorted(((global_ir or {}).get("stages") or {}).items()):
         if key in present:
             continue
-        meta = STAGE_BY_KEY.get(key) or (GAN_STAGE if key == "gan" else None)
+        meta = STAGE_BY_KEY.get(key)
         missing.append({
             "key": key,
             "title": (meta or {}).get("title", key.replace("_", " ").capitalize()),

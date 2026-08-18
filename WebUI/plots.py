@@ -36,6 +36,7 @@ TS_RE = re.compile(
     r"^(?P<stem>.+?)_(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?P<tail>_?)\.png$")
 
 _OFFBY_TREE_RE = re.compile(r"_off_by_point_tree_(?P<winner>.+?)_vs_(?P<competitor>.+)\.png$")
+_GAN_TREE_RE = re.compile(r"_gan_point_tree_(?P<winner>.+?)_vs_(?P<competitor>.+)\.png$")
 
 
 def _dir_for(tree: str, dataset: str, entity: str) -> Optional[Path]:
@@ -434,9 +435,9 @@ def _off_by(ds, ent):
         gallery.append(_fig(path, "Which point properties separate the winner",
                             "Feature importance across all pairwise comparisons."))
     # `*Misclassified*.png` is still written by the off-by stage on every run —
-    # it is simply not listed. It duplicates what the GAN card already shows
-    # under the same title, and the injected-points figure beside it is the one
-    # that says something specific to this stage.
+    # it is simply not listed, and the GAN card does not list its copy either.
+    # The injected-points figure beside it is the one that says something
+    # specific to this stage.
     for entry in dedupe_timestamped(_ls(d, "Data_vs_DataWithAnomalies_*.png")):
         gallery.append(_fig(entry["path"], "Injected borderline points",
                             timestamp=entry["timestamp"], n_older=entry["n_older"]))
@@ -445,14 +446,50 @@ def _off_by(ds, ent):
 
 def _gan(ds, ent):
     d = _dir_for(TREE_GAN, ds, ent)
-    headline = []
-    for entry in dedupe_timestamped(_ls(d)):
-        name = entry["path"].name
-        title = ("Injected borderline points" if "Data_vs" in name
-                 else "Misclassified points")
-        headline.append(_fig(entry["path"], title,
-                             timestamp=entry["timestamp"], n_older=entry["n_older"]))
-    return headline, []
+    headline, gallery = [], []
+    # The same shape as _off_by, for the same reason: both stages explain a
+    # winner's exclusive wins over injected points, so the trees are the headline
+    # and everything else is one click away. Tree filenames carry the WINNER
+    # rather than a timestamp, so a run that picks a different winner writes a
+    # whole new set beside the old one — only the group holding the newest file
+    # is offered.
+    by_winner = {}
+    for path in _ls(d, "*_gan_point_tree_*.png"):
+        m = _GAN_TREE_RE.search(path.name)
+        if m:
+            by_winner.setdefault(m.group("winner"), []).append((path, m.group("competitor")))
+    if by_winner:
+        winner = max(by_winner,
+                     key=lambda w: max(p.stat().st_mtime for p, _ in by_winner[w]))
+        trees = [_fig(path, competitor, f"Where {winner} uniquely beat {competitor}.")
+                 for path, competitor in sorted(by_winner[winner], key=lambda t: t[1])]
+        headline.append({
+            "title": f"Where {winner} uniquely wins",
+            "variants": trees, "default": 0, "select_label": "Compared against",
+        })
+    for path in _ls(d, "*_gan_point_importance.png"):
+        gallery.append(_fig(path, "Which point properties separate the winner",
+                            "Feature importance across all pairwise comparisons."))
+    # Only the newest, across every stem rather than one per stem.
+    #
+    # These names begin with the dataset as it was typed on the command line, and
+    # `load_data` lowercases only for its own lookup — so one entity run as
+    # `--dataset SKAB` and again as `--dataset skab` leaves two stems that
+    # `dedupe_timestamped` groups apart, and the card listed the same figure
+    # twice. Picking the newest of the deduped entries needs no assumption about
+    # how the name was spelled, and the count of what it hides stays honest.
+    injected = dedupe_timestamped(_ls(d, "*Data_vs_DataWithAnomalies_*.png"))
+    if injected:
+        newest = max(injected, key=lambda e: e["timestamp"] or "")
+        hidden = sum(e["n_older"] + 1 for e in injected) - 1
+        gallery.append(_fig(newest["path"], "Injected borderline points",
+                            timestamp=newest["timestamp"], n_older=hidden))
+    # `*Misclassified*.png` is written by this stage on every run and listed by
+    # neither card — the same treatment off-by's copy gets. It plots true against
+    # predicted labels for the winner alone, which says nothing about the
+    # comparison this card is for, and the injected-points figure beside it is
+    # the one specific to the stage.
+    return headline, gallery
 
 
 def _aggregation(ds, ent, which):

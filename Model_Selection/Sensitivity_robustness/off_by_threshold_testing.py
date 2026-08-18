@@ -12,19 +12,21 @@ from Model_Selection.Sensitivity_robustness.plot_retention import prune_timestam
 from Utils.model_selection_utils import evaluate_model
 
 
-def _surrogate_fidelity_module():
-    """Import surrogate_fidelity.py, tolerating standalone by-path loading of this
-    module (e.g. via importlib in test harnesses) where the Model_Selection
-    package itself may not be on sys.path — falls back to loading the sibling
-    file directly by its own location, the same trick those harnesses use."""
+def _ews_module():
+    """Import exclusive_win_surrogates.py with the same standalone-tolerant fallback.
+
+    Holds the feature-agnostic half of this stage's explainability — the
+    prediction join, the per-competitor trees and the two figures — which the
+    GAN robustness stage runs on its own features.
+    """
     try:
-        from Model_Selection.Sensitivity_robustness import surrogate_fidelity as _sf
-        return _sf
+        from Model_Selection.Sensitivity_robustness import exclusive_win_surrogates as _ews
+        return _ews
     except ModuleNotFoundError:
         import importlib.util
         _here = os.path.dirname(os.path.abspath(__file__))
         _spec = importlib.util.spec_from_file_location(
-            "surrogate_fidelity", os.path.join(_here, "surrogate_fidelity.py"))
+            "exclusive_win_surrogates", os.path.join(_here, "exclusive_win_surrogates.py"))
         _mod = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
         return _mod
@@ -347,53 +349,19 @@ def build_offby_point_table(point_records, adjusted_y_pred_dict, true_labels,
     """
     if not point_records:
         return None
-    true_labels = np.asarray(true_labels).flatten().astype(int)
-    n = len(true_labels)
+    n = len(np.asarray(true_labels).flatten())
     if n == 0:
         return None
 
     indices = [int(r['index']) for r in point_records]
-    # Drop any record whose index falls outside the augmented series (defensive).
-    keep = [k for k, idx in enumerate(indices) if 0 <= idx < n]
-    if not keep:
-        return None
-    recs = [point_records[k] for k in keep]
-    idxs = np.asarray([int(r['index']) for r in recs], dtype=int)
-
     X = np.array([[abs(float(r['scale']) - 1.0),
                    float(int(r['label'])),
                    float(r['local_std']),
-                   float(r['index']) / float(n)] for r in recs], dtype=float)
+                   float(r['index']) / float(n)] for r in point_records], dtype=float)
 
-    # Keep only models that produced a full-length prediction vector.
-    valid_models: List[str] = []
-    preds: List[np.ndarray] = []
-    for m in model_names:
-        pred_list = adjusted_y_pred_dict.get(m)
-        if not pred_list:
-            continue
-        pred = np.asarray(pred_list).flatten().astype(int)
-        if pred.shape[0] != n:
-            logger.warning(f"Off-by explain: prediction length {pred.shape[0]} != {n} for {m}; skipping.")
-            continue
-        valid_models.append(m)
-        preds.append(pred)
-    if not valid_models:
-        return None
-
-    true_at = true_labels[idxs]
-    correct = np.zeros((len(recs), len(valid_models)), dtype=bool)
-    for mi, pred in enumerate(preds):
-        correct[:, mi] = pred[idxs] == true_at
-
-    return {
-        "X": X,
-        "feature_names": list(OFFBY_FEATURE_NAMES),
-        "correct": correct,
-        "model_names": valid_models,
-        "indices": idxs,
-        "n_points": len(recs),
-    }
+    return _ews_module().join_predictions(
+        indices, X, OFFBY_FEATURE_NAMES, adjusted_y_pred_dict, true_labels,
+        model_names, stage_label="Off-by explain")
 
 
 def train_offby_point_surrogates(table, winner, max_depth: int = 3,
@@ -407,73 +375,11 @@ def train_offby_point_surrogates(table, winner, max_depth: int = 3,
     (winner never / always strictly beats k) are recorded as degenerate without
     importing sklearn. sklearn is lazy-imported only when a real tree is fit.
     """
-    models = list(table["model_names"])
-    feature_names = table["feature_names"]
-    X = table["X"]
-    correct = table["correct"]
-    if winner not in models:
-        return {"feasible": False, "winner": winner, "feature_names": feature_names,
-                "per_competitor": {}, "note": f"winner {winner} has no valid predictions"}
-    w = models.index(winner)
-    winner_correct = correct[:, w]
-
-    per_competitor: Dict[str, Any] = {}
-    for k in models:
-        if k == winner:
-            continue
-        ki = models.index(k)
-        y = winner_correct & ~correct[:, ki]
-        n_pos = int(y.sum())
-        rate = float(n_pos) / float(len(y)) if len(y) else 0.0
-        if n_pos == 0:
-            per_competitor[k] = {
-                "degenerate": True, "clf": None, "feature_importances": {},
-                "train_accuracy": float('nan'), "n_exclusive_wins": 0, "exclusive_win_rate": 0.0,
-                "rules_text": f"{winner} has no exclusive wins over {k} "
-                              f"({k} matches the winner on all injected points).",
-            }
-            continue
-        if n_pos == len(y):
-            per_competitor[k] = {
-                "degenerate": True, "clf": None, "feature_importances": {},
-                "train_accuracy": float('nan'), "n_exclusive_wins": n_pos, "exclusive_win_rate": 1.0,
-                "rules_text": f"{winner} beats {k} on every injected point.",
-            }
-            continue
-        from sklearn.tree import DecisionTreeClassifier, export_text
-        clf = DecisionTreeClassifier(max_depth=max_depth, random_state=random_state)
-        y_int = y.astype(int)
-        clf.fit(X, y_int)
-        importances = {fn: float(im) for fn, im in zip(feature_names, clf.feature_importances_)}
-        # train_accuracy is the in-sample fit used to generate the exported
-        # rules below; it is not a generalization claim. cv_accuracy is a
-        # cross-validated fidelity estimate (see surrogate_fidelity.py,
-        # grounded in Molnar 2022's point that surrogate fidelity should be
-        # assessed as a held-out property, not read off the training fit).
-        cv = _surrogate_fidelity_module().held_out_classifier_fidelity(
-            X, y_int, max_depth=max_depth, random_state=random_state)
-        per_competitor[k] = {
-            "degenerate": False, "clf": clf, "feature_importances": importances,
-            "train_accuracy": float(clf.score(X, y_int)),
-            "cv_accuracy": cv["cv_accuracy"], "cv_accuracy_std": cv["cv_accuracy_std"],
-            "cv_method": cv["method"], "cv_note": cv["note"],
-            "n_exclusive_wins": n_pos, "exclusive_win_rate": rate,
-            # boundary_distance lives in [0, 0.05]; default 2-decimal printing collapses
-            # distinct thresholds to the same value, so print with finer precision.
-            "rules_text": export_text(clf, feature_names=list(feature_names), decimals=4),
-        }
-    return {"feasible": True, "winner": winner, "feature_names": feature_names,
-            "per_competitor": per_competitor}
+    return _ews_module().train_exclusive_win_surrogates(
+        table, winner, max_depth=max_depth, random_state=random_state)
 
 
 # ── Plots ────────────────────────────────────────────────────────────────────
-
-def _offby_explain_rcparams() -> None:
-    plt.rcParams.update({
-        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
-        "legend.fontsize": 9, "xtick.labelsize": 10, "ytick.labelsize": 10,
-    })
-
 
 def _offby_explain_dir(dataset, entity) -> str:
     directory = f"myresults/robustness/off_by/{dataset}/{entity}/"
@@ -483,40 +389,21 @@ def _offby_explain_dir(dataset, entity) -> str:
 
 def plot_offby_point_tree(info, winner, competitor, dataset, entity, feature_names) -> None:
     """Plot one winner-vs-competitor exclusive-win surrogate tree (skips if degenerate)."""
-    if info is None or info.get("clf") is None:
-        return
-    from sklearn.tree import plot_tree
-    _offby_explain_rcparams()
-    fig, ax = plt.subplots(figsize=(13, 8))
-    plot_tree(info["clf"], feature_names=list(feature_names),
-              class_names=[f"not {winner}-only", f"{winner}-only win"],
-              filled=True, rounded=True, fontsize=8, ax=ax)
-    ax.set_title(f"Off-by-threshold: where {winner} beats {competitor}\n"
-                 f"(injected points the winner gets right and {competitor} misses)")
-    directory = _offby_explain_dir(dataset, entity)
-    fig.tight_layout()
-    fig.savefig(os.path.join(directory,
-                f"{dataset}_{entity}_off_by_point_tree_{winner}_vs_{competitor}.png"), dpi=300)
-    plt.close(fig)
+    _ews_module().plot_exclusive_win_tree(
+        info, winner, feature_names,
+        directory=_offby_explain_dir(dataset, entity),
+        filename=f"{dataset}_{entity}_off_by_point_tree_{winner}_vs_{competitor}.png",
+        title=f"Off-by-threshold: where {winner} beats {competitor}\n"
+              f"(injected points the winner gets right and {competitor} misses)")
 
 
 def plot_offby_point_importance(per_competitor, dataset, entity, feature_names) -> None:
     """Bar chart of mean feature importance across all (non-degenerate) competitor trees."""
-    imp_rows = [info["feature_importances"] for info in per_competitor.values()
-                if not info.get("degenerate") and info.get("feature_importances")]
-    if not imp_rows:
-        return
-    means = [float(np.mean([row.get(fn, 0.0) for row in imp_rows])) for fn in feature_names]
-    _offby_explain_rcparams()
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    order = np.argsort(means)
-    ax.barh([feature_names[i] for i in order], [means[i] for i in order], color="#4477aa")
-    ax.set_xlabel("Mean importance across competitor surrogates")
-    ax.set_title("Off-by-threshold: which point property most explains the winner's edge")
-    directory = _offby_explain_dir(dataset, entity)
-    fig.tight_layout()
-    fig.savefig(os.path.join(directory, f"{dataset}_{entity}_off_by_point_importance.png"), dpi=300)
-    plt.close(fig)
+    _ews_module().plot_exclusive_win_importance(
+        per_competitor, feature_names,
+        directory=_offby_explain_dir(dataset, entity),
+        filename=f"{dataset}_{entity}_off_by_point_importance.png",
+        title="Off-by-threshold: which point property most explains the winner's edge")
 
 
 def explain_off_by_threshold(point_records, adjusted_y_pred_dict, true_labels, ranked_f1_names,

@@ -46,6 +46,14 @@ Two choices worth stating
   what separates this from POLY (whose `np.polyfit` genuinely cannot see more
   than one channel).
 
+  TimesFM was admitted on the same argument and has since been restricted to
+  univariate (`Utils.pipeline_spec.UNIVARIATE_FAMILIES`), so it is worth saying
+  why Chronos is not. The restriction there is about COST, not correctness:
+  TimesFM's per-channel loop costs ~13 min per scoring call on 38 channels,
+  where Bolt-tiny measures ~0.6 s on the input TimesFM takes ~14 s on. Same
+  loop, same paper-fidelity caveat, ~20x apart in price — so the cost argument
+  that disqualifies TimesFM simply does not arise here.
+
 The class presents `fit(data)` / `decision_function(data)` over
 `(n_timesteps, n_channels)`, which is the TSB-AD contract, so
 `Algorithms/tsbad_model.py` adapts it with no special case.

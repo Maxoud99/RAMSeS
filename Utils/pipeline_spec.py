@@ -171,14 +171,26 @@ TSBAD_FAMILIES: FrozenSet[str] = frozenset({
 WHOLE_SERIES_FAMILIES: FrozenSet[str] = (
     frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - frozenset({"POLY"})))
 
-# Families that cannot see more than one channel. POLY fits `np.polyfit` to the
-# raw series and raises "Polynomial must be 1d only" on anything wider, which is
-# what Table I's `U` marking records. It is therefore usable on UCR and
-# genuinely unavailable on SKAB (9 channels) and SMD (38): selecting it there
-# fails with an explanation naming the detector, rather than a numpy error from
-# four frames down. Declared here, where the vocabulary lives, so the web UI can
-# say so before a run starts instead of after.
-UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset({"POLY"})
+# Families offered on univariate entities only — usable on UCR, unavailable on
+# SKAB (9 channels) and SMD (38). Selecting one there fails with an explanation
+# naming the detector rather than a numpy error from four frames down. Declared
+# here, where the vocabulary lives, so the web UI can say so before a run starts
+# instead of after; the refusal itself, with a per-family reason, is in
+# `Algorithms.tsbad_model.UNIVARIATE_ONLY`.
+#
+# The two are here for different reasons, and the distinction matters if either
+# is ever revisited:
+#   POLY    — CANNOT. `np.polyfit` raises "Polynomial must be 1d only" on
+#             anything wider, which is what Table I's `U` marking records.
+#   TIMESFM — CAN, but must not. Its per-channel loop runs correctly; it just
+#             costs ~13 min per scoring call on 38 channels (~131 forecasts/s
+#             measured on CPU) against ~0.6 s for Chronos-Bolt, and the offline
+#             pipeline scores seven times. Table I marks it 'U' and TSB-AD lists
+#             it only in the univariate hyperparameter dicts, so multivariate
+#             was never the reported configuration. Chronos keeps its own
+#             per-channel loop because Bolt is ~20x faster and the cost never
+#             arises.
+UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset({"POLY", "TIMESFM"})
 
 # Families whose `decision_function` scores each row against the OTHER ROWS OF
 # THE SAME CALL rather than against what `fit` saw. COF's scoring is literally

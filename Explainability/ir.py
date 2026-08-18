@@ -1865,10 +1865,14 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
 
 # Clause-shaped labels used inside a surrogate condition ("… when <label> is
 # at most 0.3"), and bare noun forms used when a feature is named on its own.
+# One pair per point-injection stage. `is_anomaly` is a 0/1 label rather than a
+# quantity, so it carries two ready-made statements instead of a clause label.
 _OFFBY_LABELS = {
     "position": "its position in the series",
     "local_volatility": "the local volatility",
     "boundary_distance": "the distance from the boundary",
+    "is_anomaly:false": "the point is not a real anomaly",
+    "is_anomaly:true": "the point is a real anomaly",
 }
 
 _OFFBY_NOUNS = {
@@ -1878,11 +1882,37 @@ _OFFBY_NOUNS = {
     "is_anomaly": "whether the point is a real anomaly",
 }
 
+# The GAN stage describes a generated point rather than a scaled one: its
+# distance from the discriminator's threshold stands where off-by's distance
+# from the decision boundary does, and three more features describe the signal
+# itself and the site it was dropped into.
+_GAN_LABELS = {
+    "position": "its position in the series",
+    "local_volatility": "the local volatility",
+    "ambiguity": "its distance from the discriminator's threshold",
+    "signal_magnitude": "the generated point's magnitude",
+    "signal_spread": "its spread across channels",
+    "context_gap": "its gap from the surrounding series",
+    "is_anomaly:false": "the point was labelled normal",
+    "is_anomaly:true": "the point was labelled anomalous",
+}
 
-def _offby_condition_phrase(conditions: List[Dict[str, Any]]) -> str:
+_GAN_NOUNS = {
+    "position": "the point's position in the series",
+    "local_volatility": "the local volatility",
+    "ambiguity": "the point's distance from the discriminator's threshold",
+    "signal_magnitude": "the generated point's magnitude",
+    "signal_spread": "its spread across channels",
+    "context_gap": "its gap from the surrounding series",
+    "is_anomaly": "whether the point was labelled anomalous",
+}
+
+
+def _condition_phrase(conditions: List[Dict[str, Any]],
+                      labels: Dict[str, str]) -> str:
     """Render simplified surrogate conditions as plain prose. `is_anomaly` is a
     0/1 label, so its 0.5 split becomes a statement rather than a comparison;
-    the other three features keep their raw thresholds (grounded numbers)."""
+    every other feature keeps its raw threshold (a grounded number)."""
     lower: Dict[str, Any] = {}
     upper: Dict[str, Any] = {}
     order: List[str] = []
@@ -1897,10 +1927,10 @@ def _offby_condition_phrase(conditions: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     for f in order:
         if f == "is_anomaly":
-            parts.append("the point is not a real anomaly" if f in upper
-                         else "the point is a real anomaly")
+            parts.append(labels["is_anomaly:false"] if f in upper
+                         else labels["is_anomaly:true"])
             continue
-        label = _OFFBY_LABELS.get(f, f)
+        label = labels.get(f, f)
         if f in lower and f in upper:
             parts.append(f"{label} is between {lower[f]} and {upper[f]}")
         elif f in upper:
@@ -1912,6 +1942,80 @@ def _offby_condition_phrase(conditions: List[Dict[str, Any]]) -> str:
 
 def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
                     ranked_f1_names: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Off-by-threshold: the winner's exclusive wins over the injected borderline
+    points, described by the properties of those points."""
+    return _build_exclusive_win_ir(
+        "off_by_threshold", "ob", dataset, entity, result, ranked_f1_names,
+        labels=_OFFBY_LABELS, nouns=_OFFBY_NOUNS,
+        winner_text=lambda w: f"{w} was the highest-ranked model of the "
+                              f"off-by-threshold stage.",
+        points_text=lambda n: f"{n} borderline points were injected around the "
+                              f"decision boundary.",
+        question="Which model handled the injected borderline points best, and "
+                 "what distinguishes the points it uniquely got right?",
+        info_footer=(
+            "The surrogate rules describe each injected point with four properties. "
+            "is_anomaly is the point's true label - 1 for a real anomaly, 0 for a "
+            "normal point. boundary_distance is how far the point was scaled away "
+            "from the decision boundary, so 0 sits exactly on it. local_volatility "
+            "is the standard deviation of the series around the injection site - how "
+            "noisy that neighbourhood is. position is where the point falls in the "
+            "series, from 0 at the start to 1 at the end. An exclusive win is a "
+            "point the highest-ranked model classified correctly and the named rival "
+            "did not; the rules come from a decision tree fitted to those wins, so "
+            "they describe where the edge occurred, not why."))
+
+
+def build_gan_ir(dataset: str, entity: str, result: Dict[str, Any],
+                 ranked_f1_names: Optional[List[str]] = None) -> Dict[str, Any]:
+    """GAN perturbations: the same question as off-by, asked of generated points.
+
+    The features differ — a GAN point is described by how ambiguous the
+    discriminator found it and by the shape of the signal itself — but the
+    target, the surrogate and the atom structure are the stage's sibling's.
+    """
+    return _build_exclusive_win_ir(
+        "gan", "gn", dataset, entity, result, ranked_f1_names,
+        labels=_GAN_LABELS, nouns=_GAN_NOUNS,
+        winner_text=lambda w: f"{w} was the highest-ranked model of the GAN "
+                              f"perturbation stage.",
+        points_text=lambda n: f"{n} generated points were injected near the "
+                              f"discriminator's decision threshold.",
+        question="Which model handled the injected GAN points best, and what "
+                 "distinguishes the points it uniquely got right?",
+        info_footer=(
+            "The surrogate rules describe each injected point with seven properties. "
+            "The GAN generates candidate points and its discriminator scores each "
+            "one; ambiguity is how far that score sits from the threshold separating "
+            "normal from anomalous, so 0 is a point the discriminator finds maximally "
+            "hard to place, and only the most ambiguous candidates are injected. "
+            "is_anomaly is the label the discriminator's verdict gave the point - 1 "
+            "anomalous, 0 normal. signal_magnitude is the average size of the "
+            "generated values across channels and signal_spread how much they differ "
+            "from one another. context_gap is how far the generated point sits from "
+            "the average of the real series around it - how large a jump the "
+            "injection makes. local_volatility is the standard deviation of the "
+            "series around that site - how noisy the neighbourhood is. position is "
+            "where the point falls in the series, from 0 at the start to 1 at the "
+            "end. An exclusive win is a point the highest-ranked model classified "
+            "correctly and the named rival did not; the rules come from a decision "
+            "tree fitted to those wins, so they describe where the edge occurred, "
+            "not why."))
+
+
+def _build_exclusive_win_ir(stage: str, prefix: str, dataset: str, entity: str,
+                            result: Dict[str, Any],
+                            ranked_f1_names: Optional[List[str]],
+                            *, labels: Dict[str, str], nouns: Dict[str, str],
+                            winner_text, points_text, question: str,
+                            info_footer: str) -> Dict[str, Any]:
+    """Shared IR builder for the two point-injection robustness stages.
+
+    Both ask the same question of their own injected points — which points did
+    the winner uniquely get right, and what were those points like — so the atom
+    families, the deduplication and the ordering are one implementation. Only the
+    feature vocabulary and the stage's own sentences are passed in.
+    """
     winner = result.get("winner", NOT_AVAILABLE)
     n_points = result.get("n_points", 0)
     surrogates = result.get("surrogates", {}) or {}
@@ -1926,18 +2030,16 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
         "n_injected_points": int(n_points),
     }
     evidence.append(make_atom(
-        "ob.output.winner", "stage_output", str(winner), winner,
-        f"{winner} was the highest-ranked model of the off-by-threshold stage.",
-        order=1))
-    required.append("ob.output.winner")
+        f"{prefix}.output.winner", "stage_output", str(winner), winner,
+        winner_text(winner), order=1))
+    required.append(f"{prefix}.output.winner")
     evidence.append(make_atom(
-        "ob.points", "injected_points", "injection", int(n_points),
-        f"{int(n_points)} borderline points were injected around the decision "
-        f"boundary.", order=2))
+        f"{prefix}.points", "injected_points", "injection", int(n_points),
+        points_text(int(n_points)), order=2))
 
     conf: Dict[str, Any] = {}
     caveats = [
-        make_atom("ob.caveat.f1_side", "caveat", "scope", None,
+        make_atom(f"{prefix}.caveat.f1_side", "caveat", "scope", None,
                   "Correctness is judged on thresholded predictions (the F1 side); "
                   "PR-AUC has no per-point notion of correct or incorrect."),
     ]
@@ -2007,14 +2109,14 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
     if len(low_support) == 1:
         k0, n0 = low_support[0]
         caveats.append(make_atom(
-            "ob.caveat.support", "caveat", "support", {k0: n0},
+            f"{prefix}.caveat.support", "caveat", "support", {k0: n0},
             f"The rule for {k0} rests on only {n0} exclusive-win "
             f"point{'' if n0 == 1 else 's'} — fewer than the {N_CV_FOLDS} "
             f"cross-validation folds — so its held-out fidelity is unstable; "
             f"treat it as indicative."))
     elif low_support:
         caveats.append(make_atom(
-            "ob.caveat.support", "caveat", "support",
+            f"{prefix}.caveat.support", "caveat", "support",
             {k0: n0 for k0, n0 in low_support},
             f"The rules for {_oxford([k0 for k0, _ in low_support])} each rest "
             f"on fewer than {N_CV_FOLDS} exclusive-win points — fewer than the "
@@ -2042,7 +2144,16 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
             edges.setdefault((tuple(comp_sigs.get(c, ())), key), []).append(c)
 
     def _edge_order(item: Any) -> Any:
-        """Biggest edge first; the rival name breaks ties deterministically."""
+        """Biggest edge first; the rival name breaks ties deterministically.
+
+        This is the order the narrator follows, and the card shows only the
+        opening sentences by default (`WebUI.summarize._STAGE_SUMMARY`), so it
+        also decides which rivals a reader sees without clicking.
+
+        The opposite order was tried — smallest count first, on the reading that
+        a rival the winner rarely beat outright is the one that ran it closest —
+        and rejected for both stages. Biggest margin first is what stands.
+        """
         (_sigs, (n_w, _rate)), names = item
         return (-int(n_w), sorted(names)[0])
 
@@ -2055,7 +2166,7 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
                 if len(names) == 1 else
                 f"{winner} correctly handles {pts} ({pct}%) apiece that "
                 f"{_oxford(names)} each miss")
-        phrases = [_offby_condition_phrase(rule_groups[s]["rule"]["conditions"])
+        phrases = [_condition_phrase(rule_groups[s]["rule"]["conditions"], labels)
                    for s in sigs]
         conditions = [rule_groups[s]["rule"]["conditions"] for s in sigs]
         them = "it" if len(names) == 1 else "them"
@@ -2072,7 +2183,7 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
             text = f"{head}, uniquely beating {them} when {'; or when '.join(phrases)}."
         support = ("low" if any(rule_groups[s]["support"] == "low" for s in sigs)
                    else "adequate")
-        eid = f"ob.edge.{ei}"
+        eid = f"{prefix}.edge.{ei}"
         evidence.append(make_atom(
             eid, "exclusive_wins", str(winner),
             {"count": int(n_w), "rate": rate, "competitors": names,
@@ -2089,12 +2200,12 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
         # seen at all, and stating it explicitly makes any such swap
         # self-contradictory within the narrative.
         evidence.append(make_atom(
-            "ob.degenerate", "degenerate_comparison", str(winner),
+            f"{prefix}.degenerate", "degenerate_comparison", str(winner),
             {"competitors": degenerate},
             f"{winner} never exclusively beat {_oxford(degenerate)}, so "
             f"{'none of them appears' if len(degenerate) > 1 else 'it does not appear'} "
             f"above.", order=500))
-        required.append("ob.degenerate")
+        required.append(f"{prefix}.degenerate")
 
     mean_imp = {fn: float(np.mean(v)) for fn, v in agg_imp.items() if v}
     top = (max(mean_imp.items(), key=lambda kv: kv[1])
@@ -2116,36 +2227,22 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
         against = _oxford(ks)
         each = "" if len(ks) == 1 else " in each case"
         evidence.append(make_atom(
-            f"ob.vs.{ks[0]}.importance", "feature_importance",
+            f"{prefix}.vs.{ks[0]}.importance", "feature_importance",
             ks[0] if len(ks) == 1 else "competitors",
             {"feature": feat, "importance": float(shown), "competitors": ks},
             f"Against {against}, the property that best separates those points "
-            f"is {_OFFBY_NOUNS.get(feat, feat)} (importance {shown}{each}).",
+            f"is {nouns.get(feat, feat)} (importance {shown}{each}).",
             order=300 + ii))
 
     if top is not None:
         evidence.append(make_atom(
-            "ob.summary.top_feature", "summary", top[0], _val(top[1], 3),
+            f"{prefix}.summary.top_feature", "summary", top[0], _val(top[1], 3),
             f"Across all competitors, {winner}'s edge is best explained by "
-            f"{_OFFBY_NOUNS.get(top[0], top[0])} (mean importance "
+            f"{nouns.get(top[0], top[0])} (mean importance "
             f"{_fmt(top[1], 2)}).", order=400))
-        required.append("ob.summary.top_feature")
+        required.append(f"{prefix}.summary.top_feature")
 
-    question = ("Which model handled the injected borderline points best, and "
-                "what distinguishes the points it uniquely got right?")
-    info_footer = (
-        "The surrogate rules describe each injected point with four properties. "
-        "is_anomaly is the point's true label - 1 for a real anomaly, 0 for a "
-        "normal point. boundary_distance is how far the point was scaled away "
-        "from the decision boundary, so 0 sits exactly on it. local_volatility "
-        "is the standard deviation of the series around the injection site - how "
-        "noisy that neighbourhood is. position is where the point falls in the "
-        "series, from 0 at the start to 1 at the end. An exclusive win is a "
-        "point the highest-ranked model classified correctly and the named rival "
-        "did not; the rules come from a decision tree fitted to those wins, so "
-        "they describe where the edge occurred, not why.")
-
-    return _envelope("off_by_threshold", dataset, entity, output, evidence,
+    return _envelope(stage, dataset, entity, output, evidence,
                      caveats, required, confidence=conf, question=question,
                      info_footer=info_footer)
 
@@ -2160,6 +2257,7 @@ _STAGE_FILES = {
     "thompson_ranking": "ir_thompson_ranking",
     "ga_selection": "ir_ga_selection",
     "ga_combination": "ir_ga_combination",
+    "gan": "ir_gan",
     "monte_carlo": "ir_monte_carlo",
     "off_by_threshold": "ir_off_by",
 }
@@ -2171,8 +2269,7 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     """
     Combine the per-stage IR JSONs (written by each explainability orchestrator)
     with the pipeline's decision context into ir_global_iter{iteration}.json.
-    Missing stage files → explicit not_available; GAN is always reserved
-    not_available (no explainability layer implemented).
+    Missing stage files → explicit not_available.
 
     Besides the machine-readable blocks (decision / stage_agreement / stages),
     the global IR carries its own `evidence` atoms — pre-rendered SENTENCES
@@ -2207,13 +2304,18 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     for stage, (fname, pattern) in sorted(stage_files.items()):
         loaded = _load(fname, pattern)
         if loaded is None:
-            stages[stage] = {"status": NOT_AVAILABLE}
+            # Carry a reason rather than a bare status: the page lists these
+            # under "stages without an explanation", and "not available" on its
+            # own reads as a defect where the usual cause is simply that the run
+            # skipped this stage or was not given --explain.
+            stages[stage] = {
+                "status": NOT_AVAILABLE,
+                "note": "no explanation was written for this stage — the run "
+                        "either skipped it or did not use --explain"}
         else:
             loaded_docs[stage] = loaded
             stages[stage] = {"status": "ok", "output": loaded.get("output", {})}
             all_caveats.extend(loaded.get("caveats", []))
-    stages["gan"] = {"status": NOT_AVAILABLE,
-                     "note": "no explainability layer implemented for the GAN test"}
 
     fd = results_dict.get("final_decision", {}) or {}
     choice = fd.get("framework_choice", NOT_AVAILABLE)

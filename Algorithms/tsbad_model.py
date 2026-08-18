@@ -79,7 +79,9 @@ _TSBAD_SPECS = {
     "TIMESNET":    ("TimesNet",    "TimesNet",    "enc_in",  "decision_function"),
     # Table I's Foundation Models. OFA embeds the channel count natively
     # (`enc_in`), which is why Table I marks it U&M; TIMESFM and CHRONOS score
-    # one channel at a time and average, which is upstream's own loop.
+    # one channel at a time and average, which is upstream's own loop. That loop
+    # is why TIMESFM is now univariate-only — see UNIVARIATE_ONLY below — while
+    # CHRONOS keeps it, Bolt-tiny being fast enough that the cost never bites.
     "OFA":         ("OFA",         "OFA",         "enc_in",  "decision_function"),
     # 'refit', not 'decision_function': TSB-AD's TimesFM computes its scores in
     # `fit` and leaves `decision_function` as a bare `pass` returning None —
@@ -93,7 +95,28 @@ _TSBAD_SPECS = {
 # Families that cannot see more than one channel. Checked in `fit` so the
 # failure names the detector and the dataset shape instead of surfacing as
 # numpy's "Polynomial must be 1d only" from four frames down.
-UNIVARIATE_ONLY = frozenset({"POLY"})
+# Families refused on multivariate entities, each with the clause saying why.
+#
+# A dict rather than a set because the two members are restricted for genuinely
+# different reasons, and one sentence covering both would be false of one of
+# them: POLY *cannot* see more than one channel, TimesFM *can* but must not.
+#
+# TimesFM's per-channel loop works — this is a cost refusal, not a capability
+# one. It forecasts one step from every sliding window of every channel through
+# a 200M-parameter model, measured at ~131 forecasts/s on CPU, so a 38-channel
+# SMD entity costs ~13 minutes PER SCORING CALL and the offline pipeline makes
+# seven of them: ~1.5 h for a single instance, against ~0.6 s for Chronos-Bolt
+# and ~1.5 s for OFA on identical input. Table I marks it 'U' and TSB-AD lists
+# it only in the univariate hyperparameter dicts, so the multivariate run was
+# never a configuration the paper reports.
+UNIVARIATE_ONLY = {
+    "POLY": "it fits a polynomial to the raw series, so a multivariate entity "
+            "has no meaning for it",
+    "TIMESFM": "it forecasts each channel separately, which costs roughly 13 "
+               "minutes per scoring call on a 38-channel entity — the "
+               "per-channel loop runs, but it is not a configuration Table I "
+               "reports",
+}
 
 # For the 'refit' scorers, the constructor key that sets the minimum rows per
 # call, and its default. They spell it differently — POLY fits one polynomial
@@ -171,8 +194,7 @@ class _TSBADEstimator:
         if self.family in UNIVARIATE_ONLY and n_channels != 1:
             raise ValueError(
                 f"{self.family} is univariate only and was handed "
-                f"{n_channels} channels. It fits a polynomial to the raw "
-                f"series, so a multivariate entity has no meaning for it — "
+                f"{n_channels} channels: {UNIVARIATE_ONLY[self.family]} — "
                 f"Table I marks it 'U'. Select it on a univariate dataset "
                 f"(UCR); on SKAB and SMD it is unavailable.")
 
