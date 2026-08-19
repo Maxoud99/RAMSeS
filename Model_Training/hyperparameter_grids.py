@@ -3,6 +3,9 @@
 
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by the RAMSeS project. This file is NOT identical to the original
+# in mononitogoswami/tsad-model-selection, from which it is derived.
 
 #######################################
 # DGHL Model hyper-parameter grid
@@ -446,7 +449,8 @@ LSTMAD_PARAM_GRID = {
 # family has two swept parameters the second is pinned at that optimum rather
 # than multiplied out, so the instance count stays at four.
 #
-# ABOD, KDE, COF, SOS and SR keep the contamination sweep: TSB-AD has no entry
+# ABOD, KDE, COF, SOS and SpectralResidual keep the contamination sweep: TSB-AD
+# has no entry
 # for any of them, so there is nothing upstream to copy, and a value invented
 # here would be exactly what this alignment exists to avoid.
 IFOREST_PARAM_GRID = {
@@ -497,9 +501,10 @@ MCD_PARAM_GRID = {
 # its saliency map with, so it sets how locally a spike has to stand out. It is
 # also a MINIMUM on every call: the estimator returns `max(len(X), score_window)`
 # scores, which is why a single row used to come back with three. TSB-AD's only
-# SR entry is a univariate `periodicity`, which does not apply to this pool, so
+# SpectralResidual entry is a univariate `periodicity`, which does not apply to
+# this pool, so
 # these are PyOD's own parameter with its default (3) as the low end.
-SR_PARAM_GRID = {
+SPECTRALRESIDUAL_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
     'contamination': [0.1],
@@ -516,7 +521,8 @@ SR_PARAM_GRID = {
 # reaches `pyod.models.auto_encoder.AutoEncoder` through the underscore-
 # insensitive fallback, and `train_pyod` trains it like any other PyOD family.
 #
-# window_size 64 because this is a SUBSEQUENCE autoencoder — Table I's AE, and
+# window_size 64 because this is a SUBSEQUENCE autoencoder — Table I's AE row,
+# and
 # the variant TSB-AD builds by applying `slidingWindow` before fitting. At
 # window_size 1 it would autoencode one timestep's channels in isolation, which
 # is close to a nonlinear PCA and duplicates a family already in the pool. 64/64
@@ -538,9 +544,10 @@ AE_TRAIN_PARAM_GRID = {
 # (`HP_list.Multi_algo_HP_dict['AutoEncoder']['hidden_neurons']`), including the
 # [128, 64] it reports as the tuned multivariate optimum. `epoch_num` stays at
 # PyOD's default.
-AE_PARAM_GRID = {
+AUTOENCODER_PARAM_GRID = {
     'window_size': [64],
-    # Overlapping, unlike the 64/64 that NN, LSTMVAE and DGHL use. AE is the
+    # Overlapping, unlike the 64/64 that NN, LSTMVAE and DGHL use. AutoEncoder
+    # is the
     # pool's only detector on PyOD's deep base class, whose `fit` builds
     # `DataLoader(batch_size=32, drop_last=True)` — so the window COUNT, not
     # just the window content, has to clear 32 or the loader yields no batches
@@ -615,7 +622,7 @@ KMEANSAD_PARAM_GRID = {
 # selectable on UCR and unavailable on SKAB and SMD; `_TSBADEstimator._check_width`
 # refuses with that explanation rather than letting numpy raise from four frames
 # down. It also refits on whatever it scores (its fit state is fully replaced),
-# so it is transductive in the same sense as COF/SOS/SR.
+# so it is transductive in the same sense as COF/SOS/SpectralResidual.
 # `window` is 20 rather than TSB-AD's default of 200, and that is a deliberate
 # deviation. POLY fits one polynomial per `window` block and computes
 # `N = floor(n_rows / window)`, so a call shorter than `window` divides by zero
@@ -664,7 +671,7 @@ DONUT_PARAM_GRID = {
     'detector__num_epochs': [50],
 }
 
-OA_PARAM_GRID = {
+OMNIANOMALY_PARAM_GRID = {
     'window_size': [1],
     'window_step': [1],
     'contamination': [0.1],
@@ -800,17 +807,88 @@ CHRONOS_PARAM_GRID = {
     'detector__model_size': ['tiny'],
 }
 
+#######################################
+# The Graph Based group
+#######################################
+#
+# Three graphs over three different things — samples, subsequences, channels —
+# which is the axis the group exists to expose. See `Utils.pipeline_spec.
+# DETECTOR_GROUPS` for why SOS and COF are not in it.
+
+# LUNAR reaches PyOD through the generic `train_pyod` path, so its own
+# parameters take the `detector__` prefix.
+#
+# `random_state` is NOT decoration. Unseeded, two fits on identical input score
+# 3.039 apart (measured, SMD machine-1-1, n=2000); seeded they measure
+# 0.000e+00. Irreproducibility is the exact ground PyOD's TimeSeriesOD and
+# AnomalyTransformer were refused on, so the seed is what makes this family
+# admissible at all.
+#
+# Note the spelling: PyOD's LUNAR takes `n_neighbours`, while COF next door
+# takes `n_neighbors`. Upstream's inconsistency, not a typo here.
+#
+# Cost at pool scale: 32s fit and 0.55s scoring on the full SMD machine-1-1
+# (28,479 rows x 38 channels), and the score of a row does not depend on which
+# rows share its call — so LUNAR is inductive and stays out of
+# TRANSDUCTIVE_FAMILIES.
+LUNAR_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    # The k-NN graph's degree, which is the one structural choice the method
+    # has. Spread around PyOD's default of 5 and COF's sweep of [10,20,30,40].
+    'detector__n_neighbours': [5, 10, 20, 30],
+    'detector__random_state': [1],
+}
+
+# Series2Graph. Univariate only, and the one detector NOT in this repository —
+# `Algorithms/series2graph_detector.py` says why and names the fetch command.
+#
+# Upstream derives `pattern_length` from the series by ACF period detection
+# (`find_length_rank(data, rank=periodicity)`, swept over [1,2,3]). It is set
+# explicitly here instead, which is what every other subsequence family in this
+# pool does — the grids vary a length rather than a knob that picks one — and it
+# avoids vendoring a second file for one helper. Measured on 28,479 rows:
+# 1.2s for the whole fit-and-score, so nothing here is cost-constrained.
+SERIES2GRAPH_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__pattern_length': [50, 75, 100],
+}
+
+# MTAD-GAT. Two attention graphs over one window; see `Algorithms/mtad_gat.py`.
+#
+# `win_size` is the swept axis, as for the six neural networks. Measured on the
+# full SMD machine-1-1 at 3 epochs: win 50 -> 35s fit / 5s scoring, win 100 ->
+# 104s fit / 17s scoring. The offline pipeline scores seven times, so the upper
+# arm costs ~2 minutes of scoring per run — the same order as the other neural
+# networks, and the reason the sweep stops at 100 rather than following the
+# paper's longer windows.
+MTADGAT_PARAM_GRID = {
+    'window_size': [1],
+    'window_step': [1],
+    'contamination': [0.1],
+    'device': [None],
+    'detector__win_size': [50, 100],
+    'detector__epochs': [3],
+    'detector__random_state': [1],
+}
+
 # Family -> its own grid, for the generic `train_pyod` path. Anything absent
 # uses PYOD_PARAM_GRID.
 PYOD_MODEL_GRIDS = {
     'LSTMAD': LSTMAD_PARAM_GRID,
-    'AE': AE_PARAM_GRID,
+    'AutoEncoder': AUTOENCODER_PARAM_GRID,
     'IFOREST': IFOREST_PARAM_GRID,
     'HBOS': HBOS_PARAM_GRID,
     'PCA': PCA_PARAM_GRID,
     'OCSVM': OCSVM_PARAM_GRID,
     'MCD': MCD_PARAM_GRID,
-    'SR': SR_PARAM_GRID,
+    'SpectralResidual': SPECTRALRESIDUAL_PARAM_GRID,
+    'LUNAR': LUNAR_PARAM_GRID,
 }
 
 # Family -> its grid, for the `train_tsbad` path. Every TSB-AD family needs an
@@ -820,7 +898,7 @@ TSBAD_MODEL_GRIDS = {
     'KMEANSAD': KMEANSAD_PARAM_GRID,
     'POLY': POLY_PARAM_GRID,
     'DONUT': DONUT_PARAM_GRID,
-    'OA': OA_PARAM_GRID,
+    'OmniAnomaly': OMNIANOMALY_PARAM_GRID,
     'USAD': USAD_PARAM_GRID,
     'TRANAD': TRANAD_PARAM_GRID,
     'FITS': FITS_PARAM_GRID,
@@ -828,6 +906,8 @@ TSBAD_MODEL_GRIDS = {
     'OFA': OFA_PARAM_GRID,
     'TIMESFM': TIMESFM_PARAM_GRID,
     'CHRONOS': CHRONOS_PARAM_GRID,
+    'Series2Graph': SERIES2GRAPH_PARAM_GRID,
+    'MTADGAT': MTADGAT_PARAM_GRID,
 }
 
 #######################################
@@ -858,12 +938,12 @@ FAMILY_GRIDS = {
     'PCA': PCA_PARAM_GRID,
     'OCSVM': OCSVM_PARAM_GRID,
     'MCD': MCD_PARAM_GRID,
-    'SR': SR_PARAM_GRID,
+    'SpectralResidual': SPECTRALRESIDUAL_PARAM_GRID,
     'KMEANSAD': KMEANSAD_PARAM_GRID,
     'POLY': POLY_PARAM_GRID,
-    'AE': AE_PARAM_GRID,
+    'AutoEncoder': AUTOENCODER_PARAM_GRID,
     'DONUT': DONUT_PARAM_GRID,
-    'OA': OA_PARAM_GRID,
+    'OmniAnomaly': OMNIANOMALY_PARAM_GRID,
     'USAD': USAD_PARAM_GRID,
     'TRANAD': TRANAD_PARAM_GRID,
     'FITS': FITS_PARAM_GRID,
@@ -871,6 +951,9 @@ FAMILY_GRIDS = {
     'OFA': OFA_PARAM_GRID,
     'TIMESFM': TIMESFM_PARAM_GRID,
     'CHRONOS': CHRONOS_PARAM_GRID,
+    'LUNAR': LUNAR_PARAM_GRID,
+    'Series2Graph': SERIES2GRAPH_PARAM_GRID,
+    'MTADGAT': MTADGAT_PARAM_GRID,
 }
 
 

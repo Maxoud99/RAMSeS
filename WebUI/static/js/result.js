@@ -19,13 +19,20 @@ const root = $("#result-root");
 const dataset = root.dataset.dataset;
 const entity = root.dataset.entity;
 
+/* A caption's title and its sentence are now set in the same colour, so the
+ * colon is what separates them. Added only when there is a sentence to
+ * separate: a bare title ending in ":" would promise one. */
+function captionTitle(title, caption) {
+  return caption ? `${title}:` : title;
+}
+
 function figureNode(fig) {
   if (fig.pair_picker) return pairPickerFigure(fig);
   if (fig.variants && fig.variants.length) return variantFigure(fig);
   const img = el("img", { src: fig.src, alt: fig.title, loading: "lazy" });
-  const caption = el("figcaption", {}, el("strong", { text: fig.title }),
+  const caption = el("figcaption", {}, el("strong", { text: captionTitle(fig.title, fig.caption) }),
     fig.caption ? ` ${fig.caption}` : "",
-    fig.n_older ? el("span", { class: "muted", text: ` · ${fig.n_older} older version(s) hidden` }) : null);
+    fig.n_older ? el("span", { text: ` · ${fig.n_older} older version(s) hidden` }) : null);
   const figure = el("figure", {}, img, caption);
   img.addEventListener("click", () => openLightbox([fig], 0));
   return figure;
@@ -77,10 +84,12 @@ function pairPickerFigure(spec) {
     el("label", { class: "small muted", text: "vs" }),
     picker(b, (v) => { b = v; refresh(); }),
     status);
-  const caption = el("figcaption", {}, el("strong", { text: spec.title }),
+  const caption = el("figcaption", {},
+    el("strong", { text: captionTitle(spec.title, spec.caption) }),
     spec.caption ? ` ${spec.caption}` : "");
   img.addEventListener("click", () =>
-    openLightbox([{ src: img.src, title: `${a} vs ${b}`, caption: spec.caption }], 0));
+    openLightbox([{ src: img.src, caption: spec.caption,
+                    title: `${a} vs ${b}` }], 0));
   return el("figure", {}, tabs, img, caption);
 }
 
@@ -96,11 +105,13 @@ function variantFigure(spec) {
   // reward and a deviation from a typical window — so a fixed caption would
   // describe whichever one happened to be first.
   const captionText = el("span", {});
+  const captionHead = el("strong", {});
   const setCaption = () => {
     const text = spec.caption || spec.variants[index].caption || "";
+    captionHead.textContent = captionTitle(spec.title, text);
     captionText.textContent = text ? ` ${text}` : "";
   };
-  const caption = el("figcaption", {}, el("strong", { text: spec.title }), captionText);
+  const caption = el("figcaption", {}, captionHead, captionText);
   setCaption();
 
   // Past four options a tab strip wraps onto a second row and stops reading as
@@ -218,6 +229,16 @@ const EXTENDED_LABEL = {
   thompson_ranking: "Read the full explanation, including how leadership changed hands",
 };
 
+/* Stages whose headline figure is a surrogate decision tree.
+ *
+ * The tree is the evidence behind the prose, not the finding itself, and at
+ * full width it is the tallest thing on the card — so it opens on demand, the
+ * way the full narrative does. Same <details> idiom, so it prints open. */
+const TREE_LABEL = {
+  off_by_threshold: "Show the decision trees behind these rules",
+  gan: "Show the decision trees behind these rules",
+};
+
 function narrativeDisclosure(stage) {
   // When the summary IS the whole narrative the same markup renders open and
   // relabelled, so a stage moving in or out of summarisation changes only the
@@ -324,7 +345,14 @@ function stageCard(stage, payload) {
       // the card, not part of its finding, so it sits with the metadata rather
       // than in the reading order of the prose.
       docsLink(stage)),
-    stage.question ? el("p", { class: "muted small", text: stage.question }) : null);
+    stage.question ? el("p", { class: "muted small", text: stage.question }) : null,
+    // Names what the definition list under it is for. Only when there is one:
+    // the sentence otherwise promises terms that never arrive. "this stage"
+    // rather than the title, which is in the heading directly above it.
+    (stage.terms || []).length
+      ? el("p", { class: "muted small", text:
+          "The following terms and metrics are used to explain this stage:" })
+      : null);
 
   const body = el("div", { class: "stack" });
   // The prose is older than the facts it describes, so it may be narrating a
@@ -348,7 +376,11 @@ function stageCard(stage, payload) {
 
   const group = (payload.plots || {})[stage.plot_group] || {};
   if (group.headline && group.headline.length) {
-    body.append(el("div", { class: "figures" }, group.headline.map(figureNode)));
+    const figures = el("div", { class: "figures" }, group.headline.map(figureNode));
+    const treeLabel = TREE_LABEL[stage.key];
+    body.append(treeLabel
+      ? el("details", {}, el("summary", { text: treeLabel }), figures)
+      : figures);
   }
   const regimes = regimeSection(stage);
   if (regimes) body.append(regimes);
@@ -362,15 +394,42 @@ function stageCard(stage, payload) {
       el("ul", { class: "small muted" }, stage.caveats.map((c) => el("li", { text: c })))));
   }
 
-  const footer = el("div", { class: "row small muted no-print" },
+  // Provenance only, and dim: these are measurements of the prose rather than
+  // part of it. Nothing else is left in the row, so it is dropped entirely when
+  // the run recorded no faithfulness numbers.
+  const provenance = [
     faith.n_claims !== undefined && faith.n_claims !== null
       ? el("span", { text: `${pct(faith.hallucination_rate)} unsupported over ${faith.n_claims} claims · ${pct(faith.omission_rate)} omitted` })
       : null,
     faith.repaired ? el("span", { class: "badge badge-warn", text: "repaired" }) : null,
-    el("a", { href: `/api/explanations/${dataset}/${entity}/download?stage=${stage.key}`,
-              text: "Download .txt" }));
+  ].filter(Boolean);
+  const footer = provenance.length
+    ? el("div", { class: "row small dim no-print" }, provenance) : null;
 
   return el("section", { class: "card stage-card stack" }, header, body, footer);
+}
+
+/* Two of the algorithms answer two questions each and so occupy two cards. Said
+ * once, immediately above the first of the pair, so the second card is read as
+ * its other half rather than as a separate stage. Keyed on the first card's
+ * stage: a run that explained only the second gets no preface, because there is
+ * then no pair on the page to introduce. */
+const PAIR_PREFACE = {
+  ga_selection: "GA Ensemble is explained in two sections: selection explanation "
+              + "and combination explanation.",
+  thompson_ranking: "Thompson Sampling is explained in two sections: ranking "
+                  + "explanation and selection explanation.",
+};
+
+function pairPreface(stage) {
+  const text = PAIR_PREFACE[stage.key];
+  if (!text) return null;
+  // `.prose`, so it is set in the same serif face and size as the narratives it
+  // introduces — it is read as part of them, not as a UI label. The 68ch
+  // measure is dropped: it exists to keep a paragraph readable over many lines,
+  // and here it was breaking a single sentence that fits the card.
+  return el("section", { class: "card card-tight" },
+    el("p", { class: "prose", style: "margin: 0; max-width: none;", text }));
 }
 
 function decisionHero(payload) {
@@ -402,14 +461,32 @@ function decisionHero(payload) {
     byline.length ? el("p", { class: "byline", text: byline.join(" · ") }) : null);
 }
 
+/* Display names for the agreement sources.
+ *
+ * The keys are the global IR's own — `borderline` for the off-by test,
+ * `robust_consensus` for the robustness aggregation — and they stay as they
+ * are: they are written into every result tree on disk and into the atom ids
+ * the verifier joins on. This maps them to the names the stage cards use, so
+ * one method is not called two things on one page. An unmapped source falls
+ * back to its key with the underscores opened out, as before. */
+const SOURCE_LABEL = {
+  thompson: "Thompson",
+  monte_carlo: "Monte Carlo",
+  borderline: "Off-by-threshold",
+  gan: "GAN",
+  robust_consensus: "Robustness Aggregated",
+};
+
+const sourceLabel = (source) => SOURCE_LABEL[source] || source.replace(/_/g, " ");
+
 function consensusStrip(payload) {
   if (!payload.agreement || !payload.agreement.length) return null;
   const chips = payload.agreement.map((a) => {
     const glyph = a.agrees === true ? "✓" : a.agrees === false ? "≠" : "–";
     const cls = a.agrees === true ? "badge badge-ok"
       : a.agrees === false ? "badge badge-warn" : "badge badge-muted";
-    return el("span", { class: cls, title: `${a.source}: ${a.top_pick}` },
-      `${glyph} ${a.source.replace(/_/g, " ")}: ${a.top_pick || "—"}`);
+    return el("span", { class: cls, title: `${sourceLabel(a.source)}: ${a.top_pick}` },
+      `${glyph} ${sourceLabel(a.source)}: ${a.top_pick || "—"}`);
   });
   // The chips carry only each source's winner, which cannot say whether a
   // disagreeing source put the consensus pick second or last. The orderings
@@ -419,7 +496,7 @@ function consensusStrip(payload) {
     el("summary", { text: `Full ranking from each of the ${ranked.length} methods` }),
     el("div", { class: "ranking-grid", style: "margin-top: var(--sp-3);" },
       ...ranked.map((a) => el("div", {},
-        el("h3", { class: "small", text: a.source.replace(/_/g, " ") }),
+        el("h3", { class: "small", text: sourceLabel(a.source) }),
         el("ol", { class: "small mono ranking-list" },
           ...a.ranking.map((name) => el("li", { text: name })))))),
   ) : null;
@@ -454,9 +531,8 @@ function comprehensiveCard(payload) {
   return el("section", { class: "card stack" },
     el("div", { class: "row-between" },
       el("h2", { id: "comprehensive", text: "Comprehensive results" }),
-      el("div", { class: "row no-print" },
-        el("a", { class: "button primary", href: report.url, text: "Open report →" }),
-        el("a", { class: "button", href: report.download_url, text: "Download .txt" }))),
+      el("a", { class: "button primary no-print", href: report.url,
+                text: "Open report →" })),
     el("p", { class: "prose small muted" },
       "Measured module timings, memory, the ranking each stage produced and the final " +
       "decision, exactly as the pipeline wrote them. Separate from the explanation above, " +
@@ -524,7 +600,10 @@ async function render() {
       "This result predates the structured global report, so only the per-stage " +
       "explanations are shown." }));
   }
-  payload.stages.forEach((stage) => children.push(stageCard(stage, payload)));
+  payload.stages.forEach((stage) => {
+    children.push(pairPreface(stage));
+    children.push(stageCard(stage, payload));
+  });
   children.push(missingSection(payload));
   children.push(comprehensiveCard(payload));
   children.push(appendix(payload));

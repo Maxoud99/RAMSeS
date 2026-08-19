@@ -396,9 +396,9 @@ class TestBuildPayload(ArtifactTreeCase):
         self.assertEqual([s["key"] for s in p["stages"]],
                          ["thompson_ranking", "thompson_sampling", "monte_carlo",
                           "rank_aggregation_robust"])
-        # GAN took order 5 when it gained an explainability layer, shifting the
-        # robustness block and both consensus stages down by one.
-        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 6, 8])
+        # The robustness block reads Monte Carlo, off-by, GAN, so Monte Carlo
+        # holds order 5 and the two aggregation stages close the page.
+        self.assertEqual([s["order"] for s in p["stages"]], [3, 4, 5, 8])
 
     def test_stage_order_matches_the_narrator(self):
         """The merged .txt and the page must present the stages in one order.
@@ -476,7 +476,7 @@ class TestBuildPayload(ArtifactTreeCase):
         p = artifacts.build_payload(self.DATASET, self.ENTITY)
         gan = next(m for m in p["missing_stages"] if m["key"] == "gan")
         self.assertEqual(gan["status"], "not_available")
-        self.assertEqual(gan["title"], "Robustness: GAN perturbations")
+        self.assertEqual(gan["title"], "Robustness: GAN")
         self.assertIn("--explain", gan["note"])
 
     def test_decision_and_agreement_come_from_the_global_ir(self):
@@ -1319,9 +1319,13 @@ class TestCatalog(unittest.TestCase):
 
     def test_catalog_lists_groups_including_the_empty_one(self):
         """FM has no detectors in the pool, so it cannot be inferred from the
-        detector list — the run page needs it from here to show the button."""
+        detector list — the run page needs it from here to show the button.
+
+        `Graph` is the fourth group and is NOT one of the paper's three; see
+        `Utils.pipeline_spec.DETECTOR_GROUPS`.
+        """
         self.assertEqual(catalog.catalog(refresh=True)["detector_groups"],
-                         ["NN", "Stat", "FM"])
+                         ["NN", "Stat", "FM", "Graph"])
 
     def test_every_family_has_a_chip_colour(self):
         """`familyClass` emits chip-{family}; a family with no rule falls back

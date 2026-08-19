@@ -74,7 +74,8 @@ def _release_training_state(model) -> None:
     `logging_obj.save` AFTER training has already finished, so the work is done
     and then thrown away.
 
-    Verified on AE, the pool's only such detector: scores before and after the
+    Verified on AutoEncoder, the pool's only such detector: scores before and
+    after the
     drop are bit-identical (max |diff| 0.0), the checkpoint then writes, and a
     reloaded model scores the same again. Nothing here is read by
     `decision_function`; PyOD rebuilds the optimiser in `training_prepare` on
@@ -95,7 +96,8 @@ def _check_enough_windows(model, n_rows: int) -> None:
     variable 'loss'`, four frames inside PyOD, naming neither the detector nor
     the requirement, after silently training on nothing.
 
-    AE is the pool's only such detector, and the window COUNT is set by the
+    AutoEncoder is the pool's only such detector, and the window COUNT is set
+    by the
     grid's `window_step`: at the 64/64 its neighbours use, a 917-step SKAB
     entity produced 14 windows. Same role as the minimum-length notes
     `score_windows` carries for COF and SpectralResidual, and as

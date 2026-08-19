@@ -17,7 +17,8 @@ from typing import Any, Dict, List, Optional
 # stays cheap — it does not drag torch/matplotlib in the way Utils.utils would.
 from Utils.pipeline_spec import (ALL_DETECTORS, DATASET_LABELS, DETECTOR_FAMILIES,
                                  DETECTOR_GROUPS, GROUP_LABELS, dataset_label,
-                                 family_of, group_of)
+                                 family_of,
+                                 group_of)
 # hyperparameter_grids.py is plain dict literals with no imports at all, and
 # Model_Training/__init__.py is empty, so this reaches the grids without
 # pulling torch or sklearn into the Flask process.
@@ -205,6 +206,11 @@ def detectors_for(dataset: str, entity: str) -> List[Dict[str, Any]]:
         out.append({
             "name": name,
             "family": family_of(name),
+            # There is no separate display name. `name` is canonical AND what
+            # the reader sees — it is what the CLI takes, what the checkpoint is
+            # called, and what every selection is submitted as. This payload
+            # used to carry `display`/`family_display` alongside it, from when
+            # four families were spelled short in the pool and long on screen.
             # The paper's Table I group, so the run page can colour a chip and
             # build its select-all buttons without a second copy of the taxonomy.
             "group": group_of(family_of(name)),

@@ -28,7 +28,9 @@ from Utils.pipeline_spec import ALL_DETECTORS, ALL_STAGES, OFFLINE_ITERATION
 from WebUI import artifacts, markers, paths
 
 LOG_RING = 20000            # lines kept in memory; the full log also goes to disk
-DEFAULT_TIMEOUT = 7200      # SMD runs approach an hour before narration
+DEFAULT_TIMEOUT = 14400     # 4 hours. A 38-channel SMD entity with the neural
+                            # networks and foundation models in the pool spends
+                            # well over an hour before narration even starts.
 _LINE_SPLIT = re.compile(r"[\r\n]")   # tqdm rewrites lines with \r
 
 

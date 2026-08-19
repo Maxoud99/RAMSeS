@@ -8,7 +8,8 @@ import numpy as np
 from loguru import logger
 
 from Metrics.metrics import range_based_precision_recall_f1_auc
-from Model_Selection.Sensitivity_robustness.plot_retention import prune_timestamped
+from Model_Selection.Sensitivity_robustness.plot_retention import (
+    prune_superseded, prune_timestamped)
 from Utils.model_selection_utils import evaluate_model
 
 
@@ -387,9 +388,9 @@ def _offby_explain_dir(dataset, entity) -> str:
     return directory
 
 
-def plot_offby_point_tree(info, winner, competitor, dataset, entity, feature_names) -> None:
-    """Plot one winner-vs-competitor exclusive-win surrogate tree (skips if degenerate)."""
-    _ews_module().plot_exclusive_win_tree(
+def plot_offby_point_tree(info, winner, competitor, dataset, entity, feature_names):
+    """One winner-vs-competitor tree; returns its filename, None if degenerate."""
+    return _ews_module().plot_exclusive_win_tree(
         info, winner, feature_names,
         directory=_offby_explain_dir(dataset, entity),
         filename=f"{dataset}_{entity}_off_by_point_tree_{winner}_vs_{competitor}.png",
@@ -439,9 +440,18 @@ def explain_off_by_threshold(point_records, adjusted_y_pred_dict, true_labels, r
     if not surrogate_note:
         # Plot every generated surrogate tree, one per competitor (degenerate ones,
         # whose clf is None, are skipped inside plot_offby_point_tree).
-        for k, info in per_competitor.items():
-            plot_offby_point_tree(info, winner, k, dataset, entity, table["feature_names"])
+        written = [plot_offby_point_tree(info, winner, k, dataset, entity,
+                                        table["feature_names"])
+                   for k, info in per_competitor.items()]
         plot_offby_point_importance(per_competitor, dataset, entity, table["feature_names"])
+        # Whatever an earlier run left here describes a different outcome —
+        # a different winner, or the same winner against differently-spelled
+        # competitors — and the picker cannot tell the two apart. Pruned
+        # AFTER the new set is on disk, so a run that dies mid-plot leaves
+        # the previous set rather than deleting it and not replacing it.
+        prune_superseded(_offby_explain_dir(dataset, entity),
+                         f"{dataset}_{entity}_off_by_point_tree_",
+                         [n for n in written if n])
 
     directory = _offby_explain_dir(dataset, entity)
     report_path = os.path.join(directory, f"{dataset}_{entity}_off_by_explainability.txt")

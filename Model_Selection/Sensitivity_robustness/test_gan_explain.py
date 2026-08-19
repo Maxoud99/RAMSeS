@@ -67,6 +67,14 @@ class _Logger:
 
 _set("Metrics")
 _set("Utils")
+# `Utils.pipeline_spec` is stdlib-only and is wanted for real. A stand-in `Utils`
+# has no __path__, so that submodule would not resolve; giving it one lets the
+# real file load while the mocked `Utils.model_selection_utils` below still
+# shadows its sibling. Harmless when `Utils` is already the real package.
+if not hasattr(sys.modules["Utils"], "__path__"):
+    sys.modules["Utils"].__path__ = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "Utils")]
 _set("Metrics.metrics",
      range_based_precision_recall_f1_auc=lambda *a, **k: (0, 0, 0.5, 0.5, None),
      prauc=lambda *a, **k: 0.5,

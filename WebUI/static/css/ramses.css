@@ -38,7 +38,14 @@
   --border: #E6E4DF;
   --border-strong: #D4D1CA;
   --text: #1B1B18;
-  --text-muted: #6B6862;
+  /* Secondary text is set in the body colour, not a grey: a caption, a glossary
+     definition and a table header are all read, so dimming them only made them
+     harder to read. `--text-dim` is what is left of the old grey, kept for the
+     handful of things that are genuinely not content — a placeholder, a CLI
+     flag beside its checkbox, an untrained detector's name, the provenance
+     byline. */
+  --text-muted: var(--text);
+  --text-dim: #6B6862;
   --accent: #3B5BDB;
   --accent-soft: #EDF1FE;
 
@@ -67,7 +74,7 @@
   --fam-mcd: #744210;   /* bronze    */
   --fam-cof: #9B2C2C;   /* red       */
   --fam-sos: #6D28D9;   /* violet    */
-  --fam-sr: #1A4971; /* navy */
+  --fam-spectralresidual: #1A4971; /* navy */
   --fam-rnn: #B83280;   /* pink      */
   --fam-lstmvae: #276749; /* forest   */
   --fam-dghl: #8B4513;  /* rust      */
@@ -81,9 +88,9 @@
      cue rather than the identifier. */
   --fam-kmeansad: #4D7C0F;    /* lime      */
   --fam-poly: #86198F;        /* fuchsia   */
-  --fam-ae: #BE123C; /* rose      */
+  --fam-autoencoder: #BE123C; /* rose      */
   --fam-donut: #065F46;       /* emerald   */
-  --fam-oa: #7E22CE; /* purple    */
+  --fam-omnianomaly: #7E22CE; /* purple    */
   --fam-usad: #A16207;        /* dark gold */
   --fam-tranad: #1D4ED8;      /* royal blue*/
   --fam-fits: #155E75;        /* dark cyan */
@@ -93,6 +100,11 @@
   --fam-ofa: #0F766E;         /* deep teal */
   --fam-timesfm: #3F6212;     /* moss      */
   --fam-chronos: #6D28D9;     /* indigo-violet */
+  /* The Graph Based group. Kept in the blue-green band the group tint
+     occupies, so a graph detector's chip reads as one before its name is. */
+  --fam-lunar: #0E7490;       /* teal-blue */
+  --fam-series2graph: #4338CA;         /* deep indigo */
+  --fam-mtadgat: #047857;     /* pine      */
 
   /* Paper Table I groups: Neural Networks, Statistical, Foundation Models.
      Used on the run page, where the question is which KIND a detector is, not
@@ -100,6 +112,7 @@
   --grp-nn: #6B46C1;   /* purple */
   --grp-stat: #B83280; /* pink; FM already owns the teal */
   --grp-fm: #2C7A7B;   /* teal   */
+  --grp-graph: #4338CA; /* indigo; the fourth group, not the paper's */
 
   --shadow: 0 1px 2px rgba(27, 27, 24, .05), 0 1px 8px rgba(27, 27, 24, .04);
   --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
@@ -109,7 +122,7 @@
   :root:not([data-theme="light"]) {
     --bg: #141413; --surface: #1D1D1B; --surface-sunken: #232320;
     --border: #302F2C; --border-strong: #3D3C38;
-    --text: #EDEBE6; --text-muted: #9A968E;
+    --text: #EDEBE6; --text-dim: #9A968E;
     --accent: #8DA2FB; --accent-soft: #232741;
     --ok: #68D391; --warn: #F6C177; --error: #FC8181;
     --ok-soft: #1B2A22; --warn-soft: #2C2519; --error-soft: #2C1D1D;
@@ -117,16 +130,18 @@
     --fam-abod: #81E6D9; --fam-kde: #F687B3; --fam-iforest: #9AE6B4;
     --fam-hbos: #FBD38D; --fam-pca: #A3BFFA; --fam-ocsvm: #76E4F7;
     --fam-mcd: #D6A960; --fam-cof: #FEB2B2; --fam-sos: #C7A2FF;
-    --fam-sr: #7EC3F0; --fam-rnn: #FBB6CE;
+    --fam-spectralresidual: #7EC3F0; --fam-rnn: #FBB6CE;
     --fam-lstmvae: #7BD8A4; --fam-dghl: #E9A87C; --fam-rm: #C3CBD6;
     --fam-md: #E3C15E; --fam-lstmad: #B794F4;
     --fam-kmeansad: #BEF264; --fam-poly: #F0ABFC;
-    --fam-ae: #FDA4AF; --fam-donut: #6EE7B7;
-    --fam-oa: #D8B4FE; --fam-usad: #FCD34D;
+    --fam-autoencoder: #FDA4AF; --fam-donut: #6EE7B7;
+    --fam-omnianomaly: #D8B4FE; --fam-usad: #FCD34D;
     --fam-tranad: #93C5FD; --fam-fits: #67E8F9;
     --fam-timesnet: #F9A8D4;
     --fam-ofa: #5EEAD4; --fam-timesfm: #BEF264; --fam-chronos: #C4B5FD;
+    --fam-lunar: #67E8F9; --fam-series2graph: #A5B4FC; --fam-mtadgat: #6EE7B7;
     --grp-nn: #C4A7F7; --grp-stat: #F0A0C8; --grp-fm: #81E6D9;
+    --grp-graph: #A5B4FC;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 1px 8px rgba(0,0,0,.2);
   }
 }
@@ -134,7 +149,7 @@
 :root[data-theme="dark"] {
   --bg: #141413; --surface: #1D1D1B; --surface-sunken: #232320;
   --border: #302F2C; --border-strong: #3D3C38;
-  --text: #EDEBE6; --text-muted: #9A968E;
+  --text: #EDEBE6; --text-dim: #9A968E;
   --accent: #8DA2FB; --accent-soft: #232741;
   --ok: #68D391; --warn: #F6C177; --error: #FC8181;
   --ok-soft: #1B2A22; --warn-soft: #2C2519; --error-soft: #2C1D1D;
@@ -142,16 +157,18 @@
   --fam-abod: #81E6D9; --fam-kde: #F687B3; --fam-iforest: #9AE6B4;
   --fam-hbos: #FBD38D; --fam-pca: #A3BFFA; --fam-ocsvm: #76E4F7;
   --fam-mcd: #D6A960; --fam-cof: #FEB2B2; --fam-sos: #C7A2FF;
-  --fam-sr: #7EC3F0; --fam-rnn: #FBB6CE;
+  --fam-spectralresidual: #7EC3F0; --fam-rnn: #FBB6CE;
   --fam-lstmvae: #7BD8A4; --fam-dghl: #E9A87C; --fam-rm: #C3CBD6;
   --fam-md: #E3C15E; --fam-lstmad: #B794F4;
   --fam-kmeansad: #BEF264; --fam-poly: #F0ABFC;
-  --fam-ae: #FDA4AF; --fam-donut: #6EE7B7;
-  --fam-oa: #D8B4FE; --fam-usad: #FCD34D;
+  --fam-autoencoder: #FDA4AF; --fam-donut: #6EE7B7;
+  --fam-omnianomaly: #D8B4FE; --fam-usad: #FCD34D;
   --fam-tranad: #93C5FD; --fam-fits: #67E8F9;
   --fam-timesnet: #F9A8D4;
   --fam-ofa: #5EEAD4; --fam-timesfm: #BEF264; --fam-chronos: #C4B5FD;
+  --fam-lunar: #67E8F9; --fam-series2graph: #A5B4FC; --fam-mtadgat: #6EE7B7;
   --grp-nn: #C4A7F7; --grp-stat: #F0A0C8; --grp-fm: #81E6D9;
+  --grp-graph: #A5B4FC;
   --shadow: 0 1px 2px rgba(0,0,0,.3), 0 1px 8px rgba(0,0,0,.2);
 }
 
@@ -217,6 +234,9 @@ h3 { font-size: var(--fs-lg); }
 .card-tight { padding: var(--sp-4); }
 
 .muted { color: var(--text-muted); }
+/* Not content: provenance, a flag name, a state marker. The only text on the
+   page still set in grey. */
+.dim { color: var(--text-dim); }
 .small { font-size: var(--fs-sm); }
 .mono { font-family: var(--font-mono); font-size: var(--fs-sm); }
 
@@ -260,7 +280,7 @@ h3 { font-size: var(--fs-lg); }
 .chip-mcd { color: var(--fam-mcd); border-color: color-mix(in srgb, var(--fam-mcd) 40%, var(--border)); }
 .chip-cof { color: var(--fam-cof); border-color: color-mix(in srgb, var(--fam-cof) 40%, var(--border)); }
 .chip-sos { color: var(--fam-sos); border-color: color-mix(in srgb, var(--fam-sos) 40%, var(--border)); }
-.chip-sr { color: var(--fam-sr); border-color: color-mix(in srgb, var(--fam-sr) 40%, var(--border)); }
+.chip-spectralresidual { color: var(--fam-spectralresidual); border-color: color-mix(in srgb, var(--fam-spectralresidual) 40%, var(--border)); }
 .chip-rnn { color: var(--fam-rnn); border-color: color-mix(in srgb, var(--fam-rnn) 40%, var(--border)); }
 .chip-lstmvae { color: var(--fam-lstmvae); border-color: color-mix(in srgb, var(--fam-lstmvae) 40%, var(--border)); }
 .chip-dghl { color: var(--fam-dghl); border-color: color-mix(in srgb, var(--fam-dghl) 40%, var(--border)); }
@@ -269,9 +289,9 @@ h3 { font-size: var(--fs-lg); }
 .chip-lstmad { color: var(--fam-lstmad); border-color: color-mix(in srgb, var(--fam-lstmad) 40%, var(--border)); }
 .chip-kmeansad { color: var(--fam-kmeansad); border-color: color-mix(in srgb, var(--fam-kmeansad) 40%, var(--border)); }
 .chip-poly { color: var(--fam-poly); border-color: color-mix(in srgb, var(--fam-poly) 40%, var(--border)); }
-.chip-ae { color: var(--fam-ae); border-color: color-mix(in srgb, var(--fam-ae) 40%, var(--border)); }
+.chip-autoencoder { color: var(--fam-autoencoder); border-color: color-mix(in srgb, var(--fam-autoencoder) 40%, var(--border)); }
 .chip-donut { color: var(--fam-donut); border-color: color-mix(in srgb, var(--fam-donut) 40%, var(--border)); }
-.chip-oa { color: var(--fam-oa); border-color: color-mix(in srgb, var(--fam-oa) 40%, var(--border)); }
+.chip-omnianomaly { color: var(--fam-omnianomaly); border-color: color-mix(in srgb, var(--fam-omnianomaly) 40%, var(--border)); }
 .chip-usad { color: var(--fam-usad); border-color: color-mix(in srgb, var(--fam-usad) 40%, var(--border)); }
 .chip-tranad { color: var(--fam-tranad); border-color: color-mix(in srgb, var(--fam-tranad) 40%, var(--border)); }
 .chip-fits { color: var(--fam-fits); border-color: color-mix(in srgb, var(--fam-fits) 40%, var(--border)); }
@@ -279,6 +299,9 @@ h3 { font-size: var(--fs-lg); }
 .chip-ofa { color: var(--fam-ofa); border-color: color-mix(in srgb, var(--fam-ofa) 40%, var(--border)); }
 .chip-timesfm { color: var(--fam-timesfm); border-color: color-mix(in srgb, var(--fam-timesfm) 40%, var(--border)); }
 .chip-chronos { color: var(--fam-chronos); border-color: color-mix(in srgb, var(--fam-chronos) 40%, var(--border)); }
+.chip-lunar { color: var(--fam-lunar); border-color: color-mix(in srgb, var(--fam-lunar) 40%, var(--border)); }
+.chip-series2graph { color: var(--fam-series2graph); border-color: color-mix(in srgb, var(--fam-series2graph) 40%, var(--border)); }
+.chip-mtadgat { color: var(--fam-mtadgat); border-color: color-mix(in srgb, var(--fam-mtadgat) 40%, var(--border)); }
 
 /* Paper Table I groups, on the run page only: the family select-all button, the
    group select-all buttons, and the detector chips. Tinted rather than filled,
@@ -287,26 +310,30 @@ h3 { font-size: var(--fs-lg); }
 .grp-nn { --grp: var(--grp-nn); }
 .grp-stat { --grp: var(--grp-stat); }
 .grp-fm { --grp: var(--grp-fm); }
+.grp-graph { --grp: var(--grp-graph); }
 .toggle[class*="grp-"] { border-color: color-mix(in srgb, var(--grp) 35%, var(--border)); }
 .toggle[class*="grp-"] .detector { color: var(--grp); }
 .toggle[class*="grp-"].is-on { border-color: var(--grp); }
-button.grp-nn, button.grp-stat, button.grp-fm {
+button.grp-nn, button.grp-stat, button.grp-fm, button.grp-graph {
   color: var(--grp);
   border-color: color-mix(in srgb, var(--grp) 35%, var(--border));
 }
 /* Selected: filled, the way a checked chip is. `is-partial` is deliberately a
    weaker signal than `is-on` — some of the group picked is not the group
    picked, and one state for both would overclaim. */
-button.grp-nn.is-on, button.grp-stat.is-on, button.grp-fm.is-on {
+button.grp-nn.is-on, button.grp-stat.is-on, button.grp-fm.is-on,
+button.grp-graph.is-on {
   background: color-mix(in srgb, var(--grp) 16%, var(--surface));
   border-color: var(--grp);
   font-weight: 600;
 }
-button.grp-nn.is-partial, button.grp-stat.is-partial, button.grp-fm.is-partial {
+button.grp-nn.is-partial, button.grp-stat.is-partial, button.grp-fm.is-partial,
+button.grp-graph.is-partial {
   background: color-mix(in srgb, var(--grp) 7%, var(--surface));
   border-style: dashed;
 }
-button.grp-nn:disabled, button.grp-stat:disabled, button.grp-fm:disabled {
+button.grp-nn:disabled, button.grp-stat:disabled, button.grp-fm:disabled,
+button.grp-graph:disabled {
   color: var(--text-muted);
   border-color: var(--border);
   background: none;
@@ -394,10 +421,10 @@ button.toggle[aria-pressed="true"] { font-weight: 600; }
 /* Selectable, but nothing is on disk for it yet: picking it adds a training
    phase to the run, so it is marked rather than dimmed like a dead control. */
 .toggle.untrained { border-style: dashed; }
-.toggle.untrained .detector { color: var(--text-muted); }
+.toggle.untrained .detector { color: var(--text-dim); }
 .toggle.untrained.is-on .detector,
 .toggle.untrained:has(input:checked) .detector { color: var(--text); }
-.toggle .hint { font-size: var(--fs-xs); color: var(--text-muted); font-family: var(--font-mono); }
+.toggle .hint { font-size: var(--fs-xs); color: var(--text-dim); font-family: var(--font-mono); }
 .toggle .detector { font-family: var(--font-detector); letter-spacing: -0.02em; }
 
 /* Per-family hyperparameter tooltip. Hover or keyboard focus, no click: the
@@ -410,7 +437,10 @@ button.toggle[aria-pressed="true"] { font-weight: 600; }
   border: 1px solid var(--border-strong); border-radius: 50%;
   font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1;
   color: var(--text-muted); background: var(--surface);
-  cursor: help; user-select: none;
+  /* `default`, not `help`: the tooltip opens on hover with no action to take,
+     and the question-mark pointer read as an unanswered question rather than as
+     a label. Explicit, because a <span> of text would otherwise show a caret. */
+  cursor: default; user-select: none;
   transition: color 140ms ease-out, border-color 140ms ease-out;
 }
 .paraminfo:hover, .paraminfo:focus-visible {
@@ -580,7 +610,7 @@ details[open] > summary::before { transform: rotate(90deg); }
 }
 
 .byline {
-  font-size: var(--fs-xs); color: var(--text-muted);
+  font-size: var(--fs-xs); color: var(--text-dim);
   font-family: var(--font-mono);
 }
 
@@ -619,7 +649,13 @@ figcaption strong { color: var(--text); font-weight: 550; }
   border-radius: 999px; border: 1px solid var(--border);
 }
 .variant-tabs select {
-  padding: 1px var(--sp-1); font-size: var(--fs-xs); max-width: 12ch;
+  /* 12ch was set when every detector name was an acronym. "SpectralResidual_1"
+     is 18 characters and was clipped to something that read as an abbreviation
+     the page had supposedly stopped using. The cap exists so a picker cannot
+     push a figure out of its grid column, so it is raised rather than removed —
+     and `text-overflow` makes any future overflow read as truncation. */
+  padding: 1px var(--sp-1); font-size: var(--fs-xs);
+  max-width: 22ch; text-overflow: ellipsis;
   border-radius: var(--radius-sm); border: 1px solid var(--border);
   background: var(--surface); color: var(--text);
 }
@@ -786,7 +822,7 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
 
 @media print {
   :root { --bg: #fff; --surface: #fff; --surface-sunken: #fff;
-          --text: #000; --text-muted: #333; --border: #bbb; --border-strong: #999; }
+          --text: #000; --text-dim: #333; --border: #bbb; --border-strong: #999; }
   .site-header, .console, .run-layout, .lightbox, .no-print,
   .docs-nav, .variant-tabs, button, .gallery-controls { display: none !important; }
   /* Without its sidebar the documentation is a single column. */

@@ -30,10 +30,10 @@ from WebUI.summarize import attribute_sentences, summarize
 # that mapping; plots.py, markers.py and the frontend all join on `key`.
 # Order matches Explainability.llm._GLOBAL_STAGE_ORDER.
 STAGES: Tuple[Dict[str, Any], ...] = (
-    {"key": "ga_selection", "title": "Ensemble selection (genetic algorithm)",
+    {"key": "ga_selection", "title": "Genetic Algorithm: Selection",
      "cli": "ga", "ir": "ir_ga_selection", "nl": "nl_ga_selection",
      "plot_group": "ga_selection", "order": 1},
-    {"key": "ga_combination", "title": "Ensemble weighting (meta-learner)",
+    {"key": "ga_combination", "title": "Genetic Algorithm: Combination",
      "cli": "ga", "ir": "ir_ga_combination", "nl": "nl_ga_combination",
      "plot_group": "ga_combination", "order": 2},
     # One CLI token, two stages — the same split as ga_selection/ga_combination.
@@ -47,30 +47,30 @@ STAGES: Tuple[Dict[str, Any], ...] = (
     # galleries. `regimes` names the plot subdirectory whose per-regime figures
     # pair with this stage's regime atoms; its presence is what makes a stage
     # regime-bearing, replacing a hardcoded stage-key check here and in server.py.
-    {"key": "thompson_ranking", "title": "Thompson Sampling: ranking criterion",
+    {"key": "thompson_ranking", "title": "Thompson Sampling: Ranking",
      "cli": "thompson", "ir": "ir_thompson_ranking", "nl": "nl_thompson_ranking",
      "plot_group": "ts_ranking", "order": 3,
      "regimes": ["ranking_per_regime"]},
-    {"key": "thompson_sampling", "title": "Thompson Sampling: selection dynamics",
+    {"key": "thompson_sampling", "title": "Thompson Sampling: Selection",
      "cli": "thompson", "ir": "ir_thompson", "nl": "nl_thompson",
      "plot_group": "thompson", "order": 4,
      "regimes": ["reward_per_regime", "shap_per_regime"]},
+    {"key": "monte_carlo", "title": "Robustness: Monte Carlo",
+     "cli": "montecarlo", "ir": "ir_monte_carlo", "nl": "nl_monte_carlo",
+     "plot_group": "monte_carlo", "order": 5},
+    {"key": "off_by_threshold", "title": "Robustness: Off-by-threshold",
+     "cli": "offby", "ir": "ir_off_by", "nl": "nl_off_by",
+     "plot_group": "off_by", "order": 6},
     # `plot_group` is "gan", which is prefix-free against "ga_selection" and
     # "ga_combination" — the lazy-gallery matcher joins on startswith, so a
     # group that prefixed another would let one card claim the other's galleries.
-    {"key": "gan", "title": "Robustness: GAN perturbations",
+    {"key": "gan", "title": "Robustness: GAN",
      "cli": "gan", "ir": "ir_gan", "nl": "nl_gan",
-     "plot_group": "gan", "order": 5},
-    {"key": "monte_carlo", "title": "Robustness: Monte Carlo noise sweep",
-     "cli": "montecarlo", "ir": "ir_monte_carlo", "nl": "nl_monte_carlo",
-     "plot_group": "monte_carlo", "order": 6},
-    {"key": "off_by_threshold", "title": "Sensitivity: off-by-threshold test",
-     "cli": "offby", "ir": "ir_off_by", "nl": "nl_off_by",
-     "plot_group": "off_by", "order": 7},
-    {"key": "rank_aggregation_robust", "title": "Robustness consensus",
+     "plot_group": "gan", "order": 7},
+    {"key": "rank_aggregation_robust", "title": "Robustness Aggregation",
      "cli": None, "ir": "ir_rank_aggregation_robust", "nl": "nl_rank_aggregation_robust",
      "plot_group": "rank_aggregation_robust", "order": 8, "iterated": True},
-    {"key": "rank_aggregation_final", "title": "Final consensus",
+    {"key": "rank_aggregation_final", "title": "Final Aggregation",
      "cli": None, "ir": "ir_rank_aggregation_final", "nl": "nl_rank_aggregation_final",
      "plot_group": "rank_aggregation_final", "order": 9, "iterated": True},
 )

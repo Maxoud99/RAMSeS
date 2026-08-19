@@ -37,7 +37,8 @@ properties of the detector, not of this pipeline:
     real interface is `fit(X)` then read `decision_scores_`. Measured: `fit(B)`
     then `fit(A)` gives byte-identical scores to `fit(A)` alone (max difference
     0.000e+00), i.e. fit state is fully replaced. So scoring refits, which makes
-    the score a function of the call's rows alone — the COF/SOS/SR property, and
+    the score a function of the call's rows alone — the COF/SOS/SpectralResidual
+    property, and
     why POLY joins TRANSDUCTIVE_FAMILIES.
 """
 
@@ -72,7 +73,8 @@ _TSBAD_SPECS = {
     "KMEANSAD":    ("KMeansAD",    "KMeansAD",    None,      "predict"),
     "POLY":        ("POLY",        "POLY",        None,      "refit"),
     "DONUT":       ("Donut",       "Donut",       "input_c", "decision_function"),
-    "OA": ("OmniAnomaly", "OmniAnomaly", "feats",   "decision_function"),
+    "OmniAnomaly": ("OmniAnomaly", "OmniAnomaly", "feats",
+                    "decision_function"),
     "USAD":        ("USAD",        "USAD",        "feats",   "decision_function"),
     "TRANAD":      ("TranAD",      "TranAD",      "feats",   "decision_function"),
     "FITS":        ("FITS",        "FITS",        "input_c", "decision_function"),
@@ -90,6 +92,20 @@ _TSBAD_SPECS = {
     "TIMESFM":     ("TimesFM",     "TimesFM",     "input_c", "refit"),
     "CHRONOS":     ("Algorithms.chronos_detector", "Chronos", "input_c",
                     "decision_function"),
+    # The Graph Based group's two whole-series members. Both take the dotted
+    # form for the same reason CHRONOS does — they are written under
+    # `Algorithms/` rather than vendored — and both already present
+    # `fit(series)` / `decision_function(series)` with one score per timestep,
+    # so neither needs a scorer mode of its own.
+    #
+    # Series2Graph's adapter is what absorbs its three-call interface
+    # (`fit` -> `score(query_length, dataset)` -> read `decision_scores_`) and
+    # its short output, and it is also where the "not fetched yet" error lives:
+    # that one file is deliberately absent from this repository.
+    "MTADGAT":     ("Algorithms.mtad_gat", "MTADGAT", "n_features",
+                    "decision_function"),
+    "Series2Graph": ("Algorithms.series2graph_detector",
+                     "Series2GraphDetector", None, "decision_function"),
 }
 
 # Families that cannot see more than one channel. Checked in `fit` so the
@@ -116,6 +132,10 @@ UNIVARIATE_ONLY = {
                "minutes per scoring call on a 38-channel entity — the "
                "per-channel loop runs, but it is not a configuration Table I "
                "reports",
+    "Series2Graph": "it embeds a scalar subsequence into a 2-D phase space and reads a "
+           "graph off that embedding, so a multivariate entity has no meaning "
+           "for it — TSB-AD's own wrapper opens with `data.squeeze()` and "
+           "lists it in the uni-variate pool",
 }
 
 # For the 'refit' scorers, the constructor key that sets the minimum rows per
@@ -141,14 +161,21 @@ _MIN_LENGTH_KEYS = {
 _TRAINING_ONLY_ATTRS = ("model_optim", "optimizer", "scheduler")
 
 
+# Case- and underscore-folded index over the specs above. The pool spells every
+# family exactly as its key, so the exact name always hits; this only keeps the
+# lookup tolerant of a differently-cased spelling reaching it from elsewhere.
+_SPECS_BY_FOLDED = {k.upper().replace("_", ""): v for k, v in _TSBAD_SPECS.items()}
+
+
 def _class_for(family: str):
     """The vendored estimator class for a pool family name."""
-    key = family.upper().replace("_", "")
-    if key not in _TSBAD_SPECS:
+    spec = _TSBAD_SPECS.get(family) or _SPECS_BY_FOLDED.get(
+        str(family).upper().replace("_", ""))
+    if spec is None:
         raise ValueError(
             f"{family} is not a TSB-AD family. Known: "
             f"{', '.join(sorted(_TSBAD_SPECS))}")
-    module_name, class_name, channel_arg, scorer = _TSBAD_SPECS[key]
+    module_name, class_name, channel_arg, scorer = spec
     if "." not in module_name:
         module_name = f"Algorithms.tsb_ad.models.{module_name}"
     module = importlib.import_module(module_name)
@@ -166,7 +193,10 @@ class _TSBADEstimator:
     """
 
     def __init__(self, family: str, contamination: float, detector_kwargs: dict):
-        self.family = family.upper()
+        # Canonical, not upper-cased: the pool name IS the family name, and
+        # four of them are mixed case (`OmniAnomaly`, `Series2Graph`). Folding
+        # here would miss every dict below that is keyed by it.
+        self.family = str(family)
         self.detector_name = self.family
         self.contamination = contamination
         self.detector_kwargs = dict(detector_kwargs or {})

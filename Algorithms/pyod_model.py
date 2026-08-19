@@ -23,28 +23,17 @@ def get_all_module_names(library):
 # of seven entries beats importing all sixty-nine modules to search for a class,
 # and `Utils/test_pipeline_spec` fails if one of these ever stops resolving.
 _TS_MODULES = {
-    # Not a time-series detector, but here for the same reason: the pool spells
-    # it AE and no amount of case- or underscale-folding gets from "AE" to
-    # "auto_encoder". `AUTOENCODER` used to reach it through the fallback below;
-    # the abbreviation cannot.
-    "AE": "pyod.models.auto_encoder",
     "LSTMAD": "pyod.models.ts_lstm",
     "ANOMALYTRANSFORMER": "pyod.models.ts_anomaly_transformer",
     "MATRIXPROFILE": "pyod.models.ts_matrix_profile",
-    "SR": "pyod.models.ts_spectral_residual",
+    # The module carries a `ts_` prefix its class does not, so no amount of
+    # case- or underscore-folding gets there from `SpectralResidual`.
+    # `AutoEncoder` needs no entry: `pyod.models.auto_encoder` differs from it
+    # by an underscore alone, which the fallback below already folds away.
+    "SPECTRALRESIDUAL": "pyod.models.ts_spectral_residual",
     "KSHAPE": "pyod.models.ts_kshape",
     "TIMESERIESOD": "pyod.models.ts_od",
     "SAND": "pyod.models.ts_sand",
-}
-
-# Families whose pool name is not the PyOD class name. `_class_in` matches
-# case- and underscore-insensitively, which reaches `IForest` from `IFOREST`,
-# but cannot reach `SpectralResidual` from `SR` — nothing in the string says
-# so. One entry rather than a general abbreviation scheme, because a general
-# one would start guessing.
-_TS_CLASSES = {
-    "SR": "SpectralResidual",
-    "AE": "AutoEncoder",
 }
 
 
@@ -78,12 +67,12 @@ def _class_in(module, model_name):
     HBOS and misses every mixed-case name pyod ships — `IForest` is in
     `pyod.models.iforest` but is not `IFOREST`, so IForest, AutoEncoder and
     DeepSVDD were all unreachable.
+
+    There used to be an alias table here as well, mapping `SR` to
+    `SpectralResidual` and `AE` to `AutoEncoder`, because nothing in those two
+    strings says so. Now that the pool spells both families the way PyOD does,
+    the exact match below reaches them and the table is gone.
     """
-    aliased = _TS_CLASSES.get(model_name.upper().replace('_', ''))
-    if aliased is not None:
-        obj = getattr(module, aliased, None)
-        if isinstance(obj, type):
-            return obj
     exact = getattr(module, model_name, None)
     if isinstance(exact, type):
         return exact

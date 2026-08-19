@@ -13,6 +13,9 @@ from loguru import logger
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import multivariate_normal
 
+from Utils.pipeline_spec import abbreviate_detector
+from Utils.plot_labels import draw_abbreviation_key
+
 from Metrics.Ensemble_GA import evaluate_individual_models
 from Metrics.Ensemble_GA import evaluate_model_consistently
 from Metrics.metrics import prauc, range_based_precision_recall_f1_auc
@@ -934,7 +937,8 @@ def plot_history(history: List[Dict[str, np.ndarray]], models: Dict[str, Any],
     for model_name in models.keys():
         raw_scores = [calculate_score(h[model_name]) for h in history]
         smoothed_scores = gaussian_filter1d(raw_scores, sigma=2)  # Set sigma=0 to disable smoothing
-        ax.plot(range(len(history)), smoothed_scores, label=model_name, linewidth=1.4)
+        ax.plot(range(len(history)), smoothed_scores,
+                label=model_name, linewidth=1.4)
 
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Score')
@@ -994,7 +998,11 @@ def plot_expected_rewards(
         nan_mean = float(np.nanmean(raw)) if not np.all(np.isnan(raw)) else 0.0
         nan_free = np.where(np.isnan(raw), nan_mean, raw)
         series = gaussian_filter1d(nan_free, sigma=2) if smooth else nan_free
-        ax.plot(range(T), series, label=model_name, linewidth=1.4, color=colour_map[model_name])
+        # SHORTENED: up to 107 legend entries stacked beside the axes, where a
+        # full name pushes the legend over the plot. `draw_abbreviation_key`
+        # below says what the short form stands for.
+        ax.plot(range(T), series, label=abbreviate_detector(model_name),
+                linewidth=1.4, color=colour_map[model_name])
 
     # Shade each regime, mark every boundary, and label every regime with the
     # model that dominates it — written vertically, centred in the regime span.
@@ -1005,8 +1013,11 @@ def plot_expected_rewards(
             if rm in colour_map:
                 ax.axvspan(start, end + 1, alpha=0.08, color=colour_map[rm], lw=0)
             center = (start + end + 1) / 2.0
-            ax.text(center, y_top * 0.97, rm, fontsize=8, ha='center', va='top',
-                    rotation=90, fontweight='bold', alpha=0.85)
+            # Shortened to match the legend, so one detector is not spelled two
+            # ways inside one figure.
+            ax.text(center, y_top * 0.97, abbreviate_detector(rm), fontsize=8,
+                    ha='center', va='top', rotation=90, fontweight='bold',
+                    alpha=0.85)
         for shift in regime_shifts:
             ax.axvline(x=shift['window'], color='black', linestyle='--', linewidth=0.9, alpha=0.7)
 
@@ -1015,8 +1026,15 @@ def plot_expected_rewards(
     ax.set_ylabel('Expected Reward (mu_k^T * x_t)')
     ax.set_title('Expected Reward Trajectories Over Windows' + title_suffix)
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
-    ax.legend(loc='upper left', ncol=2, frameon=False,
+    # One column, matching plot_ranking_score_trace: two columns of up to 107
+    # detectors is wider than the axes it sits beside, and the eye has to track
+    # a colour across a gap to use it. Font one step down so the single column
+    # still fits the figure's height.
+    ax.legend(loc='upper left', ncol=1, frameon=False, fontsize=8,
               bbox_to_anchor=(1.01, 1), borderaxespad=0)
+    # One legend entry per detector, up to 107 of them, so the short form stays
+    # and the key below says what it stands for.
+    draw_abbreviation_key(fig, model_names)
     plt.tight_layout(pad=1.2)
 
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
@@ -1285,7 +1303,8 @@ def _render_shap_comparison(
     fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(channels) + 4), 5))
     for i, m in enumerate(top_models):
         vals = per_channel_by_model[m][channels]
-        ax.bar(x_base + i * bar_width, vals, bar_width, label=m, color=colour_map[m])
+        ax.bar(x_base + i * bar_width, vals, bar_width,
+               label=m, color=colour_map[m])
 
     ax.axhline(0, color='black', linewidth=0.6)
     ax.set_xticks(x_base + bar_width * (n_models - 1) / 2)
@@ -2234,7 +2253,11 @@ def plot_ranking_criterion(means_history: List[Dict[str, np.ndarray]],
     colour_map = {m: plt.cm.tab20(i / max(len(model_names), 1))
                   for i, m in enumerate(model_names)}
     for m in model_names:
-        ax.plot(range(T), series[m], label=m, linewidth=1.4, color=colour_map[m])
+        # SHORTENED, for the same reason as the expected-reward traces: one
+        # legend entry per detector, outside the axes. The key underneath
+        # says what each stands for.
+        ax.plot(range(T), series[m], label=abbreviate_detector(m),
+                linewidth=1.4, color=colour_map[m])
 
     # Fix the ceiling before annotating: every axvspan below would otherwise
     # move it, and the labels would drift off the top of the axes.
@@ -2256,9 +2279,12 @@ def plot_ranking_criterion(means_history: List[Dict[str, np.ndarray]],
         # Alternate the label height so neighbouring short regimes — which pure
         # run-length encoding does produce wherever two detectors are near-tied —
         # do not print on top of each other.
+        # Shortened to match the legend: a figure that spelled the leader out
+        # here and abbreviated the same detector three inches to the right
+        # would read as two different detectors.
         ax.text((start + end) / 2.0, ymax * (0.99 if i % 2 == 0 else 0.90),
-                f'R{i} {leader}', ha='center', va='top', fontsize=7,
-                rotation=90, color='black', alpha=0.75)
+                f'R{i} {abbreviate_detector(leader)}', ha='center', va='top',
+                fontsize=7, rotation=90, color='black', alpha=0.75)
 
     ax.set_xlabel('Window')
     ax.set_ylabel(r'Ranking score  $\|\mu_k\|^2$')
@@ -2266,6 +2292,9 @@ def plot_ranking_criterion(means_history: List[Dict[str, np.ndarray]],
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
     ax.legend(loc='upper left', frameon=False, bbox_to_anchor=(1.01, 1),
               borderaxespad=0)
+    # Short names kept: they label both the legend and every regime band, and a
+    # regime band is only as wide as the regime.
+    draw_abbreviation_key(fig, list(series))
 
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
     os.makedirs(directory, exist_ok=True)
@@ -2304,6 +2333,8 @@ def plot_ranking_final(means: Dict[str, np.ndarray],
     fig, ax = plt.subplots(figsize=(9, max(4, 0.45 * len(labels) + 1.5)))
     colours = ['#3B5BDB' if i == len(labels) - 1 else '#AAB2C8'
                for i in range(len(labels))]
+    # Ticks carry the long name; `labels` stays canonical below, since it is
+    # what `counts` is keyed by.
     bars = ax.barh(labels, values, color=colours)
     span = max(values) if values else 1.0
     for bar, name in zip(bars, labels):
@@ -2841,7 +2872,8 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
         # Highlight false negatives with a different color
         # axes[i + 2].vlines(false_negative_indices, ymin=0, ymax=1, color='purple', label='False Negatives')
 
-        axes[i + 2].set_title(f'{algorithm} Anomaly Scores, F1 Score = {f1_score_value}, PR AUC = {pr_auc_value}')
+        axes[i + 2].set_title(f'{algorithm} Anomaly Scores, '
+                              f'F1 Score = {f1_score_value}, PR AUC = {pr_auc_value}')
         axes[i + 2].set_ylabel('Score')
         axes[i + 2].grid(True)
 

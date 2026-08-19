@@ -2257,9 +2257,11 @@ _STAGE_FILES = {
     "thompson_ranking": "ir_thompson_ranking",
     "ga_selection": "ir_ga_selection",
     "ga_combination": "ir_ga_combination",
-    "gan": "ir_gan",
+    # The robustness block in the order it is read on the page and in the global
+    # narrative; see Explainability.llm._GLOBAL_STAGE_ORDER, which this feeds.
     "monte_carlo": "ir_monte_carlo",
     "off_by_threshold": "ir_off_by",
+    "gan": "ir_gan",
 }
 
 

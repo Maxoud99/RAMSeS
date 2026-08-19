@@ -26,6 +26,7 @@ import numpy as np
 from loguru import logger
 
 
+
 def _surrogate_fidelity_module():
     """Import surrogate_fidelity.py, tolerating standalone by-path loading of this
     module (e.g. via importlib in test harnesses) where the Model_Selection
@@ -191,10 +192,17 @@ def explain_rcparams() -> None:
 
 
 def plot_exclusive_win_tree(info, winner, feature_names, *, directory: str,
-                            filename: str, title: str) -> None:
-    """Plot one winner-vs-competitor exclusive-win surrogate tree (skips if degenerate)."""
+                            filename: str, title: str):
+    """Plot one winner-vs-competitor exclusive-win surrogate tree.
+
+    Returns the filename written, or None when the surrogate is degenerate and
+    there is no tree to draw. The caller collects those names so
+    `plot_retention.prune_superseded` can remove whatever an earlier run left
+    behind — a competitor this run has no tree for must not keep the tree some
+    previous run drew for it.
+    """
     if info is None or info.get("clf") is None:
-        return
+        return None
     from sklearn.tree import plot_tree
     explain_rcparams()
     fig, ax = plt.subplots(figsize=(13, 8))
@@ -205,6 +213,7 @@ def plot_exclusive_win_tree(info, winner, feature_names, *, directory: str,
     fig.tight_layout()
     fig.savefig(os.path.join(directory, filename), dpi=300)
     plt.close(fig)
+    return filename
 
 
 def plot_exclusive_win_importance(per_competitor, feature_names, *, directory: str,

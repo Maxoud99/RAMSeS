@@ -3,6 +3,9 @@
 
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by the RAMSeS project. This file is NOT identical to the original
+# in mononitogoswami/tsad-model-selection, from which it is derived.
 
 #######################################
 # Script to train algorithm on a dataset of entities
@@ -150,7 +153,7 @@ class TrainModels(object):
         the plot shows is the scoring the pipeline will actually do. Same `+
         window_size` slack as there, for the loader's right-padding.
         """
-        if family.upper() not in TRANSDUCTIVE_FAMILIES | WHOLE_SERIES_FAMILIES:
+        if family not in TRANSDUCTIVE_FAMILIES | WHOLE_SERIES_FAMILIES:
             return self.batch_size
         n_time = max(e.Y.shape[1] for e in self.test_data.entities)
         return max(1, n_time + max(1, int(window_size)))
@@ -227,7 +230,7 @@ class TrainModels(object):
                 self.train_sos()
             elif ('ALAD' == model_name) & (model_name not in exist_model_list):
                 self.train_alad()
-            elif (model_name.upper() in TSBAD_FAMILIES) & (model_name not in exist_model_list):
+            elif (model_name in TSBAD_FAMILIES) & (model_name not in exist_model_list):
                 self.train_tsbad(model_name)
             elif (model_name not in exist_model_list):
                 self.train_pyod(model_name)
@@ -1235,7 +1238,7 @@ class TrainModels(object):
         # a different subsequence length and a lower epoch count than the shared
         # contamination sweep, and AutoEncoder varies its architecture.
         # Everything else keeps PYOD_PARAM_GRID.
-        grid = PYOD_MODEL_GRIDS.get(model_name.upper(), PYOD_PARAM_GRID)
+        grid = PYOD_MODEL_GRIDS.get(model_name, PYOD_PARAM_GRID)
         self._train_wrapped(PyodModel, model_name, grid, batch_size)
 
     def train_tsbad(self, model_name: str, batch_size=32):
@@ -1247,7 +1250,7 @@ class TrainModels(object):
         no two of these detectors take the same parameters, so there is no
         shared default to fall back to.
         """
-        grid = TSBAD_MODEL_GRIDS.get(model_name.upper())
+        grid = TSBAD_MODEL_GRIDS.get(model_name)
         if grid is None:
             raise ValueError(
                 f"No hyperparameter grid for TSB-AD family {model_name}. "
@@ -1262,7 +1265,13 @@ class TrainModels(object):
         take `(model_name, **framework_params, detector_kwargs=...)`.
         """
         MODEL_ID = 0
-        upper_model_name = model_name.upper()
+        # The checkpoint carries the family name VERBATIM, because the pool name
+        # is the family name: `SpectralResidual_1.pth` is what
+        # `Utils.pipeline_spec.ALL_DETECTORS` lists and what the loader looks
+        # for. This used to `.upper()` it, which was a no-op back when every
+        # family was an acronym and would now write `SPECTRALRESIDUAL_1.pth`
+        # for a detector nothing goes looking for.
+        checkpoint_family = model_name
         model_hyper_param_configurations = list(ParameterGrid(grid))
         train_hyper_param_configurations = list(
             ParameterGrid(PYOD_TRAIN_PARAM_GRID))
@@ -1279,8 +1288,8 @@ class TrainModels(object):
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"{upper_model_name}_{MODEL_ID + 1}"):
-                        print(f'Model {upper_model_name}_{MODEL_ID + 1} already trained!')
+                            obj_name=f"{checkpoint_family}_{MODEL_ID + 1}"):
+                        print(f'Model {checkpoint_family}_{MODEL_ID + 1} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -1296,7 +1305,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"{upper_model_name}_{MODEL_ID + 1}.png"
+                img_name = f"{checkpoint_family}_{MODEL_ID + 1}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -1332,7 +1341,7 @@ class TrainModels(object):
                 MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
-                                      obj_name=f"{upper_model_name}_{MODEL_ID}",
+                                      obj_name=f"{checkpoint_family}_{MODEL_ID}",
                                       obj_meta={
                                           'train_hyperparameters':
                                               train_hyper_params,

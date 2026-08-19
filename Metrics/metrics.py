@@ -1,5 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by the RAMSeS project. This file is NOT identical to the original
+# in mononitogoswami/tsad-model-selection, from which it is derived.
 
 ######################################################
 # Metrics to evaluate the quality of model selection

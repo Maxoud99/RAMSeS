@@ -28,6 +28,13 @@ def _mk(name):
 
 for _n in ("Metrics", "Metrics.metrics", "Utils", "Utils.model_selection_utils", "loguru"):
     _mk(_n)
+# `Utils` is a stand-in so that `Utils.model_selection_utils` can be mocked, but
+# `Utils.pipeline_spec` is stdlib-only and is wanted for real — giving the
+# stand-in a __path__ lets that one submodule resolve from disk while the mock
+# above still shadows its sibling.
+sys.modules["Utils"].__path__ = [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "Utils")]
 sys.modules["Metrics.metrics"].range_based_precision_recall_f1_auc = lambda *a, **k: (0, 0, 0.5, 0.5, None)
 sys.modules["Utils.model_selection_utils"].evaluate_model = lambda *a, **k: {}
 

@@ -37,7 +37,7 @@ function currentBody(extra = {}) {
     // programmatically keeps working.
     overwrite: $("#overwrite").checked,
     iteration: Number($("#iteration").value) || 5,
-    timeout: Number($("#timeout").value) || 7200,
+    timeout: Number($("#timeout").value) || 14400,
     llm_model: $("#llm_model").value.trim() || null,
     llm_base_url: $("#llm_base_url").value.trim() || null,
     ...extra,
@@ -251,7 +251,8 @@ async function refreshDetectors() {
   // start means the run is whatever was deliberately picked.
   selectedDetectors = new Set();
   detectorInfo = new Map(detectors.map(
-    (d) => [d.name, { available: !!d.available, family: d.family || d.name.split("_")[0] }]));
+    (d) => [d.name, { available: !!d.available,
+                      family: d.family || d.name.split("_")[0] }]));
 
   renderGroupButtons(detectors);
 
@@ -264,13 +265,17 @@ async function refreshDetectors() {
   box.replaceChildren(...Object.entries(byFamily).map(([family, members]) => {
     // Clicking the family name toggles the whole family: if any member is
     // unselected it selects them all, otherwise it clears them.
+    const familyLabel = family;
     const familyButton = el("button", {
       type: "button", class: `small grp-${groupClass(members[0].group)}`,
       "data-family": family,
       "aria-pressed": "false",
-      style: "width: 7.5em; text-align: left; font-family: var(--font-detector);",
-      // Always the full name here, since the label may be abbreviated.
-      title: `Select or clear every ${family} detector`,
+      // A MINIMUM, not a fixed width. 7.5em was set when every family name
+      // was an acronym; "SpectralResidual" is 16 characters and was simply
+      // clipped. The column still aligns for the short names, and the four
+      // long ones push their own row out instead of losing letters.
+      style: "min-width: 7.5em; text-align: left; white-space: nowrap; font-family: var(--font-detector);",
+      title: `Select or clear every ${familyLabel} detector`,
       onclick: () => {
         const turnOn = members.some((d) => !selectedDetectors.has(d.name));
         members.forEach((d) => {
@@ -279,7 +284,7 @@ async function refreshDetectors() {
         });
         onChange();
       },
-    }, family);
+    }, familyLabel);
 
     const chips = members.map((d) => {
       const group = groupClass(d.group);
@@ -289,8 +294,8 @@ async function refreshDetectors() {
         "data-detector": d.name,
         "aria-pressed": "false",
         title: d.available ? ""
-          : `${d.name} has no trained model for this entity — selecting it trains `
-            + `the ${d.family || d.name.split("_")[0]} family first.`,
+          : `${d.name} has no trained model for this entity — selecting `
+            + `it trains the ${d.family || d.name.split("_")[0]} family first.`,
         onclick: () => {
           if (selectedDetectors.has(d.name)) selectedDetectors.delete(d.name);
           else selectedDetectors.add(d.name);
@@ -328,10 +333,12 @@ function renderTrainingBanner() {
   const willTrain = [...detectorInfo.entries()]
     .filter(([, info]) => families.includes(info.family))
     .map(([name]) => name);
+  // Prose, so the families read the way the chips above them do.
+  const familyNames = families.slice();
   const plural = families.length === 1 ? "family" : "families";
   banner.replaceChildren(
     el("strong", { text: "Training first." }),
-    el("span", { text: ` This run trains the ${families.join(" and ")} ${plural} `
+    el("span", { text: ` This run trains the ${familyNames.join(" and ")} ${plural} `
       + `before it starts the selection, because you picked at least one detector `
       + `that wasn't trained for this entity yet. Training is per family, so all of `
       + `${willTrain.join(", ")} are fitted.` }));

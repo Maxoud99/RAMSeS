@@ -36,3 +36,8 @@ shells/
 .DS_Store
 .ipynb_checkpoints/
 RAMS-TSAD-Up-to-date.zip
+# Series2Graph is fetched, never committed: it is patent-encumbered and licensed
+# for research use only, unlike the Apache-2.0 TSB-AD code vendored around it.
+#   python -m Algorithms.tsb_ad.fetch_series2graph
+# See Algorithms/series2graph_detector.py for why.
+Algorithms/tsb_ad/models/Series2Graph.py

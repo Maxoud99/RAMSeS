@@ -9,7 +9,6 @@ import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 
-
 class ResultsFormatter:
     """Handles formatting and saving of model selection results with timing analysis"""
     
@@ -74,8 +73,8 @@ class ResultsFormatter:
         # 1. Save human-readable text report
         text_file = os.path.join(base_dir, f"results_{timestamp}.txt")
         self._save_text_report(text_file)
-        
-        # 2. Save JSON with all data
+
+        # 2. Save JSON with all data.
         json_file = os.path.join(base_dir, f"results_{timestamp}.json")
         self._save_json_report(json_file)
         

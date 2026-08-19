@@ -69,3 +69,48 @@ def prune_timestamped(directory: str, keep: int = KEEP_NEWEST) -> List[str]:
         logger.info(f"Pruned {len(removed)} superseded figure(s) in {directory}, "
                     f"keeping the newest {keep} of each.")
     return removed
+
+
+def prune_superseded(directory: str, prefix: str, keep_names) -> List[str]:
+    """Delete `{prefix}*.png` in `directory` that this run did not write.
+
+    A DIFFERENT retention problem from `prune_timestamped` above, and the two do
+    not overlap. Those filenames carry a timestamp, so every run mints a new one
+    and keeping the newest three is a choice. These carry the run's OUTCOME —
+    `..._point_tree_{winner}_vs_{competitor}.png` — so a run whose outcome
+    differs writes a new file *beside* the old one rather than over it, and the
+    directory ends up describing two runs at once with no way to tell which is
+    which. The winner-grouping in `WebUI.plots` catches a changed winner; it
+    cannot catch a changed COMPETITOR, because those files sit in the same
+    group.
+
+    That is not hypothetical: renaming the four abbreviated families left
+    `LUNAR_2_vs_AE_1.png` on disk beside the `LUNAR_2_vs_AutoEncoder_1.png`
+    that replaced it, and the picker offered both.
+
+    Called AFTER the new figures are written, with the names that were written,
+    so a run that dies mid-plot leaves the previous set intact rather than
+    deleting it and failing to replace it. Never raises, for the same reason
+    `prune_timestamped` does not.
+    """
+    keep = {os.path.basename(n) for n in (keep_names or ())}
+    removed: List[str] = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith(".png"):
+            continue
+        if name in keep:
+            continue
+        path = os.path.join(directory, name)
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError as e:
+            logger.warning(f"Could not prune {path}: {e}")
+    if removed:
+        logger.info(f"Removed {len(removed)} figure(s) in {directory} left by an "
+                    f"earlier run with a different outcome.")
+    return removed

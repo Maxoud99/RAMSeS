@@ -547,28 +547,30 @@ _GLOBAL_STAGE_ORDER = (
     # to consume, and the selection dynamics then account for how the run got
     # there. WebUI.artifacts.STAGES must stay in this order.
     "thompson_ranking", "thompson_sampling",
-    # GAN leads the robustness block: it is sub-stage 6.3, ahead of off-by at
-    # 6.4 and Monte Carlo at 6.5. The existing monte_carlo/off_by_threshold
-    # order is left as it stands rather than reshuffled here.
+    # The robustness block reads from the broadest perturbation to the narrowest:
+    # Monte Carlo sweeps noise over the whole series, off-by moves the decision
+    # boundary at a set of borderline points, GAN generates the points it
+    # injects. This is a reading order, not the execution order — the pipeline
+    # still runs GAN at sub-stage 6.3, ahead of off-by and Monte Carlo.
     # NOTE: no parentheses in this comment — WebUI.test_webui parses this tuple
     # with a non-greedy regex that would stop at the first closing bracket.
-    "gan", "monte_carlo", "off_by_threshold",
+    "monte_carlo", "off_by_threshold", "gan",
     "rank_aggregation_robust", "rank_aggregation_final",
 )
 
 _GLOBAL_STAGE_TITLES = {
-    "ga_selection": "Ensemble selection (genetic algorithm)",
-    "ga_combination": "Ensemble weighting (meta-learner)",
     # Two stages explain one algorithm, so neither may claim the plain name:
     # these titles say which question each answers. Duplicated verbatim in
     # WebUI.artifacts.STAGES.
-    "thompson_ranking": "Thompson Sampling: ranking criterion",
-    "thompson_sampling": "Thompson Sampling: selection dynamics",
-    "gan": "Robustness: GAN perturbations",
-    "monte_carlo": "Robustness: Monte Carlo noise sweep",
-    "off_by_threshold": "Sensitivity: off-by-threshold test",
-    "rank_aggregation_robust": "Robustness consensus",
-    "rank_aggregation_final": "Final consensus",
+    "ga_selection": "Genetic Algorithm: Selection",
+    "ga_combination": "Genetic Algorithm: Combination",
+    "thompson_ranking": "Thompson Sampling: Ranking",
+    "thompson_sampling": "Thompson Sampling: Selection",
+    "monte_carlo": "Robustness: Monte Carlo",
+    "off_by_threshold": "Robustness: Off-by-threshold",
+    "gan": "Robustness: GAN",
+    "rank_aggregation_robust": "Robustness Aggregation",
+    "rank_aggregation_final": "Final Aggregation",
 }
 
 

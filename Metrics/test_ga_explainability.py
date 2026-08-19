@@ -64,6 +64,17 @@ _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# Make the stubbed `Utils` a PACKAGE, so submodules that are safe to import for
+# real resolve to the real files. `Utils.pipeline_spec` (the display-name map)
+# and `Utils.plot_labels` (which only reads it) are deliberately stdlib-only —
+# that is the whole reason pipeline_spec exists apart from `Utils.utils` — so
+# there is nothing heavy to keep out, and stubbing them would mean this suite
+# tested a fake rendering instead of the shipped one.
+#
+# Submodules already in sys.modules above keep their stubs: an entry there wins
+# over the finder, so `Utils.model_selection_utils` stays mocked.
+sys.modules["Utils"].__path__ = [os.path.join(_PROJECT_ROOT, "Utils")]
+
 from Metrics.Ensemble_GA import (
     compute_lofo_utility,
     compute_mean_marginal_contribution,

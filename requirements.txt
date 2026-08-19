@@ -31,7 +31,13 @@ numpy==2.0.0
 pandas==2.3.3
 Pillow==11.3.0
 psutil==6.1.1
-pyod==2.0.5
+# PyOD 3, not 2. The pool reaches LSTMAD, SR, AE and LUNAR through
+# pyod.models.{ts_lstm,ts_spectral_residual,auto_encoder,lunar}; the first two do
+# not exist in 2.0.5, so this pin was silently wrong — a fresh install could not
+# resolve those families at all. It is also why Utils/model_io.py serialises with
+# dill: PyOD 3 defines LSTMAD's network inside a function, which pickle cannot
+# handle. Pinned to the version this project is developed and tested against.
+pyod==3.6.4
 PyYAML==6.0.2
 ray==2.49.2
 Requests==2.32.5

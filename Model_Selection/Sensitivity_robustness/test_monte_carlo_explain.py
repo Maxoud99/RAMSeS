@@ -27,6 +27,11 @@ def _mk(name):
 
 for _n in ("Metrics", "Metrics.metrics", "Utils", "Utils.model_selection_utils", "loguru"):
     _mk(_n)
+# See test_off_by_explain: `Utils.pipeline_spec` is stdlib-only and is wanted for
+# real, so the stand-in gets a __path__ while the mocked sibling still shadows.
+sys.modules["Utils"].__path__ = [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "Utils")]
 sys.modules["Metrics.metrics"].range_based_precision_recall_f1_auc = lambda *a, **k: (0, 0, 0.5, 0.5, None)
 sys.modules["Metrics.metrics"].prauc = lambda *a, **k: 0.5
 sys.modules["Metrics.metrics"].f1_score = lambda *a, **k: (0.5,) * 7

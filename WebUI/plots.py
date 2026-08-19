@@ -152,8 +152,15 @@ def _ga_combination(ds, ent):
     headline = [_fig(p, "Detector weighting",
                      "Absolute SHAP, PFI and total ALE — the three magnitude measures "
                      "that feed the Markov consensus ranking. All are magnitudes; "
-                     "the sign is in the next figure.")
+                     "the sign is in the ALE figure below.")
                 for p in _ls(d, "ga_combination_importance_*.png")]
+    # Its own figure since the two were split apart; the caption is what still
+    # ties it to the weighting figure above.
+    headline += [_fig(p, "Consensus ranking",
+                      "The Markov stationary probability each detector ends up "
+                      "with, as the result of the three measures on the previous "
+                      "plot.")
+                 for p in _ls(d, "ga_combination_ranking_*.png")]
     # Both ALE figures live under the same prefix, so they are split by name
     # rather than by glob: the dataset name follows the prefix and could itself
     # begin with any letter, which rules out a character-class pattern.
@@ -375,14 +382,18 @@ def _monte_carlo(ds, ent):
         headline.append({"title": "Score against noise level",
                          "caption": "Each detector's score as injected noise grows.",
                          "variants": curve_variants, "default": 0})
-    # The annotated and fixed-threshold variants are browse-only: the plain
-    # curves are the ones that belong in a figure, the rest are for digging.
+    # Browse-only: the plain curves above are the ones that belong in a figure,
+    # these are for digging.
+    #
+    # Three of what the stage writes are deliberately NOT offered. The pipeline
+    # still generates them — they are on disk for anyone who wants them — but
+    # the annotated F1 and PR-AUC curves are the same data as the plain pair in
+    # the headline with labels drawn on top, and the annotated fixed-threshold
+    # curve is superseded by its own plain version two lines below it. Offering
+    # all seven made the reader choose between near-duplicates.
     for pattern, title in (
-            ("*_MonteCarlo_noise_curves_F1.png", "F1 (annotated)"),
-            ("*_MonteCarlo_noise_curves_F1_fixed.png", "F1 at a fixed threshold"),
             ("*_MonteCarlo_noise_curves_F1_fixed_plain.png",
-             "F1 at a fixed threshold (plain)"),
-            ("*_MonteCarlo_noise_curves_PRAUC.png", "PR-AUC (annotated)"),
+             "F1 at a fixed threshold"),
             ("*_MonteCarlo_ranking_stability.png", "Ranking stability"),
             ("*_MonteCarlo_surrogate_tree_F1.png", "Surrogate tree (F1)"),
             ("*_MonteCarlo_surrogate_tree_PRAUC.png", "Surrogate tree (PR-AUC)")):

@@ -2,6 +2,16 @@
 """Classes of feature mapping for model type B
 """
 # Author: Yinchen Wu <yinchen@uchicago.edu>
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Derived from `src/tsadams/vus/feature.py` in
+# mononitogoswami/tsad-model-selection (Apache-2.0), which carries the author
+# line above from the VUS reference implementation.
+#
+# Modified by the RAMSeS project. This file is NOT identical to that original:
+# `np.NaN` is spelled `np.nan` (the capitalised alias was removed in numpy 2.0,
+# which this project pins).
 
 import numpy as np
 # import matplotlib.pyplot as plt

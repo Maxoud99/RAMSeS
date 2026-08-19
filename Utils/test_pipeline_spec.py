@@ -97,7 +97,7 @@ class TestFamilies(unittest.TestCase):
         self.assertEqual(spec.family_of("NN_3"), "NN")
 
     def test_ae_cuts_enough_windows_for_pyods_dropped_last_batch(self):
-        """AE is the only pool detector on PyOD's deep base class.
+        """AutoEncoder is the only pool detector on PyOD's deep base class.
 
         `base_dl.fit` builds `DataLoader(batch_size=32, drop_last=True)`, so the
         window COUNT has to clear 32 or the loader yields no batches, the
@@ -110,9 +110,9 @@ class TestFamilies(unittest.TestCase):
         SMD 2848. A grid change that stopped clearing 32 on the shorter of them
         would put the crash back.
         """
-        from Model_Training.hyperparameter_grids import AE_PARAM_GRID
-        window = AE_PARAM_GRID["window_size"][0]
-        step = AE_PARAM_GRID["window_step"][0]
+        from Model_Training.hyperparameter_grids import AUTOENCODER_PARAM_GRID
+        window = AUTOENCODER_PARAM_GRID["window_size"][0]
+        step = AUTOENCODER_PARAM_GRID["window_step"][0]
         for n_time, name in ((917, "SKAB"), (2848, "SMD")):
             with self.subTest(entity=name):
                 n_windows = (n_time - window) // step + 1
@@ -232,12 +232,19 @@ class TestFamilies(unittest.TestCase):
         self.assertGreaterEqual(checked, 5, "no pyod-backed family was checked")
 
     def test_detector_names_match_what_the_generic_trainer_writes(self):
-        """`train_pyod` names its checkpoints `{FAMILY.upper()}_{i}`, and the
-        loader looks for exactly the name in this tuple. A lower- or mixed-case
-        family here would train `IFOREST_1.pth` and then fail to find
-        `IForest_1.pth`."""
-        for family in spec.DETECTOR_FAMILIES:
-            self.assertEqual(family, family.upper(), family)
+        """`_train_wrapped` names its checkpoints `{FAMILY}_{i}` VERBATIM, and
+        the loader looks for exactly the name in this tuple.
+
+        It used to `.upper()` the family, which was a no-op while every family
+        was an acronym and would now write `SPECTRALRESIDUAL_1.pth` for a
+        detector the pool calls `SpectralResidual_1`. Asserted by rebuilding
+        the name from its parts rather than by restating a casing rule, since
+        the rule is now "whatever the pool says"."""
+        for name in spec.ALL_DETECTORS:
+            family, sep, index = name.rpartition("_")
+            self.assertTrue(sep, name)
+            self.assertIn(family, spec.DETECTOR_FAMILIES, name)
+            self.assertEqual(f"{family}_{index}", name)
 
 
 class TestSpecMatchesAppPy(unittest.TestCase):
@@ -402,7 +409,7 @@ class TestTransductiveFamilies(unittest.TestCase):
         detector nor the requirement and arrives four frames down, after it has
         silently trained on nothing.
         """
-        model = self.create_model("AE", self.modules, contamination=0.1,
+        model = self.create_model("AutoEncoder", self.modules, contamination=0.1,
                                   hidden_neuron_list=[64, 32], epoch_num=10)
         rows = self.t.tensor(self.rng.normal(size=(8, 9, 64)),
                              dtype=self.t.float32)   # 8 windows, batch_size 32
@@ -419,7 +426,7 @@ class TestTransductiveFamilies(unittest.TestCase):
         self.assertIn("window_step", message)
 
     def test_a_fitted_deep_detector_can_be_checkpointed(self):
-        """AE must survive `logging_obj.save`, which is dill through torch.save.
+        """AutoEncoder must survive `logging_obj.save`, which is dill through torch.save.
 
         PyOD's deep base leaves `self.optimizer` on the detector, and a torch
         optimiser reaches a `torch._dynamo` config module: `TypeError: cannot
@@ -430,7 +437,7 @@ class TestTransductiveFamilies(unittest.TestCase):
         """
         import io
         import dill
-        model = self.create_model("AE", self.modules, contamination=0.1,
+        model = self.create_model("AutoEncoder", self.modules, contamination=0.1,
                                   hidden_neuron_list=[64, 32], epoch_num=2)
         rows = self.t.tensor(self.rng.normal(size=(40, 3, 8)),
                              dtype=self.t.float32)
@@ -489,7 +496,7 @@ class TestTSBADFamilies(unittest.TestCase):
     _KWARGS = {
         "KMEANSAD": {"k": 4, "window_size": 20, "stride": 1},
         "DONUT": {"win_size": 20, "num_epochs": 1},
-        "OA": {"win_size": 20, "epochs": 1},
+        "OmniAnomaly": {"win_size": 20, "epochs": 1},
         "USAD": {"win_size": 20, "epochs": 1},
         "TRANAD": {"win_size": 20, "epochs": 1},
         # FITS is the one whose two parameters are coupled: it keeps `cut_freq`
@@ -499,6 +506,9 @@ class TestTSBADFamilies(unittest.TestCase):
         # production grid uses the same window for the same reason.
         "FITS": {"win_size": 100, "cut_freq": 6, "epochs": 1},
         "TIMESNET": {"win_size": 20, "epochs": 1},
+        # The Graph Based group's multivariate member. Series2Graph needs no
+        # entry: it is univariate, so `skip` below already excludes it.
+        "MTADGAT": {"win_size": 20, "epochs": 1},
     }
 
     def test_every_family_resolves_to_a_class(self):
@@ -710,6 +720,7 @@ class TestTSBADFamilies(unittest.TestCase):
         invisible until stage 3."""
         self.assertIn("POLY", spec.UNIVARIATE_FAMILIES)
         self.assertIn("TIMESFM", spec.UNIVARIATE_FAMILIES)
+        self.assertIn("Series2Graph", spec.UNIVARIATE_FAMILIES)
         self.assertTrue(spec.UNIVARIATE_FAMILIES <= set(spec.DETECTOR_FAMILIES))
 
     def test_the_two_vocabularies_of_the_restriction_agree(self):
@@ -747,6 +758,37 @@ class TestTSBADFamilies(unittest.TestCase):
         # The channel count is what the decision turns on, and it is only known
         # after the test entity loads.
         self.assertIn("n_channels", source)
+
+    def test_series2graph_is_absent_by_licence_and_says_how_to_get_it(self):
+        """Series2Graph is the one pool detector whose source is NOT here.
+
+        Its file is patent-encumbered and licensed for research use only, unlike
+        the Apache-2.0 TSB-AD code vendored around it, so it is fetched rather
+        than redistributed. Three things have to hold for that to be a design
+        rather than a broken family: it is gitignored, the failure names the
+        command that fixes it, and the failure arrives at TRAINING time — not
+        three stages later when something reads `decision_scores_`.
+
+        The test passes either way, because a developer who has run the fetch
+        should not see a red suite for having done so.
+        """
+        import os
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)
+        with open(os.path.join(root, ".gitignore")) as f:
+            self.assertIn("Algorithms/tsb_ad/models/Series2Graph.py", f.read())
+
+        model = self.estimator("Series2Graph", 0.1, {"pattern_length": 20})
+        series = self.np.random.default_rng(0).normal(size=(500, 1))
+        try:
+            model.fit(series)
+        except ImportError as exc:
+            self.assertIn("python -m Algorithms.tsb_ad.fetch_series2graph", str(exc))
+            self.assertIn("research use", str(exc))
+            return
+        # Fetched: then it must behave like every other whole-series detector.
+        scores = model.decision_function(series)
+        self.assertEqual(scores.shape, (len(series),))
+        self.assertTrue(self.np.isfinite(scores).all())
 
     def test_timesfm_refuses_a_multivariate_call_by_name(self):
         """A cost refusal, not a capability one — TimesFM's per-channel loop
@@ -791,9 +833,30 @@ class TestDetectorGroups(unittest.TestCase):
         self.assertNotIn("NN", spec.DETECTOR_GROUPS["NN"])
 
     def test_the_paper_s_three_groups_are_all_present(self):
-        """FM is empty today. It stays listed so the taxonomy is visible and a
-        foundation model has an obvious home."""
-        self.assertEqual(set(spec.DETECTOR_GROUPS), {"NN", "Stat", "FM"})
+        """The paper's three, plus one this pool adds.
+
+        Table I has NN, Stat and FM. `Graph` is a fourth, so the taxonomy here
+        is the paper's EXTENDED rather than the paper's — asserted explicitly so
+        the divergence is a decision on record instead of something a reader of
+        Table I has to notice.
+        """
+        self.assertEqual(set(spec.DETECTOR_GROUPS), {"NN", "Stat", "FM", "Graph"})
+        self.assertEqual(sorted(spec.DETECTOR_GROUPS["Graph"]),
+                         ["LUNAR", "MTADGAT", "Series2Graph"])
+
+    def test_the_graph_group_keeps_upstreams_boundary(self):
+        """SOS and COF are near misses that stay in Stat.
+
+        Both are defined over something graph-shaped — SOS over an affinity
+        graph, COF over a set-based nearest path — and moving them would make
+        the new group look better populated than it is. PyOD's own taxonomy
+        files them "Probabilistic" and "Proximity-Based" while filing LUNAR
+        under "Graph-based", and following upstream beats inventing a second
+        classification only this repository would use.
+        """
+        for family in ("SOS", "COF"):
+            self.assertEqual(spec.group_of(family), "Stat", family)
+        self.assertEqual(spec.group_of("LUNAR"), "Graph")
 
 
 class TestGridReadback(unittest.TestCase):
@@ -858,10 +921,10 @@ class TestGridReadback(unittest.TestCase):
         sweep (LOF, CBLOF, IFOREST, HBOS, PCA, OCSVM, MCD), separating by
         3.1e-01, 1.5e+00, 6.6e-02, 2.4e+00, 1.2e+02, 2.5e+00 and 2.7e+00. The
         other five have no TSB-AD entry to copy — the name ABOD does not occur
-        anywhere in that package, and its only SR entry is a univariate
+        anywhere in that package, and its only SpectralResidual entry is a
         `periodicity` — so they took the parameter PyOD's own estimator exposes:
         ABOD `n_neighbors`, KDE `bandwidth`, COF `n_neighbors`, SOS
-        `perplexity`, SR `score_window`.
+        `perplexity`, SpectralResidual `score_window`.
 
         Written as "none" rather than as a shrinking allow-list so a NEW family
         cannot be added on a contamination sweep without this failing.

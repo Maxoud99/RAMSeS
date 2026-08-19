@@ -20,7 +20,7 @@ from typing import Dict, FrozenSet, List, Optional, Sequence, Set
 #   * LOF, NN, CBLOF have bespoke classes in Algorithms/ and their own grids.
 #   * ABOD and KDE also have bespoke classes and grids, and a branch each in
 #     TrainModels.train_models.
-#   * IFOREST, HBOS, PCA, OCSVM, MCD, SR have none of that. They
+#   * IFOREST, HBOS, PCA, OCSVM, MCD, SpectralResidual have none of that. They
 #     reach PyOD through the generic `train_pyod` fallback and
 #     `Algorithms/pyod_model.PyodModel`, which names its checkpoints
 #     `{FAMILY.upper()}_{i}` — which is why they are spelled in upper case here
@@ -31,7 +31,7 @@ from typing import Dict, FrozenSet, List, Optional, Sequence, Set
 # against this tuple, `families_for` turns it into what gets trained, and the
 # web UI's chips are built from it.
 #
-# COF, SOS and SR are TRANSDUCTIVE and are admitted on that
+# COF, SOS and SpectralResidual are TRANSDUCTIVE and are admitted on that
 # understanding — see TRANSDUCTIVE_FAMILIES below for what it costs and what
 # makes it safe.
 ALL_DETECTORS = (
@@ -49,11 +49,12 @@ ALL_DETECTORS = (
     # and the framework's temporal models, because that is what they are: they
     # judge a point against its neighbours, not against a fitted model. COF and
     # SOS have bespoke classes in Algorithms/ and their own training branches;
-    # SR reaches PyOD 3 through the generic `train_pyod` fallback
+    # SpectralResidual reaches PyOD 3 through the generic `train_pyod` fallback
     # (its module is mapped in `Algorithms.pyod_model._TS_MODULES`).
     "COF_1", "COF_2", "COF_3", "COF_4",
     "SOS_1", "SOS_2", "SOS_3", "SOS_4",
-    "SR_1", "SR_2", "SR_3", "SR_4",
+    "SpectralResidual_1", "SpectralResidual_2",
+    "SpectralResidual_3", "SpectralResidual_4",
     # RM and MD close out the Statistical group. They are the framework's own
     # code rather than PyOD's, but what they compute — a moving average and a
     # per-channel mean — is what the paper files under Stat, so they belong
@@ -79,7 +80,7 @@ ALL_DETECTORS = (
     # the pool's fourth subsequence detector (window_size 64), which is what
     # Table I's AE means. Three instances, one per encoder shape in TSB-AD's own
     # AutoEncoder sweep.
-    "AE_1", "AE_2", "AE_3",
+    "AutoEncoder_1", "AutoEncoder_2", "AutoEncoder_3",
     "RNN_1", "RNN_2", "RNN_3", "RNN_4",
     "LSTMVAE_1", "LSTMVAE_2", "LSTMVAE_3", "LSTMVAE_4",
     "DGHL_1", "DGHL_2", "DGHL_3", "DGHL_4",
@@ -117,7 +118,7 @@ ALL_DETECTORS = (
     # is a 30-step instance added to give the family one arm Thompson can
     # actually pull; 60 and 90 remain upstream's.
     "DONUT_1", "DONUT_2", "DONUT_3",
-    "OA_1", "OA_2",
+    "OmniAnomaly_1", "OmniAnomaly_2",
     "USAD_1", "USAD_2",
     "TRANAD_1", "TRANAD_2",
     "FITS_1", "FITS_2",
@@ -136,23 +137,55 @@ ALL_DETECTORS = (
     "OFA_1", "OFA_2",
     "TIMESFM_1", "TIMESFM_2",
     "CHRONOS_1", "CHRONOS_2",
+    # The Graph Based group. Three detectors that differ in WHAT the graph is
+    # over, which is the axis worth having a group for:
+    #
+    #   LUNAR   — a graph over SAMPLES. A k-NN graph of the rows with a GNN
+    #             learning the message-passing that LOF, kNN and DBSCAN each
+    #             hard-code. PyOD's own taxonomy files it under Graph-based, and
+    #             it reaches the pool through the generic `train_pyod` path with
+    #             no wrapper. `detector__random_state` is NOT optional: unseeded
+    #             it scores 3.039 apart on two fits of identical input, which is
+    #             what TimeSeriesOD and AnomalyTransformer were refused for.
+    #   Series2Graph — a graph over SUBSEQUENCES. It embeds every
+    #             length-`pattern_length` subsequence, extracts nodes and edges
+    #             from that embedding, and scores a query by the degree of the
+    #             path it traces. UNIVARIATE ONLY, and the one detector here
+    #             that is NOT in the repository — see `Algorithms/tsb_ad/
+    #             models/README_Series2Graph.md` for why and how to fetch it.
+    #   MTADGAT — a graph over CHANNELS (and one over timestamps). The only
+    #             member that says anything about inter-sensor structure, which
+    #             is what makes the group non-degenerate on SKAB and SMD, where
+    #             Series2Graph cannot run at all.
+    "LUNAR_1", "LUNAR_2", "LUNAR_3", "LUNAR_4",
+    "Series2Graph_1", "Series2Graph_2", "Series2Graph_3",
+    "MTADGAT_1", "MTADGAT_2",
 )
 
 DETECTOR_FAMILIES = ("LOF", "NN", "CBLOF", "ABOD", "KDE",
                      "IFOREST", "HBOS", "PCA", "OCSVM", "MCD",
-                     "COF", "SOS", "SR", "RM", "MD", "KMEANSAD", "POLY",
-                     "AE", "RNN", "LSTMVAE", "DGHL", "LSTMAD",
-                     "DONUT", "OA", "USAD", "TRANAD", "FITS",
-                     "TIMESNET", "OFA", "TIMESFM", "CHRONOS")
+                     "COF", "SOS", "SpectralResidual", "RM", "MD",
+                     "KMEANSAD", "POLY",
+                     "AutoEncoder", "RNN", "LSTMVAE", "DGHL", "LSTMAD",
+                     "DONUT", "OmniAnomaly", "USAD", "TRANAD", "FITS",
+                     "TIMESNET", "OFA", "TIMESFM", "CHRONOS",
+                     "LUNAR", "Series2Graph", "MTADGAT")
 
-# Families reached through `Algorithms.tsbad_model.TSBADModel` over the vendored
-# code in `Algorithms/tsb_ad`, rather than through PyOD. Single owner of the
-# fact, so `TrainModels.train_models` can route them and the tests can check
-# that every one has a grid. AE is deliberately NOT here: PyOD ships it,
-# and taking TSB-AD's fork instead would add a second copy of the same idea.
+# Families reached through `Algorithms.tsbad_model.TSBADModel`, rather than
+# through PyOD. Single owner of the fact, so `TrainModels.train_models` can
+# route them and the tests can check that every one has a grid. AutoEncoder is
+# deliberately NOT here: PyOD ships it, and taking TSB-AD's fork instead would
+# add a second copy of the same idea.
+#
+# Most run over vendored code in `Algorithms/tsb_ad`, but the set is really
+# "detectors with TSB-AD's whole-series interface", not "detectors from that
+# directory" — CHRONOS and MTADGAT are written in `Algorithms/` and reached
+# through `_TSBAD_SPECS`'s dotted-path form, and Series2Graph is fetched rather
+# than vendored. What they share is the contract: `(n_timesteps, n_channels)`
+# in, one score per timestep out.
 TSBAD_FAMILIES: FrozenSet[str] = frozenset({
-    "KMEANSAD", "POLY", "DONUT", "OA", "USAD", "TRANAD", "FITS",
-    "TIMESNET", "OFA", "TIMESFM", "CHRONOS"})
+    "KMEANSAD", "POLY", "DONUT", "OmniAnomaly", "USAD", "TRANAD", "FITS",
+    "TIMESNET", "OFA", "TIMESFM", "CHRONOS", "Series2Graph", "MTADGAT"})
 
 # Families that cut their own subsequences out of whatever call they are given,
 # so a call shorter than that subsequence has nothing to cut. They are all
@@ -190,7 +223,14 @@ WHOLE_SERIES_FAMILIES: FrozenSet[str] = (
 #             was never the reported configuration. Chronos keeps its own
 #             per-channel loop because Bolt is ~20x faster and the cost never
 #             arises.
-UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset({"POLY", "TIMESFM"})
+#   Series2Graph — CANNOT, like POLY. TSB-AD's own wrapper opens with
+#             `data.squeeze()` and the method embeds a scalar subsequence into
+#             a 2-D phase space, so there is no multivariate reading of it. It
+#             is in TSB-AD's uni-variate pool for that reason. This is what
+#             makes MTADGAT worth having: without it the Graph Based group
+#             would be empty of anything runnable on SKAB and SMD.
+UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset(
+    {"POLY", "TIMESFM", "Series2Graph"})
 
 # Families whose `decision_function` scores each row against the OTHER ROWS OF
 # THE SAME CALL rather than against what `fit` saw. COF's scoring is literally
@@ -220,7 +260,8 @@ UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset({"POLY", "TIMESFM"})
 # it is handed. Measured: `fit(B)` then `fit(A)` gives byte-identical scores to
 # `fit(A)` alone (0.000e+00), i.e. fit state is fully replaced. So the score is
 # a function of the call's rows alone, which is the property this set names.
-TRANSDUCTIVE_FAMILIES: FrozenSet[str] = frozenset({"COF", "SOS", "SR", "POLY"})
+TRANSDUCTIVE_FAMILIES: FrozenSet[str] = frozenset(
+    {"COF", "SOS", "SpectralResidual", "POLY"})
 
 # The paper's Table I taxonomy: "Base models grouped by family: Neural Networks
 # (NN), Statistical (Stat) or Foundation Models (FM)". Keys are the paper's
@@ -244,13 +285,27 @@ TRANSDUCTIVE_FAMILIES: FrozenSet[str] = frozenset({"COF", "SOS", "SR", "POLY"})
 # FM is empty: the paper's foundation models (OFA, Lag-Llama, Chronos, TimesFM,
 # MOMENT) are none of them in this pool. It is listed anyway so the taxonomy is
 # visible and a future FM detector has an obvious home.
+#
+# `Graph` is a FOURTH group, and the paper has no such row — so this taxonomy is
+# the paper's EXTENDED, not the paper's. Worth stating plainly when the thesis
+# reproduces Table I. A detector earns the group by constructing an explicit
+# graph and reading the score off a graph quantity (degree, path, connectivity,
+# message passing), which is the criterion PyOD's own taxonomy applies when it
+# files LUNAR and R-Graph under "Graph-based".
+#
+# Under that criterion SOS and COF stay in Stat, though both are near misses and
+# the temptation to move them is real: SOS is defined over an affinity graph and
+# COF over a set-based nearest path. PyOD files them "Probabilistic" and
+# "Proximity-Based" respectively, and following upstream beats inventing a
+# second classification that only this repository would use.
 DETECTOR_GROUPS: Dict[str, tuple] = {
-    "NN": ("AE", "RNN", "LSTMVAE", "DGHL", "LSTMAD", "DONUT",
-           "OA", "USAD", "TRANAD", "FITS", "TIMESNET"),
+    "NN": ("AutoEncoder", "RNN", "LSTMVAE", "DGHL", "LSTMAD", "DONUT",
+           "OmniAnomaly", "USAD", "TRANAD", "FITS", "TIMESNET"),
     "Stat": ("LOF", "NN", "CBLOF", "ABOD", "KDE", "IFOREST", "HBOS", "PCA",
-             "OCSVM", "MCD", "COF", "SOS", "SR", "RM", "MD", "KMEANSAD",
-             "POLY"),
+             "OCSVM", "MCD", "COF", "SOS", "SpectralResidual", "RM", "MD",
+             "KMEANSAD", "POLY"),
     "FM": ("OFA", "TIMESFM", "CHRONOS"),
+    "Graph": ("LUNAR", "Series2Graph", "MTADGAT"),
 }
 
 
@@ -260,7 +315,82 @@ GROUP_LABELS: Dict[str, str] = {
     "NN": "Neural Networks",
     "Stat": "Statistical",
     "FM": "Foundation",
+    "Graph": "Graph Based",
 }
+
+
+# ── Abbreviations ───────────────────────────────────────────────────────────
+#
+# The pool name is the CANONICAL identifier: it is in every checkpoint filename,
+# every `--detectors` token, every IR atom, every result tree on disk. It is
+# also what the reader sees, everywhere, by default — so nothing has to be
+# expanded on the way out and no display path can forget to.
+#
+# This map runs the OTHER way. It is a shortening applied by the two figures
+# that cannot fit a full name, and NOTHING MAY JOIN ON IT: an abbreviation is
+# ink, never a key.
+#
+# The names here are the upstream's own, which is what makes them canonical:
+#
+#     SpectralResidual -> pyod.models.ts_spectral_residual.SpectralResidual
+#     AutoEncoder      -> pyod.models.auto_encoder.AutoEncoder
+#     OmniAnomaly      -> Algorithms.tsb_ad.models.OmniAnomaly.OmniAnomaly
+#     Series2Graph     -> Boniol & Palpanas, PVLDB 2020
+#
+# These four were previously spelled SR/AE/OA/S2G, shortenings this project
+# invented; every other family already IS its published acronym (LOF, HBOS,
+# USAD, FITS, LUNAR, OFA) or the framework's own short name (RM, MD, NN), so
+# there is nothing to abbreviate and nothing to expand.
+#
+# The direction matters for what goes wrong. A figure that forgets to call
+# `abbreviate_detector` is slightly crowded; a figure that used to forget the
+# old `display_detector` showed the reader a name no other part of the system
+# used.
+FAMILY_ABBREVIATIONS: Dict[str, str] = {
+    "SpectralResidual": "SR",
+    "AutoEncoder": "AE",
+    "OmniAnomaly": "OA",
+    "Series2Graph": "S2G",
+}
+
+_ABBREV_BY_UPPER = {k.upper(): v for k, v in FAMILY_ABBREVIATIONS.items()}
+
+
+def family_abbrev(family: str) -> str:
+    """'OmniAnomaly' -> 'OA'. A family with no entry comes back unchanged."""
+    return _ABBREV_BY_UPPER.get(str(family).upper(), str(family))
+
+
+def abbreviate_detector(name: str) -> str:
+    """'OmniAnomaly_2' -> 'OA_2'. The instance suffix is kept verbatim.
+
+    Total on any input: a name with no underscore, an unknown family, or a
+    string that is not a detector at all comes back unchanged. The callers are
+    figure labels that also carry non-detector text ("ensemble", a channel
+    name), and those must pass through untouched.
+    """
+    text = str(name)
+    family, sep, suffix = text.partition("_")
+    if not sep:
+        return family_abbrev(text)
+    short = family_abbrev(family)
+    return f"{short}{sep}{suffix}" if short != family else text
+
+
+def abbreviation_legend(names) -> Dict[str, str]:
+    """{'SR_1': 'SpectralResidual_1'}, for the names that actually shorten.
+
+    Short form to long, because that is the direction the key is READ: a
+    reader meets "SR_1" on the figure and wants to know what it stands for.
+    Empty when nothing in `names` abbreviates, so a caller can skip drawing the
+    note entirely rather than printing an empty box.
+    """
+    out = {}
+    for name in names or ():
+        short = abbreviate_detector(name)
+        if short != str(name):
+            out[short] = str(name)
+    return out
 
 
 def group_of(family: str) -> Optional[str]:

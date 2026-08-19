@@ -1,5 +1,6 @@
 import math
 import os
+import textwrap
 import random
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -11,6 +12,9 @@ from loguru import logger
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
+
+from Utils.pipeline_spec import abbreviate_detector
+from Utils.plot_labels import draw_abbreviation_key
 
 from Metrics.metrics import prauc, f1_score
 from Utils.model_selection_utils import evaluate_model
@@ -1364,7 +1368,8 @@ def plot_ga_utility(
         x = np.arange(len(best_ensemble))
         ax_top.bar(x, [0.0 if np.isnan(v) else v for v in vals], color=colours)
         ax_top.set_xticks(x)
-        ax_top.set_xticklabels(best_ensemble, rotation=30, ha="right")
+        ax_top.set_xticklabels(list(best_ensemble),
+                               rotation=30, ha="right")
         ax_top.axhline(0, color="black", linewidth=0.6)
         ax_top.set_ylabel("fitness(best) − fitness(best \\ detector)")
         ax_top.set_title(
@@ -1383,7 +1388,8 @@ def plot_ga_utility(
     xb = np.arange(len(algorithm_list))
     ax_bot.bar(xb, bot_vals, color=bot_colours)
     ax_bot.set_xticks(xb)
-    ax_bot.set_xticklabels(algorithm_list, rotation=30, ha="right")
+    ax_bot.set_xticklabels(list(algorithm_list),
+                           rotation=30, ha="right")
     ax_bot.axhline(0, color="black", linewidth=0.6)
     ax_bot.set_ylabel("E[fit | present] − E[fit | absent]")
     ax_bot.set_title("Mean marginal contribution across evaluated subsets")
@@ -1434,9 +1440,10 @@ def plot_ga_interaction(
     cmap.set_bad(color="#dddddd")
     im = ax.imshow(masked, cmap=cmap, vmin=0.0, vmax=vmax, aspect="auto")
     ax.set_xticks(np.arange(n))
-    ax.set_xticklabels(algorithm_list, rotation=45, ha="right")
+    ax.set_xticklabels(list(algorithm_list),
+                       rotation=45, ha="right")
     ax.set_yticks(np.arange(n))
-    ax.set_yticklabels(algorithm_list)
+    ax.set_yticklabels(list(algorithm_list))
 
     for jj in range(n):
         for kk in range(n):
@@ -1495,7 +1502,8 @@ def plot_ga_total_interaction(
     x = np.arange(len(algorithm_list))
     ax.bar(x, vals, color=colours)
     ax.set_xticks(x)
-    ax.set_xticklabels(algorithm_list, rotation=30, ha="right")
+    ax.set_xticklabels(list(algorithm_list),
+                       rotation=30, ha="right")
     ax.set_ylabel("H_j  (total interaction)")
     ax.set_ylim(0, max(1.0, max(vals) * 1.1) if vals else 1.0)
     ax.set_title("Axis 2 · Friedman total interaction  H_j (Eq. 45)  "
@@ -1586,6 +1594,71 @@ def plot_ga_survival(
     )
 
 
+def _spread_annotations(fig, annotations, max_passes: int = 80) -> None:
+    """Nudge overlapping point labels apart, in place.
+
+    The archetype scatter names every point, and points cluster: two detectors
+    with near-identical utility and stability sit on top of each other, and so
+    did their names. Dropping labels is not an option — placing every detector
+    is the figure's whole job — so they are moved instead.
+
+    Pairwise repulsion in DISPLAY coordinates, which is the only space where
+    "these two labels overlap" is a question at all: the axes carry different
+    units (a fitness difference against a survival rate), so data coordinates
+    cannot say whether two boxes collide.
+
+    Each annotation was placed with `textcoords="offset points"`, so the nudge
+    is applied to that offset — the label moves and the point does not. The
+    vertical push is the larger one because a detector name is far wider than
+    it is tall, so vertical separation buys more clearance per point moved.
+
+    Deliberately not `adjustText`: a dependency for one figure, where a few
+    passes of this converge. Stops as soon as a pass finds no collision, so the
+    common case of a well-spread pool costs one draw.
+    """
+    if len(annotations) < 2:
+        return
+    fig.canvas.draw()                 # extents are undefined before a draw
+    renderer = fig.canvas.get_renderer()
+    boxes = [a.get_window_extent(renderer=renderer) for a in annotations]
+    shift = [np.zeros(2) for _ in annotations]
+
+    for _ in range(max_passes):
+        collided = False
+        for i in range(len(annotations)):
+            for j in range(i + 1, len(annotations)):
+                a = boxes[i].translated(*shift[i])
+                b = boxes[j].translated(*shift[j])
+                if not a.overlaps(b):
+                    continue
+                collided = True
+                dx = ((a.x0 + a.x1) - (b.x0 + b.x1)) / 2.0
+                dy = ((a.y0 + a.y1) - (b.y0 + b.y1)) / 2.0
+                norm = max((dx * dx + dy * dy) ** 0.5, 1e-6)
+                # A dead-on vertical tie gets an arbitrary but deterministic
+                # nudge, or the pair would push along a zero-length vector.
+                step = np.array([dx / norm * 1.2,
+                                 (dy / norm * 2.4) if abs(dy) > 1e-9 else 2.4])
+                shift[i] += step
+                shift[j] -= step
+        if not collided:
+            break
+
+    px_to_points = 72.0 / fig.dpi
+    for ann, (dx, dy) in zip(annotations, shift):
+        if not dx and not dy:
+            continue
+        ox, oy = ann.xyann
+        ann.xyann = (ox + dx * px_to_points, oy + dy * px_to_points)
+        # Far enough that the label no longer reads as belonging to its point:
+        # reveal the leader line. The patch is created with every annotation and
+        # left transparent, because matplotlib positions `arrow_patch` itself
+        # and only does so for an annotation that was BUILT with `arrowprops` —
+        # attaching one afterwards leaves it unplaced.
+        if abs(dx) + abs(dy) > 14 and ann.arrow_patch is not None:
+            ann.arrow_patch.set_alpha(0.6)
+
+
 def plot_ga_archetypes(
     archetypes: Dict[str, Dict[str, Any]],
     algorithm_list: List[str],
@@ -1632,6 +1705,7 @@ def plot_ga_archetypes(
     unclassified = sorted({d for d in algorithm_list
                            if archetypes[d]["relative"]["archetype"] == ARCHETYPE_UNCLASSIFIED})
     seen_labels = set()
+    annotations = []
 
     for ax, scheme in zip(axes, ("relative",)):
         tu, ts = thresholds[scheme]
@@ -1647,8 +1721,20 @@ def plot_ga_archetypes(
             ax.scatter([u], [s], s=90, color=colour,
                        edgecolors=colour, linewidths=1.5,
                        facecolors=colour, label=label, zorder=3)
-            ax.annotate(d, (u, s), textcoords="offset points", xytext=(5, 4),
-                        fontsize=8, alpha=0.85)
+            # SHORTENED, and one of only three figures that are — every point
+            # carries its own name a few characters from its neighbour, and a
+            # full name here collides outright. `draw_abbreviation_key` below
+            # says what the short form stands for.
+            #
+            # Built WITH a leader line, drawn transparent. `_spread_annotations`
+            # reveals it on the labels it has to move far.
+            annotations.append(
+                ax.annotate(abbreviate_detector(d), (u, s),
+                            textcoords="offset points",
+                            xytext=(5, 4), fontsize=8, alpha=0.85,
+                            arrowprops=dict(arrowstyle="-", linewidth=0.5,
+                                            color="grey", alpha=0.0,
+                                            shrinkA=0, shrinkB=2)))
         if not np.isnan(tu):
             ax.axvline(tu, color="grey", linestyle="--", linewidth=0.8, alpha=0.7)
         if not np.isnan(ts):
@@ -1690,6 +1776,10 @@ def plot_ga_archetypes(
         _zero_anchored_axis(ax, "x", [util[d] for d in algorithm_list] + [tu])
         _zero_anchored_axis(ax, "y", [stab[d] for d in algorithm_list] + [ts])
 
+    # After the limits are final: a nudge computed against one set of axis
+    # limits is wrong once `_zero_anchored_axis` moves them.
+    _spread_annotations(fig, annotations)
+
     handles, labels = [], []
     for ax in axes:
         h, l = ax.get_legend_handles_labels()
@@ -1701,7 +1791,12 @@ def plot_ga_archetypes(
                frameon=False, title="Archetype")
     if unclassified:
         fig.text(0.5, -0.02, "Unclassified (no marginal-contribution data): "
-                 + ", ".join(unclassified), ha="center", fontsize=9, alpha=0.8)
+                 + ", ".join(unclassified),
+                 ha="center", fontsize=9, alpha=0.8)
+
+    # What the shortened point labels stand for. Below the unclassified note
+    # when there is one, so the two never collide.
+    draw_abbreviation_key(fig, algorithm_list, y=-0.06 if unclassified else -0.02)
 
     fig.suptitle("Functional Archetypes · utility × stability", y=1.0)
     plt.tight_layout(pad=1.2)
@@ -2342,8 +2437,12 @@ def plot_ga_combination(
         m = m if m > 0 else 1.0
         return [0.0 if np.isnan(v) else v / m for v in vals]
 
-    fig, (ax_imp, ax_markov) = plt.subplots(1, 2, figsize=(13, max(4, 0.6 * len(feature_names) + 2)))
+    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    os.makedirs(directory, exist_ok=True)
+    height = max(4, 0.6 * len(feature_names) + 2)
 
+    # ── Figure 1: the three magnitude measures ──────────────────────────────
+    fig, ax_imp = plt.subplots(figsize=(9, height))
     y = np.arange(len(feature_names))
     h = 0.27
     ax_imp.barh(y - h, _norm(shap_abs), height=h, label="mean|SHAP|", color="#1f77b4")
@@ -2351,34 +2450,45 @@ def plot_ga_combination(
     ax_imp.barh(y + h, _norm(ale_total), height=h, label="total |ALE|", color="#2ca02c")
     ax_imp.axvline(0, color="black", linewidth=0.6)
     ax_imp.set_yticks(y)
-    ax_imp.set_yticklabels(feature_names)
+    ax_imp.set_yticklabels(list(feature_names))
     ax_imp.invert_yaxis()
     ax_imp.set_xlabel("Importance (normalised to each method's max |·|)")
     ax_imp.set_title("Meta-learner feature attribution (magnitude)")
     ax_imp.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
-    ax_imp.legend(loc="lower right", frameon=False)
+    # Outside the axes. In the corner it sat on top of whichever detector had
+    # the shortest bars, and which detector that is changes per entity.
+    ax_imp.legend(loc="upper left", frameon=False,
+                  bbox_to_anchor=(1.01, 1), borderaxespad=0)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(f"{directory}/ga_combination_importance_{dataset}_{entity}.png",
+                format="png", dpi=300, bbox_inches="tight")
+    plt.close()
 
+    # ── Figure 2: the consensus ranking those three feed ────────────────────
+    #
+    # Its own figure rather than a second panel: side by side, the ranking's
+    # tick labels had to be written either into the gutter (where they reached
+    # the left panel) or on the outside edge (where they read as belonging to
+    # nothing). Alone, they go back where a bar chart's labels belong.
     ranked = list(final_ranking)
     pts = [markov_scores.get(f, 0.0) for f in ranked]
     yb = np.arange(len(ranked))
     # Competition ranks so tied Markov scores share a rank number on the labels.
     rk = _competition_ranks(markov_scores, ranked)
+    fig, ax_markov = plt.subplots(figsize=(9, height))
     ax_markov.barh(yb, pts, color="#2ca02c")
     ax_markov.set_yticks(yb)
     ax_markov.set_yticklabels([f"{rk[f]}. {f}" for f in ranked])
     ax_markov.invert_yaxis()
     ax_markov.set_xlabel("Markov score (stationary prob.)")
-    # Names all three sources, and the same three the left panel draws. The
+    # Names all three sources, and the same three the other figure draws. The
     # label said "mean|SHAP| + PFI" for as long as ALE had been feeding the
     # chain, so the figure claimed a two-source consensus beside a panel
     # showing three bars.
     ax_markov.set_title("Final ranking (Markov: mean|SHAP| + PFI + total |ALE|)")
     ax_markov.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
-
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
-    os.makedirs(directory, exist_ok=True)
-    plt.savefig(f"{directory}/ga_combination_importance_{dataset}_{entity}.png",
+    plt.savefig(f"{directory}/ga_combination_ranking_{dataset}_{entity}.png",
                 format="png", dpi=300, bbox_inches="tight")
     plt.close()
 
@@ -2460,7 +2570,13 @@ def plot_ga_combination_ale(
                      if reasons else "")
         sign = signs.get(name, "not_available")
         label = "no sign (no net effect)" if sign == "not_available" else sign
-        ax.set_title(f"{name} — {label}{qualifier}", fontsize=11)
+        # Wrapped, not truncated. A panel is ~4.2in wide and the longest title
+        # this can produce — "SpectralResidual_1 — negative (low consistency,
+        # weak influence)" — is 74 characters, which ran off both sides at
+        # fontsize 11. Wrapping keeps every word and grows downward, and
+        # `constrained_layout`/`tight_layout` reserves the extra height.
+        ax.set_title("\n".join(textwrap.wrap(f"{name} — {label}{qualifier}", 34)),
+                     fontsize=10)
         ax.set_xlabel(f"{name} score" + (f" ({rec['n_bins']} bins)" if mark_bins else ""))
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
         cons = rec["consistency"]
@@ -2492,7 +2608,14 @@ def plot_ga_combination_ale(
         note += f"  Not shown (no ALE could be computed): {', '.join(skipped)}."
     fig.suptitle("How each detector moves the meta-learner (ALE)"
                  + (" — bins marked" if mark_bins else ""), fontsize=13)
-    fig.text(0.5, -0.01, note, ha="center", fontsize=8, color="dimgrey")
+    # WRAPPED to a fixed width, and this is why the two ALE figures used to come
+    # out different sizes. The note is one line of `fig.text` outside the axes,
+    # and `bbox_inches="tight"` grows the saved image to contain it — so the
+    # bins version, whose note carries an extra sentence, was saved WIDER than
+    # the plain one and the card then scaled it down to the same column. Same
+    # wrap width means the same bbox, so the two render at the same size.
+    fig.text(0.5, -0.01, textwrap.fill(note, 108),
+             ha="center", va="top", fontsize=8, color="dimgrey")
 
     plt.tight_layout(pad=1.2)
     directory = f"myresults/GA_Ens/{dataset}/{entity}/"

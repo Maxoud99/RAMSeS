@@ -231,6 +231,8 @@ def create_app(**overrides) -> Flask:
         if payload is None:
             return jsonify({"error": "no_artifacts",
                             "hint": "Run this dataset/entity with explanations enabled."}), 404
+        # Titles and captions only: `src` is a filename and the pair picker's
+        # detector list is a query parameter, both of which must stay canonical.
         payload["plots"] = plots.manifest(dataset, entity)
         # Each regime-bearing stage names its own plot subdirectory in STAGES,
         # so both Thompson stages get their regimes paired without either one
