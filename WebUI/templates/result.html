@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset }} / {{ entity }} — RAMSeS explanation{% endblock %}
+
+{% block headeractions %}
+<a class="button" id="open-report" href="#" hidden
+   title="The pipeline's own numeric report">Comprehensive results</a>
+<a class="button" id="open-docs" href="/docs/{{ dataset }}/{{ entity }}" target="_blank"
+   rel="noopener" title="What the terms on each stage mean">ⓘ Documentation</a>
+<button id="toggle-all-full" type="button" title="Expand or collapse every explanation">Expand all</button>
+{% endblock %}
+
+{% block content %}
+<div id="result-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
+  <p class="muted">Loading explanation…</p>
+</div>
+
+<div class="lightbox no-print" id="lightbox" hidden>
+  <div class="lightbox-bar">
+    <span id="lightbox-title" class="small"></span>
+    <button type="button" id="lightbox-close" aria-label="Close">Close ✕</button>
+  </div>
+  <div class="lightbox-stage"><img id="lightbox-img" alt=""></div>
+  <div class="lightbox-bar">
+    <button type="button" id="lightbox-prev">← Previous</button>
+    <span id="lightbox-count" class="small">
+      <input type="number" id="lightbox-index" min="1" step="1"
+             aria-label="Go to figure number" inputmode="numeric">
+      <span id="lightbox-total"></span>
+    </span>
+    <button type="button" id="lightbox-next">Next →</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ asset('js/result.js') }}"></script>
+{% endblock %}

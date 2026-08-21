@@ -1,3 +1,14 @@
+# -*- coding: utf-8 -*-
+# SPDX-License-Identifier: Apache-2.0
+#
+# Derived from `src/tsadams/vus/robustness_eval.py` in
+# mononitogoswami/tsad-model-selection (Apache-2.0). `Metrics/metrics.py` reaches
+# `generate_curve` here; see `vus/feature.py` for the VUS authorship this
+# package carries.
+#
+# Modified by the RAMSeS project. This file is NOT identical to that original:
+# the `metricor` import is spelled for this project's layout.
+
 from random import shuffle
 import numpy as np
 import math

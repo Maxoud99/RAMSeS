@@ -2,6 +2,7 @@ import os
 from typing import List, Optional, Union, Dict
 import pandas as pd
 import pickle as pkl
+import dill
 import numpy as np
 import torch as t
 
@@ -49,7 +50,21 @@ class Logger(object):
                 os.path.join(self.obj_save_path,
                              str(self.obj_name) + '.pth'), 'wb') as f:
             # t.save(self.obj.state_dict(), f) # TODO: We will not support saving state dicts for now
-            t.save(self.obj, f)
+            #
+            # `dill` rather than the stdlib pickle torch defaults to, because
+            # one detector in the pool cannot be pickled at all: PyOD 3 defines
+            # LSTMAD's network as a class inside a function
+            # (`_LSTMModel.__init__.<locals>._Net`), and pickle can only
+            # serialise classes reachable at module level. It raised
+            # "Can't pickle local object", after `fit` and after the diagnostic
+            # plot, leaving a truncated .pth that then read as a trained model.
+            # That is why no LSTMAD checkpoint has ever existed on any entity.
+            #
+            # Whole-object saves are what this line already does, so the choice
+            # is only which pickler; dill handles local classes and is a strict
+            # superset here. Loads must pass the same module — see
+            # `Utils.model_io.load_checkpoint`, which every load site uses.
+            t.save(self.obj, f, pickle_module=dill)
 
     def save_data_object(self):
         with open(

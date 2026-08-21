@@ -32,8 +32,23 @@ from Model_Selection.Thompson_Sampling import (
     initialize_sliding_windows,
 )
 from Model_Selection.inject_anomalies import Inject
-from Model_Selection.rank_aggregation import enhanced_markov_chain_rank_aggregator_text
+from Model_Selection.rank_aggregation import (
+    enhanced_markov_chain_rank_aggregator_text,
+    explain_rank_aggregation,
+)
 from Model_Training.train import TrainModels
+from Utils.model_io import load_checkpoint
+from Utils.pipeline_spec import (
+    ALL_DETECTORS,
+    dataset_label,
+    DETECTOR_FAMILIES,
+    MIN_DETECTORS,
+    families_for,
+    family_of,
+    UNIVARIATE_FAMILIES,
+)
+from Utils.pipeline_spec import ALL_STAGES as _SPEC_ALL_STAGES
+from Utils.pipeline_spec import OFFLINE_ITERATION as _SPEC_OFFLINE_ITERATION
 from Utils.utils import get_args_from_cmdline
 # from comprehensive_results_writer import write_comprehensive_results
 
@@ -44,11 +59,21 @@ from Utils.utils import get_args_from_cmdline
 # save_dir removed - now dynamically determined from command-line args
 # Old hardcoded path was causing wrong models to load for different datasets
 
-algorithm_list = ['NN', 'LOF', 'CBLOF']
-algorithm_list_instances = [
-        'LOF_1', 'LOF_2', 'LOF_3', 'LOF_4', 'NN_1', 'NN_2', 'NN_3',
-        'CBLOF_1', 'CBLOF_2', 'CBLOF_3', 'CBLOF_4'
-    ]
+# The detector/stage vocabulary lives in Utils/pipeline_spec.py so that app.py,
+# Utils/utils.py (the CLI) and the web UI all read one definition.
+algorithm_list = list(DETECTOR_FAMILIES)
+algorithm_list_instances = list(ALL_DETECTORS)
+
+# Sub-stages of the offline model-selection pipeline (stage 6). The --stages CLI
+# flag selects a subset; a strict subset is a "partial run" (runs only those
+# stages + their explainability, then stops before rank aggregation).
+ALL_STAGES = set(_SPEC_ALL_STAGES)
+
+# Iteration tag of the OFFLINE model-selection run. The offline pipeline and its
+# artifacts (rank-aggregation reports, explanation IRs, narration) all use this
+# value; the CLI --iteration arg is the window-sizing parameter, a different
+# concept that must not leak into these filenames.
+OFFLINE_ITERATION = _SPEC_OFFLINE_ITERATION
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -105,7 +130,7 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
     with open(output_file, 'w') as f:
         f.write("="*80 + "\n")
         f.write(f"RAMSeS Framework - Comprehensive Results\n")
-        f.write(f"Dataset: {dataset} | Entity: {entity} | Iteration: {iteration}\n")
+        f.write(f"Dataset: {dataset_label(dataset)} | Entity: {entity} | Iteration: {iteration}\n")
         f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("="*80 + "\n\n")
         
@@ -236,18 +261,18 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
         f.write("Robust Aggregation (GAN → Borderline → Monte Carlo):\n")
         f.write("-" * 50 + "\n")
         robust_agg = aggregation_results.get('robust_agg', [])
-        if isinstance(robust_agg, (list, tuple)) and len(robust_agg) > 1:
-            f.write(f"  Best Model: {robust_agg[1] if len(robust_agg) > 1 else 'N/A'}\n")
+        if isinstance(robust_agg, (list, tuple)) and len(robust_agg) > 0:
+            f.write(f"  Best Model: {robust_agg[0]}\n")
             f.write(f"  Full Ranking: {robust_agg}\n")
         else:
             f.write(f"  Result: {robust_agg}\n")
         f.write("\n")
-        
+
         f.write("Final Aggregation (Robust + Thompson Sampling):\n")
         f.write("-" * 50 + "\n")
         final_agg = aggregation_results.get('final_agg', [])
-        if isinstance(final_agg, (list, tuple)) and len(final_agg) > 1:
-            f.write(f"  Best Model: {final_agg[1] if len(final_agg) > 1 else 'N/A'}\n")
+        if isinstance(final_agg, (list, tuple)) and len(final_agg) > 0:
+            f.write(f"  Best Model: {final_agg[0]}\n")
             f.write(f"  Full Ranking: {final_agg}\n")
         else:
             f.write(f"  Result: {final_agg}\n")
@@ -328,7 +353,22 @@ def load_trained_models(model_names, models_dir):
             logger.warning(f"Model {name} not found in {models_dir}, skipping")
             continue
         with open(path, 'rb') as fh:
-            model = t.load(fh, weights_only=False)
+            # map_location: checkpoints trained on a GPU box carry CUDA storages
+            # and fail to unpickle at all on a CPU-only machine.
+            model = load_checkpoint(fh, map_location='cpu')
+            # …and that is only half of it. MD, LSTMVAE and DGHL also pickle
+            # `device = cuda` as plain state, so their forward passes went on
+            # allocating CUDA tensors after map_location had moved every weight
+            # to the CPU, and every one of them died on "Torch not compiled with
+            # CUDA enabled". Redirecting the attribute (and any submodule that
+            # came with it) is what actually makes a GPU-trained checkpoint
+            # runnable here; it is a no-op when CUDA is present or the model
+            # never carried a device.
+            if not t.cuda.is_available() and str(getattr(model, 'device', 'cpu')) != 'cpu':
+                model.device = t.device('cpu')
+                for attribute in vars(model).values():
+                    if isinstance(attribute, t.nn.Module):
+                        attribute.to('cpu')
             try:
                 model.eval()
             except AttributeError:
@@ -345,7 +385,7 @@ def load_trained_models(model_names, models_dir):
 # Model-Selection Pipelines
 # ------------------------------------------------------------------------------
 
-def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False):
+def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=False, stages=None):
     """
     One-pass model selection pipeline in the order:
       1) GA (stacking ensemble search)
@@ -380,71 +420,95 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     """
     # Use provided model list or fall back to global
     models_to_use = model_list if model_list is not None else algorithm_list_instances
-    
+
+    # Which sub-stages to run (a strict subset of ALL_STAGES is a "partial run":
+    # those stages execute, then the function returns before rank aggregation).
+    stages = set(ALL_STAGES) if stages is None else set(stages)
+
     timing_dict = {}
     memory_dict = {'modules': {}}
-    
+
+    # Safe defaults so the return tuple is well-formed even when a stage is skipped.
+    best_ensemble = []
+    best_f1 = best_pr_auc = best_fitness = 0.0
+    individual_predictions = None
+    base_model_predictions_train = base_model_predictions_test = None
+    y_true_train = y_true_test = None
+    meta_model_type = None
+    thompson_model_names = []
+    Gan_ranked_by_f1 = Gan_ranked_by_pr_auc = []
+    Gan_ranked_by_f1_names = Gan_ranked_by_pr_auc_names = []
+    ranked_by_f1 = ranked_by_pr_auc = []
+    ranked_by_f1_names_sensitivity = ranked_by_pr_auc_names_sensitivity = []
+    monte_carlo_ranked_models_F1 = monte_carlo_ranked_models_PR = []
+    robust_agg = [None, []]
+    full_aggregated = [None, []]
+
     # Track initial memory
     initial_memory = get_memory_usage_mb()
     memory_dict['initial'] = initial_memory
     logger.info(f"  💾 Initial memory usage: {initial_memory:.2f} MB")
-    
+
     # -------------------------
     # 1) Genetic Algorithm (GA)
     # -------------------------
-    logger.info("  📊 Sub-stage 6.1: Genetic Algorithm (GA) - Finding best ensemble...")
-    logger.info("     This will evaluate individual models and run 20 generations")
-    mem_before = get_memory_usage_mb()
-    start_time = time.time()
-    best_ensemble, best_f1, best_pr_auc, best_fitness, \
-    individual_predictions, base_model_predictions_train, base_model_predictions_test, \
-    y_true_train, y_true_test, meta_model_type = genetic_algorithm(
-        dataset, entity, train_data, test_data,
-        models_to_use, trained_models,
-        population_size=20, generations=20,
-        meta_model_type='rf', mutation_rate=0.1,
-    )
-    timing_dict['1_Genetic_Algorithm'] = time.time() - start_time
-    mem_after = get_memory_usage_mb()
-    memory_dict['modules']['1_Genetic_Algorithm'] = {
-        'before': mem_before,
-        'after': mem_after,
-        'delta': mem_after - mem_before
-    }
-    logger.info(
-        "  ✓ [GA] Best ensemble=%s | F1=%.4f | PR-AUC=%.4f | fitness=%.4f | Time=%.4fs",
-        best_ensemble, best_f1, best_pr_auc, best_fitness, timing_dict['1_Genetic_Algorithm']
-    )
+    if "ga" in stages:
+        logger.info("  📊 Sub-stage 6.1: Genetic Algorithm (GA) - Finding best ensemble...")
+        logger.info("     This will evaluate individual models and run 20 generations")
+        mem_before = get_memory_usage_mb()
+        start_time = time.time()
+        best_ensemble, best_f1, best_pr_auc, best_fitness, \
+        individual_predictions, base_model_predictions_train, base_model_predictions_test, \
+        y_true_train, y_true_test, meta_model_type = genetic_algorithm(
+            dataset, entity, train_data, test_data,
+            models_to_use, trained_models,
+            population_size=20, generations=20,
+            meta_model_type='rf', mutation_rate=0.1,
+            explain=explain,
+        )
+        timing_dict['1_Genetic_Algorithm'] = time.time() - start_time
+        mem_after = get_memory_usage_mb()
+        memory_dict['modules']['1_Genetic_Algorithm'] = {
+            'before': mem_before,
+            'after': mem_after,
+            'delta': mem_after - mem_before
+        }
+        logger.info(
+            "  ✓ [GA] Best ensemble=%s | F1=%.4f | PR-AUC=%.4f | fitness=%.4f | Time=%.4fs",
+            best_ensemble, best_f1, best_pr_auc, best_fitness, timing_dict['1_Genetic_Algorithm']
+        )
 
     # -----------------------------------
     # 2) Thompson Sampling (LinTS, online)
     # -----------------------------------
-    logger.info("  📊 Sub-stage 6.2: Thompson Sampling - Online model selection...")
-    mem_before = get_memory_usage_mb()
-    start_time = time.time()
-    thompson_model_names = run_linear_thompson_sampling(
-        test_data=test_data,
-        trained_models=trained_models,
-        model_names=algorithm_list_instances,
-        dataset=dataset,
-        entity=entity,
-        iterations=50,
-        iteration=iteration,
-    )
-    timing_dict['2_Thompson_Sampling'] = time.time() - start_time
-    mem_after = get_memory_usage_mb()
-    memory_dict['modules']['2_Thompson_Sampling'] = {
-        'before': mem_before,
-        'after': mem_after,
-        'delta': mem_after - mem_before
-    }
-    logger.info("  ✓ [Thompson] Top-5: %s | Time=%.4fs", thompson_model_names[:5], 
-                timing_dict['2_Thompson_Sampling'])
+    if "thompson" in stages:
+        logger.info("  📊 Sub-stage 6.2: Thompson Sampling - Online model selection...")
+        mem_before = get_memory_usage_mb()
+        start_time = time.time()
+        thompson_model_names = run_linear_thompson_sampling(
+            test_data=test_data,
+            trained_models=trained_models,
+            model_names=models_to_use,
+            dataset=dataset,
+            entity=entity,
+            iterations=50,
+            iteration=iteration,
+            explain=explain,
+        )
+        timing_dict['2_Thompson_Sampling'] = time.time() - start_time
+        mem_after = get_memory_usage_mb()
+        memory_dict['modules']['2_Thompson_Sampling'] = {
+            'before': mem_before,
+            'after': mem_after,
+            'delta': mem_after - mem_before
+        }
+        logger.info("  ✓ [Thompson] Top-5: %s | Time=%.4fs", thompson_model_names[:5],
+                    timing_dict['2_Thompson_Sampling'])
 
     # -------------------------
     # 3) GAN Robustness Testing
     # -------------------------
-    if not skip_gan:
+    if "gan" in stages and not skip_gan:
         logger.info("  📊 Sub-stage 6.3: GAN Robustness Testing...")
         mem_before = get_memory_usage_mb()
         start_time = time.time()
@@ -452,7 +516,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         # GAN creates its own perturbations internally
         test_data_for_gan = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
         gan_results = run_Gan(
-            test_data_for_gan, trained_models, algorithm_list_instances, dataset, entity
+            test_data_for_gan, trained_models, models_to_use, dataset, entity,
+            explain=explain
         )
         timing_dict['3_GAN_Robustness'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -469,59 +534,114 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
                     timing_dict['3_GAN_Robustness'])
         logger.info("     [GAN] PR names top-5: %s", Gan_ranked_by_pr_auc_names[:5])
     else:
-        logger.info("  ⏩ Sub-stage 6.3: GAN Robustness Testing SKIPPED (skip_gan=True)")
-        # Use empty placeholders for skipped GAN
-        Gan_ranked_by_f1 = []
-        Gan_ranked_by_pr_auc = []
-        Gan_ranked_by_f1_names = []
-        Gan_ranked_by_pr_auc_names = []
+        reason = "skip_gan=True" if ("gan" in stages and skip_gan) else "not in --stages"
+        logger.info(f"  ⏩ Sub-stage 6.3: GAN Robustness Testing SKIPPED ({reason})")
+        # Empty placeholders already set above for skipped GAN
         timing_dict['3_GAN_Robustness'] = 0.0
 
     # --------------------------------------------
     # 4) Off-by-threshold (borderline sensitivity)
     # --------------------------------------------
-    logger.info("  📊 Sub-stage 6.4: Off-by-Threshold Testing...")
-    mem_before = get_memory_usage_mb()
-    start_time = time.time()
-    # Use original un-injected data so synthetic spike labels don't cause single-class skips
-    test_data_for_borderline = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
-    ranked_by_f1, ranked_by_pr_auc, \
-    ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity = run_off_by_threshold(
-        test_data_for_borderline, trained_models, algorithm_list_instances, dataset, entity
-    )
-    timing_dict['4_Borderline_Sensitivity'] = time.time() - start_time
-    mem_after = get_memory_usage_mb()
-    memory_dict['modules']['4_Borderline_Sensitivity'] = {
-        'before': mem_before,
-        'after': mem_after,
-        'delta': mem_after - mem_before
-    }
-    logger.info("  ✓ [Borderline] F1 names top-5: %s | Time=%.4fs", ranked_by_f1_names_sensitivity[:5],
-                timing_dict['4_Borderline_Sensitivity'])
-    logger.info("     [Borderline] PR names top-5: %s", ranked_by_pr_auc_names_sensitivity[:5])
+    if "offby" in stages:
+        logger.info("  📊 Sub-stage 6.4: Off-by-Threshold Testing...")
+        mem_before = get_memory_usage_mb()
+        start_time = time.time()
+        # Use original un-injected data so synthetic spike labels don't cause single-class skips
+        test_data_for_borderline = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
+        ranked_by_f1, ranked_by_pr_auc, \
+        ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity = run_off_by_threshold(
+            test_data_for_borderline, trained_models, models_to_use, dataset, entity, explain=explain
+        )
+        timing_dict['4_Borderline_Sensitivity'] = time.time() - start_time
+        mem_after = get_memory_usage_mb()
+        memory_dict['modules']['4_Borderline_Sensitivity'] = {
+            'before': mem_before,
+            'after': mem_after,
+            'delta': mem_after - mem_before
+        }
+        logger.info("  ✓ [Borderline] F1 names top-5: %s | Time=%.4fs", ranked_by_f1_names_sensitivity[:5],
+                    timing_dict['4_Borderline_Sensitivity'])
+        logger.info("     [Borderline] PR names top-5: %s", ranked_by_pr_auc_names_sensitivity[:5])
 
     # ---------------------------------
     # 5) Monte Carlo (noise stress test)
     # ---------------------------------
-    logger.info("  📊 Sub-stage 6.5: Monte Carlo Simulation...")
-    mem_before = get_memory_usage_mb()
-    start_time = time.time()
-    # Use original un-injected data for the same reason
-    test_data_for_mc = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
-    monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR = run_monte_carlo_simulation(
-        test_data_for_mc, trained_models, algorithm_list_instances, dataset, entity,
-        n_simulations=2, noise_level=0.1,
-    )
-    timing_dict['5_Monte_Carlo'] = time.time() - start_time
-    mem_after = get_memory_usage_mb()
-    memory_dict['modules']['5_Monte_Carlo'] = {
-        'before': mem_before,
-        'after': mem_after,
-        'delta': mem_after - mem_before
-    }
-    logger.info("  ✓ [MonteCarlo] F1 names top-5: %s | Time=%.4fs", monte_carlo_ranked_models_F1[:5],
-                timing_dict['5_Monte_Carlo'])
-    logger.info("     [MonteCarlo] PR names top-5: %s", monte_carlo_ranked_models_PR[:5])
+    if "montecarlo" in stages:
+        logger.info("  📊 Sub-stage 6.5: Monte Carlo Simulation...")
+        mem_before = get_memory_usage_mb()
+        start_time = time.time()
+        # Use original un-injected data for the same reason
+        test_data_for_mc = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
+        monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR = run_monte_carlo_simulation(
+            test_data_for_mc, trained_models, models_to_use, dataset, entity,
+            n_simulations=2, noise_level=0.1, explain=explain,
+        )
+        timing_dict['5_Monte_Carlo'] = time.time() - start_time
+        mem_after = get_memory_usage_mb()
+        memory_dict['modules']['5_Monte_Carlo'] = {
+            'before': mem_before,
+            'after': mem_after,
+            'delta': mem_after - mem_before
+        }
+        logger.info("  ✓ [MonteCarlo] F1 names top-5: %s | Time=%.4fs", monte_carlo_ranked_models_F1[:5],
+                    timing_dict['5_Monte_Carlo'])
+        logger.info("     [MonteCarlo] PR names top-5: %s", monte_carlo_ranked_models_PR[:5])
+
+    # Builder for the 11-item return tuple, shared by the partial-run early return
+    # below and the full-run return at the end (captures current values at call time).
+    def _result():
+        return (
+            (thompson_model_names[0] if thompson_model_names else None),
+            robust_agg[1],
+            full_aggregated[1],
+            best_ensemble,
+            individual_predictions,
+            base_model_predictions_train,
+            base_model_predictions_test,
+            y_true_train,
+            y_true_test,
+            meta_model_type,
+            {
+                'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness},
+                'thompson': thompson_model_names,
+                'gan': {
+                    'f1_names': Gan_ranked_by_f1_names,
+                    'pr_auc_names': Gan_ranked_by_pr_auc_names,
+                    'f1_scores': Gan_ranked_by_f1,
+                    'pr_auc_scores': Gan_ranked_by_pr_auc,
+                    'best_model': Gan_ranked_by_f1_names[0] if len(Gan_ranked_by_f1_names) > 0 else 'N/A',
+                    'best_f1': Gan_ranked_by_f1[0][1][0]['f1'] if len(Gan_ranked_by_f1) > 0 else 0.0,
+                    'best_pr_auc': Gan_ranked_by_pr_auc[0][1][0]['pr_auc'] if len(Gan_ranked_by_pr_auc) > 0 else 0.0,
+                },
+                'borderline': {
+                    'f1_names': ranked_by_f1_names_sensitivity,
+                    'pr_auc_names': ranked_by_pr_auc_names_sensitivity,
+                    'f1_scores': ranked_by_f1,
+                    'pr_auc_scores': ranked_by_pr_auc,
+                    'best_model': ranked_by_f1_names_sensitivity[0] if len(ranked_by_f1_names_sensitivity) > 0 else 'N/A',
+                    'best_f1': ranked_by_f1[0][1][0]['f1'] if len(ranked_by_f1) > 0 else 0.0,
+                    'best_pr_auc': ranked_by_pr_auc[0][1][0]['pr_auc'] if len(ranked_by_pr_auc) > 0 else 0.0,
+                },
+                'monte_carlo': {
+                    'f1_names': monte_carlo_ranked_models_F1,
+                    'pr_auc_names': monte_carlo_ranked_models_PR,
+                    'best_model_f1': monte_carlo_ranked_models_F1[0] if len(monte_carlo_ranked_models_F1) > 0 else 'N/A',
+                    'best_model_pr_auc': monte_carlo_ranked_models_PR[0] if len(monte_carlo_ranked_models_PR) > 0 else 'N/A'
+                },
+                'robust_agg': robust_agg,
+                'full_aggregated': full_aggregated,
+                'timing': timing_dict,
+                'memory': memory_dict
+            }
+        )
+
+    # Partial run (strict subset of stages): rank aggregation needs all robustness
+    # tests + Thompson, so stop here and return what ran.
+    if stages != ALL_STAGES:
+        logger.info(f"  ⏩ Sub-stage 6.6: Rank Aggregation SKIPPED (partial run: {','.join(sorted(stages))})")
+        memory_dict['final'] = get_memory_usage_mb()
+        memory_dict['peak'] = get_peak_memory_mb()
+        return _result()
 
     # -----------------------
     # 6) Rank Aggregations
@@ -536,10 +656,26 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR,
     ]
     robust_agg = enhanced_markov_chain_rank_aggregator_text(test_for_rank)
+    explain_rank_aggregation(
+        rankings=test_for_rank,
+        source_names=["GAN_F1", "GAN_PR_AUC",
+                      "Borderline_F1", "Borderline_PR_AUC",
+                      "MonteCarlo_F1", "MonteCarlo_PR_AUC"],
+        full_ranking=robust_agg[1],
+        stage_name="robust",
+        dataset=dataset, entity=entity, iteration=iteration, explain=explain,
+    )
 
     # Final merge of robust aggregation vs Thompson Sampling
     full_ = [robust_agg[1], thompson_model_names]
     full_aggregated = enhanced_markov_chain_rank_aggregator_text(full_)
+    explain_rank_aggregation(
+        rankings=full_,
+        source_names=["Robust_Aggregated", "Thompson_Sampling"],
+        full_ranking=full_aggregated[1],
+        stage_name="final",
+        dataset=dataset, entity=entity, iteration=iteration, explain=explain,
+    )
     timing_dict['6_Rank_Aggregation'] = time.time() - start_time
     mem_after = get_memory_usage_mb()
     memory_dict['modules']['6_Rank_Aggregation'] = {
@@ -576,55 +712,10 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         f.write(f"{full_aggregated}\n")
 
     # Return extended tuple with all necessary data for comprehensive results
-    return (
-        thompson_model_names[0],
-        robust_agg[1],
-        full_aggregated[1],
-        best_ensemble,
-        individual_predictions,
-        base_model_predictions_train,
-        base_model_predictions_test,
-        y_true_train,
-        y_true_test,
-        meta_model_type,
-        # Additional data for comprehensive results
-        {
-            'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness},
-            'thompson': thompson_model_names,
-            'gan': {
-                'f1_names': Gan_ranked_by_f1_names, 
-                'pr_auc_names': Gan_ranked_by_pr_auc_names,
-                'f1_scores': Gan_ranked_by_f1,
-                'pr_auc_scores': Gan_ranked_by_pr_auc,
-                'best_model': Gan_ranked_by_f1_names[0] if len(Gan_ranked_by_f1_names) > 0 else 'N/A',
-                'best_f1': Gan_ranked_by_f1[0][1][0]['f1'] if len(Gan_ranked_by_f1) > 0 else 0.0,
-                'best_pr_auc': Gan_ranked_by_pr_auc[0][1][0]['pr_auc'] if len(Gan_ranked_by_pr_auc) > 0 else 0.0,
-            },
-            'borderline': {
-                'f1_names': ranked_by_f1_names_sensitivity, 
-                'pr_auc_names': ranked_by_pr_auc_names_sensitivity,
-                'f1_scores': ranked_by_f1,
-                'pr_auc_scores': ranked_by_pr_auc,
-                'best_model': ranked_by_f1_names_sensitivity[0] if len(ranked_by_f1_names_sensitivity) > 0 else 'N/A',
-                'best_f1': ranked_by_f1[0][1][0]['f1'] if len(ranked_by_f1) > 0 else 0.0,
-                'best_pr_auc': ranked_by_pr_auc[0][1][0]['pr_auc'] if len(ranked_by_pr_auc) > 0 else 0.0,
-            },
-            'monte_carlo': {
-                'f1_names': monte_carlo_ranked_models_F1, 
-                'pr_auc_names': monte_carlo_ranked_models_PR,
-                # Note: Monte Carlo returns names only, not scores
-                'best_model_f1': monte_carlo_ranked_models_F1[0] if len(monte_carlo_ranked_models_F1) > 0 else 'N/A',
-                'best_model_pr_auc': monte_carlo_ranked_models_PR[0] if len(monte_carlo_ranked_models_PR) > 0 else 'N/A'
-            },
-            'robust_agg': robust_agg,
-            'full_aggregated': full_aggregated,
-            'timing': timing_dict,
-            'memory': memory_dict
-        }
-    )
+    return _result()
 
 
-def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, iteration, trained_models, model_list=None, test_data_gan=None, skip_gan=False):
+def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, iteration, trained_models, model_list=None, test_data_gan=None, skip_gan=False, explain=False):
     """
     PARALLEL VERSION: Runs model selection algorithms concurrently using ThreadPoolExecutor.
     
@@ -686,7 +777,8 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             genetic_algorithm,
             dataset, entity, train_data, test_data_ga,
             models_to_use, trained_models,
-            20, 20, 'rf', 0.1
+            population_size=20, generations=20, meta_model_type='rf', mutation_rate=0.1,
+            explain=explain
         )
         thompson_future = executor.submit(
             run_linear_thompson_sampling,
@@ -697,24 +789,25 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             entity=entity,
             iterations=50,
             iteration=iteration,
+            explain=explain,
         )
         
         if not skip_gan:
             gan_future = executor.submit(
                 run_Gan,
                 test_data_gan_copy, trained_models, models_to_use,
-                dataset, entity
+                dataset, entity, explain=explain
             )
         
         borderline_future = executor.submit(
             run_off_by_threshold,
             test_data_borderline, trained_models, models_to_use,
-            dataset, entity
+            dataset, entity, explain=explain
         )
         monte_carlo_future = executor.submit(
             run_monte_carlo_simulation,
             test_data_montecarlo, trained_models, models_to_use,
-            dataset, entity, 2, 0.1
+            dataset, entity, 2, 0.1, explain=explain
         )
 
         # Collect results
@@ -795,8 +888,24 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR,
     ]
     robust_agg = enhanced_markov_chain_rank_aggregator_text(test_for_rank)
+    explain_rank_aggregation(
+        rankings=test_for_rank,
+        source_names=["GAN_F1", "GAN_PR_AUC",
+                      "Borderline_F1", "Borderline_PR_AUC",
+                      "MonteCarlo_F1", "MonteCarlo_PR_AUC"],
+        full_ranking=robust_agg[1],
+        stage_name="robust",
+        dataset=dataset, entity=entity, iteration=iteration, explain=explain,
+    )
     full_ = [robust_agg[1], thompson_model_names]
     full_aggregated = enhanced_markov_chain_rank_aggregator_text(full_)
+    explain_rank_aggregation(
+        rankings=full_,
+        source_names=["Robust_Aggregated", "Thompson_Sampling"],
+        full_ranking=full_aggregated[1],
+        stage_name="final",
+        dataset=dataset, entity=entity, iteration=iteration, explain=explain,
+    )
     timing_dict['6_Aggregation'] = time.time() - agg_start
     mem_after_agg = get_memory_usage_mb()
     memory_dict['modules']['6_Aggregation'] = {
@@ -1046,16 +1155,16 @@ def perform_reoptimization_task(
         (best_thompson, robust_agg, full_aggregated, best_ensemble,
          individual_predictions_new, base_model_predictions_train_new, base_model_predictions_test_new,
          y_true_train_new, y_true_test_new, meta_model_type_new, _) = run_model_selection_algorithms_2(
-            train_data, test_data_new_sliding, dataset, entity, iteration=window_idx, 
-            trained_models=trained_models, model_list=loaded_model_names, 
-            test_data_gan=test_data_before, skip_gan=True
+            train_data, test_data_new_sliding, dataset, entity, iteration=window_idx,
+            trained_models=trained_models, model_list=loaded_model_names,
+            test_data_gan=test_data_before, skip_gan=True, explain=explain
         )
     else:
         (best_thompson, robust_agg, full_aggregated, best_ensemble,
          individual_predictions_new, base_model_predictions_train_new, base_model_predictions_test_new,
          y_true_train_new, y_true_test_new, meta_model_type_new, _) = run_model_selection_algorithms_1(
-            train_data, test_data_new_sliding, dataset, entity, iteration=window_idx, 
-            model_list=loaded_model_names, test_data_gan=test_data_before, skip_gan=True
+            train_data, test_data_new_sliding, dataset, entity, iteration=window_idx,
+            model_list=loaded_model_names, test_data_gan=test_data_before, skip_gan=True, explain=explain
         )
     
     candidate_best_ensemble = best_ensemble.copy()
@@ -1084,11 +1193,20 @@ def run_app(algorithm_list, algorithm_list_instances):
     strategy = args.get('strategy', 'adaptive')  # adaptive, fixed-best, or fixed-random
     inject_online_regime = args.get('inject_online_regime', False)  # Regime shifts on online data only
     max_online_windows = args.get('max_online_windows', None)  # Limit online windows (None = no limit)
-    
+    explain = args.get('explain', False)  # Explainability OFF by default; --explain enables it
+    stages = set(args.get('stages', ALL_STAGES))  # Which stage-6 sub-stages to run
+    is_partial = stages != ALL_STAGES  # Strict subset → partial run (stop after selected stages)
+
+    # Which base detectors to select among. None (the default) means all of
+    # them; only the families of the requested detectors get trained.
+    requested_detectors = args.get('detectors')
+    detectors_to_load = list(requested_detectors or algorithm_list_instances)
+    families_to_train = families_for(detectors_to_load)
+
     data_dir = args['dataset_path']
-    
+
     logger.info("="*80)
-    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}")
+    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}, stages={','.join(sorted(stages))}, detectors={len(detectors_to_load)}/{len(algorithm_list_instances)}")
     logger.info("="*80)
     
     logger.info("📂 STAGE 1/7: Loading Training Data...")
@@ -1110,15 +1228,39 @@ def run_app(algorithm_list, algorithm_list_instances):
     if not train_data.entities:
         logger.error("Failed to load training data. Check dataset and paths.")
         return
-    if not test_data.entities:
-        logger.error("Failed to load test data. Check dataset and paths.")
-        return
+    # Univariate-only families are dropped from the pool HERE, the first point
+    # at which the channel count is known.
+    #
+    # Declaring the restriction is not enough on its own: nothing else consumed
+    # UNIVARIATE_FAMILIES, so selecting one of these on a multivariate entity
+    # reached `_TSBADEstimator._check_width`, whose ValueError is raised from
+    # inside `TrainModels.train_models` — a loop with no per-family recovery, so
+    # one unusable detector aborted training for every family after it. Dropping
+    # them up front turns that into a warning naming the detectors, and leaves
+    # the rest of the pool intact.
+    n_channels = test_data.entities[0].Y.shape[0]
+    if n_channels > 1:
+        dropped = [d for d in detectors_to_load
+                   if family_of(d) in UNIVARIATE_FAMILIES]
+        if dropped:
+            detectors_to_load = [d for d in detectors_to_load if d not in dropped]
+            families_to_train = families_for(detectors_to_load)
+            logger.warning(
+                f"⚠ Skipping {len(dropped)} univariate-only detector(s) on a "
+                f"{n_channels}-channel entity: {', '.join(dropped)}. "
+                f"Table I marks these 'U'; they run on UCR.")
+            if not detectors_to_load:
+                logger.error(
+                    "Every requested detector is univariate-only and this "
+                    f"entity has {n_channels} channels — nothing left to run. "
+                    "Select a multivariate detector, or run on UCR.")
+                return
 
     logger.info("🔧 STAGE 3/7: Training/Loading Models...")
     model_trainer = TrainModels(
         dataset=dataset,
         entity=entity,
-        algorithm_list=algorithm_list,
+        algorithm_list=families_to_train,
         downsampling=args['downsampling'],
         min_length=args['min_length'],
         root_dir=args['dataset_path'],
@@ -1138,12 +1280,27 @@ def run_app(algorithm_list, algorithm_list_instances):
         logger.info("  → Loading trained models from disk...")
         global trained_models
         models_dir = os.path.join(args['trained_model_path'], dataset, entity)
-        trained_models = load_trained_models(algorithm_list_instances, models_dir)
+        trained_models = load_trained_models(detectors_to_load, models_dir)
         if not trained_models:
             raise ValueError("No models loaded. Check model paths and ensure models are trained.")
-        
-        # Filter algorithm_list_instances to only include successfully loaded models
+
+        # Filter to only the detectors that actually loaded. A requested detector
+        # with no checkpoint degrades to "run without it, say so loudly" rather
+        # than failing the run — but below two detectors there is nothing to
+        # select between, and GA fitness / rank aggregation / the off-by
+        # pairwise surrogates would all be vacuous.
         loaded_model_names = list(trained_models.keys())
+        missing = [d for d in detectors_to_load if d not in trained_models]
+        if missing:
+            logger.warning(f"⚠ Requested detectors with no trained model (skipped): {', '.join(missing)}")
+        if len(loaded_model_names) < MIN_DETECTORS:
+            raise ValueError(
+                f"Need at least {MIN_DETECTORS} trained detectors to run model selection; "
+                f"got {len(loaded_model_names)} ({', '.join(loaded_model_names) or 'none'}). "
+                f"Train the missing models or widen --detectors.")
+        if len(loaded_model_names) < 3:
+            logger.warning(f"⚠ Only {len(loaded_model_names)} detectors available — ensemble and "
+                           f"ranking explanations will be degenerate.")
         logger.info(f"✓ Loaded {len(loaded_model_names)} models: {', '.join(loaded_model_names)}")
 
         logger.info("💉 STAGE 4/7: Injecting Synthetic Anomalies...")
@@ -1258,24 +1415,41 @@ def run_app(algorithm_list, algorithm_list_instances):
 
         # Start end-to-end timing
         e2e_start_time = time.time()
-        if use_parallel:
+        # Partial runs (a strict subset of stages) always take the sequential path
+        # and stop after the selected stages — see the early-exit just below.
+        if use_parallel and not is_partial:
             logger.info("  ⏱ Starting model selection pipeline (PARALLEL mode)...")
             (best_thompson, robust_agg, full_aggregated, best_ensemble,
              individual_predictions, base_model_predictions_train, base_model_predictions_test,
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_2(
-                train_data, test_data_new, dataset, entity, iteration=0, 
-                trained_models=trained_models, model_list=loaded_model_names, test_data_gan=test_data_before
+                train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
+                trained_models=trained_models, model_list=loaded_model_names,
+                test_data_gan=test_data_before, explain=explain
             )
         else:
-            logger.info("  ⏱ Starting model selection pipeline (SEQUENTIAL mode)...")
+            mode = f"PARTIAL: {','.join(sorted(stages))}" if is_partial else "SEQUENTIAL mode"
+            logger.info(f"  ⏱ Starting model selection pipeline ({mode})...")
             (best_thompson, robust_agg, full_aggregated, best_ensemble,
              individual_predictions, base_model_predictions_train, base_model_predictions_test,
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_1(
-                train_data, test_data_new, dataset, entity, iteration=0, model_list=loaded_model_names, test_data_gan=test_data_before
+                train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
+                model_list=loaded_model_names, test_data_gan=test_data_before, explain=explain,
+                stages=stages
             )
-        
+
         # Calculate end-to-end time
         e2e_time = time.time() - e2e_start_time
+
+        # Partial run: the selected stages (+ their explainability) are done. The
+        # downstream rank aggregation, ensemble-vs-single decision, comprehensive
+        # report and online phase all require the full set of stages, so stop here.
+        if is_partial:
+            logger.info("="*80)
+            logger.info(f"✅ Partial run complete (stages={','.join(sorted(stages))}). "
+                        f"Skipped rank aggregation, final decision, comprehensive report & online phase. "
+                        f"Time: {e2e_time:.2f}s")
+            logger.info("="*80)
+            return
         logger.info(f"✓ Model selection completed in {e2e_time:.2f}s ({e2e_time/60:.2f} min)")
         
         # Helper function to convert any value to scalar
@@ -1298,8 +1472,8 @@ def run_app(algorithm_list, algorithm_list_instances):
         ensemble_f1 = to_scalar(extra_results['ga']['f1'])
         ensemble_pr_auc = to_scalar(extra_results['ga']['pr_auc'])
         
-        # Get best single model from final aggregation
-        best_single_model = full_aggregated[1] if isinstance(full_aggregated, (list, tuple)) and len(full_aggregated) > 1 else full_aggregated
+        # Get best single model from final aggregation (top of the flat ranking list)
+        best_single_model = full_aggregated[0] if isinstance(full_aggregated, (list, tuple)) and len(full_aggregated) > 0 else full_aggregated
         
         # Evaluate Thompson Sampling best model on the SAME injected data the ensemble sees
         # (test_data_new). This keeps single-model and ensemble F1 directly comparable.
@@ -1402,6 +1576,56 @@ def run_app(algorithm_list, algorithm_list_instances):
         # Get memory dict from extra_results
         memory_dict = extra_results.get('memory', None)
         
+        # Global Intermediate Representation: combine the per-stage IR JSONs with
+        # the decision context (grounded LLM input; non-fatal). Runs BEFORE the
+        # comprehensive results are written so the LLM layer's runtime and
+        # memory land in the report like every other pipeline module.
+        if explain:
+            explain_mem_before = get_memory_usage_mb()
+            explain_start = time.time()
+            try:
+                from Explainability.ir import assemble_global_ir
+                ir_path = assemble_global_ir(results_dict, dataset, entity, OFFLINE_ITERATION)
+                logger.info(f"✓ Global explanation IR written to: {ir_path}")
+            except Exception as e:
+                logger.error(f"Global IR assembly failed (non-fatal): {e}")
+
+            # LLM narration over the IR files (non-fatal; skipped with a hint when
+            # no local LLM server is reachable). Regenerable any time via
+            # `python -m Explainability.narrate`.
+            try:
+                from Explainability.llm import (DEFAULT_BASE_URL, DEFAULT_MODEL,
+                                                LLMClient, narrate_entity)
+                llm_client = LLMClient(
+                    base_url=args.get('llm_base_url') or DEFAULT_BASE_URL,
+                    model=args.get('llm_model') or DEFAULT_MODEL)
+                logger.info(f"📝 Generating LLM narratives ({llm_client.model})...")
+                nl_report = narrate_entity(dataset, entity, OFFLINE_ITERATION, llm_client)
+                ov = nl_report['overall']
+                logger.info(f"✓ LLM narratives written "
+                            f"(hallucination {ov['hallucination_rate']:.3f}, "
+                            f"omission {ov['omission_rate']:.3f}): "
+                            f"{nl_report['faithfulness_txt']}")
+            except ConnectionError as e:
+                logger.warning(f"LLM narration skipped — {e}")
+            except Exception as e:
+                logger.error(f"LLM narration failed (non-fatal): {e}")
+
+            explain_mem_after = get_memory_usage_mb()
+            timing_dict['modules']['7_LLM_Explainability'] = time.time() - explain_start
+            if memory_dict is not None:
+                memory_dict.setdefault('modules', {})['7_LLM_Explainability'] = {
+                    'before': explain_mem_before,
+                    'after': explain_mem_after,
+                    'delta': explain_mem_after - explain_mem_before,
+                }
+                # The narration ran after the algorithms' final/peak snapshot;
+                # refresh so the report reflects the whole pipeline.
+                memory_dict['final'] = get_memory_usage_mb()
+                memory_dict['peak'] = get_peak_memory_mb()
+            e2e_time = time.time() - e2e_start_time
+            timing_dict['total'] = e2e_time
+
         logger.info("📝 STAGE 7/7: Writing Comprehensive Results...")
         # Write comprehensive results
         comp_results_dir = f"myresults/comprehensive/{dataset}/{entity}/"
@@ -1573,7 +1797,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                         anomaly_list, individual_predictions, base_model_predictions_train,
                         base_model_predictions_test, y_true_train, y_true_test, meta_model_type,
                         use_parallel, test_data_before, logger, current_best_ensemble, current_best_single,
-                        algorithm_list_instances
+                        loaded_model_names
                     )
                     pending_reopt_window = i
                     logger.info(f"  🚀 Background re-optimization task submitted for window {i}")
@@ -1619,7 +1843,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                     test_data_new_copy = copy.deepcopy(test_data_new)
                     values = fitness_function(
                         best_ensemble, train_data, test_data_new_copy, trained_models_new,
-                        individual_predictions, base_model_predictions_train, algorithm_list_instances,
+                        individual_predictions, base_model_predictions_train, loaded_model_names,
                         base_model_predictions_test, y_true_train, y_true_test,
                         meta_model_type=meta_model_type
                     )
@@ -1679,7 +1903,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                 f.write("="*80 + "\n")
                 f.write("RAMSeS Online Phase Timing Summary\n")
                 f.write("="*80 + "\n")
-                f.write(f"Dataset: {dataset}\n")
+                f.write(f"Dataset: {dataset_label(dataset)}\n")
                 f.write(f"Entity: {entity}\n")
                 f.write(f"Iteration: {iteration}\n")
                 f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")

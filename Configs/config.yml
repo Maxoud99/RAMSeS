@@ -5,8 +5,8 @@ overwrite: True  # MUST RETRAIN: Models have 10 features (bug), need 9 features 
 
 # Model training parameters
 downsampling: 10
-trained_model_path: "/raid0_ssd2/maxoud/projects/RAMSeS/Mononito/trained_models"
-dataset_path: "/raid0_ssd2/maxoud/projects/RAMSeS/Mononito/datasets"
+trained_model_path: "/Users/hasanerencoskun/Downloads/Dataset_Files_from_Mononito/Mononito/trained_models"
+dataset_path: "/Users/hasanerencoskun/Downloads/Dataset_Files_from_Mononito/Mononito/datasets"
 
 #docker path
 #trained_model_path: '/trained_models/'
@@ -19,7 +19,7 @@ model_architectures: 'all'
 
 # Model evaluation parametersq
 normalize: True
-results_path: "/raid0_ssd2/maxoud/projects/RAMSeS/Mononito/results"
+results_path: "/Users/hasanerencoskun/RAMSeS(1)/results"
 
 #docker path
 #results_path: '/results/'

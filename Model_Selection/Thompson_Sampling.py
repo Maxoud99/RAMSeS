@@ -1,8 +1,9 @@
 import copy
+import json
 import os
 import random
 import traceback
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 # from sklearn.metrics import f1_score, precision_recall_curve, auc
 from typing import Tuple
 
@@ -12,9 +13,29 @@ from loguru import logger
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import multivariate_normal
 
+from Utils.pipeline_spec import abbreviate_detector
+from Utils.plot_labels import draw_abbreviation_key
+
 from Metrics.Ensemble_GA import evaluate_individual_models
 from Metrics.Ensemble_GA import evaluate_model_consistently
-from Metrics.metrics import prauc, f1_score
+from Metrics.metrics import prauc, range_based_precision_recall_f1_auc
+
+
+def _ir_module():
+    """Import Explainability.ir, tolerating standalone by-path loading of this
+    module where the package root is not on sys.path — falls back to loading
+    ir.py directly by its file location."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
 
 
 def initialize_sliding_windows(data: np.ndarray, targets: np.ndarray, mask: np.ndarray, window_size: int,
@@ -63,7 +84,7 @@ def initialize_sliding_windows(data: np.ndarray, targets: np.ndarray, mask: np.n
 
 
 def sample_model(models: Dict[str, Any], means: Dict[str, np.ndarray], covariances: Dict[str, np.ndarray],
-                 epsilon: float, context: np.ndarray) -> str:
+                 epsilon: float, context: np.ndarray) -> Tuple[str, bool]:
     """
     Sample a model using Epsilon-Greedy or Linear Thompson Sampling strategy.
 
@@ -77,26 +98,29 @@ def sample_model(models: Dict[str, Any], means: Dict[str, np.ndarray], covarianc
       correct Linear Thompson Sampling selection criterion.
 
     Returns:
-    - str: The chosen model name.
+    - Tuple[str, bool]: (chosen model name, was_random) where was_random is True iff the
+      epsilon-greedy random branch fired. The flag enables downstream classification of
+      the selection as random / exploitation / informed_exploration.
     """
     if random.random() < epsilon:
         chosen_model = random.choice(list(models.keys()))
         logger.info(f"Epsilon-Greedy: Randomly chosen model {chosen_model}")
-    else:
-        x = context.flatten()  # shape: (d,)
-        samples = {}
-        for model_name, mean in means.items():
-            try:
-                # Draw a full sample theta_tilde ~ N(mu, Sigma)
-                theta_tilde = multivariate_normal.rvs(mean=mean.flatten(), cov=covariances[model_name])
-                # Compute expected reward: theta_tilde^T * x  (the "Linear" in LinTS)
-                samples[model_name] = float(np.dot(theta_tilde, x))
-            except ValueError as e:
-                logger.error(f"Error sampling model {model_name}: {e}")
-                raise
-        chosen_model = max(samples, key=samples.get)
-        logger.info(f"Linear Thompson Sampling: Chosen model {chosen_model} with expected reward {samples[chosen_model]:.4f}")
-    return chosen_model
+        return chosen_model, True
+
+    x = context.flatten()  # shape: (d,)
+    samples = {}
+    for model_name, mean in means.items():
+        try:
+            # Draw a full sample theta_tilde ~ N(mu, Sigma)
+            theta_tilde = multivariate_normal.rvs(mean=mean.flatten(), cov=covariances[model_name])
+            # Compute expected reward: theta_tilde^T * x  (the "Linear" in LinTS)
+            samples[model_name] = float(np.dot(theta_tilde, x))
+        except ValueError as e:
+            logger.error(f"Error sampling model {model_name}: {e}")
+            raise
+    chosen_model = max(samples, key=samples.get)
+    logger.info(f"Linear Thompson Sampling: Chosen model {chosen_model} with expected reward {samples[chosen_model]:.4f}")
+    return chosen_model, False
 
 
 def update_posteriors(means: Dict[str, np.ndarray], covariances: Dict[str, np.ndarray], model_name: str, reward: float,
@@ -179,11 +203,476 @@ def calculate_reward(f1: float, pr_auc: float, f1_weight: float, pr_auc_weight: 
     return (f1_weight * f1) + (pr_auc_weight * pr_auc)
 
 
+def compute_expected_rewards(means: Dict[str, np.ndarray], context: np.ndarray) -> Dict[str, float]:
+    """
+    Compute the expected reward for every model given current posterior means and a context vector.
+
+    E[reward | model_k, context_t] = mu_k^T * context_t
+
+    Parameters
+    ----------
+    means : Dict[str, np.ndarray]
+        Posterior mean vectors mu_k. Each may be 1-D (d,) or column (d, 1).
+    context : np.ndarray
+        The flattened data window at the current timestep, shape (d,).
+
+    Returns
+    -------
+    Dict[str, float]
+        Keys are model names; values are scalar expected rewards mu_k^T * x.
+        Values can be negative (standardised data, uninitialised means).
+    """
+    return {m: float(np.dot(mu.flatten(), context.flatten())) for m, mu in means.items()}
+
+
+def classify_selection(
+    chosen_model: str,
+    was_random: bool,
+    expected_rewards: Dict[str, float],
+) -> str:
+    """
+    Categorize a model selection into one of three behavioral states.
+
+    States
+    ------
+    - "random"               : ε-greedy random pick fired (exploration floor).
+    - "exploitation"         : chosen model equals argmax_k (mu_k^T * x) over current
+                               (pre-update) posterior means; the agent picked what it
+                               already believed was best.
+    - "informed_exploration" : chosen via Thompson sampling but differs from the mean-
+                               based argmax; posterior uncertainty steered the agent
+                               away from its mean-best guess.
+
+    Parameters
+    ----------
+    chosen_model : str
+        The model that was actually selected at this window.
+    was_random : bool
+        True iff ε-greedy fired. Takes precedence over the argmax comparison so that
+        an ε-greedy pick that happens to match the argmax is still labeled "random".
+    expected_rewards : Dict[str, float]
+        Output of compute_expected_rewards(means, context) using the PRE-update means
+        (the beliefs that informed this decision).
+
+    Returns
+    -------
+    str : one of {"random", "exploitation", "informed_exploration"}.
+    """
+    if was_random:
+        return "random"
+    expected_best = max(expected_rewards, key=expected_rewards.get)
+    return "exploitation" if chosen_model == expected_best else "informed_exploration"
+
+
+def compute_shap_values(mean: np.ndarray, context: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+    """
+    Per-feature SHAP attribution for a linear model E[R] = mean^T x.
+
+    Closed form for linear models (matches shap.LinearExplainer with
+    feature_dependence='independent'):
+
+        phi_0 = mean^T baseline          (baseline expected reward)
+        phi_i = mean_i * (x_i - baseline_i)
+        phi_0 + sum(phi) = mean^T x      (additivity guarantee)
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        Linear weights (the posterior mean mu_k). May be 1-D (d,) or column (d, 1).
+    context : np.ndarray
+        The instance to explain, shape (d,).
+    baseline : np.ndarray
+        The reference distribution mean E[X], shape (d,).
+
+    Returns
+    -------
+    np.ndarray
+        Per-feature SHAP attributions, shape (d,).
+    """
+    return mean.flatten() * (context.flatten() - baseline.flatten())
+
+
+def aggregate_shap_per_channel(shap_values: np.ndarray, n_channels: int) -> np.ndarray:
+    """
+    Sum SHAP values within each channel's window-of-timesteps slice.
+
+    The flattened feature vector is assumed to be reshape(n_channels, window_size)
+    flattened in C-order (numpy default), so feature i belongs to channel i // window_size.
+
+    If shap_values.size is not divisible by n_channels (should not happen after the
+    n_features fix), trailing entries are dropped.
+
+    Parameters
+    ----------
+    shap_values : np.ndarray
+        Per-feature SHAP values, shape (d,).
+    n_channels : int
+        Number of sensor channels.
+
+    Returns
+    -------
+    np.ndarray
+        Per-channel contributions, shape (n_channels,).
+    """
+    if n_channels <= 0:
+        return np.zeros(0)
+    window_size = shap_values.size // n_channels
+    if window_size == 0:
+        return np.zeros(n_channels)
+    return shap_values[: n_channels * window_size].reshape(n_channels, window_size).sum(axis=1)
+
+
+def reward_contribution_per_channel(mean: np.ndarray, context: np.ndarray,
+                                    n_channels: int) -> np.ndarray:
+    """
+    Split the expected reward mu^T x into one contribution per channel.
+
+    contrib(c) = sum over channel c's timesteps of mu_i * x_i, so the parts sum
+    to mu^T x EXACTLY — the model has no intercept, so there is no remainder.
+
+    This is the honest answer to "how much does this channel contribute to this
+    detector's expected reward". SHAP answers a different question: it measures
+    each channel's deviation from a TYPICAL window, so it explains only
+    mu^T x - mu^T baseline and discards the constant mu^T baseline, which is
+    usually the bulk of the prediction. Worse for any averaged view, the signed
+    SHAP average over all windows is identically zero by construction, because
+    the baseline IS the mean of those windows.
+
+    Signed: mu and the (L2-normalised) context can both be negative, so a
+    channel can pull the expected reward down.
+    """
+    if n_channels <= 0:
+        return np.zeros(0)
+    mu, x = mean.flatten(), context.flatten()
+    d = min(mu.size, x.size)
+    window_size = d // n_channels
+    if window_size == 0:
+        return np.zeros(n_channels)
+    keep = n_channels * window_size
+    return (mu[:keep] * x[:keep]).reshape(n_channels, window_size).sum(axis=1)
+
+
+def _per_channel_reward_map(
+    means: Dict[str, np.ndarray],
+    top_models: List[str],
+    context: np.ndarray,
+    n_channels: int,
+) -> Dict[str, np.ndarray]:
+    """Per-channel expected-reward contribution for each model at one context."""
+    return {m: reward_contribution_per_channel(means[m], context, n_channels)
+            for m in top_models}
+
+
+def _avg_per_channel_reward_map(
+    means: Dict[str, np.ndarray],
+    top_models: List[str],
+    contexts: List[np.ndarray],
+    n_channels: int,
+    means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Per-channel reward contribution averaged over a list of contexts.
+
+    No `absolute` switch, unlike the SHAP version: this average is not
+    structurally zero, so the signed mean is the meaningful quantity and there
+    is nothing to work around. Averaged over every window it is each channel's
+    share of the detector's expected reward on a typical window.
+
+    `means_per_context` explains window t with the beliefs held at window t;
+    the product mu*x is bilinear, so the per-window loop is the correct order.
+    """
+    out: Dict[str, np.ndarray] = {}
+    n = max(len(contexts), 1)
+    for m in top_models:
+        mu_fixed = means[m].flatten() if means_per_context is None else None
+        acc = np.zeros(n_channels)
+        for i, ctx in enumerate(contexts):
+            if mu_fixed is not None:
+                mu = mu_fixed
+            else:
+                if i >= len(means_per_context) or m not in means_per_context[i]:
+                    continue
+                mu = np.asarray(means_per_context[i][m]).flatten()
+            acc += reward_contribution_per_channel(mu, ctx, n_channels)
+        out[m] = acc / n
+    return out
+
+
+def aggregate_squared_per_channel(mean: np.ndarray, n_channels: int) -> np.ndarray:
+    """
+    Split the ranking score ||mu||^2 into one contribution per channel.
+
+    The ranking criterion is mu^T mu = sum_i mu_i^2, and the flattened feature
+    vector lays channels out in contiguous blocks of window_size timesteps (the
+    same layout aggregate_shap_per_channel assumes), so channel c contributes
+
+        contrib(c) = sum_{i in block c} mu_i^2
+
+    and sum_c contrib(c) == ||mu||^2 exactly. Unlike a SHAP attribution this is
+    a sum of squares, so **every contribution is non-negative**: it says how a
+    detector's score is divided among channels, never which channels pushed it
+    down. Only a comparison between two detectors (rank_gap_decomposition) is
+    signed.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The posterior mean mu_k. May be 1-D (d,) or column (d, 1).
+    n_channels : int
+        Number of sensor channels.
+
+    Returns
+    -------
+    np.ndarray
+        Per-channel contributions to ||mu||^2, shape (n_channels,), all >= 0.
+    """
+    if n_channels <= 0:
+        return np.zeros(0)
+    mu = mean.flatten()
+    window_size = mu.size // n_channels
+    if window_size == 0:
+        return np.zeros(n_channels)
+    block = mu[: n_channels * window_size].reshape(n_channels, window_size)
+    return np.square(block).sum(axis=1)
+
+
+def rank_gap_decomposition(mean_a: np.ndarray, mean_b: np.ndarray,
+                           n_channels: int) -> np.ndarray:
+    """
+    Split the ranking gap ||mu_a||^2 - ||mu_b||^2 into one term per channel.
+
+    This is the signed counterpart of aggregate_squared_per_channel: it sums to
+    the margin exactly, and a negative entry means that channel was worked in
+    B's favour, i.e. it cost A part of its lead. This — not the per-detector
+    split — is what answers "which channels put A ahead of B".
+
+    Returns
+    -------
+    np.ndarray
+        Per-channel signed contributions to the gap, shape (n_channels,).
+    """
+    return (aggregate_squared_per_channel(mean_a, n_channels)
+            - aggregate_squared_per_channel(mean_b, n_channels))
+
+
+def detect_regime_shifts(
+    expected_rewards_history: Dict[str, List[float]],
+    smoothing_window: int = 5,
+    min_regime_length: int = 3,
+) -> Tuple[List[Dict], List[str]]:
+    """
+    Detect sustained changes in the dominant model from expected-reward history.
+
+    A regime is a sustained period where one model holds the highest expected reward.
+    A regime shift is recorded when the new dominant model persists for at least
+    min_regime_length consecutive windows. Shorter changes are classified as blips.
+
+    Parameters
+    ----------
+    expected_rewards_history : Dict[str, List[float]]
+        Per-model expected reward sequences. NaN values (from skipped windows) are handled.
+    smoothing_window : int, default 5
+        Width of rolling mean used to suppress per-window noise (1 = no smoothing).
+    min_regime_length : int, default 3
+        Minimum consecutive windows a model must dominate to constitute a true regime.
+
+    Returns
+    -------
+    regime_shifts : List[Dict]
+        Each dict has keys: window, from_model, to_model, reward_delta, regime_length.
+        reward_delta is smoothed[to_model] - smoothed[from_model] at the shift window.
+        regime_length is the duration (windows) of the OLD regime.
+    blip_windows : List[str]
+        Human-readable labels for transient dominance changes below min_regime_length.
+    """
+    model_list = list(expected_rewards_history.keys())
+    if not model_list:
+        return [], []
+
+    T = len(expected_rewards_history[model_list[0]])
+    if T == 0:
+        return [], []
+
+    reward_matrix = np.array([expected_rewards_history[m] for m in model_list], dtype=float)
+
+    # Rolling mean smoothing per model; replace NaN with 0 for convolution stability
+    nan_mask = np.isnan(reward_matrix)
+    safe_matrix = np.where(nan_mask, 0.0, reward_matrix)
+    if smoothing_window > 1:
+        kernel = np.ones(smoothing_window) / smoothing_window
+        smoothed = np.array([np.convolve(safe_matrix[k], kernel, 'same') for k in range(len(model_list))])
+    else:
+        smoothed = safe_matrix.copy()
+
+    # Dominant model per window (None where all models have NaN)
+    all_nan = np.all(nan_mask, axis=0)
+    dominant = [
+        None if all_nan[t] else model_list[int(np.argmax(smoothed[:, t]))]
+        for t in range(T)
+    ]
+
+    # Run-length encode the non-None dominant sequence into segments
+    segments = []
+    i = 0
+    while i < T:
+        if dominant[i] is None:
+            i += 1
+            continue
+        j = i + 1
+        while j < T and dominant[j] == dominant[i]:
+            j += 1
+        segments.append((dominant[i], i, j - i))
+        i = j
+
+    if len(segments) <= 1:
+        return [], []
+
+    # Walk segments: sustained change → regime shift; short change → blip
+    regime_shifts = []
+    blip_windows = []
+    prev_model = segments[0][0]
+    prev_start = segments[0][1]
+
+    for model, start, length in segments[1:]:
+        if model == prev_model:
+            # Continuation of current regime after a blip sequence
+            continue
+        if length >= min_regime_length:
+            k_new = model_list.index(model)
+            k_old = model_list.index(prev_model)
+            regime_shifts.append({
+                'window': start,
+                'from_model': prev_model,
+                'to_model': model,
+                'reward_delta': float(smoothed[k_new, start] - smoothed[k_old, start]),
+                'regime_length': start - prev_start,
+            })
+            prev_model = model
+            prev_start = start
+        else:
+            for t in range(start, start + length):
+                blip_windows.append(f"window {t}: {prev_model} -> {model} (blip)")
+
+    return regime_shifts, blip_windows
+
+
+def reconstruct_regime_segments(
+    regime_shifts: List[Dict],
+    T: int,
+    fallback_model: str = 'N/A',
+) -> List[Tuple[int, int, str, int]]:
+    """
+    Rebuild contiguous regime segments from the list of regime-shift events.
+
+    Parameters
+    ----------
+    regime_shifts : List[Dict]
+        Output of detect_regime_shifts(); each dict has 'window', 'from_model',
+        'to_model'.
+    T : int
+        Total number of windows.
+    fallback_model : str
+        Model name to use for the single segment when there are no shifts.
+
+    Returns
+    -------
+    List[Tuple[int, int, str, int]]
+        One tuple per regime: (start, end_inclusive, dominant_model, duration).
+    """
+    if T <= 0:
+        return []
+    if regime_shifts:
+        starts = [0] + [s['window'] for s in regime_shifts]
+        ends = [s['window'] for s in regime_shifts] + [T]
+        models_seq = [regime_shifts[0]['from_model']] + [s['to_model'] for s in regime_shifts]
+        return [(rs, re - 1, rm, re - rs) for rm, rs, re in zip(models_seq, starts, ends)]
+    return [(0, T - 1, fallback_model, T)]
+
+
+def leadership_regimes(
+    means_history: List[Dict[str, np.ndarray]],
+    warmup: int = 10,
+) -> Tuple[List[Tuple[int, int, str, int]], int]:
+    """
+    Segment the run by whichever detector leads on the ranking score ||mu||^2.
+
+    Deliberately simpler than detect_regime_shifts(), which smooths expected
+    rewards and imposes a minimum length: here a regime is just a maximal run of
+    consecutive windows with the same argmax_k ||mu_k||^2 — no smoothing, no
+    minimum length. ||mu||^2 leadership is far stickier than expected-reward
+    leadership (it only moves in the windows where that arm was selected), so
+    plain run-length encoding already yields a handful of regimes rather than
+    one per handful of windows.
+
+    The first `warmup` windows are excluded: until every arm has been sampled at
+    least once most scores are still exactly zero, so leadership there is an
+    artefact of sampling order rather than a finding. The warm-up collapses to 0
+    on runs too short to spare it, and the value actually used is returned so
+    the explanation can state it instead of asserting a constant.
+
+    Reads the PRE-update means, keeping this stage on the single vintage the fit
+    loop snapshots (see _pre_means_hist) — every quantity here describes the
+    same moment. The post-update norms in _l2_norm_hist are the alternative.
+
+    Ties are resolved in favour of the incumbent leader, so an exact tie (all
+    scores zero, in practice) never manufactures a boundary; with no incumbent
+    the first name in sorted order wins, which keeps the result deterministic.
+
+    Parameters
+    ----------
+    means_history : List[Dict[str, np.ndarray]]
+        Per-window posterior means, one dict of {model: mu} per window.
+    warmup : int
+        Number of leading windows to exclude.
+
+    Returns
+    -------
+    Tuple[List[Tuple[int, int, str, int]], int]
+        (segments, warmup_used), segments as (start, end_inclusive, leader,
+        duration) with window indices on the original, un-trimmed timeline.
+    """
+    T = len(means_history)
+    if T <= 0:
+        return [], 0
+    warmup_used = warmup if (warmup > 0 and T > warmup + 2) else 0
+
+    segments: List[Tuple[int, int, str, int]] = []
+    leader: Optional[str] = None
+    start = warmup_used
+    for t in range(warmup_used, T):
+        scores = {m: float(np.dot(mu.flatten(), mu.flatten()))
+                  for m, mu in means_history[t].items()}
+        finite = {m: s for m, s in scores.items() if np.isfinite(s)}
+        if not finite:
+            # Every score unusable; carry the incumbent rather than inventing a
+            # boundary out of a failed window.
+            if leader is None:
+                continue
+            current = leader
+        else:
+            best = max(finite.values())
+            if leader is not None and np.isclose(finite.get(leader, -np.inf), best):
+                current = leader
+            else:
+                current = min(m for m, s in finite.items() if np.isclose(s, best))
+
+        if leader is None:
+            leader, start = current, t
+        elif current != leader:
+            segments.append((start, t - 1, leader, t - start))
+            leader, start = current, t
+
+    if leader is not None:
+        segments.append((start, T - 1, leader, T - start))
+    return segments, warmup_used
+
+
 def fit_linear_thompson_sampling(dataset,
                                  models: Dict[str, Any], data: np.ndarray, targets: np.ndarray,
                                  initial_epsilon: float = 0.2,
                                  epsilon_decay: float = 0.99, f1_weight: float = 0.7, pr_auc_weight: float = 0.3,
-                                 iterations: int = 100) -> Tuple[
+                                 iterations: int = 100,
+                                 explain: bool = False) -> Tuple[
     Dict[str, np.ndarray], Dict[str, np.ndarray], List[Dict[str, float]]]:
     """
     Fit models using Linear Thompson Sampling.
@@ -223,22 +712,45 @@ def fit_linear_thompson_sampling(dataset,
     epsilon = initial_epsilon
     history = []
     list_of_chosen_models = []
+    _exp_rewards_hist: Dict[str, List[float]] = {m: [] for m in models}
+    _pre_exp_rewards_hist: Dict[str, List[float]] = {m: [] for m in models}
+    _l2_norm_hist: Dict[str, List[float]] = {m: [] for m in models}
+    _selection_states: List[str] = []
+    _window_contexts: List[np.ndarray] = []
+    # Posterior means as they stood BEFORE each window's update — the beliefs that
+    # informed the decision. Every explainability quantity (regime detection,
+    # selection states, SHAP) reads from this one vintage so the stage never
+    # compares a detector against itself at two different points in its learning.
+    _pre_means_hist: List[Dict[str, np.ndarray]] = []
 
     for iteration in range(num_windows):
         logger.info(f"Iteration {iteration + 1}")
         try:
-            # Pass the current window as context so selection uses theta_tilde^T * x
+            # Pass the current window as context so selection uses theta_tilde^T * x.
             # Normalise to unit length so that datasets with large sensor values
             # (e.g. SMD with 38 channels) do not cause xxᵀ to explode and collapse Σ.
             context = data_windows[iteration].flatten()
-            context_norm = np.linalg.norm(context)
-            context = context / (context_norm + 1e-10)
-            chosen_model_name = sample_model(models, means, covariances, epsilon, context)
+            context = context / (np.linalg.norm(context) + 1e-10)
+            chosen_model_name, was_random = sample_model(models, means, covariances, epsilon, context)
         except ValueError as e:
             logger.error(f"Error sampling model: {e}")
             continue  # Skip to the next iteration on error
         chosen_model = models[chosen_model_name]
         list_of_chosen_models.append(chosen_model_name)
+
+        if explain:
+            # Expected rewards from the PRE-update means — the beliefs at the time
+            # of sampling. Used for classification and for the report's Dominant /
+            # Top E[Reward] columns (which describe the decision, not its aftermath).
+            pre_update_rewards = compute_expected_rewards(means, context)
+            _selection_states.append(classify_selection(chosen_model_name, was_random, pre_update_rewards))
+            for _m in models:
+                _pre_exp_rewards_hist[_m].append(pre_update_rewards[_m])
+            # Snapshot (copy — means are mutated in place) alongside the rewards
+            # so the two stay index-aligned even when a window is skipped.
+            _pre_means_hist.append({_m: means[_m].flatten().copy() for _m in models})
+            # Store the (L2-normalised) context so SHAP can be computed per window later.
+            _window_contexts.append(context)
 
         X_test_window = data_windows[iteration]
         y_test_window = targets_windows[iteration]
@@ -254,16 +766,43 @@ def fit_linear_thompson_sampling(dataset,
             y_true, y_scores, y_true_dict, y_scores_dict = evaluate_model_consistently(dataset, chosen_model,
                                                                                        chosen_model_name)
 
-            # _, _, f1, pr_auc, *_ = range_based_precision_recall_f1_auc(y_true, y_scores)
-            f1, precision, recall, TP, TN, FP, FN = f1_score(y_scores, y_true)
-            # f1, precision, recall, TP, TN, FP, FN = f1_soft_score(y_scores, y_true)
-            # f1 = get_composite_fscore_raw(y_scores, y_true)
+            # `f1_score` counts TP as `sum(predict * actual)`, so it is an F1 only
+            # when `predict` is 0/1. This line used to hand it raw `entity_scores`,
+            # and the arithmetic still ran — it just stopped measuring anything:
+            # `1 - predict` became `1 - 0.83`, and `precision` reduced to
+            # `sum(s*y) / sum(s)`, which has no bound once a score can be negative.
+            #
+            # LSTMVAE is the one detector that makes it negative. Its score is a
+            # Gaussian NLL, 0.5*(log(var) + (y-mu)^2/var), and the log term goes
+            # below zero whenever the predicted sigma is under 1 — measured on
+            # skab/1, sigma stays in [0.127, 0.657], so 71.9% of timesteps score
+            # negative. That drove sum(s) toward zero and the ratio through it:
+            # the "F1" reached 8.52 and the reward 4.32, where both belong in
+            # [0, 1]. LinTS absorbed the inflated reward, and `rank_models` scores
+            # by ||mu||^2, which squares it — LSTMVAE took the top four ranking
+            # slots on an entity where it is the worst of the twelve by every
+            # honest metric (full-series reward 0.023-0.029 vs RNN's 0.060-0.066).
+            #
+            # The range-based metric thresholds internally over its own sweep, so
+            # it never sees a raw score as a prediction, and it is what the other
+            # seven call sites use (Monte_Carlo_Simulation:99, off_by:200,
+            # GAN_test:251, Adversarial_testing:74, model_stress_testing:177,
+            # Ensemble_GA:269, ranking_metrics:83). Thompson was the only stage
+            # that did not. Cost is linear in window length and it runs once per
+            # window, for the chosen detector only: 44 ms/call on skab's 4-step
+            # windows (~5 s per run) and 488 ms on SMD's 47-step windows (~49 s).
+            #
+            # pr_auc is left on `prauc` — it was never affected by this, and it is
+            # a different (point-adjusted) metric, so moving it would shift results
+            # for a reason unrelated to the defect. Taking both from the one call
+            # would match the other stages exactly and save a sweep.
+            _, _, f1, _range_pr_auc, _ = range_based_precision_recall_f1_auc(y_true, y_scores)
 
             pr_auc = prauc(y_true, y_scores)
             reward = calculate_reward(f1, pr_auc, f1_weight, pr_auc_weight)
             # Normalise features to unit length — must match the normalisation applied
-            # to context in sample_model so that θ̃ᵀx (selection) and the posterior
-            # update operate in the same feature space.
+            # to context above so that θ̃ᵀx (selection) and the posterior update operate
+            # in the same feature space.
             features = X_test_window.flatten()
             features = features / (np.linalg.norm(features) + 1e-10)
 
@@ -279,15 +818,33 @@ def fit_linear_thompson_sampling(dataset,
             logger.debug(f"Covariance matrix shape: {covariances[chosen_model_name].shape}")
 
             update_posteriors(means, covariances, chosen_model_name, reward, features)
+
+            if explain:
+                for _m, _mu in means.items():
+                    _exp_rewards_hist[_m].append(float(np.dot(_mu.flatten(), context)))
+                    _l2_norm_hist[_m].append(float(np.dot(_mu.flatten(), _mu.flatten())))
+
             logger.info(
                 f"Window {iteration + 1}: Model {chosen_model_name} - F1 Score = {f1}, PR AUC = {pr_auc}, Reward = {reward}")
-            logger.info(f"Means: {means}")
-            logger.info(f"Covariances: {covariances}")
+            # Norms, not the arrays. Printing every mu and every d-by-d Sigma
+            # here cost 628 lines PER WINDOW — 95% of a run's log, and enough to
+            # push every stage banner out of the WebUI's 20,000-line ring buffer
+            # before the run finished. ||mu||^2 is the ranking criterion itself,
+            # so this line still tracks what the arrays were being read for.
+            # logger.info(f"Means: {means}")
+            # logger.info(f"Covariances: {covariances}")
+            logger.info("Posterior norms: " + ", ".join(
+                f"{_m}: ||mu||^2={float(np.dot(_mu.flatten(), _mu.flatten())):.6g}"
+                for _m, _mu in means.items()))
 
         except Exception as e:
             logger.error(f"Error evaluating model {chosen_model_name}: {e}")
             detailed_traceback = traceback.format_exc()
             print(detailed_traceback)
+            if explain:
+                for _m in models:
+                    _exp_rewards_hist[_m].append(float('nan'))
+                    _l2_norm_hist[_m].append(float('nan'))
             continue  # Skip the current iteration on error
 
         epsilon *= epsilon_decay
@@ -295,6 +852,31 @@ def fit_linear_thompson_sampling(dataset,
         history.append({model_name: means[model_name].flatten() for model_name in models})
         logger.info(f"Finished iteration {iteration + 1}")
 
+    if explain:
+        # Build the SHAP payload from the per-window contexts the bandit actually
+        # processed (_window_contexts), which stays index-aligned with the regime
+        # detection and the explainability histories. Each context is already
+        # L2-normalised. all_contexts enables per-window / per-regime SHAP plots.
+        n_channels = data_windows[0].shape[0] if data_windows else 0
+        if _window_contexts:
+            baseline_context = np.mean(_window_contexts, axis=0)
+            explanation_context = _window_contexts[-1]
+        else:
+            baseline_context = np.zeros(n_features)
+            explanation_context = np.zeros(n_features)
+        shap_payload = {
+            "explanation_context": explanation_context,
+            "baseline_context": baseline_context,
+            "all_contexts": _window_contexts,
+            "n_channels": n_channels,
+            # Per-window pre-update means; SHAP uses means_history[t] with
+            # all_contexts[t] so every attribution reflects the beliefs held
+            # when that window was decided.
+            "means_history": _pre_means_hist,
+        }
+        return (means, covariances, history, list_of_chosen_models,
+                _exp_rewards_hist, _l2_norm_hist, _selection_states,
+                _pre_exp_rewards_hist, shap_payload)
     return means, covariances, history, list_of_chosen_models
 
 
@@ -355,7 +937,8 @@ def plot_history(history: List[Dict[str, np.ndarray]], models: Dict[str, Any],
     for model_name in models.keys():
         raw_scores = [calculate_score(h[model_name]) for h in history]
         smoothed_scores = gaussian_filter1d(raw_scores, sigma=2)  # Set sigma=0 to disable smoothing
-        ax.plot(range(len(history)), smoothed_scores, label=model_name, linewidth=1.4)
+        ax.plot(range(len(history)), smoothed_scores,
+                label=model_name, linewidth=1.4)
 
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Score')
@@ -369,6 +952,1854 @@ def plot_history(history: List[Dict[str, np.ndarray]], models: Dict[str, Any],
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f'{directory}/history_plot_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
     plt.close()
+
+
+def plot_expected_rewards(
+    expected_rewards_history: Dict[str, List[float]],
+    regime_shifts: List[Dict],
+    model_names: List[str],
+    dataset: str,
+    entity: str,
+    iterations: int,
+    smooth: bool = False,
+) -> None:
+    """
+    Plot expected reward evolution for all models with regimes annotated.
+
+    Regime regions are shaded by dominant model, regime boundaries are marked
+    with dashed vertical lines, and every regime is labelled at its centre
+    (vertically) with the model that dominates it.
+
+    smooth : bool
+        When False (default) each trajectory is the raw per-window value, saved
+        as expected_rewards_{iterations}.png. When True each trajectory is
+        Gaussian-smoothed (sigma=2) and saved as
+        expected_rewards_smoothed_{iterations}.png. Both variants are produced
+        per run so the raw and smoothed views can be compared side by side.
+    """
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10
+    })
+
+    T = len(next(iter(expected_rewards_history.values()))) if expected_rewards_history else 0
+    colour_map = {name: plt.cm.tab20(i / max(len(model_names), 1)) for i, name in enumerate(model_names)}
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for model_name in model_names:
+        raw = np.array(expected_rewards_history.get(model_name, []), dtype=float)
+        if raw.size == 0:
+            continue
+        nan_mean = float(np.nanmean(raw)) if not np.all(np.isnan(raw)) else 0.0
+        nan_free = np.where(np.isnan(raw), nan_mean, raw)
+        series = gaussian_filter1d(nan_free, sigma=2) if smooth else nan_free
+        # SHORTENED: up to 107 legend entries stacked beside the axes, where a
+        # full name pushes the legend over the plot. `draw_abbreviation_key`
+        # below says what the short form stands for.
+        ax.plot(range(T), series, label=abbreviate_detector(model_name),
+                linewidth=1.4, color=colour_map[model_name])
+
+    # Shade each regime, mark every boundary, and label every regime with the
+    # model that dominates it — written vertically, centred in the regime span.
+    if T > 0 and model_names:
+        segments = reconstruct_regime_segments(regime_shifts, T, fallback_model=model_names[0])
+        y_top = ax.get_ylim()[1]
+        for (start, end, rm, _duration) in segments:
+            if rm in colour_map:
+                ax.axvspan(start, end + 1, alpha=0.08, color=colour_map[rm], lw=0)
+            center = (start + end + 1) / 2.0
+            # Shortened to match the legend, so one detector is not spelled two
+            # ways inside one figure.
+            ax.text(center, y_top * 0.97, abbreviate_detector(rm), fontsize=8,
+                    ha='center', va='top', rotation=90, fontweight='bold',
+                    alpha=0.85)
+        for shift in regime_shifts:
+            ax.axvline(x=shift['window'], color='black', linestyle='--', linewidth=0.9, alpha=0.7)
+
+    title_suffix = ' (smoothed)' if smooth else ''
+    ax.set_xlabel('Window')
+    ax.set_ylabel('Expected Reward (mu_k^T * x_t)')
+    ax.set_title('Expected Reward Trajectories Over Windows' + title_suffix)
+    ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+    # One column, matching plot_ranking_score_trace: two columns of up to 107
+    # detectors is wider than the axes it sits beside, and the eye has to track
+    # a colour across a gap to use it. Font one step down so the single column
+    # still fits the figure's height.
+    ax.legend(loc='upper left', ncol=1, frameon=False, fontsize=8,
+              bbox_to_anchor=(1.01, 1), borderaxespad=0)
+    # One legend entry per detector, up to 107 of them, so the short form stays
+    # and the key below says what it stands for.
+    draw_abbreviation_key(fig, model_names)
+    plt.tight_layout(pad=1.2)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    fname = (f'expected_rewards_smoothed_{iterations}.png' if smooth
+             else f'expected_rewards_{iterations}.png')
+    plt.savefig(f'{directory}/{fname}', format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_selection_states(
+    selection_states: List[str],
+    dataset: str,
+    entity: str,
+    iterations: int,
+) -> None:
+    """
+    Visualize the per-window selection state (random / exploitation / informed_exploration).
+
+    Two stacked subplots:
+      - Top: a per-window coloured timeline strip showing the state at each window.
+      - Bottom: a bar chart with total counts and percentage labels.
+
+    Saves to myresults/Thomposon/{dataset}/{entity}/selection_states_{iterations}.png.
+    """
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
+    state_colours = {
+        "random":               "#d62728",  # red
+        "exploitation":         "#2ca02c",  # green
+        "informed_exploration": "#1f77b4",  # blue
+    }
+    state_order = ["random", "exploitation", "informed_exploration"]
+
+    T = len(selection_states)
+    counts = {s: selection_states.count(s) for s in state_order}
+    total = max(T, 1)
+
+    fig, (ax_strip, ax_bar) = plt.subplots(
+        2, 1, figsize=(10, 4), gridspec_kw={"height_ratios": [1, 3]}
+    )
+
+    # Top: timeline strip — one coloured cell per window
+    strip_colours = [state_colours.get(s, "#888888") for s in selection_states]
+    for t, c in enumerate(strip_colours):
+        ax_strip.axvspan(t, t + 1, color=c, lw=0)
+    ax_strip.set_xlim(0, max(T, 1))
+    ax_strip.set_ylim(0, 1)
+    ax_strip.set_yticks([])
+    ax_strip.set_xlabel('Window')
+    ax_strip.set_title('Selection State Timeline')
+
+    # Bottom: bar chart of counts with percentage annotations
+    bars = ax_bar.bar(
+        state_order,
+        [counts[s] for s in state_order],
+        color=[state_colours[s] for s in state_order],
+    )
+    for bar, s in zip(bars, state_order):
+        pct = 100.0 * counts[s] / total
+        ax_bar.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{counts[s]} ({pct:.1f}%)",
+            ha='center', va='bottom', fontsize=10,
+        )
+    ax_bar.set_ylabel('Window Count')
+    ax_bar.set_title('Selection State Totals')
+    ax_bar.grid(True, axis='y', linestyle='--', linewidth=0.5, alpha=0.7)
+
+    # Legend outside the plot area
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color=state_colours[s], label=s) for s in state_order
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc='center left',
+        bbox_to_anchor=(1.0, 0.5),
+        frameon=False,
+    )
+
+    plt.tight_layout(pad=1.2)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.savefig(f'{directory}/selection_states_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _top_k_models_by_norm(means: Dict[str, np.ndarray], k: int) -> List[str]:
+    """Return the names of the top-k models by ||mu||^2."""
+    ranked = sorted(
+        {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means.items()}.items(),
+        key=lambda x: x[1], reverse=True,
+    )
+    return [name for name, _ in ranked[:k]]
+
+
+def _top_k_models_by_expected_reward(
+    means: Dict[str, np.ndarray],
+    contexts: List[np.ndarray],
+    k: int,
+    means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
+) -> List[str]:
+    """
+    Return the top-k models by expected reward mu·x averaged over the given
+    contexts.
+
+    means_per_context : the beliefs held at each context, aligned with
+        `contexts`. Supplying it makes the selection read the same mu·x the run
+        actually saw at each window — which is what the regime prose ranks by
+        (pre_expected_rewards_history) and what the plotted bars are computed
+        from. Falling back to the final `means` here would let a plot show three
+        detectors while the sentence beside it named a different runner-up.
+    """
+    if not contexts or not means:
+        return list(means.keys())[:k]
+    totals: Dict[str, float] = {m: 0.0 for m in means}
+    for i, ctx in enumerate(contexts):
+        at = means
+        if means_per_context and i < len(means_per_context) and means_per_context[i]:
+            at = {m: np.asarray(v).reshape(-1, 1)
+                  for m, v in means_per_context[i].items()}
+        for m, v in compute_expected_rewards(at, ctx).items():
+            if m in totals:
+                totals[m] += v
+    ranked = sorted(totals.items(), key=lambda x: x[1], reverse=True)
+    return [name for name, _ in ranked[:k]]
+
+
+def _per_channel_shap_map(
+    means: Dict[str, np.ndarray],
+    top_models: List[str],
+    context: np.ndarray,
+    baseline: np.ndarray,
+    n_channels: int,
+) -> Dict[str, np.ndarray]:
+    """Per-channel SHAP for each model at a single context (raw, signed)."""
+    return {
+        m: aggregate_shap_per_channel(
+            compute_shap_values(means[m].flatten(), context, baseline), n_channels)
+        for m in top_models
+    }
+
+
+def _fresh_plot_dir(directory: str) -> str:
+    """
+    Create `directory` and drop the .png files a previous run left there.
+
+    Plot filenames embed the window range (e.g. regime_01_w0-4_NN_3.png), so a
+    run with different regime boundaries writes new names and the stale ones
+    linger — leaving several runs' plots side by side in one folder. Only .png
+    files directly inside this generated directory are removed.
+    """
+    os.makedirs(directory, exist_ok=True)
+    try:
+        for name in os.listdir(directory):
+            if name.lower().endswith('.png'):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+    except OSError as e:
+        logger.warning(f"Could not clear stale plots in {directory}: {e}")
+    return directory
+
+
+def _avg_per_channel_shap_map(
+    means: Dict[str, np.ndarray],
+    top_models: List[str],
+    contexts: List[np.ndarray],
+    baseline: np.ndarray,
+    n_channels: int,
+    absolute: bool = False,
+    means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Per-channel SHAP for each model, averaged over a list of contexts.
+
+    absolute=False : raw signed average (meaningful for a regime, whose mean
+                     context differs from the global baseline).
+    absolute=True  : mean of |per-channel SHAP| — the standard SHAP global-
+                     importance measure. Required for the whole-data average,
+                     where the raw signed average is identically zero because
+                     the baseline IS the mean of all contexts.
+
+    means_per_context : the pre-update means for each context, index-aligned with
+        `contexts`. When given, context t is explained with the beliefs held at
+        window t. SHAP is bilinear in (mu, x), so the average of the per-window
+        attributions is NOT the attribution of the averaged mean at the averaged
+        context — the per-window loop below is the correct order.
+    """
+    out: Dict[str, np.ndarray] = {}
+    n = max(len(contexts), 1)
+    for m in top_models:
+        mu_fixed = means[m].flatten() if means_per_context is None else None
+        acc = np.zeros(n_channels)
+        for i, ctx in enumerate(contexts):
+            if mu_fixed is not None:
+                mu = mu_fixed
+            else:
+                if i >= len(means_per_context) or m not in means_per_context[i]:
+                    continue
+                mu = np.asarray(means_per_context[i][m]).flatten()
+            pc = aggregate_shap_per_channel(compute_shap_values(mu, ctx, baseline), n_channels)
+            acc += np.abs(pc) if absolute else pc
+        out[m] = acc / n
+    return out
+
+
+def _render_shap_comparison(
+    per_channel_by_model: Dict[str, np.ndarray],
+    top_models: List[str],
+    top_n_channels: int,
+    title: str,
+    save_path: str,
+    ylabel: str = 'Per-channel SHAP contribution',
+    n_channels_total: Optional[int] = None,
+    note: Optional[str] = None,
+) -> None:
+    """
+    Shared grouped-bar renderer for per-channel comparison plots. Channels shown
+    are the union of each model's top_n_channels by |per-channel value|. One bar
+    per model per channel; legend placed outside the plot area.
+
+    `ylabel` names the quantity: the SHAP stage leaves the default, the ranking
+    stage passes the ||mu||^2 wording. Everything else about the two is identical,
+    so they share this renderer rather than a near-copy of it.
+
+    A footnote stating the channel-selection rule is added automatically, and
+    `note` is prepended to it. Every one of these figures shows a SUBSET of the
+    channels — datasets here carry 9 to 38 — and a reader cannot tell from the
+    bars alone whether an absent channel was small or simply not plotted. The
+    rule is generated here rather than written out at each call site so it can
+    never drift from the selection the code just performed.
+    """
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
+    candidate_channels: set = set()
+    for m in top_models:
+        per_channel = per_channel_by_model[m]
+        order = np.argsort(np.abs(per_channel))[::-1][:top_n_channels]
+        candidate_channels.update(int(c) for c in order)
+    channels = sorted(candidate_channels)
+    if not channels:
+        return
+
+    n_models = len(top_models)
+    bar_width = 0.8 / max(n_models, 1)
+    x_base = np.arange(len(channels))
+    colour_map = {name: plt.cm.tab20(i / max(n_models, 1)) for i, name in enumerate(top_models)}
+
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(channels) + 4), 5))
+    for i, m in enumerate(top_models):
+        vals = per_channel_by_model[m][channels]
+        ax.bar(x_base + i * bar_width, vals, bar_width,
+               label=m, color=colour_map[m])
+
+    ax.axhline(0, color='black', linewidth=0.6)
+    ax.set_xticks(x_base + bar_width * (n_models - 1) / 2)
+    ax.set_xticklabels([f"ch{c}" for c in channels], rotation=45, ha='right')
+    ax.set_xlabel('Channel')
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, axis='y', linestyle='--', linewidth=0.5, alpha=0.6)
+    ax.legend(loc='upper left', frameon=False, bbox_to_anchor=(1.01, 1), borderaxespad=0)
+
+    scope = (f"{len(channels)} of {n_channels_total}" if n_channels_total
+             else f"{len(channels)}")
+    rule = (f"Channels shown ({scope}): the union over the plotted detectors of "
+            f"each one's {top_n_channels} largest |values|. A channel absent "
+            f"here was outside every plotted detector's top {top_n_channels}, "
+            f"not necessarily zero.")
+    ax.text(0.0, -0.17, ((note + "  ") if note else "") + rule,
+            transform=ax.transAxes, fontsize=7.5, color='dimgrey',
+            va='top', ha='left', wrap=True)
+
+    plt.tight_layout(pad=1.2)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_shap_per_model(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 10,
+) -> None:
+    """
+    For the top_k_models (by ||mu||^2), draw horizontal bar charts of the
+    top_n_channels with the largest |per-channel SHAP| contribution at the
+    explanation context. Bars are coloured by sign (green > 0, red < 0).
+
+    Saves to myresults/Thomposon/{dataset}/{entity}/shap_per_model_{iterations}.png.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
+    context = shap_payload["explanation_context"]
+    baseline = shap_payload["baseline_context"]
+    n_channels = shap_payload["n_channels"]
+
+    top_models = _top_k_models_by_norm(means, top_k_models)
+    k = len(top_models)
+    if k == 0:
+        return
+
+    fig, axes = plt.subplots(k, 1, figsize=(8, max(2.2 * k, 3.0)))
+    if k == 1:
+        axes = [axes]
+
+    for ax, model_name in zip(axes, top_models):
+        mu = means[model_name].flatten()
+        shap_vals = compute_shap_values(mu, context, baseline)
+        per_channel = aggregate_shap_per_channel(shap_vals, n_channels)
+        e_r = float(np.dot(mu, context))
+
+        order = np.argsort(np.abs(per_channel))[::-1][:top_n_channels]
+        vals = per_channel[order]
+        labels = [f"ch{c}" for c in order]
+        colours = ["#2ca02c" if v >= 0 else "#d62728" for v in vals]
+
+        y_pos = np.arange(len(order))
+        ax.barh(y_pos, vals, color=colours)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels)
+        ax.invert_yaxis()
+        ax.axvline(0, color='black', linewidth=0.6)
+        ax.set_xlabel('Per-channel SHAP contribution')
+        ax.set_title(f"{model_name}  |  E[R | last] = {e_r:+.4f}")
+        ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
+
+    plt.tight_layout(pad=1.2)
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.savefig(f'{directory}/shap_per_model_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_shap_comparison(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+) -> None:
+    """
+    Grouped bar chart comparing models on the channels most relevant to their
+    disagreement at the last window. Channels shown are the union of each model's
+    top_n_channels by |per-channel SHAP|.
+
+    all_models : bool
+        When False (default) the top_k_models by ||mu||^2 are shown, saved as
+        shap_comparison_{iterations}.png. When True every model is shown, saved
+        as shap_comparison_all_{iterations}.png.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+
+    context = shap_payload["explanation_context"]
+    baseline = shap_payload["baseline_context"]
+    n_channels = shap_payload["n_channels"]
+
+    if all_models:
+        sel_models = _top_k_models_by_norm(means, len(means))
+        suffix, title = '_all', 'SHAP Comparison Across All Models (at last window)'
+    else:
+        sel_models = _top_k_models_by_norm(means, top_k_models)
+        suffix, title = '', 'SHAP Comparison Across Top Models (at last window)'
+    if not sel_models:
+        return
+
+    per_channel = _per_channel_shap_map(means, sel_models, context, baseline, n_channels)
+    _render_shap_comparison(
+        per_channel, sel_models, top_n_channels,
+        title=title,
+        save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_comparison{suffix}_{iterations}.png',
+        n_channels_total=n_channels,
+    )
+
+
+def plot_shap_per_window(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+    sample_stride: Optional[int] = None,
+) -> None:
+    """
+    One SHAP comparison plot per window (raw signed per-channel SHAP), in the
+    same style as shap_comparison.
+
+    all_models : bool
+        When False (default) each window's plot shows the top_k_models by
+        expected reward (mu·x) at that window's context; saved under
+        shap_per_window_{iterations}/. When True every model is shown; saved
+        under shap_per_window_all_{iterations}/.
+    sample_stride : Optional[int]
+        When set (e.g. 10) only every `sample_stride`-th window is plotted
+        (window 0, 10, 20, …), saved under shap_per_window_every{stride}_{iterations}/.
+        Useful for a quick overview without one plot per window.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    baseline = shap_payload["baseline_context"]
+    n_channels = shap_payload["n_channels"]
+
+    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
+    base = "shap_per_window_all" if all_models else "shap_per_window"
+    if sample_stride and sample_stride > 1:
+        base = f"{base}_every{sample_stride}"
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    mu_hist = shap_payload.get("means_history") or []
+    for t, ctx in enumerate(contexts):
+        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
+            continue
+        # Beliefs held at window t, so the plot explains the decision that was
+        # actually made there rather than re-reading it with end-of-run knowledge.
+        means_t = ({m: v.reshape(-1, 1) for m, v in mu_hist[t].items()}
+                   if t < len(mu_hist) else means)
+        if all_models:
+            sel_models = every_model
+            title = f'SHAP — window {t} (all models)'
+        else:
+            sel_models = _top_k_models_by_expected_reward(means_t, [ctx], top_k_models)
+            title = f'SHAP — window {t} (top {top_k_models} by E[R] in window)'
+        per_channel = _per_channel_shap_map(means_t, sel_models, ctx, baseline, n_channels)
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            n_channels_total=n_channels,
+        )
+
+
+def plot_shap_per_regime(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    regime_shifts: List[Dict],
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+) -> None:
+    """
+    One SHAP comparison plot per regime, showing the raw signed per-channel SHAP
+    averaged over that regime's windows. A regime's mean context differs from the
+    global baseline, so the signed average is meaningful (and direction-bearing).
+
+    all_models : bool
+        When False (default) each regime's plot shows the top_k_models by
+        expected reward (mu·x) averaged over that regime's windows; saved under
+        shap_per_regime_{iterations}/. When True every model is shown; saved
+        under shap_per_regime_all_{iterations}/.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    baseline = shap_payload["baseline_context"]
+    n_channels = shap_payload["n_channels"]
+
+    fallback = _top_k_models_by_norm(means, 1)[0]
+    segments = reconstruct_regime_segments(regime_shifts, len(contexts),
+                                           fallback_model=fallback)
+    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
+    folder = f'shap_per_regime_all_{iterations}' if all_models else f'shap_per_regime_{iterations}'
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
+    mu_hist = shap_payload.get("means_history") or []
+    # 0-based to match the report's "Regime 0" and the IR's ts.regime.0.* ids;
+    # the filenames are what a reader cross-references against the prose.
+    for i, (start, end, model, _duration) in enumerate(segments):
+        regime_ctx = contexts[start:end + 1]
+        if not regime_ctx:
+            continue
+        regime_mu = mu_hist[start:end + 1] if mu_hist else None
+        if all_models:
+            sel_models = every_model
+            title = f'SHAP — regime {i} ({model}, windows {start}-{end}, all models)'
+        else:
+            sel_models = _top_k_models_by_expected_reward(
+                means, regime_ctx, top_k_models, means_per_context=regime_mu)
+            title = (f'SHAP — regime {i} ({model}, windows {start}-{end}, '
+                     f'top {top_k_models} by E[R] in regime)')
+        per_channel = _avg_per_channel_shap_map(
+            means, sel_models, regime_ctx, baseline, n_channels, absolute=False,
+            means_per_context=regime_mu)
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
+            n_channels_total=n_channels,
+            note=(f'SHAP averaged over the {end - start + 1} windows of this regime.'),
+        )
+
+
+_REWARD_YLABEL = r'Contribution to expected reward  $\mu^\top x$'
+
+
+def plot_reward_per_window(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+    sample_stride: Optional[int] = None,
+) -> None:
+    """
+    Per-channel split of the expected reward, one plot per window — the sibling
+    of plot_shap_per_window, and the one whose bars sum to the prediction.
+
+    Same folders and same frame names as the SHAP sets so the two can be read
+    frame for frame: reward_per_window{,_all,_every{stride}}_{iterations}/.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    n_channels = shap_payload["n_channels"]
+
+    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
+    base = "reward_per_window_all" if all_models else "reward_per_window"
+    if sample_stride and sample_stride > 1:
+        base = f"{base}_every{sample_stride}"
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    mu_hist = shap_payload.get("means_history") or []
+    for t, ctx in enumerate(contexts):
+        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
+            continue
+        # Beliefs held at window t, so the plot explains the decision actually
+        # made there rather than re-reading it with end-of-run knowledge.
+        means_t = ({m: v.reshape(-1, 1) for m, v in mu_hist[t].items()}
+                   if t < len(mu_hist) else means)
+        if all_models:
+            sel_models = every_model
+            title = f'Expected-reward contribution — window {t} (all models)'
+        else:
+            sel_models = _top_k_models_by_expected_reward(means_t, [ctx], top_k_models)
+            title = (f'Expected-reward contribution — window {t} '
+                     f'(top {top_k_models} by E[R] in window)')
+        per_channel = _per_channel_reward_map(means_t, sel_models, ctx, n_channels)
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            ylabel=_REWARD_YLABEL,
+            n_channels_total=n_channels,
+            note=(f"Each detector's bars sum to its expected reward at window "
+                  f"{t}; no baseline is subtracted."),
+        )
+
+
+def plot_reward_per_regime(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    regime_shifts: List[Dict],
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = False,
+) -> None:
+    """
+    Per-channel expected-reward contribution averaged over each regime's
+    windows — the sibling of plot_shap_per_regime, and the default view beside
+    the regime prose.
+
+    Filenames match the SHAP set exactly (0-based index, window range, leader)
+    so one joiner pairs either set with the same regime sentence.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    n_channels = shap_payload["n_channels"]
+
+    fallback = _top_k_models_by_norm(means, 1)[0]
+    segments = reconstruct_regime_segments(regime_shifts, len(contexts),
+                                           fallback_model=fallback)
+    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
+    folder = (f'reward_per_regime_all_{iterations}' if all_models
+              else f'reward_per_regime_{iterations}')
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
+    mu_hist = shap_payload.get("means_history") or []
+    for i, (start, end, model, _duration) in enumerate(segments):
+        regime_ctx = contexts[start:end + 1]
+        if not regime_ctx:
+            continue
+        regime_mu = mu_hist[start:end + 1] if mu_hist else None
+        if all_models:
+            sel_models = every_model
+            title = (f'Expected-reward contribution — regime {i} ({model}, '
+                     f'windows {start}-{end}, all models)')
+        else:
+            sel_models = _top_k_models_by_expected_reward(
+                means, regime_ctx, top_k_models, means_per_context=regime_mu)
+            title = (f'Expected-reward contribution — regime {i} ({model}, '
+                     f'windows {start}-{end}, top {top_k_models} by E[R] in regime)')
+        per_channel = _avg_per_channel_reward_map(
+            means, sel_models, regime_ctx, n_channels, means_per_context=regime_mu)
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
+            ylabel=_REWARD_YLABEL,
+            n_channels_total=n_channels,
+            note=(f"Averaged over the {end - start + 1} windows of this regime; "
+                  f"each detector's bars sum to its mean expected reward here."),
+        )
+
+
+def plot_reward_average_all(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = True,
+) -> None:
+    """
+    One figure for the whole run: each channel's mean contribution to a
+    detector's expected reward, averaged over every window.
+
+    This replaces mean|SHAP| as the run-level summary. The signed SHAP average
+    over all windows is identically zero — the baseline IS the mean of those
+    windows — which forced the old figure onto absolute values, and mean|SHAP|
+    measures how much a channel's influence VARIES, not how much it contributes.
+    This average has no such defect: it is signed, non-degenerate, and its bars
+    sum to the detector's expected reward on a typical window.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    n_channels = shap_payload["n_channels"]
+
+    if all_models:
+        sel_models = _top_k_models_by_norm(means, len(means))
+        suffix, scope = 'all', 'all models'
+    else:
+        sel_models = _top_k_models_by_expected_reward(means, contexts, top_k_models)
+        suffix, scope = f'top{top_k_models}', f'top {top_k_models} by E[R]'
+
+    per_channel = _avg_per_channel_reward_map(
+        means, sel_models, contexts, n_channels,
+        means_per_context=shap_payload.get("means_history") or None)
+    _render_shap_comparison(
+        per_channel, sel_models, top_n_channels,
+        title=f'Mean expected-reward contribution across all windows — {scope}',
+        save_path=(f'myresults/Thomposon/{dataset}/{entity}/'
+                   f'reward_average_{suffix}_{iterations}.png'),
+        ylabel=_REWARD_YLABEL,
+        n_channels_total=n_channels,
+        note=("Averaged over every window; each detector's bars sum to its "
+              "expected reward on a typical window."),
+    )
+
+
+def plot_shap_average_all(
+    means: Dict[str, np.ndarray],
+    shap_payload: Dict,
+    dataset: str,
+    entity: str,
+    iterations: int,
+    top_k_models: int = 3,
+    top_n_channels: int = 9,
+    all_models: bool = True,
+) -> None:
+    """
+    A single SHAP comparison plot summarising the whole run: the mean of
+    |per-channel SHAP| across all windows (the standard SHAP global-importance
+    measure). The raw signed average over all windows is identically zero — the
+    baseline IS the mean of all contexts — so absolute values are used here.
+
+    all_models : bool
+        When True (default) every model is shown, saved as
+        shap_average_all_{iterations}.png. When False only the top_k_models by
+        expected reward (mu·x) averaged over the whole run are shown, saved as
+        shap_average_top3_{iterations}.png.
+    """
+    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
+        return
+    contexts = shap_payload.get("all_contexts", [])
+    if not contexts or not means:
+        return
+    baseline = shap_payload["baseline_context"]
+    n_channels = shap_payload["n_channels"]
+
+    if all_models:
+        # Every model, ordered by ||mu||^2 for a stable, meaningful legend order.
+        sel_models = _top_k_models_by_norm(means, len(means))
+        suffix = 'all'
+        title = 'Mean |SHAP| Across All Windows — all models (global importance)'
+    else:
+        sel_models = _top_k_models_by_expected_reward(means, contexts, top_k_models)
+        suffix = f'top{top_k_models}'
+        title = (f'Mean |SHAP| Across All Windows — top {top_k_models} by E[R] '
+                 '(global importance)')
+
+    per_channel = _avg_per_channel_shap_map(
+        means, sel_models, contexts, baseline, n_channels, absolute=True,
+        means_per_context=shap_payload.get("means_history") or None)
+    _render_shap_comparison(
+        per_channel, sel_models, top_n_channels,
+        title=title,
+        save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_average_{suffix}_{iterations}.png',
+        n_channels_total=n_channels,
+    )
+
+
+def explain_thompson_sampling(
+    means: Dict[str, np.ndarray],
+    expected_rewards_history: Dict[str, List[float]],
+    l2_norm_history: Dict[str, List[float]],
+    pre_expected_rewards_history: Dict[str, List[float]],
+    list_of_chosen_models: List[str],
+    regime_shifts: List[Dict],
+    blip_windows: List[str],
+    selection_states: List[str],
+    shap_payload: Optional[Dict],
+    dataset: str,
+    entity: str,
+    iterations: int,
+) -> None:
+    """
+    Write a structured plain-text explainability report to disk.
+
+    Sections: header, per-window table (chosen model, dominant model, top expected
+    reward, selection state), regime summary, shift events, blips, selection state
+    summary, SHAP feature attribution (when shap_payload is provided), SHAP preference
+    decomposition, and final ranking by ||mu_k||^2.
+
+    The Dominant / Top E[Reward] columns are computed from pre_expected_rewards_history
+    — the expected rewards at the *time of sampling* (pre-update means). When every
+    model's expected reward is identical (e.g. window 0, all means still the zero
+    vector) there is no meaningful winner, so both columns print 'N/A'.
+
+    Saves to myresults/Thomposon/{dataset}/{entity}/explainability_{iterations}.txt.
+    """
+    model_list = list(expected_rewards_history.keys())
+    T = len(list_of_chosen_models)
+
+    # Per-window dominant model + top expected reward, computed from the PRE-update
+    # means (the beliefs at the time of sampling). 'N/A' when all rewards are tied
+    # (e.g. window 0, where every mean vector is still the zero vector).
+    dominant_per_window: List[str] = []
+    top_reward_per_window: List[Optional[float]] = []
+    for t in range(T):
+        rewards_at_t = {
+            m: pre_expected_rewards_history[m][t]
+            for m in model_list
+            if t < len(pre_expected_rewards_history[m]) and not np.isnan(pre_expected_rewards_history[m][t])
+        }
+        if rewards_at_t and max(rewards_at_t.values()) != min(rewards_at_t.values()):
+            dom = max(rewards_at_t, key=rewards_at_t.get)
+            dominant_per_window.append(dom)
+            top_reward_per_window.append(rewards_at_t[dom])
+        else:
+            dominant_per_window.append('N/A')
+            top_reward_per_window.append(None)
+
+    # Reconstruct regime segments from shift events. The no-shift fallback uses the
+    # most frequent dominant model (window 0 is 'N/A' and not a meaningful fallback).
+    _valid_doms = [d for d in dominant_per_window if d != 'N/A']
+    first_dom = max(set(_valid_doms), key=_valid_doms.count) if _valid_doms else 'N/A'
+    regime_segments = reconstruct_regime_segments(regime_shifts, T, fallback_model=first_dom)
+
+    # Per-regime story blocks: regime-mean expected rewards (from the recorded
+    # pre-update beliefs), the leader's SHAP channels on the regime-aggregated
+    # context, and the leader-vs-runner-up preference decomposition. Computed
+    # ONCE here and consumed by BOTH the report below and the Intermediate
+    # Representation, so the two always match.
+    regimes_data: List[Dict[str, Any]] = []
+    try:
+        all_ctx = (shap_payload or {}).get("all_contexts") or []
+        base_ctx = (shap_payload or {}).get("baseline_context")
+        n_ch = int((shap_payload or {}).get("n_channels", 0) or 0)
+        # Pre-update means per window; empty falls back to the final means.
+        mu_hist = (shap_payload or {}).get("means_history") or []
+        for seg_idx, (seg_s, seg_e, seg_m, seg_dur) in enumerate(regime_segments):
+            seg_end = min(int(seg_e), T - 1)
+            seg_start = max(int(seg_s), 0)
+            reg_rewards: Dict[str, float] = {}
+            for m in model_list:
+                hist = pre_expected_rewards_history.get(m, [])
+                vals = [hist[t] for t in range(seg_start, seg_end + 1)
+                        if t < len(hist) and hist[t] is not None and not np.isnan(hist[t])]
+                if vals:
+                    reg_rewards[m] = float(np.mean(vals))
+            top3 = sorted(reg_rewards.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            gap = (top3[0][1] - top3[1][1]) if len(top3) >= 2 else float('nan')
+            leader = seg_m if seg_m in means else (top3[0][0] if top3 else None)
+            runner = next((m for m, _ in top3 if m != leader), None)
+
+            # Channel contributions are split by SIGN before truncation: a
+            # magnitude-sorted signed list invites "driven by" phrasings whose
+            # top entries actually push the other way. Top-3 per direction.
+            def _split_by_sign(vals: np.ndarray) -> Tuple[list, list]:
+                pos = [(int(c), float(vals[c])) for c in np.argsort(vals)[::-1]
+                       if vals[c] > 0][:3]
+                neg = [(int(c), float(vals[c])) for c in np.argsort(vals)
+                       if vals[c] < 0][:3]
+                return pos, neg
+
+            shap_raising = shap_lowering = None
+            reward_raising = reward_lowering = None
+            pref_favor_leader = pref_favor_runner = None
+            edge_favor_leader = edge_favor_runner = None
+            pref_gap = float('nan')
+            edge_gap = float('nan')
+            if leader is not None and n_ch > 0 and len(all_ctx) > seg_end:
+                # Per-window attribution with the beliefs held at that window,
+                # then averaged over the regime. SHAP is bilinear in (mu, x), so
+                # this is NOT the same as explaining the averaged mean at the
+                # averaged context — and only this order makes the channel
+                # deltas sum to the regime's reported mean-reward gap.
+                win = range(seg_start, seg_end + 1)
+                mu_at = (lambda t, m: np.asarray(mu_hist[t][m]).flatten()
+                         if t < len(mu_hist) and m in mu_hist[t]
+                         else means[m].flatten())
+                n_win = max(len(win), 1)
+                pc_l = np.zeros(n_ch)
+                pc_r = np.zeros(n_ch)
+                rc_l = np.zeros(n_ch)          # raw expected-reward contribution
+                rc_r = np.zeros(n_ch)
+                gap_acc = 0.0
+                edge_acc = 0.0
+                have_runner = runner is not None and runner in means
+                for t in win:
+                    ctx_t = np.asarray(all_ctx[t], dtype=float)
+                    mu_l = mu_at(t, leader)
+                    pc_l += aggregate_shap_per_channel(
+                        compute_shap_values(mu_l, ctx_t, base_ctx), n_ch)
+                    rc_l += reward_contribution_per_channel(mu_l, ctx_t, n_ch)
+                    if have_runner:
+                        mu_r = mu_at(t, runner)
+                        pc_r += aggregate_shap_per_channel(
+                            compute_shap_values(mu_r, ctx_t, base_ctx), n_ch)
+                        rc_r += reward_contribution_per_channel(mu_r, ctx_t, n_ch)
+                        gap_acc += float(np.dot(mu_l - mu_r, ctx_t - base_ctx))
+                        edge_acc += float(np.dot(mu_l - mu_r, ctx_t))
+                pc_l /= n_win
+                rc_l /= n_win
+                # What the leader's expected reward is actually MADE OF here.
+                # These sum to its mean expected reward over the regime, which
+                # the SHAP split cannot claim — it drops the mu.baseline term.
+                reward_raising, reward_lowering = _split_by_sign(rc_l)
+                shap_raising, shap_lowering = _split_by_sign(pc_l)
+                if have_runner:
+                    pc_r /= n_win
+                    rc_r /= n_win
+                    # The narrated edge: the leader's own expected-reward split
+                    # minus the runner-up's. These deltas sum to the gap in
+                    # expected reward the regime is actually decided by — the
+                    # same quantity `reward_gap` reports — so the sentence's
+                    # channel and its headline number describe one thing.
+                    edge_gap = edge_acc / n_win
+                    edge_favor_leader, edge_favor_runner = _split_by_sign(rc_l - rc_r)
+                    delta = pc_l - pc_r
+                    # Baseline-relative, so the channel deltas sum to it exactly.
+                    pref_gap = gap_acc / n_win
+                    pref_favor_leader, pref_favor_runner = _split_by_sign(delta)
+
+            regimes_data.append({
+                "index": seg_idx, "start": seg_start, "end": seg_end,
+                "duration": int(seg_dur), "leader": leader,
+                "rewards_top": top3, "reward_gap": gap, "runner_up": runner,
+                # The narrated channels: what the leader's expected reward is
+                # made of here. SHAP's split rides along for the deviation
+                # clause and the alternate plot, but no longer leads.
+                "reward_raising": reward_raising, "reward_lowering": reward_lowering,
+                "shap_raising": shap_raising, "shap_lowering": shap_lowering,
+                # The leader's edge over the runner-up in the SAME units as the
+                # clause before it — a slice of expected reward, not a
+                # baseline-relative deviation.
+                "edge_favor_leader": edge_favor_leader,
+                "edge_favor_runner": edge_favor_runner,
+                "edge_gap": edge_gap,
+                # The SHAP version of the same comparison, kept machine-readable
+                # for the alternate per-regime plot; it no longer feeds the prose.
+                "pref_favor_leader": pref_favor_leader,
+                "pref_favor_runner": pref_favor_runner,
+                "pref_gap": pref_gap,
+            })
+    except Exception as e:
+        logger.error(f"Thompson per-regime computation failed (non-fatal): {e}")
+        regimes_data = []
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    output_file = os.path.join(directory, f'explainability_{iterations}.txt')
+
+    with open(output_file, 'w') as f:
+        f.write("=== Thompson Sampling Explainability Report ===\n")
+        f.write(f"Dataset: {dataset}  |  Entity: {entity}  |  Windows: {T}\n\n")
+
+        f.write("--- Per-Window Summary ---\n")
+        f.write("(Dominant / Top E[Reward] reflect the beliefs at the time of sampling)\n")
+        f.write(f"{'Window':>8}  {'Chosen':>12}  {'Dominant':>12}  {'Top E[Reward]':>14}  {'State':>22}\n")
+        f.write("-" * 76 + "\n")
+        for t in range(T):
+            chosen = list_of_chosen_models[t] if t < len(list_of_chosen_models) else 'N/A'
+            dominant = dominant_per_window[t]
+            top_reward = top_reward_per_window[t]
+            top_str = f"{top_reward:.4f}" if top_reward is not None else "N/A"
+            state = selection_states[t] if t < len(selection_states) else 'N/A'
+            f.write(f"{t:>8}  {chosen:>12}  {dominant:>12}  {top_str:>14}  {state:>22}\n")
+
+        f.write("\n--- Regime Summary ---\n")
+        f.write(f"{'Start':>8}  {'End':>8}  {'Model':>12}  {'Duration':>10}\n")
+        f.write("-" * 44 + "\n")
+        for rs, re, rm, dur in regime_segments:
+            f.write(f"{rs:>8}  {re:>8}  {rm:>12}  {dur:>10} windows\n")
+
+        f.write("\n--- Regime Shift Events ---\n")
+        if regime_shifts:
+            f.write(f"{'Window':>8}  {'From':>12}  {'To':>12}  {'Delta':>10}  {'Old Regime Len':>16}\n")
+            f.write("-" * 64 + "\n")
+            for s in regime_shifts:
+                f.write(f"{s['window']:>8}  {s['from_model']:>12}  {s['to_model']:>12}  "
+                        f"{s['reward_delta']:>10.4f}  {s['regime_length']:>16} windows\n")
+        else:
+            f.write("No regime shifts detected.\n")
+
+        f.write("\n--- Brief Blips ---\n")
+        if blip_windows:
+            for b in blip_windows:
+                f.write(f"  {b}\n")
+        else:
+            f.write("No blips detected.\n")
+
+        f.write("\n--- Per-Regime Expected Rewards & Channel Attribution ---\n")
+        f.write("(Mean E[reward] over each regime's windows from the recorded pre-update\n")
+        f.write(" beliefs. Two channel splits, both averaged over the regime's windows\n")
+        f.write(" using the beliefs held at each one. CONTRIBUTION is the raw split of\n")
+        f.write(" mu.x, whose parts sum to E[reward]; DEVIATION is the SHAP split, which\n")
+        f.write(" measures departure from the run's average window and sums to nothing\n")
+        f.write(" a reader can name. Matches the Intermediate Representation.)\n")
+        if not regimes_data:
+            f.write("Not available.\n")
+        for r in regimes_data:
+            f.write(f"\nRegime {r['index']}: windows {r['start']}-{r['end']} "
+                    f"({r['duration']} windows), led by {r['leader']}\n")
+            if r["rewards_top"]:
+                rw = ", ".join(f"{m} {v:+.4f}" for m, v in r["rewards_top"])
+                gap_s = (f";  leader-vs-runner-up mean-reward gap {r['reward_gap']:+.4f}"
+                         if not np.isnan(r["reward_gap"]) else "")
+                f.write(f"  Mean E[reward]: {rw}{gap_s}\n")
+            if r["reward_raising"] or r["reward_lowering"]:
+                raise_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["reward_raising"] or [])) or "none"
+                lower_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["reward_lowering"] or [])) or "none"
+                f.write(f"  CONTRIBUTION — channels supplying {r['leader']}'s "
+                        f"E[reward]: {raise_s}\n")
+                f.write(f"  CONTRIBUTION — channels reducing it: {lower_s}\n")
+            if r["shap_raising"] or r["shap_lowering"]:
+                raise_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["shap_raising"] or [])) or "none"
+                lower_s = ", ".join(f"ch {c} {v:+.4f}"
+                                    for c, v in (r["shap_lowering"] or [])) or "none"
+                f.write(f"  DEVIATION — channels above their usual contribution: "
+                        f"{raise_s}\n")
+                f.write(f"  DEVIATION — channels below it: {lower_s}\n")
+            # The narrated edge, in contribution units: these deltas sum to the
+            # leader-vs-runner-up gap in expected reward reported above.
+            has_edge = r.get("edge_favor_leader") or r.get("edge_favor_runner")
+            if has_edge and r["runner_up"] and not np.isnan(r.get("edge_gap", float('nan'))):
+                favored = r["leader"] if r["edge_gap"] >= 0 else r["runner_up"]
+                fl = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["edge_favor_leader"] or [])) or "none"
+                fr = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["edge_favor_runner"] or [])) or "none"
+                f.write(f"  EDGE (contribution) {r['leader']} vs {r['runner_up']}: "
+                        f"E[reward] favors {favored} by {abs(r['edge_gap']):.4f}\n")
+                f.write(f"    channels favoring {r['leader']}: {fl}\n")
+                f.write(f"    channels favoring {r['runner_up']}: {fr}\n")
+            has_pref = r["pref_favor_leader"] or r["pref_favor_runner"]
+            if has_pref and r["runner_up"] and not np.isnan(r["pref_gap"]):
+                favored = r["leader"] if r["pref_gap"] >= 0 else r["runner_up"]
+                fl = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["pref_favor_leader"] or [])) or "none"
+                fr = ", ".join(f"ch {c} {d:+.4f}"
+                               for c, d in (r["pref_favor_runner"] or [])) or "none"
+                f.write(f"  EDGE (deviation) {r['leader']} vs {r['runner_up']}: linear "
+                        f"preference score at the regime-average context favors "
+                        f"{favored} by {abs(r['pref_gap']):.4f}\n")
+                f.write(f"    channels favoring {r['leader']}: {fl}\n")
+                f.write(f"    channels favoring {r['runner_up']}: {fr}\n")
+
+        f.write("\n--- Selection State Summary ---\n")
+        state_order = ["random", "exploitation", "informed_exploration"]
+        state_counts = {s: selection_states.count(s) for s in state_order}
+        state_total = max(len(selection_states), 1)
+        for s in state_order:
+            pct = 100.0 * state_counts[s] / state_total
+            f.write(f"  {s:<22}: {state_counts[s]:>5} ({pct:5.1f}%)\n")
+
+        # SHAP feature attribution & cross-model preference decomposition
+        if shap_payload and shap_payload.get("n_channels", 0) > 0:
+            ctx = shap_payload["explanation_context"]
+            base = shap_payload["baseline_context"]
+            n_ch = shap_payload["n_channels"]
+
+            f.write("\n--- SHAP Feature Attribution (final mean vectors) ---\n")
+            f.write("Explanation context : last window (L2-normalised)\n")
+            f.write("Baseline            : mean over all L2-normalised windows\n")
+            f.write("Per-feature phi_i   = mu_i * (x_i - baseline_i)\n")
+            f.write("Per-channel         = sum of phi_i over the channel's window timesteps\n\n")
+
+            top_models = _top_k_models_by_norm(means, 3)
+            per_channel_by_model: Dict[str, np.ndarray] = {}
+            for rank, model_name in enumerate(top_models, 1):
+                mu = means[model_name].flatten()
+                shap_vals = compute_shap_values(mu, ctx, base)
+                per_ch = aggregate_shap_per_channel(shap_vals, n_ch)
+                per_channel_by_model[model_name] = per_ch
+                e_r = float(np.dot(mu, ctx))
+                e_r_base = float(np.dot(mu, base))
+                delta = e_r - e_r_base
+                f.write(f"  {rank}. {model_name}  "
+                        f"(E[R | last] = {e_r:+.4f},  baseline E[R] = {e_r_base:+.4f},  delta = {delta:+.4f})\n")
+                f.write(f"     Top 5 channels by |per-channel SHAP|:\n")
+                top_idx = np.argsort(np.abs(per_ch))[::-1][:5]
+                for c in top_idx:
+                    f.write(f"       channel {int(c):>3} : {per_ch[c]:+.4f}\n")
+                f.write(f"     Sum over all channels: {float(per_ch.sum()):+.4f}\n\n")
+
+            if len(top_models) >= 2:
+                top, second = top_models[0], top_models[1]
+                gap = float(np.dot(means[top].flatten() - means[second].flatten(), ctx))
+                delta_per_ch = per_channel_by_model[top] - per_channel_by_model[second]
+                f.write("--- SHAP Preference Decomposition ---\n")
+                f.write(f"Top model: {top}  vs  2nd: {second}\n")
+                f.write(f"Preference gap at last window: (mu_{top} - mu_{second})^T x_last = {gap:+.4f}\n")
+                f.write("Top 5 channels driving the preference:\n")
+                top_idx = np.argsort(np.abs(delta_per_ch))[::-1][:5]
+                for c in top_idx:
+                    a = per_channel_by_model[top][c]
+                    b = per_channel_by_model[second][c]
+                    f.write(f"  channel {int(c):>3} : "
+                            f"{top}={a:+.4f}  {second}={b:+.4f}  delta={a - b:+.4f}\n")
+
+        f.write("\n--- Final Model Ranking (by ||mu_k||^2) ---\n")
+        f.write(f"  {'Rank':>4}  {'Model':>12}  {'Final Score':>12}  {'Peak Score':>12}\n")
+        f.write("  " + "-" * 46 + "\n")
+        final_scores = {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means.items()}
+        peak_scores = {
+            m: float(np.nanmax(l2_norm_history[m])) if l2_norm_history.get(m) else 0.0
+            for m in means
+        }
+        ranking = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
+        for rank, (m, score) in enumerate(ranking, 1):
+            f.write(f"  {rank:>4}  {m:>12}  {score:>12.6f}  {peak_scores.get(m, 0.0):>12.6f}\n")
+
+    print(f"Explainability report saved to {output_file}")
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    # Reuses regimes_data computed above — the report and the IR always match.
+    try:
+        _ir = _ir_module()
+        ir_doc = _ir.build_thompson_ir(
+            dataset, entity, n_windows=T,
+            final_ranking=ranking,
+            regimes=regimes_data,
+            shifts=regime_shifts,
+            blip_count=len(blip_windows),
+            state_fractions={s: state_counts[s] / state_total for s in state_counts},
+            # The tallies as well as the shares: the IR states both, and a share
+            # rounded back to a window count can be one out on a long run.
+            state_counts={s: int(state_counts[s]) for s in state_counts},
+            final_state=selection_states[-1] if selection_states else "not_available",
+            # Channel names when the loader supplied them; the IR falls back to
+            # "channel N" for datasets whose sources have no column headers.
+            channel_names=(shap_payload or {}).get("channel_names"),
+            n_channels=(shap_payload or {}).get("n_channels"),
+        )
+        _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson")
+    except Exception as e:
+        logger.error(f"Thompson IR emission failed (non-fatal): {e}")
+
+
+# ── Ranking-criterion explainability (||mu_k||^2) ────────────────────────────
+#
+# The stage above explains mu^T x — the expected reward that drives per-window
+# selection. Everything below explains the quantity the detectors are actually
+# ranked by, mu^T mu, which is context-free and therefore decomposes over
+# channels on its own, with no baseline and no SHAP.
+
+def _norm_scores_at(means_at: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """||mu||^2 for every detector at one window."""
+    return {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means_at.items()}
+
+
+def _channel_pairs(values: np.ndarray, top_n: Optional[int] = None,
+                   by_magnitude: bool = False) -> List[Tuple[int, float]]:
+    """[(channel_index, value)] sorted for presentation, optionally truncated."""
+    pairs = [(int(c), float(v)) for c, v in enumerate(values)]
+    pairs.sort(key=lambda cv: -abs(cv[1]) if by_magnitude else -cv[1])
+    return pairs[:top_n] if top_n else pairs
+
+
+def _regime_ranking_facts(means_history: List[Dict[str, np.ndarray]],
+                          segments: List[Tuple[int, int, str, int]],
+                          n_channels: int,
+                          top_n_channels: int = 3) -> List[Dict[str, Any]]:
+    """
+    Per-regime facts, read at the regime's LAST window — the state the leader
+    had accumulated by the time it handed over, which is what its lead over that
+    regime's runner-up rests on.
+
+    The single source for both the report/IR and the per-regime plots, so the
+    prose and the figure beside it can never disagree.
+    """
+    facts: List[Dict[str, Any]] = []
+    for i, (start, end, leader, duration) in enumerate(segments):
+        if end >= len(means_history):
+            continue
+        at = means_history[end]
+        scores = _norm_scores_at(at)
+        rivals = sorted(((s, m) for m, s in scores.items() if m != leader), reverse=True)
+        runner = rivals[0][1] if rivals else None
+
+        top_channels = _channel_pairs(
+            aggregate_squared_per_channel(at[leader], n_channels), top_n_channels)
+        gap_channels = []
+        if runner is not None:
+            gap_channels = _channel_pairs(
+                rank_gap_decomposition(at[leader], at[runner], n_channels),
+                top_n_channels, by_magnitude=True)
+
+        facts.append({
+            "index": i, "start": int(start), "end": int(end),
+            "duration": int(duration), "leader": leader, "runner_up": runner,
+            "top_channels": top_channels, "gap_channels": gap_channels,
+            "score": scores.get(leader),
+            "runner_score": scores.get(runner) if runner else None,
+        })
+    return facts
+
+
+def plot_ranking_criterion(means_history: List[Dict[str, np.ndarray]],
+                           segments: List[Tuple[int, int, str, int]],
+                           warmup: int, dataset: str, entity: str,
+                           iterations: int) -> None:
+    """
+    ||mu_k||^2 for every detector across the run, with the leadership regimes
+    shaded and the excluded warm-up greyed out.
+
+    The sibling of plot_expected_rewards, on the axis the ranking actually uses:
+    where that plot shows a detector's chance of being picked next, this one
+    shows the quantity it is finally ranked by. Unsmoothed on purpose — regimes
+    here are read off the raw series, so a smoothed curve would show boundaries
+    the segmentation did not use.
+    """
+    if not means_history:
+        return
+    plt.rcParams.update({
+        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
+        "legend.fontsize": 9, "xtick.labelsize": 10, "ytick.labelsize": 10,
+    })
+    model_names = sorted(means_history[0].keys())
+    T = len(means_history)
+    series = {m: [float(np.dot(h[m].flatten(), h[m].flatten())) for h in means_history]
+              for m in model_names}
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colour_map = {m: plt.cm.tab20(i / max(len(model_names), 1))
+                  for i, m in enumerate(model_names)}
+    for m in model_names:
+        # SHORTENED, for the same reason as the expected-reward traces: one
+        # legend entry per detector, outside the axes. The key underneath
+        # says what each stands for.
+        ax.plot(range(T), series[m], label=abbreviate_detector(m),
+                linewidth=1.4, color=colour_map[m])
+
+    # Fix the ceiling before annotating: every axvspan below would otherwise
+    # move it, and the labels would drift off the top of the axes.
+    ymax = ax.get_ylim()[1]
+    ax.set_ylim(ax.get_ylim()[0], ymax * 1.12)
+    ymax = ax.get_ylim()[1]
+
+    if warmup > 0:
+        ax.axvspan(-0.5, warmup - 0.5, color='grey', alpha=0.18, zorder=0)
+        ax.text(max(warmup / 2.0 - 0.5, 0.0), ymax * 0.5, 'warm-up',
+                ha='center', va='center', rotation=90, fontsize=8,
+                color='dimgrey')
+    for i, (start, end, leader, _duration) in enumerate(segments):
+        if i:
+            ax.axvline(start - 0.5, color='black', linestyle='--', linewidth=0.7,
+                       alpha=0.5)
+        ax.axvspan(start - 0.5, end + 0.5, color=colour_map.get(leader, 'grey'),
+                   alpha=0.10, zorder=0)
+        # Alternate the label height so neighbouring short regimes — which pure
+        # run-length encoding does produce wherever two detectors are near-tied —
+        # do not print on top of each other.
+        # Shortened to match the legend: a figure that spelled the leader out
+        # here and abbreviated the same detector three inches to the right
+        # would read as two different detectors.
+        ax.text((start + end) / 2.0, ymax * (0.99 if i % 2 == 0 else 0.90),
+                f'R{i} {abbreviate_detector(leader)}', ha='center', va='top',
+                fontsize=7, rotation=90, color='black', alpha=0.75)
+
+    ax.set_xlabel('Window')
+    ax.set_ylabel(r'Ranking score  $\|\mu_k\|^2$')
+    ax.set_title('Ranking score over the run, shaded by leadership regime')
+    ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+    ax.legend(loc='upper left', frameon=False, bbox_to_anchor=(1.01, 1),
+              borderaxespad=0)
+    # Short names kept: they label both the legend and every regime band, and a
+    # regime band is only as wide as the regime.
+    draw_abbreviation_key(fig, list(series))
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(os.path.join(directory, f'ranking_criterion_{iterations}.png'),
+                format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_ranking_final(means: Dict[str, np.ndarray],
+                       list_of_chosen_models: List[str],
+                       dataset: str, entity: str, iterations: int) -> None:
+    """
+    The final ranking as a bar chart, each bar annotated with how many windows
+    that detector was actually selected in.
+
+    The selection count is on the plot because it is the ranking's main
+    confound: mu only moves in the windows where its arm was pulled, so a low
+    bar on two selections means "barely tried", not "tried and found wanting".
+    """
+    if not means:
+        return
+    plt.rcParams.update({
+        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
+        "xtick.labelsize": 10, "ytick.labelsize": 10,
+    })
+    counts: Dict[str, int] = {}
+    for m in list_of_chosen_models or []:
+        counts[m] = counts.get(m, 0) + 1
+
+    ranking = sorted(((float(np.dot(mu.flatten(), mu.flatten())), m)
+                      for m, mu in means.items()), reverse=True)
+    labels = [m for _s, m in ranking][::-1]
+    values = [s for s, _m in ranking][::-1]
+
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.45 * len(labels) + 1.5)))
+    colours = ['#3B5BDB' if i == len(labels) - 1 else '#AAB2C8'
+               for i in range(len(labels))]
+    # Ticks carry the long name; `labels` stays canonical below, since it is
+    # what `counts` is keyed by.
+    bars = ax.barh(labels, values, color=colours)
+    span = max(values) if values else 1.0
+    for bar, name in zip(bars, labels):
+        ax.text(bar.get_width() + span * 0.01, bar.get_y() + bar.get_height() / 2,
+                f'{bar.get_width():.6f}  ({counts.get(name, 0)} selections)',
+                va='center', fontsize=8)
+
+    ax.set_xlim(0, span * 1.35 if span else 1.0)
+    ax.set_xlabel(r'Ranking score  $\|\mu_k\|^2$')
+    ax.set_title('Final ranking, with the number of windows each detector was tried')
+    ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(os.path.join(directory, f'ranking_final_{iterations}.png'),
+                format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_ranking_channels(means: Dict[str, np.ndarray], n_channels: int,
+                          dataset: str, entity: str, iterations: int,
+                          top_k_models: int = 3, top_n_channels: int = 9,
+                          all_models: bool = False) -> None:
+    """Per-channel split of the final ||mu||^2, top-k detectors or all of them."""
+    if not means or n_channels <= 0:
+        return
+    models = (_top_k_models_by_norm(means, len(means)) if all_models
+              else _top_k_models_by_norm(means, top_k_models))
+    per_channel = {m: aggregate_squared_per_channel(means[m], n_channels)
+                   for m in models}
+    suffix = '_all' if all_models else ''
+    scope = 'all models' if all_models else f'top {top_k_models} by score'
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    _render_shap_comparison(
+        per_channel, models, top_n_channels,
+        title=f'Where each detector\'s ranking score comes from ({scope})',
+        save_path=os.path.join(directory,
+                               f'ranking_channels{suffix}_{iterations}.png'),
+        ylabel=r'Contribution to $\|\mu_k\|^2$',
+        n_channels_total=n_channels,
+        note='Final weights, at the end of the run.',
+    )
+
+
+def plot_ranking_gap(means: Dict[str, np.ndarray], n_channels: int,
+                     dataset: str, entity: str, iterations: int,
+                     top_n_channels: int = 12) -> None:
+    """
+    The winner's margin over the runner-up, split per channel and signed.
+
+    This is the plot that answers the ranking question directly: the bars sum
+    exactly to the gap between the two scores, so a green bar is a channel that
+    put the winner ahead and a red one is a channel the runner-up won.
+    """
+    if not means or n_channels <= 0 or len(means) < 2:
+        return
+    order = _top_k_models_by_norm(means, 2)
+    winner, runner = order[0], order[1]
+    gap = rank_gap_decomposition(means[winner], means[runner], n_channels)
+    pairs = _channel_pairs(gap, top_n_channels, by_magnitude=True)
+    if not pairs:
+        return
+    pairs = sorted(pairs, key=lambda cv: cv[1])
+
+    plt.rcParams.update({
+        "font.family": "serif", "axes.labelsize": 12, "axes.titlesize": 13,
+        "xtick.labelsize": 10, "ytick.labelsize": 10,
+    })
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.42 * len(pairs) + 1.5)))
+    ax.barh([f'ch{c}' for c, _v in pairs], [v for _c, v in pairs],
+            color=['#2F9E44' if v >= 0 else '#C92A2A' for _c, v in pairs])
+    ax.axvline(0, color='black', linewidth=0.7)
+    total = float(np.sum(gap))
+    ax.set_xlabel(r'Contribution to the gap in $\|\mu\|^2$')
+    ax.set_title(f'{winner} vs {runner}: where the {total:+.6f} margin came from\n'
+                 f'(green: {winner} ahead, red: {runner} ahead)')
+    ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    plt.tight_layout(pad=1.2)
+    plt.savefig(os.path.join(directory, f'ranking_gap_{iterations}.png'),
+                format='png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_ranking_per_window(means_history: List[Dict[str, np.ndarray]],
+                            n_channels: int, dataset: str, entity: str,
+                            iterations: int, top_k_models: int = 3,
+                            top_n_channels: int = 9, all_models: bool = False,
+                            sample_stride: Optional[int] = None) -> None:
+    """
+    One per-channel ranking-score plot per window, the sibling of
+    plot_shap_per_window.
+
+    Answers "what did the ranking score look like at window t" without the
+    ambiguity a per-regime figure carries: a regime spans many windows, and the
+    score is cumulative, so a single regime plot can only show one moment of it.
+    Here that moment is named on every frame.
+
+    all_models : bool
+        When False (default) each frame shows the top_k_models by ||mu||^2 AT
+        THAT WINDOW — the ranking as it stood then, not the final one — saved
+        under ranking_per_window_{iterations}/. When True every detector is
+        shown, under ranking_per_window_all_{iterations}/.
+    sample_stride : Optional[int]
+        When set (e.g. 10) only every stride-th window is plotted, saved under
+        ranking_per_window_every{stride}_{iterations}/.
+    """
+    if not means_history or n_channels <= 0:
+        return
+    base = "ranking_per_window_all" if all_models else "ranking_per_window"
+    if sample_stride and sample_stride > 1:
+        base = f"{base}_every{sample_stride}"
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    for t, at in enumerate(means_history):
+        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
+            continue
+        if all_models:
+            sel_models = _top_k_models_by_norm(at, len(at))
+            title = f'Ranking score by channel — window {t} (all detectors)'
+        else:
+            sel_models = _top_k_models_by_norm(at, top_k_models)
+            title = (f'Ranking score by channel — window {t} '
+                     f'(top {top_k_models} by score at this window)')
+        per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
+                       for m in sel_models}
+        _render_shap_comparison(
+            per_channel, sel_models, top_n_channels,
+            title=title,
+            save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            ylabel=r'Contribution to $\|\mu_k\|^2$',
+            n_channels_total=n_channels,
+            note=(f'Weights as they stood at window {t}. The score is '
+                  f'cumulative, so these bars are the total accumulated up to '
+                  f'this window.'),
+        )
+
+
+# ── Per-window channel aggregates, for on-demand rendering ──────────────────
+# The three per-window families above (shap_, reward_, ranking_) each wrote one
+# PNG per window in three scopes — nine folders, ~1,100 frames and 167 MB for a
+# single 173-window entity — of which a reader opens a handful. What every one
+# of those frames draws is a per-model per-channel vector, and that is three
+# orders of magnitude smaller than its own rendering: 173x11x9x3 floats is half
+# a megabyte against 167 MB of PNG.
+#
+# So the run persists the numbers and the WebUI draws the frame that is asked
+# for (WebUI/ondemand.render_per_window). Same trade as the ranking-gap pair
+# picker, and it makes the `_all` and `_every10` sets free: they were never
+# different figures, only a different top-k and a different stride, which are
+# arguments to a renderer rather than folders on disk.
+#
+# The plot_*_per_window functions above are kept — they are the reference
+# rendering, and a thesis figure can still be minted from one directly — but the
+# pipeline no longer calls them.
+
+PER_WINDOW_SCHEMA = 1
+
+# Carried in the file itself so the on-demand renderer cannot drift from the
+# producer: these are the titles, axis labels and footnotes the eager functions
+# above passed to _render_shap_comparison, with {t} for the window index and {k}
+# for the top-k. `rank_by` names the quantity each set's top-k is chosen on —
+# every one of them is an exact sum of a stored row, so the selection is
+# reproducible from this file alone and cannot disagree with the bars.
+_PER_WINDOW_KINDS: Dict[str, Dict[str, Any]] = {
+    "reward": {
+        "label": "Reward contribution",
+        "ylabel": _REWARD_YLABEL,
+        "title_top": "Expected-reward contribution — window {t} (top {k} by E[R] in window)",
+        "title_all": "Expected-reward contribution — window {t} (all models)",
+        "note": ("Each detector's bars sum to its expected reward at window {t}; "
+                 "no baseline is subtracted."),
+        "rank_by": "reward",
+        "all_by": "final",
+    },
+    "shap": {
+        "label": "Deviation from a typical window",
+        "ylabel": "Per-channel SHAP contribution",
+        "title_top": "SHAP — window {t} (top {k} by E[R] in window)",
+        "title_all": "SHAP — window {t} (all models)",
+        "note": None,
+        # The SHAP set's top-k was chosen on expected reward, not on SHAP, so
+        # the frame shows the same detectors as its reward sibling.
+        "rank_by": "reward",
+        "all_by": "final",
+    },
+    "ranking": {
+        "label": "Ranking score",
+        "ylabel": r"Contribution to $\|\mu_k\|^2$",
+        "title_top": "Ranking score by channel — window {t} (top {k} by score at this window)",
+        "title_all": "Ranking score by channel — window {t} (all detectors)",
+        "note": ("Weights as they stood at window {t}. The score is cumulative, "
+                 "so these bars are the total accumulated up to this window."),
+        "rank_by": "ranking",
+        "all_by": "ranking",
+    },
+}
+
+
+def _json_row(values: np.ndarray) -> List[Optional[float]]:
+    """One channel vector at 6 significant digits; non-finite becomes null.
+
+    Six digits is far beyond what a bar chart can show and keeps the file an
+    order of magnitude smaller than full repr. `null` rather than NaN because
+    NaN is not valid JSON, and a window only produces one after the run logged
+    an error for it.
+    """
+    return [None if not np.isfinite(v) else float(f"{float(v):.6g}")
+            for v in np.asarray(values, dtype=float).ravel()]
+
+
+def save_per_window_channels(
+    means: Dict[str, np.ndarray],
+    shap_payload: Optional[Dict],
+    dataset: str,
+    entity: str,
+    iterations: int,
+) -> Optional[str]:
+    """Persist every per-window frame's numbers as one JSON file.
+
+    Returns the path written, or None when the run carries nothing to write
+    (no explain payload, no channels, no windows) — the same conditions under
+    which the plot functions returned without drawing anything.
+    """
+    if not shap_payload or not means:
+        return None
+    n_channels = int(shap_payload.get("n_channels") or 0)
+    contexts = shap_payload.get("all_contexts") or []
+    mu_hist = shap_payload.get("means_history") or []
+    baseline = shap_payload.get("baseline_context")
+    if n_channels <= 0 or not contexts or baseline is None:
+        return None
+
+    # Appended in the same block of the bandit loop, so these are index-aligned
+    # by construction; min() is belt and braces for a run that errored out of
+    # one of them.
+    n_windows = min(len(contexts), len(mu_hist)) if mu_hist else len(contexts)
+    if n_windows <= 0:
+        return None
+
+    # Registry order, matching the dict the top-k selectors iterate, so a tie
+    # breaks the same way here as it did in the eager plots.
+    models = list(means.keys())
+    sets: Dict[str, List[List[List[Optional[float]]]]] = {"reward": [], "shap": [], "ranking": []}
+    for t in range(n_windows):
+        ctx = contexts[t]
+        at = mu_hist[t] if t < len(mu_hist) else {m: means[m] for m in models}
+        reward_frame, shap_frame, ranking_frame = [], [], []
+        for m in models:
+            mu = np.asarray(at[m]).flatten() if m in at else np.asarray(means[m]).flatten()
+            reward_frame.append(_json_row(
+                reward_contribution_per_channel(mu, ctx, n_channels)))
+            shap_frame.append(_json_row(aggregate_shap_per_channel(
+                compute_shap_values(mu, ctx, baseline), n_channels)))
+            ranking_frame.append(_json_row(
+                aggregate_squared_per_channel(mu, n_channels)))
+        sets["reward"].append(reward_frame)
+        sets["shap"].append(shap_frame)
+        sets["ranking"].append(ranking_frame)
+
+    document = {
+        "schema": PER_WINDOW_SCHEMA,
+        "dataset": dataset,
+        "entity": entity,
+        "iterations": iterations,
+        "n_channels": n_channels,
+        "n_windows": n_windows,
+        "top_k_models": 3,
+        "top_n_channels": 9,
+        "models": models,
+        # The order the `_all` frames of the reward and SHAP sets used: final
+        # ||mu||^2, fixed for the whole run. The ranking set re-sorts per window.
+        "models_by_final_norm": _top_k_models_by_norm(means, len(means)),
+        "kinds": _PER_WINDOW_KINDS,
+        "sets": sets,
+    }
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f'per_window_channels_{iterations}.json')
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+    logger.info(f"Per-window channel aggregates written to {path} "
+                f"({n_windows} windows x {len(models)} detectors x {n_channels} channels)")
+    return path
+
+
+def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
+                            segments: List[Tuple[int, int, str, int]],
+                            n_channels: int, dataset: str, entity: str,
+                            iterations: int, top_n_channels: int = 9) -> None:
+    """
+    One figure per leadership regime: the leader's per-channel score beside that
+    regime's runner-up, read at the regime's last window.
+
+    Filenames mirror shap_per_regime_{it}/ exactly — 0-based index, window range,
+    leader — so the same WebUI joiner pairs each figure with its own sentence.
+    """
+    if not means_history or not segments or n_channels <= 0:
+        return
+    directory = _fresh_plot_dir(
+        f'myresults/Thomposon/{dataset}/{entity}/ranking_per_regime_{iterations}/')
+    for fact in _regime_ranking_facts(means_history, segments, n_channels,
+                                      top_n_channels=n_channels):
+        end, leader, runner = fact["end"], fact["leader"], fact["runner_up"]
+        at = means_history[end]
+        # Top three by ||mu||^2 at this window, which is the quantity the
+        # regime itself is defined on — so the leader heads the list and the
+        # runner-up follows. Showing a third gives the pair a scale: two bars
+        # alone cannot say whether the runner-up was close to the leader or
+        # merely the best of a distant field.
+        models = _top_k_models_by_norm(at, 3)
+        for m in ([leader] + ([runner] if runner else [])):
+            if m and m in at and m not in models:
+                models.append(m)
+        per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
+                       for m in models}
+        rng = f'{fact["start"]}-{end}'
+        _render_shap_comparison(
+            per_channel, models, top_n_channels,
+            title=(f'Ranking score by channel — regime {fact["index"]} '
+                   f'({leader}, windows {rng}), as at window {end}'),
+            save_path=os.path.join(
+                directory,
+                f'regime_{fact["index"]:02d}_w{rng}_{leader}.png'),
+            ylabel=r'Contribution to $\|\mu_k\|^2$',
+            n_channels_total=n_channels,
+            # Says plainly what a per-regime figure of a cumulative quantity can
+            # and cannot mean. Unlike the SHAP stage's per-regime plot, which
+            # averages a per-window attribution over the regime, this is a
+            # single snapshot: ||mu||^2 only moves when the arm is selected and
+            # never resets, so the bars carry everything the detector had
+            # accumulated by then, not what this regime contributed.
+            note=(f'Weights as they stood at window {end}, the last of this '
+                  f'regime. The score is cumulative, so this is the state '
+                  f'reached by the end of the regime, not the regime\'s own '
+                  f'contribution.'),
+        )
+
+
+def explain_thompson_ranking(
+    means: Dict[str, np.ndarray],
+    list_of_chosen_models: List[str],
+    shap_payload: Optional[Dict],
+    segments: List[Tuple[int, int, str, int]],
+    warmup_used: int,
+    dataset: str,
+    entity: str,
+    iterations: int,
+) -> None:
+    """
+    Write the ranking-criterion report and its IR.
+
+    Answers "why did Thompson Sampling rank the detectors as it did", which the
+    sibling stage does not: that one explains mu^T x, the per-window expected
+    reward, while the ranking is by mu^T mu. Both decompositions used here are
+    exact — the per-detector shares sum to that detector's score, and the
+    winner-minus-runner-up terms sum to the margin — so nothing is approximated
+    and there is no baseline to choose.
+    """
+    if not means:
+        return
+    payload = shap_payload or {}
+    n_channels = int(payload.get("n_channels") or 0)
+    means_history: List[Dict[str, np.ndarray]] = payload.get("means_history") or []
+    T = len(means_history)
+
+    final_scores = {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means.items()}
+    ranking = sorted(final_scores.items(), key=lambda kv: kv[1], reverse=True)
+    winner = ranking[0][0]
+    runner_up = ranking[1][0] if len(ranking) > 1 else None
+
+    winner_channels = (_channel_pairs(aggregate_squared_per_channel(means[winner], n_channels))
+                       if n_channels > 0 else [])
+    gap_channels = (_channel_pairs(
+        rank_gap_decomposition(means[winner], means[runner_up], n_channels),
+        by_magnitude=True) if (runner_up and n_channels > 0) else [])
+
+    counts: Dict[str, int] = {m: 0 for m in means}
+    for m in list_of_chosen_models or []:
+        counts[m] = counts.get(m, 0) + 1
+
+    regimes_data = _regime_ranking_facts(means_history, segments, n_channels)
+
+    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    os.makedirs(directory, exist_ok=True)
+    output_file = os.path.join(directory, f'ranking_explainability_{iterations}.txt')
+    with open(output_file, 'w') as f:
+        f.write("Thompson Sampling — ranking criterion ||mu_k||^2\n")
+        f.write("=" * 52 + "\n")
+        f.write(f"Dataset: {dataset}   Entity: {entity}   Windows: {T}   "
+                f"Channels: {n_channels}\n")
+
+        f.write("\n--- Final Ranking (by ||mu_k||^2) ---\n")
+        f.write(f"  {'Rank':>4}  {'Model':>12}  {'Score':>12}  {'Selections':>11}\n")
+        f.write("  " + "-" * 45 + "\n")
+        for rank, (m, score) in enumerate(ranking, 1):
+            f.write(f"  {rank:>4}  {m:>12}  {score:>12.6f}  {counts.get(m, 0):>11}\n")
+
+        f.write(f"\n--- Per-Channel Decomposition of {winner}'s Score ---\n")
+        f.write("  Contributions are sums of squared weights: non-negative, and they\n"
+                "  add up to the score exactly.\n")
+        total = sum(v for _c, v in winner_channels) or 1.0
+        for c, v in winner_channels[:20]:
+            f.write(f"  channel {c:>3}  {v:>12.6f}  ({100.0 * v / total:>5.1f}%)\n")
+        f.write(f"  {'total':>11}  {sum(v for _c, v in winner_channels):>12.6f}\n")
+
+        if runner_up:
+            f.write(f"\n--- {winner} vs {runner_up}: Gap Decomposition ---\n")
+            f.write("  Signed, and sums to the difference between the two scores.\n")
+            for c, v in gap_channels[:20]:
+                side = winner if v >= 0 else runner_up
+                f.write(f"  channel {c:>3}  {v:>+12.6f}  favours {side}\n")
+            f.write(f"  {'gap':>11}  {sum(v for _c, v in gap_channels):>+12.6f}\n")
+
+        f.write("\n--- Leadership Regimes ---\n")
+        f.write(f"  Warm-up windows excluded: {warmup_used}\n")
+        if not regimes_data:
+            f.write("  No regime could be formed.\n")
+        for r in regimes_data:
+            f.write(f"  Regime {r['index']:>2}  windows {r['start']:>4}-{r['end']:<4} "
+                    f"({r['duration']:>3} windows)  leader {r['leader']:>12}"
+                    f"  runner-up {str(r['runner_up']):>12}\n")
+
+        f.write("\n--- Per-Regime Channel Decomposition ---\n")
+        for r in regimes_data:
+            f.write(f"  Regime {r['index']} ({r['leader']}, windows "
+                    f"{r['start']}-{r['end']}):\n")
+            for c, v in r["top_channels"]:
+                f.write(f"      channel {c:>3}  {v:>12.6f}\n")
+            if r["runner_up"]:
+                f.write(f"    vs {r['runner_up']}:\n")
+                for c, v in r["gap_channels"]:
+                    f.write(f"      channel {c:>3}  {v:>+12.6f}\n")
+
+    print(f"Ranking explainability report saved to {output_file}")
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        ir_doc = _ir.build_thompson_ranking_ir(
+            dataset, entity, n_windows=T,
+            final_ranking=ranking,
+            winner_channels=winner_channels,
+            gap_channels=gap_channels,
+            selection_counts=counts,
+            regimes=regimes_data,
+            warmup_windows=warmup_used,
+            channel_names=payload.get("channel_names"),
+            n_channels=n_channels,
+            # Every detector's per-channel shares, so the page can decompose
+            # ANY pair's gap without the run being present: the gap split is
+            # exactly shares(a) - shares(b) (see rank_gap_decomposition), so
+            # this is all the on-demand renderer needs.
+            channel_shares={
+                m: [float(v) for v in aggregate_squared_per_channel(mu, n_channels)]
+                for m, mu in means.items()
+            } if n_channels > 0 else {},
+        )
+        _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson_ranking")
+    except Exception as e:
+        logger.error(f"Thompson ranking IR emission failed (non-fatal): {e}")
 
 
 def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity, iterations, F1_Score_list_ind_curent,
@@ -441,7 +2872,8 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
         # Highlight false negatives with a different color
         # axes[i + 2].vlines(false_negative_indices, ymin=0, ymax=1, color='purple', label='False Negatives')
 
-        axes[i + 2].set_title(f'{algorithm} Anomaly Scores, F1 Score = {f1_score_value}, PR AUC = {pr_auc_value}')
+        axes[i + 2].set_title(f'{algorithm} Anomaly Scores, '
+                              f'F1 Score = {f1_score_value}, PR AUC = {pr_auc_value}')
         axes[i + 2].set_ylabel('Score')
         axes[i + 2].grid(True)
 
@@ -463,7 +2895,8 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 
 def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset, entity, iterations, iteration,
-                                 initial_epsilon=0.2, epsilon_decay=0.99, f1_weight=0.5, pr_auc_weight=0.5):
+                                 initial_epsilon=0.2, epsilon_decay=0.99, f1_weight=0.5, pr_auc_weight=0.5,
+                                 explain=False):
     """
     Run the entire Linear Thompson Sampling process.
 
@@ -483,7 +2916,7 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
     - None
     """
     test_data_copy = copy.deepcopy(test_data)
-    means, covariances, history, list_of_chosen_models = fit_linear_thompson_sampling(
+    _fit_result = fit_linear_thompson_sampling(
         test_data,
         trained_models,
         test_data.entities[0].Y,
@@ -493,7 +2926,14 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         f1_weight=f1_weight,
         pr_auc_weight=pr_auc_weight,
         iterations=iterations,
+        explain=explain,
     )
+    if explain:
+        (means, covariances, history, list_of_chosen_models,
+         exp_rewards_hist, l2_norm_hist, selection_states,
+         pre_exp_rewards_hist, shap_payload) = _fit_result
+    else:
+        means, covariances, history, list_of_chosen_models = _fit_result
 
     # Rank models
     ranked_models = rank_models(means)
@@ -504,6 +2944,75 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
 
     # Plot history
     plot_history(history, trained_models, dataset, entity, iterations)
+
+    if explain:
+        # Regimes are detected on the PRE-update rewards. The post-update history
+        # lets the detector that was just evaluated fold that window's own reward
+        # into its value before being compared against the ones that were not
+        # evaluated — a self-selection bump of up to r/2 on a detector's first
+        # pick, largest exactly where the early regimes form.
+        regime_shifts, blip_windows = detect_regime_shifts(pre_exp_rewards_hist)
+        # Written once for all three stages: the reward, SHAP and ranking frames
+        # are all per-model per-channel vectors over the same windows, and the
+        # WebUI draws whichever one is asked for rather than the pipeline
+        # writing every one of them.
+        save_per_window_channels(means, shap_payload, dataset, entity, iterations)
+        plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
+                              dataset, entity, iterations, smooth=False)
+        plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
+                              dataset, entity, iterations, smooth=True)
+        plot_selection_states(selection_states, dataset, entity, iterations)
+        plot_shap_per_model(means, shap_payload, dataset, entity, iterations)
+        # Each SHAP comparison plot is produced in both a top-k and an all-models variant.
+        plot_shap_comparison(means, shap_payload, dataset, entity, iterations)
+        plot_shap_comparison(means, shap_payload, dataset, entity, iterations, all_models=True)
+        plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations)
+        plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations,
+                             all_models=True)
+        # Kept, but demoted: mean|SHAP| measures how much a channel's influence
+        # VARIES across windows, not how much it contributes on average. The
+        # run-level summary is now plot_reward_average_all.
+        plot_shap_average_all(means, shap_payload, dataset, entity, iterations)
+        plot_shap_average_all(means, shap_payload, dataset, entity, iterations, all_models=False)
+
+        # ── Expected-reward contribution (mu^T x split per channel) ─────────
+        # Full parity with the SHAP sets above so the two can be read frame for
+        # frame. These are the ones whose bars sum to the prediction; the SHAP
+        # ones answer the narrower question of deviation from a typical window.
+        plot_reward_per_regime(means, shap_payload, regime_shifts, dataset, entity,
+                               iterations)
+        plot_reward_per_regime(means, shap_payload, regime_shifts, dataset, entity,
+                               iterations, all_models=True)
+        plot_reward_average_all(means, shap_payload, dataset, entity, iterations)
+        plot_reward_average_all(means, shap_payload, dataset, entity, iterations,
+                                all_models=False)
+        explain_thompson_sampling(means, exp_rewards_hist, l2_norm_hist, pre_exp_rewards_hist,
+                                  list_of_chosen_models,
+                                  regime_shifts, blip_windows, selection_states,
+                                  shap_payload,
+                                  dataset, entity, iterations)
+
+        # ── Ranking criterion (||mu_k||^2) — the sibling stage ──────────────
+        # Separate regimes from the ones above: leadership on the ranking score
+        # rather than on expected reward, by plain run-length encoding of the
+        # argmax. Segmented once here and handed to both the plots and the
+        # report so a figure can never disagree with the sentence beside it.
+        means_history = (shap_payload or {}).get("means_history") or []
+        n_channels_ranking = int((shap_payload or {}).get("n_channels") or 0)
+        regime_segments, warmup_used = leadership_regimes(means_history)
+        plot_ranking_criterion(means_history, regime_segments, warmup_used,
+                               dataset, entity, iterations)
+        plot_ranking_final(means, list_of_chosen_models, dataset, entity, iterations)
+        plot_ranking_channels(means, n_channels_ranking, dataset, entity, iterations)
+        plot_ranking_channels(means, n_channels_ranking, dataset, entity, iterations,
+                              all_models=True)
+        plot_ranking_gap(means, n_channels_ranking, dataset, entity, iterations)
+        plot_ranking_per_regime(means_history, regime_segments, n_channels_ranking,
+                                dataset, entity, iterations)
+        explain_thompson_ranking(means, list_of_chosen_models, shap_payload,
+                                 regime_segments, warmup_used,
+                                 dataset, entity, iterations)
+
     # evaulate over all current data and other data
 
     model_names = [model[0] for model in ranked_models]
@@ -544,7 +3053,7 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         f.write("Summary of Linear Thompson Sampling:\n")
         for model_name, mean in means.items():
             f.write(f"Model: {model_name}\n")
-            f.write(f"  Mean: {mean}\n")
+            f.write(f"  Mean: {np.array2string(mean, threshold=np.inf, max_line_width=np.inf)}\n")
         f.write(f"choses models for each round\n")
         f.write(f"{list_of_chosen_models}\n")
 
