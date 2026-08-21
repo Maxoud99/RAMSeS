@@ -767,12 +767,10 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
                          f"{runner_up}")
         if losses:
             c, _v = losses[0]
-            # Direction in words, no number and no sign to interpret. An earlier
-            # phrasing paired the signed value with "in NN_3's favour" and got
-            # read the other way round ("channel 8 had a negative impact on
-            # NN_3's score"), inverting the one claim this stage exists to make.
-            # Naming BOTH sides ("favoured X more than Y") is what makes the
-            # comparison unambiguous without a number.
+            # Direction in words, with BOTH sides named ("favoured X more than
+            # Y") and no signed number. A signed value plus "in X's favour" is
+            # read the other way round often enough to invert the one claim
+            # this stage exists to make.
             parts.append(f"while {_ch(c)} favoured {runner_up} more than "
                          f"{top_model}")
         if parts:
@@ -2125,13 +2123,11 @@ def _build_exclusive_win_ir(stage: str, prefix: str, dataset: str, entity: str,
 
     # ── One atom per rival group: its rule(s) AND its win count together ──
     #
-    # These used to be two families — a rule atom per condition signature and a
-    # wins atom per (count, rate) — which expressed the SAME rivals twice, in
-    # two different groupings and two different orders. That redundancy is what
-    # let a narrator merge across them and emit one sentence carrying a rule
-    # from one group and names from another. Grouping by (rules, count, rate)
-    # means every rival set is named exactly once, with everything said about
-    # it in a single sentence: there is no second sentence to cross-contaminate.
+    # Grouped by (rules, count, rate) so every rival set is named exactly once,
+    # with everything about it in a single sentence. Splitting rules and wins
+    # into two atom families names the same rivals twice in two different
+    # orders, and a narrator will merge across them — emitting one sentence
+    # that carries a rule from one group and names from another.
     comp_sigs: Dict[str, List[str]] = {}
     for sig in sorted(rule_groups):
         for c in rule_groups[sig]["competitors"]:

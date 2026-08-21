@@ -18,23 +18,7 @@ from Utils.plot_labels import draw_abbreviation_key
 
 from Metrics.metrics import prauc, f1_score
 from Utils.model_selection_utils import evaluate_model
-
-
-def _ir_module():
-    """Import Explainability.ir, tolerating standalone by-path loading of this
-    module where the package root is not on sys.path — falls back to loading
-    ir.py directly by its file location."""
-    try:
-        from Explainability import ir as _ir
-        return _ir
-    except ModuleNotFoundError:
-        import importlib.util
-        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _spec = importlib.util.spec_from_file_location(
-            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
+from Explainability import ir
 
 
 def initialize_population(algorithm_list, population_size):
@@ -688,7 +672,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     PR_AUC_Score_list = []
     fitness_list = []
     # Per-generation populations — used by the selection-explainability layer
-    # (Axis 3: evolutionary survival rate). Snapshotted at the top of each loop
+    # (Axis 2: evolutionary survival rate). Snapshotted at the top of each loop
     # iteration, before fitness evaluation, so it reflects the population OF
     # that generation rather than the next one's offspring.
     generation_populations: List[List[List[str]]] = []
@@ -907,15 +891,13 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
 # ════════════════════════════════════════════════════════════════════════════
 #  GA Ensemble Selection Explainability
 #
-#  Three analytical axes per candidate detector:
-#    1. Utility       — LOFO marginal fitness change on the best ensemble,
-#                       and mean marginal contribution across evaluated subsets.
-#    2. Complementarity — interaction matrix I_jk over detector pairs:
-#                       I_jk = E[y | d_j=1, d_k=1] - (E[y|d_j=1] + E[y|d_k=1]),
-#                       with y = subset fitness.
-#    3. Stability     — evolutionary survival rate per generation:
-#                       P(d_j, g) = (#individuals in gen g containing d_j) /
-#                                    population_size.
+#  Two analytical axes per candidate detector:
+#    1. Utility    — mean marginal contribution across evaluated subsets.
+#                    LOFO is computed alongside it but is NOT part of the axis;
+#                    it explains ensemble members that are low on both.
+#    2. Stability  — evolutionary survival rate per generation:
+#                    P(d_j, g) = (#individuals in gen g containing d_j) /
+#                                 population_size.
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -989,182 +971,6 @@ def compute_mean_marginal_contribution(
     return out
 
 
-def _build_subset_matrix(
-    evaluated_ensembles: Dict[Tuple[str, ...], tuple],
-    algorithm_list: List[str],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build the binary inclusion matrix X (n_subsets × d) and fitness vector y from
-    the evaluated subsets. X[i, c] = 1 iff algorithm_list[c] is in subset i.
-    y[i] = fitness of subset i (element [2] of the cached fitness tuple).
-    """
-    d = len(algorithm_list)
-    col = {name: c for c, name in enumerate(algorithm_list)}
-    rows, ys = [], []
-    for key, result in evaluated_ensembles.items():
-        z = np.zeros(d, dtype=float)
-        for name in key:
-            if name in col:
-                z[col[name]] = 1.0
-        rows.append(z)
-        ys.append(float(result[2]))
-    if not rows:
-        return np.zeros((0, d)), np.zeros(0)
-    return np.array(rows, dtype=float), np.array(ys, dtype=float)
-
-
-# NOTE: The Complementarity axis (Friedman H) is currently DISABLED in
-# explain_ga_selection. This function and its plots (plot_ga_interaction,
-# plot_ga_total_interaction) are retained, but not invoked, so the axis can be
-# re-enabled by uncommenting the call sites in explain_ga_selection and restoring
-# the complementarity inputs to classify_detector_archetypes / plot_ga_archetypes.
-def compute_friedman_h(
-    evaluated_ensembles: Dict[Tuple[str, ...], tuple],
-    algorithm_list: List[str],
-    surrogate: str = "rf",
-    predict_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-    max_reference: int = 500,
-    random_state: int = 0,
-) -> Dict[str, Any]:
-    """
-    Axis 2 — Friedman & Popescu (2008) H-statistic over the GA-explored subset
-    space (https://projecteuclid.org/journals/annals-of-applied-statistics/volume-2/issue-3/Predictive-learning-via-rule-ensembles/10.1214/07-AOAS148.pdf).
-
-    Subset fitness is treated as a function F(z) of the binary detector-inclusion
-    vector z ∈ {0,1}^d. A surrogate regressor F̂ is fit on the evaluated
-    (z, fitness) pairs, then partial-dependence functions of F̂ yield:
-
-      Two-way interaction (Eq. 44):
-        H²_jk = Σ_i (F̃_jk − F̃_j − F̃_k)² / Σ_i F̃_jk²
-      Total interaction (Eq. 45):
-        H²_j  = Σ_i (F̃ − F̃_j − F̃_{\\j})² / Σ_i F̃²
-
-    where ~ denotes mean-centering over the reference set and H = sqrt(max(0,H²)).
-    Because inputs are binary, every partial-dependence function takes ≤2 (single)
-    or ≤4 (pair) distinct values, so the computation is cheap.
-
-    Parameters
-    ----------
-    surrogate : "rf" | "gbm"          Surrogate family (used only if predict_fn is None).
-    predict_fn : callable | None      Inject a fitted F̂: (m×d array) -> (m,) preds.
-                                      When None, a surrogate is fit on (X, y).
-    max_reference : int               Cap on reference rows (subsampled if exceeded).
-
-    Returns
-    -------
-    dict with keys:
-        "H_two_way"   : {(j, k): H_jk}  symmetric (j != k); NaN where undefined
-        "H_total"     : {j: H_j}        per detector; NaN where undefined
-        "n_subsets"   : int             training subsets used
-        "surrogate"   : str
-        "surrogate_r2": float           in-sample R² (NaN when predict_fn injected)
-        "feasible"    : bool            False when too few/degenerate subsets
-    """
-    d = len(algorithm_list)
-    nan_two = {(j, k): float('nan')
-               for i, j in enumerate(algorithm_list) for k in algorithm_list[i + 1:]}
-    # make symmetric
-    for (j, k) in list(nan_two.keys()):
-        nan_two[(k, j)] = float('nan')
-    nan_tot = {j: float('nan') for j in algorithm_list}
-
-    X, y = _build_subset_matrix(evaluated_ensembles, algorithm_list)
-    n = X.shape[0]
-    base = {"H_two_way": nan_two, "H_total": nan_tot, "n_subsets": n,
-            "surrogate": surrogate, "surrogate_r2": float('nan'), "feasible": False}
-    if n < 3 or np.allclose(y, y[0]):
-        return base
-
-    # ── Surrogate F̂ ───────────────────────────────────────────────────────
-    surrogate_r2 = float('nan')
-    if predict_fn is None:
-        try:
-            if surrogate == "gbm":
-                from sklearn.ensemble import GradientBoostingRegressor
-                model = GradientBoostingRegressor(random_state=random_state)
-            else:
-                from sklearn.ensemble import RandomForestRegressor
-                model = RandomForestRegressor(n_estimators=200, random_state=random_state)
-            model.fit(X, y)
-            preds_train = model.predict(X)
-            ss_res = float(np.sum((y - preds_train) ** 2))
-            ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-            surrogate_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
-            predict = model.predict
-        except Exception as e:
-            logger.warning(f"Friedman H surrogate fit failed: {e}")
-            return base
-    else:
-        predict = predict_fn
-
-    # ── Reference set (subsample if large) ─────────────────────────────────
-    Xr = X
-    if n > max_reference:
-        rng = np.random.RandomState(random_state)
-        Xr = X[rng.choice(n, size=max_reference, replace=False)]
-    N = Xr.shape[0]
-
-    def _predict_with(col_overrides: Dict[int, float]) -> np.ndarray:
-        Z = Xr.copy()
-        for c, v in col_overrides.items():
-            Z[:, c] = v
-        return np.asarray(predict(Z), dtype=float)
-
-    def _center(a: np.ndarray) -> np.ndarray:
-        return a - float(np.mean(a))
-
-    # Single-variable PD predictions with coord c overridden: pred1[c][v] is the
-    # length-N vector F̂(Xr with col c := v). Used two ways below:
-    #   • its MEAN is the PD scalar F_c(v) = (1/N) Σ_m F̂(x_m, c:=v);
-    #   • the per-row vectors feed the all-but-c PD (Eq. 45).
-    pred1 = {c: {0.0: _predict_with({c: 0.0}), 1.0: _predict_with({c: 1.0})}
-             for c in range(d)}
-    p_marg = {c: float(np.mean(Xr[:, c])) for c in range(d)}   # marginal P(z_c=1)
-    f_base = np.asarray(predict(Xr), dtype=float)
-    f_tilde = _center(f_base)
-    f_base_sq = float(np.sum(f_tilde ** 2))
-
-    # PD scalars F_c(v), then the centered single-variable PD evaluated at each
-    # row's own coordinate x_ic.
-    pd1_scalar = {c: {0.0: float(np.mean(pred1[c][0.0])),
-                      1.0: float(np.mean(pred1[c][1.0]))}
-                  for c in range(d)}
-    pd_j = {}
-    for c in range(d):
-        vals = np.where(Xr[:, c] == 1.0, pd1_scalar[c][1.0], pd1_scalar[c][0.0])
-        pd_j[c] = _center(vals)
-
-    # ── Two-way H (Eq. 44) ─────────────────────────────────────────────────
-    H_two: Dict[Tuple[str, str], float] = {}
-    for a in range(d):
-        for b in range(a + 1, d):
-            # Pairwise PD scalars F_ab(va, vb) = mean over rows of F̂(Xr, a:=va, b:=vb).
-            pd2_scalar = {}
-            for va in (0.0, 1.0):
-                for vb in (0.0, 1.0):
-                    pd2_scalar[(va, vb)] = float(np.mean(_predict_with({a: va, b: vb})))
-            # Evaluate the pairwise PD at each row's own (x_ia, x_ib).
-            pjk = np.array([pd2_scalar[(Xr[i, a], Xr[i, b])] for i in range(N)], dtype=float)
-            f_jk = _center(pjk)
-            num = float(np.sum((f_jk - pd_j[a] - pd_j[b]) ** 2))
-            den = float(np.sum(f_jk ** 2))
-            h = float(np.sqrt(max(0.0, num / den))) if den > 0 else float('nan')
-            H_two[(algorithm_list[a], algorithm_list[b])] = h
-            H_two[(algorithm_list[b], algorithm_list[a])] = h
-
-    # ── Total H (Eq. 45) ───────────────────────────────────────────────────
-    H_tot: Dict[str, float] = {}
-    for c in range(d):
-        # PD on all-but-c: average F̂ over z_c drawn from its marginal.
-        pd_not = (1.0 - p_marg[c]) * pred1[c][0.0] + p_marg[c] * pred1[c][1.0]
-        f_not = _center(pd_not)
-        num = float(np.sum((f_tilde - pd_j[c] - f_not) ** 2))
-        h = float(np.sqrt(max(0.0, num / f_base_sq))) if f_base_sq > 0 else float('nan')
-        H_tot[algorithm_list[c]] = h
-
-    return {"H_two_way": H_two, "H_total": H_tot, "n_subsets": n,
-            "surrogate": "injected" if predict_fn is not None else surrogate,
-            "surrogate_r2": surrogate_r2, "feasible": True}
 
 
 def compute_survival_rates(
@@ -1173,7 +979,7 @@ def compute_survival_rates(
     population_size: int,
 ) -> Dict[str, List[float]]:
     """
-    Axis 3 — survival rate per detector per generation:
+    Axis 2 — survival rate per detector per generation:
         P(d, g) = (count of individuals in generation g containing d) / population_size
     Returns {detector: [P(d, g) for g in generations]}.
     """
@@ -1188,9 +994,9 @@ def compute_survival_rates(
 
 # ── Functional archetypes (intersection of the axes) ────────────────────────
 
-# Complementarity (Friedman H) is currently disabled, so each detector is labelled
-# by the (Utility, Stability) high/low pair as a 2-letter H/L code, e.g. "HL" =
-# high utility, low stability. A detector with no utility data is "Unclassified".
+# Each detector is labelled by the (Utility, Stability) high/low pair as a
+# 2-letter H/L code, e.g. "HL" = high utility, low stability. A detector with no
+# utility data is "Unclassified".
 ARCHETYPE_UNCLASSIFIED = "Unclassified"
 
 ARCHETYPE_ORDER = [
@@ -1203,7 +1009,6 @@ def _assign_archetype(u_high: bool, s_high: bool, util_nan: bool) -> str:
     """
     Label the (utility, stability) high/low pair as a 2-letter H/L code (e.g.
     "HL"). A detector with no utility data is "Unclassified".
-    (Complementarity axis is currently disabled — see compute_friedman_h note.)
     """
     if util_nan:
         return ARCHETYPE_UNCLASSIFIED
@@ -1266,7 +1071,6 @@ def classify_detector_archetypes(
     Classify each detector into a functional archetype from the intersection of
     the two active axes (Utility × Stability). Reports BOTH a relative
     (median-split) and an absolute (fixed-cutoff) scheme side by side.
-    (Complementarity / Friedman H is currently disabled.)
 
     Axis scalars (per detector):
       utility        = mean_marginal[d]['contribution']  (Axis 1b only; LOFO excluded)
@@ -1403,119 +1207,6 @@ def plot_ga_utility(
     plt.close()
 
 
-def plot_ga_interaction(
-    friedman_h: Dict[str, Any],
-    algorithm_list: List[str],
-    dataset: str,
-    entity: str,
-) -> None:
-    """
-    Heatmap of the two-way Friedman H-statistic H_jk (Eq. 44). H ≥ 0, so a
-    sequential colormap is used (0 = additive / no interaction, higher = stronger
-    interaction). NaN cells (undefined) are drawn grey; diagonal is masked.
-
-    Saves to myresults/GA_Ens/{dataset}/{entity}/ga_selection_interaction_{dataset}_{entity}.png.
-    """
-    _ga_plot_rcparams()
-    H_two = friedman_h.get("H_two_way", {})
-    n = len(algorithm_list)
-    # Keep only the upper-right triangle (row < col); the matrix is symmetric so
-    # the lower triangle is the same values mirrored and is left blank.
-    M = np.full((n, n), np.nan, dtype=float)
-    for (j, k), v in H_two.items():
-        if j == k:
-            continue
-        try:
-            r, c = algorithm_list.index(j), algorithm_list.index(k)
-        except ValueError:
-            continue
-        if r < c:
-            M[r, c] = v
-
-    fig, ax = plt.subplots(figsize=(max(7, 0.6 * n + 2), max(6, 0.55 * n + 2)))
-    masked = np.ma.array(M, mask=np.isnan(M))
-    finite = M[np.isfinite(M)]
-    vmax = float(np.nanmax(finite)) if finite.size > 0 and np.nanmax(finite) > 0 else 1.0
-    cmap = plt.cm.viridis.copy()
-    cmap.set_bad(color="#dddddd")
-    im = ax.imshow(masked, cmap=cmap, vmin=0.0, vmax=vmax, aspect="auto")
-    ax.set_xticks(np.arange(n))
-    ax.set_xticklabels(list(algorithm_list),
-                       rotation=45, ha="right")
-    ax.set_yticks(np.arange(n))
-    ax.set_yticklabels(list(algorithm_list))
-
-    for jj in range(n):
-        for kk in range(n):
-            v = M[jj, kk]
-            if jj == kk or np.isnan(v):
-                continue
-            shade = "white" if v < 0.5 * vmax else "black"
-            ax.text(kk, jj, f"{v:.3f}", ha="center", va="center",
-                    color=shade, fontsize=7)
-
-    fig.colorbar(im, ax=ax, fraction=0.045, pad=0.04, label="H_jk (two-way)")
-    r2 = friedman_h.get("surrogate_r2", float('nan'))
-    sub = (f"surrogate={friedman_h.get('surrogate', '?')}, "
-           f"R²={r2:.3f}" if not np.isnan(r2) else
-           f"surrogate={friedman_h.get('surrogate', '?')}")
-    ax.set_title("Axis 2 · Friedman two-way interaction  H_jk (Eq. 44)\n"
-                 f"({sub}, n_subsets={friedman_h.get('n_subsets', 0)})")
-    plt.tight_layout(pad=1.2)
-
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
-    os.makedirs(directory, exist_ok=True)
-    plt.savefig(f"{directory}/ga_selection_interaction_{dataset}_{entity}.png",
-                format="png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def plot_ga_total_interaction(
-    friedman_h: Dict[str, Any],
-    algorithm_list: List[str],
-    best_ensemble: List[str],
-    dataset: str,
-    entity: str,
-) -> None:
-    """
-    Bar chart of the total Friedman H-statistic H_j (Eq. 45) — each detector's
-    overall interaction strength with all others. Members of best_ensemble are
-    drawn opaque; the rest faded. NaN values are drawn as faded grey zero bars.
-
-    Saves to myresults/GA_Ens/{dataset}/{entity}/ga_selection_total_interaction_{dataset}_{entity}.png.
-    """
-    _ga_plot_rcparams()
-    H_tot = friedman_h.get("H_total", {})
-    in_best = set(best_ensemble or [])
-    raw = [H_tot.get(d, float('nan')) for d in algorithm_list]
-    vals = [0.0 if np.isnan(v) else v for v in raw]
-    colours = []
-    for d, v in zip(algorithm_list, raw):
-        if np.isnan(v):
-            colours.append("#cccccc")
-        elif d in in_best:
-            colours.append("#1f77b4")
-        else:
-            colours.append("#9ecae1")
-
-    fig, ax = plt.subplots(figsize=(max(8, 0.55 * len(algorithm_list) + 4), 5))
-    x = np.arange(len(algorithm_list))
-    ax.bar(x, vals, color=colours)
-    ax.set_xticks(x)
-    ax.set_xticklabels(list(algorithm_list),
-                       rotation=30, ha="right")
-    ax.set_ylabel("H_j  (total interaction)")
-    ax.set_ylim(0, max(1.0, max(vals) * 1.1) if vals else 1.0)
-    ax.set_title("Axis 2 · Friedman total interaction  H_j (Eq. 45)  "
-                 "— dark = best-ensemble members")
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
-
-    plt.tight_layout(pad=1.2)
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
-    os.makedirs(directory, exist_ok=True)
-    plt.savefig(f"{directory}/ga_selection_total_interaction_{dataset}_{entity}.png",
-                format="png", dpi=300, bbox_inches="tight")
-    plt.close()
 
 
 def _plot_ga_survival_impl(
@@ -1565,7 +1256,7 @@ def plot_ga_survival(
     entity: str,
 ) -> None:
     """
-    Produce two survival-rate line plots for Axis 3.
+    Produce two survival-rate line plots for Axis 2.
 
     (a) Ensemble-highlighted version — detectors in best_ensemble are bold/opaque;
         all others are faded. Emphasises which detectors the GA converged on.
@@ -1582,14 +1273,14 @@ def plot_ga_survival(
     _plot_ga_survival_impl(
         survival_rates,
         bold_set=in_best,
-        title=("Axis 3 · Evolutionary survival per detector "
+        title=("Axis 2 · Evolutionary survival per detector "
                "(bold = members of best ensemble)"),
         save_path=f"{directory}/ga_selection_survival_{dataset}_{entity}.png",
     )
     _plot_ga_survival_impl(
         survival_rates,
         bold_set=set(survival_rates.keys()),   # every detector bold
-        title="Axis 3 · Evolutionary survival per detector (all detectors)",
+        title="Axis 2 · Evolutionary survival per detector (all detectors)",
         save_path=f"{directory}/ga_selection_survival_all_{dataset}_{entity}.png",
     )
 
@@ -1682,8 +1373,8 @@ def plot_ga_archetypes(
     matplotlib choose meant a run whose utilities spanned 0.001 got an axis
     starting at 0.0008, which reads as a large spread of a small quantity.
 
-    (Complementarity / Friedman H axis is currently disabled.) Unclassified
-    detectors (NaN utility) are not plotted; they are listed in a caption.
+    Unclassified detectors (NaN utility) are not plotted; they are listed in
+    a caption.
     Saves to ga_selection_archetypes_{dataset}_{entity}.png.
     """
     _ga_plot_rcparams()
@@ -1822,9 +1513,8 @@ def explain_ga_selection(
 ) -> Optional[Dict[str, Any]]:
     """
     GA-ensemble selection explainability: explain *why* each detector ended up
-    in best_ensemble, along two analytical axes (utility, stability). The
-    Complementarity / Friedman H axis is currently disabled. Produces three plots
-    and a structured text report under
+    in best_ensemble, along two analytical axes (utility, stability). Produces
+    three plots and a structured text report under
         myresults/GA_Ens/{dataset}/{entity}/
 
     Returns a dict with the computed structures when explain=True; None otherwise.
@@ -1836,16 +1526,11 @@ def explain_ga_selection(
 
     lofo = compute_lofo_utility(best_ensemble, evaluate_fitness)
     mean_marginal = compute_mean_marginal_contribution(evaluated_ensembles, algorithm_list)
-    # --- Complementarity axis (Friedman H) temporarily disabled ---
-    # friedman_h = compute_friedman_h(evaluated_ensembles, algorithm_list)
-    # interaction = friedman_h["H_two_way"]
     survival = compute_survival_rates(generation_populations, algorithm_list, population_size)
     archetypes = classify_detector_archetypes(
         mean_marginal, survival, algorithm_list)
 
     plot_ga_utility(lofo, mean_marginal, best_ensemble, algorithm_list, dataset, entity)
-    # plot_ga_interaction(friedman_h, algorithm_list, dataset, entity)
-    # plot_ga_total_interaction(friedman_h, algorithm_list, best_ensemble, dataset, entity)
     plot_ga_survival(survival, best_ensemble, dataset, entity)
     plot_ga_archetypes(archetypes, algorithm_list, dataset, entity)
 
@@ -1888,12 +1573,8 @@ def explain_ga_selection(
             f.write(f"      {d:<14} {c:>18} {ep:>10} {ea:>10} "
                     f"{mm['n_present']:>5d} {mm['n_absent']:>5d}\n")
 
-        # ── Axis 2 (Complementarity / Friedman H) — temporarily disabled ───
-        f.write("\n--- Axis 2: Inter-model Complementarity (Friedman H-statistic) ---\n")
-        f.write("(Temporarily disabled — the Complementarity axis is currently left out.)\n")
-
-        # ── Axis 3 ────────────────────────────────────────────────────────
-        f.write("\n--- Axis 3: Stability (Evolutionary Survival) ---\n")
+        # ── Axis 2 ────────────────────────────────────────────────────────
+        f.write("\n--- Axis 2: Stability (Evolutionary Survival) ---\n")
         f.write("P(d, g) = (#individuals in generation g containing d) / population_size\n")
         f.write(f"      {'detector':<14} {'mean P':>8} {'first':>8} "
                 f"{'last':>8} {'trend':>10}\n")
@@ -1907,7 +1588,6 @@ def explain_ga_selection(
                     f"{ys[-1]:>8.3f} {(ys[-1] - ys[0]):>+10.3f}\n")
 
         # ── Synthesis ──────────────────────────────────────────────────────
-        # (Complementarity columns total-H_j / mean-H-with-peers disabled.)
         f.write("\n--- Synthesis: why each detector of the best ensemble was selected ---\n")
         f.write(f"      {'detector':<14} {'LOFO':>10} {'mean marg.':>12} "
                 f"{'last-gen P':>12}\n")
@@ -1926,7 +1606,6 @@ def explain_ga_selection(
             )
 
         # ── Functional archetypes ──────────────────────────────────────────
-        # (Complementarity axis disabled — archetypes use Utility × Stability.)
         f.write("\n--- Functional Archetypes (axis intersections) ---\n")
         f.write("Utility = mean marginal contribution (Axis 1b only; LOFO excluded).\n")
         f.write("Stability = mean survival rate "
@@ -1963,7 +1642,6 @@ def explain_ga_selection(
         "best_ensemble": list(best_ensemble),
         "lofo": lofo,
         "mean_marginal": mean_marginal,
-        # Complementarity axis disabled: friedman_h / H_two_way / H_total omitted.
         "survival": survival,
         "archetypes": archetypes,
         "n_subsets_evaluated": n_subsets,
@@ -1972,8 +1650,7 @@ def explain_ga_selection(
 
     # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
     try:
-        _ir = _ir_module()
-        _ir.write_stage_ir(_ir.build_ga_selection_ir(dataset, entity, result),
+        ir.write_stage_ir(ir.build_ga_selection_ir(dataset, entity, result),
                            dataset, entity, "ir_ga_selection")
     except Exception as e:
         logger.error(f"GA selection IR emission failed (non-fatal): {e}")
@@ -2608,12 +2285,10 @@ def plot_ga_combination_ale(
         note += f"  Not shown (no ALE could be computed): {', '.join(skipped)}."
     fig.suptitle("How each detector moves the meta-learner (ALE)"
                  + (" — bins marked" if mark_bins else ""), fontsize=13)
-    # WRAPPED to a fixed width, and this is why the two ALE figures used to come
-    # out different sizes. The note is one line of `fig.text` outside the axes,
-    # and `bbox_inches="tight"` grows the saved image to contain it — so the
-    # bins version, whose note carries an extra sentence, was saved WIDER than
-    # the plain one and the card then scaled it down to the same column. Same
-    # wrap width means the same bbox, so the two render at the same size.
+    # WRAPPED to a fixed width, and it must stay that way: the note sits
+    # outside the axes, `bbox_inches="tight"` grows the image to contain it, so
+    # an unwrapped note makes the bins figure save wider than the plain one and
+    # the card then scales the two to different sizes.
     fig.text(0.5, -0.01, textwrap.fill(note, 108),
              ha="center", va="top", fontsize=8, color="dimgrey")
 
@@ -2882,8 +2557,7 @@ def explain_ga_combination(
 
     # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
     try:
-        _ir = _ir_module()
-        _ir.write_stage_ir(_ir.build_ga_combination_ir(dataset, entity, result),
+        ir.write_stage_ir(ir.build_ga_combination_ir(dataset, entity, result),
                            dataset, entity, "ir_ga_combination")
     except Exception as e:
         logger.error(f"GA combination IR emission failed (non-fatal): {e}")

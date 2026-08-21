@@ -13,39 +13,8 @@ from Metrics.metrics import range_based_precision_recall_f1_auc, prauc, f1_score
 from Model_Selection.Sensitivity_robustness.plot_retention import (
     prune_superseded, prune_timestamped)
 from Utils.model_selection_utils import evaluate_model
-
-
-def _ews_module():
-    """Import exclusive_win_surrogates.py, tolerating standalone by-path loading of
-    this module (e.g. via importlib in test harnesses) where the Model_Selection
-    package itself may not be on sys.path — falls back to loading the sibling
-    file directly by its own location, the same trick those harnesses use."""
-    try:
-        from Model_Selection.Sensitivity_robustness import exclusive_win_surrogates as _ews
-        return _ews
-    except ModuleNotFoundError:
-        import importlib.util
-        _here = os.path.dirname(os.path.abspath(__file__))
-        _spec = importlib.util.spec_from_file_location(
-            "exclusive_win_surrogates", os.path.join(_here, "exclusive_win_surrogates.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
-
-
-def _ir_module():
-    """Import Explainability.ir with the same standalone-tolerant fallback."""
-    try:
-        from Explainability import ir as _ir
-        return _ir
-    except ModuleNotFoundError:
-        import importlib.util
-        _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        _spec = importlib.util.spec_from_file_location(
-            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
+from Explainability import ir
+from Model_Selection.Sensitivity_robustness import exclusive_win_surrogates as ews
 
 
 # Define the generator and discriminator models for GAN
@@ -550,7 +519,7 @@ def build_gan_point_table(point_records, adjusted_y_pred_dict, true_labels,
                    float(r['local_std']),
                    float(r['index']) / float(n)] for r in point_records], dtype=float)
 
-    return _ews_module().join_predictions(
+    return ews.join_predictions(
         indices, X, GAN_FEATURE_NAMES, adjusted_y_pred_dict, true_labels,
         model_names, stage_label="GAN explain")
 
@@ -561,7 +530,7 @@ def train_gan_point_surrogates(table, winner, max_depth: int = 3,
     For the winner, fit one DecisionTreeClassifier per competitor `k` predicting
     the winner's *exclusive wins*: y_i = winner_correct_i AND NOT k_correct_i.
     """
-    return _ews_module().train_exclusive_win_surrogates(
+    return ews.train_exclusive_win_surrogates(
         table, winner, max_depth=max_depth, random_state=random_state)
 
 
@@ -575,7 +544,7 @@ def _gan_explain_dir(dataset, entity) -> str:
 
 def plot_gan_point_tree(info, winner, competitor, dataset, entity, feature_names):
     """One winner-vs-competitor tree; returns its filename, None if degenerate."""
-    return _ews_module().plot_exclusive_win_tree(
+    return ews.plot_exclusive_win_tree(
         info, winner, feature_names,
         directory=_gan_explain_dir(dataset, entity),
         filename=f"{dataset}_{entity}_gan_point_tree_{winner}_vs_{competitor}.png",
@@ -585,7 +554,7 @@ def plot_gan_point_tree(info, winner, competitor, dataset, entity, feature_names
 
 def plot_gan_point_importance(per_competitor, dataset, entity, feature_names) -> None:
     """Bar chart of mean feature importance across all (non-degenerate) competitor trees."""
-    _ews_module().plot_exclusive_win_importance(
+    ews.plot_exclusive_win_importance(
         per_competitor, feature_names,
         directory=_gan_explain_dir(dataset, entity),
         filename=f"{dataset}_{entity}_gan_point_importance.png",
@@ -599,105 +568,22 @@ def explain_gan_robustness(point_records, adjusted_y_pred_dict, true_labels, ran
     table from the production run, picks the F1 winner, fits per-competitor exclusive-win
     surrogates, writes a report + two plots under myresults/robustness/GAN/{ds}/{ent}/,
     and returns the structures. explain=False → None; infeasible table → None.
+
+    The body is `exclusive_win_surrogates.explain_exclusive_win_stage`, shared
+    with the off-by-threshold stage; only the names and wording below are this
+    stage's own.
     """
-    if not explain:
-        return None
-    table = build_gan_point_table(point_records, adjusted_y_pred_dict, true_labels, model_names)
-    if table is None:
-        logger.warning("GAN explainability skipped: no injected points / valid predictions.")
-        return None
-
-    models = table["model_names"]
-    # Winner = highest-ranked F1 model that actually has predictions; else first valid.
-    winner = next((m for m in (ranked_f1_names or []) if m in models), models[0])
-    ranked_valid = [m for m in (ranked_f1_names or []) if m in models]
-    runnerup = next((m for m in ranked_valid if m != winner), None)
-
-    surrogate_note = ""
-    res = {"feasible": False, "winner": winner, "feature_names": table["feature_names"], "per_competitor": {}}
-    try:
-        res = train_gan_point_surrogates(table, winner)
-    except ImportError:
-        surrogate_note = "scikit-learn unavailable — per-competitor surrogates skipped."
-        logger.warning(f"GAN explainability: {surrogate_note}")
-
-    per_competitor = res.get("per_competitor", {})
-    if not surrogate_note:
-        # Plot every generated surrogate tree, one per competitor (degenerate ones,
-        # whose clf is None, are skipped inside plot_gan_point_tree).
-        written = [plot_gan_point_tree(info, winner, k, dataset, entity,
-                                        table["feature_names"])
-                   for k, info in per_competitor.items()]
-        plot_gan_point_importance(per_competitor, dataset, entity, table["feature_names"])
-        # Whatever an earlier run left here describes a different outcome —
-        # a different winner, or the same winner against differently-spelled
-        # competitors — and the picker cannot tell the two apart. Pruned
-        # AFTER the new set is on disk, so a run that dies mid-plot leaves
-        # the previous set rather than deleting it and not replacing it.
-        prune_superseded(_gan_explain_dir(dataset, entity),
-                         f"{dataset}_{entity}_gan_point_tree_",
-                         [n for n in written if n])
-
-    directory = _gan_explain_dir(dataset, entity)
-    report_path = os.path.join(directory, f"{dataset}_{entity}_gan_explainability.txt")
-    with open(report_path, "w") as f:
-        f.write("=== GAN Robustness Explainability ===\n")
-        f.write(f"Dataset: {dataset}  |  Entity: {entity}\n")
-        f.write(f"Models with predictions ({len(models)}): {', '.join(models)}\n")
-        f.write(f"Injected GAN points: {table['n_points']}\n")
-        f.write(f"Features: {', '.join(table['feature_names'])}\n")
-        f.write(f"F1 winner (production ranking): {winner}\n")
-        f.write("(Explains the actual production run; correctness is F1/prediction-side — "
-                "PR-AUC has no per-point correct/incorrect. The production ranking is unchanged.)\n\n")
-
-        if surrogate_note:
-            f.write(surrogate_note + "\n")
-        elif not per_competitor:
-            f.write("No competitors to compare against (winner is the only model with predictions).\n")
-        else:
-            order = [m for m in ranked_valid if m in per_competitor] + \
-                    [m for m in per_competitor if m not in ranked_valid]
-            agg: Dict[str, List[float]] = {fn: [] for fn in table["feature_names"]}
-            for k in order:
-                info = per_competitor[k]
-                f.write(f"--- {winner} vs {k} ---\n")
-                f.write(f"Exclusive wins: {info['n_exclusive_wins']} "
-                        f"({info['exclusive_win_rate']:.2%} of injected points)\n")
-                if info.get("degenerate"):
-                    f.write(f"    {info['rules_text']}\n\n")
-                    continue
-                f.write(f"Surrogate train accuracy (in-sample fit): {info['train_accuracy']:.3f}\n")
-                cv_acc = info.get("cv_accuracy", float('nan'))
-                if not np.isnan(cv_acc):
-                    f.write(f"Surrogate held-out accuracy ({info.get('cv_method', 'cv')}, "
-                            f"{info.get('cv_accuracy_std', float('nan')):.3f} std): {cv_acc:.3f}\n")
-                elif info.get("cv_note"):
-                    f.write(f"Surrogate held-out accuracy: not estimated ({info['cv_note']})\n")
-                imps = sorted(info["feature_importances"].items(), key=lambda kv: kv[1], reverse=True)
-                f.write("Feature importances: "
-                        + ", ".join(f"{fn} {im:.2f}" for fn, im in imps if im > 0) + "\n")
-                for fn, im in info["feature_importances"].items():
-                    agg[fn].append(im)
-                f.write("Rules (1 = point the winner uniquely gets right):\n")
-                for line in info["rules_text"].rstrip().splitlines():
-                    f.write(f"    {line}\n")
-                f.write("\n")
-            mean_imp = {fn: (float(np.mean(v)) if v else 0.0) for fn, v in agg.items()}
-            if any(mean_imp.values()):
-                top = max(mean_imp.items(), key=lambda kv: kv[1])
-                f.write(f"Across competitors, the winner's edge is best explained by: "
-                        f"{top[0]} (mean importance {top[1]:.2f}).\n")
-
-    result = {"table": table, "winner": winner, "runnerup": runnerup,
-              "surrogates": res, "n_points": table["n_points"]}
-
-    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
-    try:
-        _ir = _ir_module()
-        _ir.write_stage_ir(
-            _ir.build_gan_ir(dataset, entity, result, ranked_f1_names),
-            dataset, entity, "ir_gan")
-    except Exception as e:
-        logger.error(f"GAN IR emission failed (non-fatal): {e}")
-
-    return result
+    return ews.explain_exclusive_win_stage(
+        point_records, adjusted_y_pred_dict, true_labels, ranked_f1_names,
+        model_names, dataset, entity, explain,
+        stage_label="GAN",
+        build_table=build_gan_point_table,
+        plot_tree_fn=plot_gan_point_tree,
+        plot_importance_fn=plot_gan_point_importance,
+        explain_dir_fn=_gan_explain_dir,
+        tree_prefix="gan_point_tree_",
+        report_stem="gan_explainability",
+        report_heading="GAN Robustness Explainability",
+        points_label="Injected GAN points",
+        build_ir=ir.build_gan_ir,
+        ir_stem="ir_gan")

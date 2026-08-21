@@ -419,23 +419,6 @@ def enhanced_markov_chain_rank_aggregator_text(rankings: List[List[str]], base_s
 #    • Borda alignment (default arbiter for every source)
 # ════════════════════════════════════════════════════════════════════════════
 
-def _ir_module():
-    """Import Explainability.ir, tolerating standalone by-path loading of this
-    module where the package root is not on sys.path — falls back to loading
-    ir.py directly by its file location."""
-    try:
-        from Explainability import ir as _ir
-        return _ir
-    except ModuleNotFoundError:
-        import importlib.util
-        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _spec = importlib.util.spec_from_file_location(
-            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
-
-
 def kendall_tau_restricted(a: List[str], b: List[str]) -> float:
     """
     Kendall's tau in [-1, 1] between two rankings, restricted to the common set
@@ -493,44 +476,6 @@ def kendall_tau_alignments(
     """
     return {name: kendall_tau_restricted(r, full_ranking)
             for name, r in zip(source_names, rankings)}
-
-
-# ─── Kept for future use ────────────────────────────────────────────────────
-# Earlier design: positional-agreement Borda — measured how well each source's
-# own ranking matched the consensus's positional preferences (per-source score
-# in [0, 1]). Replaced by `borda_count_resolution` below, which applies Borda
-# COUNT VOTING over the LOO and Kendall rankings-of-sources to produce a single
-# resolved ranking. The old implementation is retained verbatim in case the
-# positional-agreement variant is useful again later.
-#
-# def borda_alignments(
-#     rankings: List[List[str]],
-#     source_names: List[str],
-#     full_ranking: List[str],
-# ) -> Dict[str, float]:
-#     """
-#     Normalised Borda alignment in [0, 1] between each source and the final
-#     ranking. For each model m at source position src_pos and final position
-#     full_pos (over the common item set of size n):
-#         score_m = (n - src_pos) * (n - full_pos)
-#     The total score is normalised by the score that would be achieved if the
-#     source matched the final ranking exactly (sum of squares of (n - pos)).
-#     Higher = source's positional preferences align with the final's.
-#     """
-#     full_positions = {m: i for i, m in enumerate(full_ranking)}
-#     n = len(full_ranking)
-#     if n == 0:
-#         return {name: 0.0 for name in source_names}
-#     max_score = float(sum((n - i) ** 2 for i in range(n)))
-#     out: Dict[str, float] = {}
-#     for name, r in zip(source_names, rankings):
-#         s = 0.0
-#         for src_pos, m in enumerate(r):
-#             if m in full_positions:
-#                 s += (n - src_pos) * (n - full_positions[m])
-#         out[name] = s / max_score if max_score > 0 else 0.0
-#     return out
-# ────────────────────────────────────────────────────────────────────────────
 
 
 def borda_count_resolution(
@@ -989,15 +934,14 @@ def explain_rank_aggregation(
 
     # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
     try:
-        _ir = _ir_module()
         source_top_picks = {
             name: (rankings[i][0] if rankings[i] else "not_available")
             for i, name in enumerate(source_names)
         }
-        ir_doc = _ir.build_rank_aggregation_ir(
+        ir_doc = ir.build_rank_aggregation_ir(
             dataset, entity, stage_name, iteration, result,
             source_names, source_top_picks, full_ranking)
-        _ir.write_stage_ir(ir_doc, dataset, entity,
+        ir.write_stage_ir(ir_doc, dataset, entity,
                            f"ir_rank_aggregation_{stage_name}_{iteration}")
     except Exception as e:
         logger.error(f"Rank-aggregation IR emission failed (non-fatal): {e}")
@@ -1101,6 +1045,7 @@ def copeland_rank_aggregator(*rankings: np.ndarray) -> Tuple[float, np.ndarray]:
 # *********************************************************
 # #########################################################
 from scipy.optimize import linear_sum_assignment
+from Explainability import ir
 
 
 def spearmans_footrule_aggregator(*rankings: np.ndarray) -> Tuple[float, np.ndarray]:

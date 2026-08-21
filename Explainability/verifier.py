@@ -49,7 +49,7 @@ set membership against values harvested from the IR. stdlib-only.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 # A number not embedded in an identifier (rejects the "1"s in "LOF_1" and
 # "machine-1-6") while still matching at sentence-final punctuation

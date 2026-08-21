@@ -346,7 +346,6 @@ button.grp-graph:disabled {
 }
 .badge-ok { background: var(--ok-soft); color: var(--ok); }
 .badge-warn { background: var(--warn-soft); color: var(--warn); }
-.badge-error { background: var(--error-soft); color: var(--error); }
 .badge-muted { background: var(--surface-sunken); color: var(--text-muted); }
 
 /* ── Forms ────────────────────────────────────────────────────────────────── */
@@ -380,14 +379,12 @@ a.button { display: inline-block; text-decoration: none; color: var(--text); }
 button:hover:not(:disabled), .button:hover { background: var(--surface-sunken); }
 button:disabled { opacity: .5; cursor: not-allowed; }
 
-.button-primary, button.primary, a.button.primary {
+button.primary, a.button.primary {
   background: var(--accent); border-color: var(--accent); color: #fff;
 }
-:root[data-theme="dark"] .button-primary,
 :root[data-theme="dark"] button.primary,
 :root[data-theme="dark"] a.button.primary { color: #14161f; }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .button-primary,
   :root:not([data-theme="light"]) button.primary,
   :root:not([data-theme="light"]) a.button.primary { color: #14161f; }
 }
@@ -767,7 +764,6 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
   border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4);
   font-size: var(--fs-sm);
 }
-.banner-info { background: var(--accent-soft); border-left-color: var(--accent); }
 .banner-warn { background: var(--warn-soft); border-left-color: var(--warn); }
 .banner-error { background: var(--error-soft); border-left-color: var(--error); }
 
