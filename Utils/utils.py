@@ -3,6 +3,7 @@ import torch as t
 import matplotlib.pyplot as plt
 from argparse import ArgumentParser
 from Utils.config import Config
+from Utils.pipeline_spec import parse_detectors, parse_stages
 from pathlib import Path
 import os
 from loguru import logger
@@ -71,7 +72,46 @@ def get_args_from_cmdline():
     parser.add_argument('--skip_gan',
                         action='store_true',
                         help='Skip GAN robustness testing for faster execution (testing/debugging)')
-    
+    parser.add_argument('--explain',
+                        action='store_true',
+                        help='Enable all explainability outputs (reports/plots). Explainability is OFF by default.')
+    parser.add_argument('--llm_model',
+                        type=str,
+                        default=None,
+                        help='Model for the automatic LLM narration after an --explain run '
+                             '(default: qwen2.5:14b-instruct). Narration is skipped with a '
+                             'warning if no local LLM server is reachable.')
+    parser.add_argument('--llm_base_url',
+                        type=str,
+                        default=None,
+                        help='OpenAI-compatible base URL for LLM narration '
+                             '(default: http://localhost:11434/v1, i.e. Ollama).')
+    parser.add_argument('--stages',
+                        type=str,
+                        default='all',
+                        help="Comma-separated sub-stages of the model-selection pipeline to run. "
+                             "Tokens: ga, thompson, gan, offby, montecarlo (plus 'all' and "
+                             "'robustness'=gan,offby,montecarlo). Default 'all' runs the full pipeline; "
+                             "any strict subset runs only those stages + their explainability, then stops "
+                             "(no rank aggregation / final decision / online phase) and runs sequentially.")
+
+    parser.add_argument('--overwrite',
+                        type=str,
+                        default=None,
+                        choices=['true', 'false'],
+                        help="Retrain the base detectors even when checkpoints already exist. "
+                             "Overrides `overwrite` in the config file. Training dominates the "
+                             "runtime, so 'false' reuses existing models and is much faster.")
+
+    parser.add_argument('--detectors',
+                        type=str,
+                        default=None,
+                        help="Comma-separated base detectors to select among, e.g. "
+                             "'LOF_1,NN_2,CBLOF_3'. Default: all 11. Only the families of the "
+                             "requested detectors are trained. Detectors with no trained model "
+                             "for the chosen dataset/entity are skipped with a warning; at least "
+                             "two must remain.")
+
     cmd_args = parser.parse_args()
     
     # Load config from file
@@ -113,7 +153,30 @@ def get_args_from_cmdline():
     
     # Skip GAN flag
     args['skip_gan'] = cmd_args.skip_gan
-    
+
+    # Explainability is OFF by default; --explain enables it everywhere.
+    args['explain'] = cmd_args.explain
+    # LLM narration overrides (None → Explainability.llm defaults in app.py).
+    args['llm_model'] = cmd_args.llm_model
+    args['llm_base_url'] = cmd_args.llm_base_url
+
+    # Which pipeline sub-stages to run, and which detectors to select among.
+    # Both vocabularies live in Utils/pipeline_spec.py so app.py and the web UI
+    # read the same definitions ('all' and 'robustness' are stage groups).
+    try:
+        args['stages'] = parse_stages(cmd_args.stages)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        args['detectors'] = parse_detectors(cmd_args.detectors)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # CLI overrides the config file, so a caller can reuse checkpoints without
+    # editing Configs/config.yml.
+    if cmd_args.overwrite is not None:
+        args['overwrite'] = cmd_args.overwrite == 'true'
+
     return args
 
 def de_unfold(windows, window_step):

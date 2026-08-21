@@ -1,5 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by the RAMSeS project. This file is NOT identical to the original
+# in mononitogoswami/tsad-model-selection, from which it is derived.
 
 ######################################################
 # Metrics to evaluate the quality of model selection
@@ -232,9 +235,25 @@ def normalize_scores(scores, interval_size):
 
 def adjusted_precision_recall_f1_auc(y_true: np.ndarray, y_scores: np.ndarray, n_splits=750):
     """Function to compute adjusted precision, recall, PR-AUC (average precision) and predictions.
+    
+    Handles edge cases where scores have zero variance or other degenerate conditions.
     """
     from sklearn.metrics import auc
 
+    # Handle degenerate case: all scores identical (zero variance)
+    score_range = y_scores.max() - y_scores.min()
+    if score_range < 1e-10:
+        # All scores are the same - cannot compute meaningful PR-AUC
+        # Return neutral/zero values
+        adjusted_precision = np.zeros(1)
+        adjusted_recall = np.zeros(1)
+        adjusted_f1 = np.array([0.0])
+        best_adjusted_f1 = 0.0
+        best_threshold = y_scores[0]
+        adjusted_prauc = 0.0  # Cannot compute PR-AUC with zero variance
+        adjusted_y_pred = y_scores >= best_threshold
+        return adjusted_precision, adjusted_recall, best_adjusted_f1, adjusted_prauc, adjusted_y_pred
+    
     thresholds = np.linspace(y_scores.min(), y_scores.max(), n_splits)
     adjusted_precision = np.zeros(thresholds.shape)
     adjusted_recall = np.zeros(thresholds.shape)
@@ -248,6 +267,10 @@ def adjusted_precision_recall_f1_auc(y_true: np.ndarray, y_scores: np.ndarray, n
     best_adjusted_f1 = np.max(adjusted_f1)
     best_threshold = thresholds[np.argmax(adjusted_f1)]
     adjusted_prauc = auc(adjusted_recall, adjusted_precision)
+    
+    # Ensure PR-AUC is not NaN or Inf
+    if np.isnan(adjusted_prauc) or np.isinf(adjusted_prauc):
+        adjusted_prauc = 0.0
 
     adjusted_y_pred = y_scores >= best_threshold
     adjusted_y_pred = adjust_predicts(score=y_scores, label=(y_true > 0), threshold=None, pred=adjusted_y_pred,

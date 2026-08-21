@@ -3,19 +3,25 @@
 
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by the RAMSeS project. This file is NOT identical to the original
+# in mononitogoswami/tsad-model-selection, from which it is derived.
 
 ##########################################
 # Functions for rank aggregation
 ##########################################
 
+import os
 from itertools import combinations, permutations
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import logging
 
 import cvxpy as cp
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
+from scipy.stats import kendalltau
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import MinMaxScaler
@@ -404,6 +410,599 @@ def enhanced_markov_chain_rank_aggregator_text(rankings: List[List[str]], base_s
     print(sorted_algorithms)
 
     return objective, sorted_algorithms[::-1]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Rank-aggregation explainability
+#    • Leave-one-out marginal contribution
+#    • Kendall τ alignment
+#    • Borda alignment (default arbiter for every source)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _ir_module():
+    """Import Explainability.ir, tolerating standalone by-path loading of this
+    module where the package root is not on sys.path — falls back to loading
+    ir.py directly by its file location."""
+    try:
+        from Explainability import ir as _ir
+        return _ir
+    except ModuleNotFoundError:
+        import importlib.util
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _spec = importlib.util.spec_from_file_location(
+            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+
+
+def kendall_tau_restricted(a: List[str], b: List[str]) -> float:
+    """
+    Kendall's tau in [-1, 1] between two rankings, restricted to the common set
+    of items. Identical ordering → +1, reverse → -1, independent → ~0.
+
+    Items missing from either ranking are dropped from the comparison. If fewer
+    than 2 items remain in common, returns 0.0 (tau undefined).
+    """
+    common = [x for x in a if x in b]
+    if len(common) < 2:
+        return 0.0
+    pos_a = [a.index(x) for x in common]
+    pos_b = [b.index(x) for x in common]
+    tau, _ = kendalltau(pos_a, pos_b)
+    if tau is None or np.isnan(tau):
+        return 0.0
+    return float(tau)
+
+
+def leave_one_out_contributions(
+    rankings: List[List[str]],
+    source_names: List[str],
+    full_ranking: List[str],
+    aggregator=None,
+) -> Dict[str, float]:
+    """
+    For each source i, re-aggregate without it and return the normalised Kendall
+    distance (1 - tau)/2 ∈ [0, 1] between full_ranking and the LOO result.
+    Higher = removing this source moves the consensus more = bigger marginal contribution.
+
+    If removing leaves 0 sources, contribution = 0.0 for that source.
+    """
+    if aggregator is None:
+        aggregator = enhanced_markov_chain_rank_aggregator_text
+    out: Dict[str, float] = {}
+    for i, name in enumerate(source_names):
+        loo_input = rankings[:i] + rankings[i + 1:]
+        if not loo_input:
+            out[name] = 0.0
+            continue
+        _, loo_ranking = aggregator(loo_input)
+        tau = kendall_tau_restricted(full_ranking, loo_ranking)
+        out[name] = (1.0 - tau) / 2.0
+    return out
+
+
+def kendall_tau_alignments(
+    rankings: List[List[str]],
+    source_names: List[str],
+    full_ranking: List[str],
+) -> Dict[str, float]:
+    """
+    For each source, return Kendall's tau against the full ranking ∈ [-1, 1].
+    Higher = source agrees more with the consensus.
+    """
+    return {name: kendall_tau_restricted(r, full_ranking)
+            for name, r in zip(source_names, rankings)}
+
+
+# ─── Kept for future use ────────────────────────────────────────────────────
+# Earlier design: positional-agreement Borda — measured how well each source's
+# own ranking matched the consensus's positional preferences (per-source score
+# in [0, 1]). Replaced by `borda_count_resolution` below, which applies Borda
+# COUNT VOTING over the LOO and Kendall rankings-of-sources to produce a single
+# resolved ranking. The old implementation is retained verbatim in case the
+# positional-agreement variant is useful again later.
+#
+# def borda_alignments(
+#     rankings: List[List[str]],
+#     source_names: List[str],
+#     full_ranking: List[str],
+# ) -> Dict[str, float]:
+#     """
+#     Normalised Borda alignment in [0, 1] between each source and the final
+#     ranking. For each model m at source position src_pos and final position
+#     full_pos (over the common item set of size n):
+#         score_m = (n - src_pos) * (n - full_pos)
+#     The total score is normalised by the score that would be achieved if the
+#     source matched the final ranking exactly (sum of squares of (n - pos)).
+#     Higher = source's positional preferences align with the final's.
+#     """
+#     full_positions = {m: i for i, m in enumerate(full_ranking)}
+#     n = len(full_ranking)
+#     if n == 0:
+#         return {name: 0.0 for name in source_names}
+#     max_score = float(sum((n - i) ** 2 for i in range(n)))
+#     out: Dict[str, float] = {}
+#     for name, r in zip(source_names, rankings):
+#         s = 0.0
+#         for src_pos, m in enumerate(r):
+#             if m in full_positions:
+#                 s += (n - src_pos) * (n - full_positions[m])
+#         out[name] = s / max_score if max_score > 0 else 0.0
+#     return out
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def borda_count_resolution(
+    loo_scores: Dict[str, float],
+    align_scores: Dict[str, float],
+) -> Dict[str, float]:
+    """
+    Apply Borda count voting over the two rankings-of-sources implied by LOO
+    contribution and Kendall τ alignment, producing a single resolved ranking.
+
+    Mechanics
+    ---------
+    Each voter is one of the two rankings of sources:
+        Voter 1 : sources ordered by LOO contribution, descending
+        Voter 2 : sources ordered by Kendall τ alignment, descending
+    Under standard Borda voting, a source at position `r` (1-based) in a
+    ranking of N sources receives `(N - r)` points from that voter. The total
+    Borda count is the sum across the two voters:
+
+        borda_count(source) = (N − loo_rank) + (N − align_rank)
+
+    The Borda count therefore lies in [0, 2(N−1)]; sources with higher counts
+    are better-ranked overall. The resulting Borda ranking of sources IS the
+    resolution when LOO and Kendall disagree.
+
+    Tie handling: the ranks that feed this ARITHMETIC use AVERAGE (fractional)
+    ranking, whose sum-preserving property keeps tied sources contributing
+    symmetrically to the count — the textbook-fair Borda tie rule. (The
+    displayed influence/agreement/Borda ranks and the pattern labels use
+    competition ranking; see `_ranks_from_scores`.)
+
+    Parameters
+    ----------
+    loo_scores, align_scores : Dict[str, float]
+        Same source names as keys.
+
+    Returns
+    -------
+    Dict[str, float]
+        {source: borda_count}; higher = preferred by the joint vote.
+    """
+    if set(loo_scores.keys()) != set(align_scores.keys()):
+        raise ValueError("loo_scores and align_scores must have identical keys.")
+    n = len(loo_scores)
+    loo_rank   = _ranks_from_scores(loo_scores,   descending=True, method="average")
+    align_rank = _ranks_from_scores(align_scores, descending=True, method="average")
+    return {name: (n - loo_rank[name]) + (n - align_rank[name])
+            for name in loo_scores}
+
+
+def _ranks_from_scores(scores: Dict[str, float], descending: bool = True,
+                       method: str = "competition") -> Dict[str, float]:
+    """Convert a {name: score} mapping into {name: 1-based rank}.
+
+    method="competition" (default) — STANDARD COMPETITION RANKING ("1224"):
+        tied scores share the smallest rank in their group and the next score
+        skips (two tied for 2nd are both rank 2, the next is rank 4). Integer
+        ranks, directly interpretable ("k−1 sources are strictly better"). This
+        is what every DISPLAYED rank and the pattern labels use.
+    method="average" — FRACTIONAL / AVERAGE RANKING: a tied group shares the
+        mean of the positions it spans (two tied for 2nd/3rd are both 2.5).
+        Sum-preserving, which is the correct tie handling when ranks feed
+        ARITHMETIC — used only inside the Borda count so tied sources contribute
+        symmetrically instead of getting a min-rank boost.
+
+    descending=True means the highest score gets rank 1.
+    """
+    names = list(scores.keys())
+    vals = np.array([scores[n] for n in names], dtype=float)
+    if descending:
+        vals = -vals
+    # np.unique sorts ascending; with vals negated for descending, the first
+    # group is the best. `starts[g]` = number of items in strictly-better groups.
+    _, inv, counts = np.unique(vals, return_inverse=True, return_counts=True)
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    if method == "average":
+        group_rank = starts + (counts + 1) / 2.0          # min + (size+1)/2
+        return {n: float(group_rank[inv[i]]) for i, n in enumerate(names)}
+    min_rank = (starts + 1).astype(int)                   # competition ("1224")
+    return {n: int(min_rank[inv[i]]) for i, n in enumerate(names)}
+
+
+def borda_verdict_per_source(
+    loo_scores: Dict[str, float],
+    align_scores: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """
+    For EVERY source, report its LOO rank, Kendall-alignment rank, and the
+    Borda count + Borda rank produced by `borda_count_resolution` (Borda voting
+    over the two source-rankings). The Borda rank IS the resolution: when LOO
+    and Kendall disagree about a source, Borda's ranking is the consensus.
+
+    Returns a list of dicts (one per source, in source order) with keys:
+        source, loo_score, loo_rank, align_score, align_rank,
+        borda_count, borda_rank, pattern, lo_align_rank_delta
+
+    'pattern' is descriptive:
+        'influential_disagreer' — LOO rank ≪ alignment rank (high LOO, low Kendall)
+        'redundant_agreer'    — LOO rank ≫ alignment rank (low LOO, high Kendall)
+        'consistent'          — LOO and alignment ranks agree
+    """
+    names = list(loo_scores.keys())
+    # Hybrid tie handling: displayed ranks and the pattern labels use COMPETITION
+    # ranking (interpretable "1224"); the Borda COUNT alone uses average ranks
+    # internally (via borda_count_resolution) for fair arithmetic. The Borda
+    # RANK shown here is the competition rank OF that fairly-computed count.
+    loo_rank    = _ranks_from_scores(loo_scores,   descending=True)
+    align_rank  = _ranks_from_scores(align_scores, descending=True)
+    borda_count = borda_count_resolution(loo_scores, align_scores)
+    borda_rank  = _ranks_from_scores(borda_count,  descending=True)
+
+    verdicts: List[Dict[str, Any]] = []
+    for name in names:
+        lr = loo_rank[name]
+        ar = align_rank[name]
+        delta = abs(lr - ar)
+        if lr < ar:
+            pattern = "influential_disagreer"   # high LOO, lower alignment
+        elif lr > ar:
+            pattern = "redundant_agreer"      # lower LOO, higher alignment
+        else:
+            pattern = "consistent"
+
+        verdicts.append({
+            "source":      name,
+            "loo_score":   float(loo_scores[name]),
+            "loo_rank":    lr,
+            "align_score": float(align_scores[name]),
+            "align_rank":  ar,
+            "borda_count": float(borda_count[name]),
+            "borda_rank":  borda_rank[name],
+            "pattern":     pattern,
+            "lo_align_rank_delta": float(delta),
+        })
+    return verdicts
+
+
+def prominent_contradictions(
+    verdicts: List[Dict[str, Any]],
+    rank_delta_threshold: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Subset of verdicts whose |loo_rank - align_rank| >= threshold.
+    Default threshold = max(2, n // 3).
+    """
+    n = len(verdicts)
+    if n == 0:
+        return []
+    threshold = rank_delta_threshold if rank_delta_threshold is not None else max(2, n // 3)
+    return [v for v in verdicts if v["lo_align_rank_delta"] >= threshold]
+
+
+def plot_aggregation_explainability(
+    source_names: List[str],
+    loo_scores: Dict[str, float],
+    align_scores: Dict[str, float],
+    borda_counts: Dict[str, float],
+    stage_name: str,
+    dataset: str,
+    entity: str,
+    iteration: int,
+) -> None:
+    """
+    Grouped bar chart: x = source names; three bars per source for LOO contribution,
+    Kendall τ alignment, and the Borda-count resolution. Kendall τ ∈ [-1, 1] is
+    shifted to [0, 1] for visual comparison; Borda counts are normalised to [0, 1]
+    by dividing by their max-possible value 2(N − 1). The report retains raw values.
+
+    Saves to:
+        myresults/robust_aggregated/{dataset}/{entity}/aggregation_explainability_{stage_name}_{iteration}.png
+    """
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+
+    n = len(source_names)
+    x = np.arange(n)
+    width = 0.27
+
+    max_borda  = float(2 * (n - 1)) if n > 1 else 1.0
+    loo_vals   = [loo_scores[s]                      for s in source_names]
+    align_vals = [(align_scores[s] + 1.0) / 2.0      for s in source_names]
+    borda_vals = [borda_counts[s] / max_borda        for s in source_names]
+
+    fig, ax = plt.subplots(figsize=(max(8, 0.9 * n + 4), 5))
+    ax.bar(x - width, loo_vals,   width, label="LOO contribution",          color="#d62728")
+    ax.bar(x,         align_vals, width, label="Kendall τ (rescaled)",      color="#1f77b4")
+    ax.bar(x + width, borda_vals, width, label="Borda count (normalised)",  color="#2ca02c")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(source_names, rotation=30, ha="right")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Score (rescaled to [0, 1])")
+    ax.set_title(f"Rank Aggregation Explainability — {stage_name} stage")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+    ax.legend(loc="upper left", frameon=False,
+              bbox_to_anchor=(1.01, 1), borderaxespad=0)
+
+    plt.tight_layout(pad=1.2)
+    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    os.makedirs(directory, exist_ok=True)
+    plt.savefig(f"{directory}/aggregation_explainability_{stage_name}_{iteration}.png",
+                format="png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_kendall_only_alignment(
+    source_names: List[str],
+    align_scores: Dict[str, float],
+    winner: str,
+    stage_name: str,
+    dataset: str,
+    entity: str,
+    iteration: int,
+) -> None:
+    """
+    Bar chart of Kendall's τ between each of the two sources and the final
+    ranking. The more-aligned source (the winner) is highlighted in green.
+
+    Saves to:
+        myresults/robust_aggregated/{dataset}/{entity}/aggregation_explainability_{stage_name}_kendall_only_{iteration}.png
+    """
+    plt.rcParams.update({
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+    })
+    x = np.arange(len(source_names))
+    vals = [align_scores[s] for s in source_names]
+    colours = ["#2ca02c" if s == winner else "#1f77b4" for s in source_names]
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    bars = ax.bar(x, vals, width=0.5, color=colours)
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:+.3f}",
+                ha="center", va="bottom" if v >= 0 else "top", fontsize=10)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(source_names, rotation=15, ha="right")
+    ax.set_ylabel("Kendall's tau with final ranking")
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_title(f"Kendall-tau-Only Alignment — {stage_name} stage")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+
+    plt.tight_layout(pad=1.2)
+    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    os.makedirs(directory, exist_ok=True)
+    plt.savefig(
+        f"{directory}/aggregation_explainability_{stage_name}_kendall_only_{iteration}.png",
+        format="png", dpi=300, bbox_inches="tight",
+    )
+    plt.close()
+
+
+def explain_rank_aggregation_kendall_only(
+    rankings: List[List[str]],
+    source_names: List[str],
+    full_ranking: List[str],
+    stage_name: str,
+    dataset: str,
+    entity: str,
+    iteration: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Kendall-tau-only explainability for a TWO-source aggregation.
+
+    When exactly two ranking lists feed an aggregation (as in the final stage,
+    Robust_Aggregated + Thompson_Sampling), leave-one-out and Borda voting become
+    degenerate — removing one source simply leaves the other untouched. A direct
+    Kendall's tau comparison is the cleaner diagnostic: whichever source has the
+    higher tau with the final ranking is the one the consensus leans toward.
+
+    This is an alternative to (not a replacement for) explain_rank_aggregation —
+    both sets of outputs are produced so the two methods can be compared.
+
+    Produces (only when len(rankings) == 2):
+        aggregation_explainability_{stage_name}_kendall_only_{iteration}.txt
+        aggregation_explainability_{stage_name}_kendall_only_{iteration}.png
+
+    Returns None when the source count is not 2; otherwise a dict with the tau
+    values and the verdict.
+    """
+    if len(rankings) != 2 or len(source_names) != 2:
+        return None
+
+    align = kendall_tau_alignments(rankings, source_names, full_ranking)
+    ranked = sorted(align.items(), key=lambda x: x[1], reverse=True)
+    winner, winner_tau = ranked[0]
+    runner, runner_tau = ranked[1]
+    gap = winner_tau - runner_tau
+
+    plot_kendall_only_alignment(source_names, align, winner,
+                                stage_name, dataset, entity, iteration)
+
+    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    os.makedirs(directory, exist_ok=True)
+    report_path = os.path.join(
+        directory,
+        f"aggregation_explainability_{stage_name}_kendall_only_{iteration}.txt",
+    )
+    with open(report_path, "w") as f:
+        f.write(f"=== Rank Aggregation Explainability (Kendall-tau-only method) "
+                f"— {stage_name} stage ===\n")
+        f.write(f"Dataset: {dataset}  |  Entity: {entity}  |  Iteration: {iteration}\n")
+        f.write(f"Sources (n=2): {', '.join(source_names)}\n")
+        f.write(f"Final ranking: {full_ranking}\n\n")
+        f.write("This method applies only when exactly two ranking lists feed the\n")
+        f.write("aggregation. With two sources, leave-one-out and Borda voting are\n")
+        f.write("degenerate (removing one source leaves the other unchanged), so a\n")
+        f.write("direct Kendall's tau comparison is the cleaner diagnostic.\n\n")
+
+        f.write("--- Kendall's tau Alignment with the Final Ranking ---\n")
+        f.write(f"  {'Source':<22} {'Kendall tau':>12}\n")
+        f.write("  " + "-" * 35 + "\n")
+        for name in source_names:
+            f.write(f"  {name:<22} {align[name]:>+12.4f}\n")
+
+        f.write("\n--- Verdict ---\n")
+        f.write(f"The final ranking is most aligned with: {winner} "
+                f"(tau = {winner_tau:+.4f}).\n")
+        f.write(f"{runner} is less aligned (tau = {runner_tau:+.4f}).\n")
+        f.write(f"Alignment gap: {gap:.4f}.\n")
+
+    return {
+        "align_scores": align,
+        "winner": winner,
+        "winner_tau": winner_tau,
+        "runner_up": runner,
+        "runner_up_tau": runner_tau,
+        "alignment_gap": gap,
+    }
+
+
+def explain_rank_aggregation(
+    rankings: List[List[str]],
+    source_names: List[str],
+    full_ranking: List[str],
+    stage_name: str,
+    dataset: str,
+    entity: str,
+    iteration: int,
+    explain: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute LOO contributions, Kendall τ alignments, Borda alignments, then for
+    every source decide via Borda whether the LOO or Kendall perspective wins.
+    Write a structured text report and a grouped bar plot to:
+        myresults/robust_aggregated/{dataset}/{entity}/
+    Files:
+        aggregation_explainability_{stage_name}_{iteration}.txt
+        aggregation_explainability_{stage_name}_{iteration}.png
+
+    When exactly two ranking lists feed the aggregation (the final stage), an
+    additional Kendall-τ-only analysis is produced as well — see
+    explain_rank_aggregation_kendall_only — so both methods are visible side by
+    side. The two extra files carry a _kendall_only suffix.
+
+    Returns the dict of computed scores + verdicts when explain=True; None otherwise.
+    """
+    if not explain:
+        return None
+    if len(rankings) != len(source_names):
+        raise ValueError(
+            f"rankings ({len(rankings)}) and source_names ({len(source_names)}) "
+            "must have the same length."
+        )
+
+    loo = leave_one_out_contributions(rankings, source_names, full_ranking)
+    align = kendall_tau_alignments(rankings, source_names, full_ranking)
+    borda_counts = borda_count_resolution(loo, align)
+    verdicts = borda_verdict_per_source(loo, align)
+    prominent = prominent_contradictions(verdicts)
+
+    plot_aggregation_explainability(
+        source_names, loo, align, borda_counts,
+        stage_name, dataset, entity, iteration,
+    )
+
+    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    os.makedirs(directory, exist_ok=True)
+    report_path = os.path.join(
+        directory, f"aggregation_explainability_{stage_name}_{iteration}.txt"
+    )
+    with open(report_path, "w") as f:
+        f.write(f"=== Rank Aggregation Explainability — {stage_name} stage ===\n")
+        f.write(f"Dataset: {dataset}  |  Entity: {entity}  |  Iteration: {iteration}\n")
+        f.write(f"Sources (n={len(source_names)}): {', '.join(source_names)}\n")
+        f.write(f"Final ranking: {full_ranking}\n\n")
+
+        f.write("--- Per-Source Scores ---\n")
+        f.write(f"{'Source':<22} {'LOO contrib.':>12} {'Kendall τ':>12} {'Borda count':>12}\n")
+        f.write("-" * 62 + "\n")
+        for name in source_names:
+            f.write(
+                f"{name:<22} {loo[name]:>12.4f} {align[name]:>+12.4f} "
+                f"{borda_counts[name]:>12.2f}\n"
+            )
+
+        f.write("\n--- Per-Source Ranks (1 = best by that criterion;"
+                " Borda rank IS the resolved ranking) ---\n")
+        f.write(f"{'Source':<22} {'LOO':>5} {'Align':>6} {'Borda':>6}  {'Pattern'}\n")
+        f.write("-" * 70 + "\n")
+        for v in verdicts:
+            f.write(
+                f"{v['source']:<22} {v['loo_rank']:>5.0f} {v['align_rank']:>6.0f} "
+                f"{v['borda_rank']:>6.0f}  {v['pattern']}\n"
+            )
+
+        # Show the final Borda-voted ranking of sources explicitly.
+        borda_sorted = sorted(verdicts, key=lambda v: v["borda_rank"])
+        f.write("\n--- Borda-Resolved Source Ranking (Borda count voting"
+                " over LOO and Kendall) ---\n")
+        for i, v in enumerate(borda_sorted, 1):
+            f.write(
+                f"  {i}. {v['source']:<22} "
+                f"borda_count = {v['borda_count']:.2f}   (LOO rank {v['loo_rank']:.0f}, "
+                f"Align rank {v['align_rank']:.0f})\n"
+            )
+
+        f.write("\n--- Prominent Contradictions (largest LOO vs Alignment rank gaps) ---\n")
+        if not prominent:
+            f.write("None detected.\n")
+        else:
+            for v in prominent:
+                f.write(
+                    f"{v['source']}: LOO rank {v['loo_rank']:.0f}, "
+                    f"Alignment rank {v['align_rank']:.0f} "
+                    f"(delta={v['lo_align_rank_delta']:.0f}) → {v['pattern']}\n"
+                    f"   Borda resolution → rank {v['borda_rank']:.0f}"
+                    f" (count {v['borda_count']:.2f})\n"
+                )
+
+    # For a two-source aggregation, also run the Kendall-τ-only method so both
+    # diagnostics are visible side by side.
+    kendall_only = None
+    if len(rankings) == 2:
+        kendall_only = explain_rank_aggregation_kendall_only(
+            rankings, source_names, full_ranking, stage_name, dataset, entity, iteration)
+
+    result = {
+        "loo_scores": loo,
+        "align_scores": align,
+        "borda_counts": borda_counts,
+        "verdicts": verdicts,
+        "prominent_contradictions": prominent,
+        "kendall_only": kendall_only,
+    }
+
+    # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
+    try:
+        _ir = _ir_module()
+        source_top_picks = {
+            name: (rankings[i][0] if rankings[i] else "not_available")
+            for i, name in enumerate(source_names)
+        }
+        ir_doc = _ir.build_rank_aggregation_ir(
+            dataset, entity, stage_name, iteration, result,
+            source_names, source_top_picks, full_ranking)
+        _ir.write_stage_ir(ir_doc, dataset, entity,
+                           f"ir_rank_aggregation_{stage_name}_{iteration}")
+    except Exception as e:
+        logger.error(f"Rank-aggregation IR emission failed (non-fatal): {e}")
+
+    return result
 
 
 def enhanced_markov_chain_rank_aggregator_text_old(rankings: List[List[str]]) -> Tuple[float, List[str]]:

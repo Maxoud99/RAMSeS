@@ -12,6 +12,9 @@ Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
   See the License for the specific language governing permissions and
   limitations under the License.
+
+Modified by the RAMSeS project. This file is NOT identical to the original
+in mononitogoswami/tsad-model-selection, from which it is derived.
 """
 
 import time

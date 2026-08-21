@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Run {{ job_id }} — RAMSeS{% endblock %}
+
+{% block content %}
+<div id="run-root" data-job="{{ job_id }}" class="stack">
+
+  <section class="stack">
+    <div class="row-between">
+      <div>
+        <h1 id="run-title">Running…</h1>
+        <p id="run-subtitle" class="muted small" style="margin: var(--sp-1) 0 0;"></p>
+      </div>
+      <div class="row">
+        <span id="elapsed" class="mono muted"></span>
+        <button type="button" id="cancel">Cancel run</button>
+        <a class="button" id="view-report" href="#" hidden>Comprehensive results</a>
+        <a class="button primary" id="view-result" href="#" hidden>View explanation →</a>
+      </div>
+    </div>
+    <div class="progress-track"><div class="progress-fill" id="progress" style="width: 0%"></div></div>
+    <div id="banners" class="stack"></div>
+  </section>
+
+  <div class="run-layout">
+    <section class="card stack">
+      <h2 class="small muted">Pipeline</h2>
+      <ul class="rail" id="rail"></ul>
+      <details>
+        <summary>Command</summary>
+        <pre id="argv" class="mono" style="white-space: pre-wrap; word-break: break-all;"></pre>
+      </details>
+    </section>
+
+    <section class="card stack">
+      <div class="row-between">
+        <h2 class="small muted">Log</h2>
+        <div class="row small">
+          <label class="toggle"><input type="checkbox" id="important-only"><span>Important lines only</span></label>
+          <input type="search" id="log-filter" placeholder="Filter…">
+          <a id="download-log" href="#">Download</a>
+        </div>
+      </div>
+      <div class="console" id="console" aria-live="off"></div>
+      <p class="small muted" id="stick-hint">Auto-scrolling. Scroll up to pause.</p>
+    </section>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ asset('js/run.js') }}"></script>
+{% endblock %}
