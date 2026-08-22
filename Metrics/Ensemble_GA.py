@@ -35,7 +35,11 @@ def initialize_population(algorithm_list, population_size):
     population = []
     unique_ensembles = set()
 
-    while len(population) < population_size:
+    # Only size>1 ensembles are kept, so the pool is the 2^n - n - 1 subsets of
+    # size >= 2. Asking for more than exist does not run slowly, it never returns.
+    target = min(population_size, 2 ** len(algorithm_list) - len(algorithm_list) - 1)
+
+    while len(population) < target:
         ensemble_size = random.randint(1, len(algorithm_list))
         ensemble = random.sample(algorithm_list, k=ensemble_size)
         ensemble = tuple(sorted(ensemble))  # Canonical ordering and convert to tuple for set operations
@@ -44,7 +48,7 @@ def initialize_population(algorithm_list, population_size):
             unique_ensembles.add(ensemble)
             population.append(list(ensemble))  # Convert back to list for the population
 
-    logger.info(f"Initialized population with {population_size} unique ensembles")
+    logger.info(f"Initialized population with {len(population)} unique ensembles")
     return population
 
 
