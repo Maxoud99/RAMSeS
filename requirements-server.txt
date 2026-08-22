@@ -1,0 +1,100 @@
+# Server variant of requirements.txt — Linux x86_64, Python 3.12, no GPU.
+#
+# Install with BOTH of these, in this order:
+#
+#     pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+#     pip install --ignore-requires-python -r requirements-server.txt
+#
+# Two differences from the file beside it, each forced by the target machine,
+# and one flag that needs justifying.
+#
+# 1. tensorflow-cpu, not tensorflow. TensorFlow is used by the GAN robustness
+#    stage alone. The CPU build is 230 MB against 616 MB and the machine has no
+#    GPU, so the difference buys nothing.
+#
+# 2. torch comes from PyTorch's CPU index, BEFORE this file. PyPI's default
+#    torch wheel is the CUDA build: 906 MB plus ~1.9 GB of nvidia-* runtime
+#    packages (cudnn 665 MB, cublas 363 MB, cufft 211 MB, ...), roughly 5 GB
+#    installed and entirely dead weight without a GPU. `torch==2.5.1` below is
+#    then already satisfied, because PEP 440 ignores the local version segment
+#    for `==` and 2.5.1+cpu matches.
+#
+# 3. `--ignore-requires-python` is needed for ONE package: timesfm 1.3.0 caps
+#    at Requires-Python <3.12. That cap is about its jax/paxml route, not a
+#    binary limit — the wheel is `py3-none-any`, and jax, paxml, lingvo and
+#    torch[cuda] all sit behind extras ([pax], [torch]) this file never
+#    requests. `timesfm/__init__.py` tries the jax backend and falls back to
+#    the torch one; with no jax installed it takes the torch path, which is the
+#    same path Python 3.11 already takes. Verified by installing and importing
+#    it on a real 3.12.3: TimesFm, TimesFmHparams and TimesFmCheckpoint — the
+#    three symbols the vendored TSB-AD wrapper uses — all resolve.
+#
+#    The flag is safe here because every requirement below is an exact `==`
+#    pin, so pip has exactly one candidate per package and the loosened check
+#    cannot let it choose differently. Do not carry the flag over to an
+#    unpinned install.
+#
+# Not changed, and worth knowing: the Foundation Models download their weights
+# at run time into ~/.cache/huggingface — timesfm-1.0-200m-pytorch 777 MB,
+# gpt2 523 MB (OFA), chronos tiny models 65 MB. Budget ~1.3 GB beyond this file.
+#
+#
+# Six pins were removed as unused. `ray` is imported only by
+# Model_Optimization/Optimize.py, and `tsfresh`/`hurst` only by vus/feature.py —
+# neither module is reachable from app.py, WebUI or Explainability.narrate.
+# `evaluation`, `services` and `templates` were worse than unused: the code that
+# names them wants `evaluation.constants` and `services.mdata.mdata`, which
+# those PyPI projects do not contain — they are name collisions, so the pins
+# satisfied nothing while installing unrelated third-party code. Verified by
+# blocking all six at import time and re-running every entry point and all 13
+# dynamically-loaded detector families.
+#
+# arch and torchinfo are required by the vendored TSB-AD subset in
+# Algorithms/tsb_ad: POLY reaches `Fourier` in models/distance.py, which imports
+# arch, and Donut/FITS/TimesNet import torchinfo. Both install against the
+# numpy 2.0.0 pinned below, which is why that subset is vendored rather than
+# installed from the TSB-AD wheel (it pins numpy<2.0).
+arch==8.0.0
+# The Foundation Model group. transformers+einops carry OFA (it runs GPT-2 over
+# patched windows); chronos-forecasting is the 17-package route to Chronos that
+# TSB-AD reaches through autogluon's 69. All install against numpy 2.0.0.
+#
+# timesfm is pinned to 1.x deliberately: 2.x replaced `TimesFm`/`TimesFmHparams`
+# with `TimesFM_2p5_200M_torch`, and the vendored TSB-AD wrapper targets the 1.x
+# API. Unpinning it breaks TIMESFM with "module 'timesfm' has no attribute
+# 'TimesFm'".
+chronos-forecasting==2.3.1
+cvxpy==1.6.6
+einops==0.8.2
+# dill, not stdlib pickle, is what Utils/logger.py serialises checkpoints with:
+# PyOD 3 defines LSTMAD's network as a class inside a function, which pickle
+# cannot serialise at all. See Utils/model_io.py — every load site reads through
+# it so the pickler always matches the save.
+dill==0.4.1
+Flask==3.1.2
+joblib==1.5.1
+loguru==0.7.3
+matplotlib==3.10.7
+networkx==3.5
+numpy==2.0.0
+pandas==2.3.3
+Pillow==11.3.0
+psutil==6.1.1
+# PyOD 3, not 2. The pool reaches LSTMAD, SR, AE and LUNAR through
+# pyod.models.{ts_lstm,ts_spectral_residual,auto_encoder,lunar}; the first two do
+# not exist in 2.0.5, so this pin was silently wrong — a fresh install could not
+# resolve those families at all. It is also why Utils/model_io.py serialises with
+# dill: PyOD 3 defines LSTMAD's network inside a function, which pickle cannot
+# handle. Pinned to the version this project is developed and tested against.
+pyod==3.6.4
+PyYAML==6.0.2
+Requests==2.32.5
+scikit_learn==1.7.2
+scipy==1.16.2
+statsmodels==0.14.4
+tensorflow-cpu==2.18.1
+timesfm==1.3.0
+torch==2.5.1
+torchinfo==1.8.0
+tqdm==4.67.1
+transformers==5.15.0
