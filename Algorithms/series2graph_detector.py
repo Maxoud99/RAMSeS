@@ -44,14 +44,24 @@ What this adapter absorbs
 Series2Graph has a three-call interface — `fit(ts)`, then
 `score(query_length, dataset)`, then read `decision_scores_` — and returns
 `len(ts) - query_length` scores rather than one per timestep. Both are dealt
-with here, so `Algorithms/tsbad_model.py` reaches it through the plain
-`decision_function` scorer with no mode of its own.
+with here.
+
+`score` also accepts `dataset` and never reads it: every value it produces comes
+from the graph `fit` built, so `decision_function` returns the FIT series'
+scores whatever it is handed. Measured: fit on 3,000 rows, then score 9,000,
+gives 2,900 scores `array_equal` to scoring the 3,000 back. That is why
+`tsbad_model` reaches this class through the 'refit' scorer — a fresh graph per
+call — and why the family sits in TRANSDUCTIVE_FAMILIES. It is also what the
+method is: an unsupervised search over one series, not a train/test split.
+
+Left as `decision_function`, it produced one score per TRAINING row against a
+test series of a different length, which `windowed.score_windows` caught as a
+shape mismatch on every UCR entity — the only dataset it runs on, being
+univariate — so the family could not be trained at all.
 
 Measured on SMD machine-1-1's first channel: deterministic across two fits
-(0.000e+00), 1.2s for a fit-and-score over 28,479 rows, and the graph built in
-`fit` genuinely determines the score — scoring series B after fitting on A
-differs from fitting on B by 2.94e+02 — so it is INDUCTIVE and belongs in
-WHOLE_SERIES_FAMILIES rather than TRANSDUCTIVE_FAMILIES.
+(0.000e+00) and 1.2s for a fit-and-score over 28,479 rows, so refitting per call
+costs nothing the pipeline notices.
 """
 
 import math

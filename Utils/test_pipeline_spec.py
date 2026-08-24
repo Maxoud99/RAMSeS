@@ -300,12 +300,14 @@ class TestTransductiveFamilies(unittest.TestCase):
         self.pad_a = t.tensor(self.rng.normal(size=(25, 4, 16)), dtype=t.float32)
         self.pad_b = t.tensor(self.rng.normal(size=(25, 4, 16)), dtype=t.float32) * 5
 
-    # POLY is univariate only, so it needs its own probe: `windows_as_rows`
-    # must yield ONE column. Its production `window` is 200, which would need a
-    # 200-row call to exercise, so the probe uses 20 — the property under test
-    # is refit-per-call, which the window length does not change.
-    _UNIVARIATE = {"POLY"}
-    _PROBE_KWARGS = {"POLY": {"power": 3, "window": 20}}
+    # POLY and Series2Graph are univariate only, so they need their own probe:
+    # `windows_as_rows` must yield ONE column. Both are also shrunk from their
+    # production lengths (POLY's `window` is 200, Series2Graph's smallest
+    # `pattern_length` is 50) because the property under test is refit-per-call,
+    # which neither length changes.
+    _UNIVARIATE = {"POLY", "Series2Graph"}
+    _PROBE_KWARGS = {"POLY": {"power": 3, "window": 20},
+                     "Series2Graph": {"pattern_length": 10, "rate": 1}}
 
     def _shape_for(self, family):
         return (1, 1) if family in self._UNIVARIATE else (4, 16)
@@ -337,7 +339,10 @@ class TestTransductiveFamilies(unittest.TestCase):
             model = _TSBADEstimator(family, 0.1, self._PROBE_KWARGS.get(family, {}))
         else:
             model = self.create_model(family, self.modules, contamination=0.1)
-        self.windowed.fit_windows(model, _Loader())
+        try:
+            self.windowed.fit_windows(model, _Loader())
+        except ImportError as exc:      # Series2Graph, not fetched — see its own test
+            self.skipTest(str(exc).splitlines()[0])
         return model
 
     def test_one_finite_score_per_row_on_a_whole_series_call(self):
@@ -789,6 +794,25 @@ class TestTSBADFamilies(unittest.TestCase):
         scores = model.decision_function(series)
         self.assertEqual(scores.shape, (len(series),))
         self.assertTrue(self.np.isfinite(scores).all())
+
+    def test_series2graph_scores_the_series_it_is_given(self):
+        """The vendored `score(query_length, dataset)` never reads `dataset` —
+        it re-reports the series `fit` built its graph from. Fitting and scoring
+        the same length hides that, which is why this scores a different one:
+        UCR splits train from test, so one score per TRAINING row reached
+        `windowed.score_windows` as a shape mismatch and the family could not be
+        trained at all. The 'refit' scorer is what fixes it.
+        """
+        model = self.estimator("Series2Graph", 0.1, {"pattern_length": 20})
+        rng = self.np.random.default_rng(0)
+        try:
+            model.fit(rng.normal(size=(300, 1)))
+        except ImportError:
+            self.skipTest("Series2Graph not fetched")
+        for n in (300, 700):
+            with self.subTest(rows=n):
+                scores = model.decision_function(rng.normal(size=(n, 1)))
+                self.assertEqual(scores.shape, (n,))
 
     def test_timesfm_refuses_a_multivariate_call_by_name(self):
         """A cost refusal, not a capability one — TimesFM's per-channel loop

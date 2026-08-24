@@ -202,7 +202,7 @@ TSBAD_FAMILIES: FrozenSet[str] = frozenset({
 # raised "negative dimensions are not allowed" — before `logging_obj.save`, so
 # LSTMAD could not be trained on any entity at all.
 WHOLE_SERIES_FAMILIES: FrozenSet[str] = (
-    frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - frozenset({"POLY"})))
+    frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - frozenset({"POLY", "Series2Graph"})))
 
 # Families offered on univariate entities only — usable on UCR, unavailable on
 # SKAB (9 channels) and SMD (38). Selecting one there fails with an explanation
@@ -260,8 +260,16 @@ UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset(
 # it is handed. Measured: `fit(B)` then `fit(A)` gives byte-identical scores to
 # `fit(A)` alone (0.000e+00), i.e. fit state is fully replaced. So the score is
 # a function of the call's rows alone, which is the property this set names.
+#
+# Series2Graph joins them for the same reason as POLY. The vendored
+# `score(query_length, dataset)` accepts `dataset` and never reads it — every
+# value comes from the graph `fit` built — so it returns the TRAINING series'
+# scores whatever it is handed. Measured: fit on 3,000 rows, then score 9,000,
+# gives 2,900 scores identical to scoring the 3,000 back (`array_equal`). The
+# adapter therefore refits per call, which is also what the method is: an
+# unsupervised whole-series search, not a train/test one.
 TRANSDUCTIVE_FAMILIES: FrozenSet[str] = frozenset(
-    {"COF", "SOS", "SpectralResidual", "POLY"})
+    {"COF", "SOS", "SpectralResidual", "POLY", "Series2Graph"})
 
 # The paper's Table I taxonomy: "Base models grouped by family: Neural Networks
 # (NN), Statistical (Stat) or Foundation Models (FM)". Keys are the paper's
