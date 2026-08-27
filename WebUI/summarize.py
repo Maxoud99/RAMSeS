@@ -293,15 +293,14 @@ def _rank_aggregation_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 atom.get("subject"),
                 v.get("influence_rank"),
                 v.get("agreement_rank"),
-                str(v.get("pattern") or "").replace("_", " "),
             ],
         })
     if not rows:
         return None
     rows.sort(key=lambda r: r["_sort"])
     return {
-        "columns": ["Overall standing", "Source", "Influence", "Agreement", "Pattern"],
-        "align": ["num", "name", "num", "num", "text"],
+        "columns": ["Overall Rank", "Source", "Influence Rank", "Agreement Rank"],
+        "align": ["num", "name", "num", "num"],
         "rows": [r["cells"] for r in rows],
     }
 

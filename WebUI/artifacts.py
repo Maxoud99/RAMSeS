@@ -101,7 +101,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "LOF_1..LOF_4, NN_1..NN_3, CBLOF_1..CBLOF_4. Each is "
                      "trained beforehand and, for every window of the series, "
                      "emits an anomaly score. Every stage below consumes those "
-                     "scores; none of them retrains a base detector."},
+                     "scores, none of them retrains a base detector."},
         )},
         {"id": "overview-branches", "title": "The ensemble and single-model branches", "blocks": (
             {"text": "From the shared pool the framework runs two branches with "
@@ -176,7 +176,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         {"id": "ga-meta-learner",
          "title": "Why the meta-learner is fixed", "blocks": (
             {"text": "RAMSeS uses a Random Forest, chosen for F1 comparable to "
-                     "an SVM at lower cost; logistic regression, gradient "
+                     "an SVM at lower cost. Logistic regression, gradient "
                      "boosting and SVM are also supported. It is not searched "
                      "over per subset, because doing so would raise the risk of "
                      "overfitting, destabilise the optimisation, and make "
@@ -213,7 +213,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "trained first, so that it learns how much to trust each "
                      "detector and in what direction. It does not average them "
                      "and it does not weight them by any external notion of "
-                     "quality; the weighting is whatever fitting the training "
+                     "quality, the weighting is whatever fitting the training "
                      "data produced."},
         )},
         {"id": "ga-explained", "title": "What the explanation answers", "blocks": (
@@ -284,7 +284,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
     {"id": "lints", "title": "Linear Thompson Sampling",
      "stages": ("thompson_ranking", "thompson_sampling"), "blocks": (
         {"text": "LinTS treats detector choice as a contextual bandit. Each "
-                 "detector is an arm; each window of the series is a round; "
+                 "detector is an arm, each window of the series is a round, "
                  "pulling an arm means running that detector on that window and "
                  "observing how well it did. The time-series is split into "
                  "windows in the beginning."},
@@ -330,7 +330,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         {"id": "lints-two-views", "title": "μᵀx versus ‖μ‖²", "blocks": (
             {"text": "The branch produces two different numbers, which is why it "
                      "has two cards. μᵀx is the expected reward at a given "
-                     "window and is what drove the choice made there; it moves "
+                     "window and is what drove the choice made there, it moves "
                      "as the series moves. ‖μ‖² is the accumulated ranking score "
                      "and only grows when a detector is picked and rewarded. A "
                      "detector can therefore lead the expected-reward view for "
@@ -402,7 +402,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "detector than the one with the highest μᵀx. Random "
                      "exploration: A forced exploration step fired, so the pick "
                      "was random rather than informed. A run that is mostly "
-                     "random exploration is one where ε had not yet decayed; one "
+                     "random exploration is one where ε had not yet decayed, one "
                      "that is mostly informed exploration is one where the "
                      "detectors stayed closely matched and the posteriors "
                      "uncertain."},
@@ -501,7 +501,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
             {"lead": "signal_spread.",
              "text": "How much those values differ from one another across "
                      "channels. A low spread is a point that moved every channel "
-                     "together; a high one is a point that moved them apart."},
+                     "together, a high one is a point that moved them apart."},
             {"formula": "signal_spread(x) = std_c ( x_c )"},
             {"lead": "context_gap.",
              "text": "How far the generated point sits from the average of the "
@@ -595,13 +595,30 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "classified correctly and that rival did not. A small "
                      "decision tree is fitted to predict those exclusive wins "
                      "from four properties of the point, none of which depends "
-                     "on any detector: its boundary distance, how far the random "
-                     "factor landed from 1 and therefore how far off the "
-                     "threshold the point sits; whether it was injected as an "
-                     "anomaly or as normal; its local volatility, the local "
-                     "standard deviation at the injection site; and its position "
-                     "in the series, from 0 at the start to 1 at the end. The "
-                     "tree's splits become plain rules, and the average "
+                     "on any detector. Writing s for the random factor drawn for "
+                     "the point, W for the contextual window of the real series "
+                     "around the injection site over d channels, i for the index "
+                     "the point was injected at and N for the length of the "
+                     "augmented series:"},
+            {"lead": "boundary_distance.",
+             "text": "How far the random factor landed from 1, and therefore how "
+                     "far off the threshold the point sits. A 0 marks a point "
+                     "drawn exactly at the boundary."},
+            {"formula": "boundary_distance(x) = | s - 1 |"},
+            {"lead": "is_anomaly.",
+             "text": "Whether the point was injected as an anomaly or as normal: "
+                     "1 anomalous, 0 normal. The same factor that placed it."},
+            {"formula": "is_anomaly(x) = 1 [ s > 1 ]"},
+            {"lead": "local_volatility.",
+             "text": "The standard deviation of the real series in the "
+                     "neighbourhood the point landed in, averaged over channels "
+                     "— how noisy that stretch already was."},
+            {"formula": "local_volatility = (1/d) * sum_c std( W_c )"},
+            {"lead": "position.",
+             "text": "Where the point falls in the series, from 0 at the start "
+                     "to 1 at the end."},
+            {"formula": "position = i / N"},
+            {"text": "The tree's splits become plain rules, and the average "
                      "importance across all the rival trees shows which property "
                      "best explains the winner's edge."},
             {"text": "Each tree also reports a held-out, cross-validated "
@@ -663,7 +680,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "numbers are not directly comparable to production values, "
                      "and it exists to show shape rather than to rank. And the "
                      "surrogates report a held-out, cross-validated fidelity "
-                     "next to their fit on the sweep itself; on flat curves cut "
+                     "next to their fit on the sweep itself. On flat curves cut "
                      "into small folds the held-out figure can legitimately be "
                      "worse than predicting the mean, and where most folds are "
                      "degenerate the estimate is marked unavailable rather than "
@@ -716,16 +733,9 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "Kendall's tau."},
             {"text": "Each score induces its own ranking of the sources, and "
                      "those two rankings are then treated as two voters and "
-                     "merged by Borda count into a single standing. That "
-                     "standing is the verdict, and it is what \"shaped the "
-                     "consensus most, second most, and so on\" reports. "
-                     "Comparing a source's two ranks also gives it a pattern: an "
-                     "influential disagreer moved the consensus a long way while "
-                     "agreeing with it poorly, meaning it pulled the result away "
-                     "from its own view and was partly counteracted; a redundant "
-                     "agreer agrees closely but changed nothing, its view "
-                     "already covered by others; a consistent source ranks "
-                     "similarly on both."},
+                     "merged by Borda count into a single overall rank. That "
+                     "rank is the verdict, and it is what \"shaped the "
+                     "consensus most, second most, and so on\" reports."},
             {"formula": "borda(s) = (N − rank_influence(s)) + (N − rank_agreement(s))"},
             {"text": "where N is the number of ranking sources being merged."},
         )},
@@ -824,17 +834,15 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("Position", "Where the point falls in the series, from 0 at the start "
                      "to 1 at the end."),
     ),
-    # Both consensus cards get all three: they are one stage, and the vocabulary
-    # is the stage's. A two-source aggregation reports no influence — leave-one-
-    # out is undefined there — but defining the word costs nothing and the card's
+    # Both consensus cards get both: they are one stage, and the vocabulary is
+    # the stage's. A two-source aggregation reports no influence — leave-one-out
+    # is undefined there — but defining the word costs nothing and the card's
     # own prose is what says whether it applied.
     "rank_aggregation_robust": (
         ("Influence", "How much the aggregated ranking changes when that source "
                       "is left out."),
         ("Agreement", "How similar the source's own ranking is to the aggregated "
                       "ranking."),
-        ("Pattern", "The two read together: influential disagreer, redundant "
-                    "agreer, or consistent."),
     ),
 }
 STAGE_TERMS["rank_aggregation_final"] = STAGE_TERMS["rank_aggregation_robust"]

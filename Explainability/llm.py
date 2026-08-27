@@ -309,10 +309,23 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
     "rank_aggregation_robust": (
         " Open by naming the consensus's own top-ranked detector and the source "
         "rankings being aggregated. Then describe each source in the order "
-        "given; for each one, state its overall standing rank, its influence "
-        "rank, its agreement rank, and its pattern. A rank is a position — rank "
+        "given; for each one, state its overall rank, its influence "
+        "rank, and its agreement rank. A rank is a position — rank "
         "1 is best — so give the rank number itself rather than calling it high "
         "or low."
+    ),
+    # The two facts here describe different KINDS of thing — one names a
+    # detector, the other a source ranking — and with nothing between them the
+    # narrator joined them into "LOF_3, which aligns more closely with
+    # Thompson_Sampling's ranking". On SKAB/7 that inverted the finding: LOF_3
+    # leads because Robust_Aggregated ranked it first and Thompson ranked it
+    # third. It scored 0.000 hallucination, every name in it being in the IR.
+    "rank_aggregation_final": (
+        " Say which of the two sources the consensus followed more closely, "
+        "with both agreement scores and the gap. Then, in a sentence of its "
+        "own, name the consensus's top-ranked detector. Agreement is a property "
+        "of a whole source ranking, never of one detector, so do not write that "
+        "a detector agrees with, aligns with or is closer to either source."
     ),
     "ga_combination": (
         " Describe each detector in the order given; for each one, state its "

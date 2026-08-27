@@ -504,8 +504,8 @@ def borda_count_resolution(
     Tie handling: the ranks that feed this ARITHMETIC use AVERAGE (fractional)
     ranking, whose sum-preserving property keeps tied sources contributing
     symmetrically to the count — the textbook-fair Borda tie rule. (The
-    displayed influence/agreement/Borda ranks and the pattern labels use
-    competition ranking; see `_ranks_from_scores`.)
+    displayed influence/agreement/Borda ranks use competition ranking; see
+    `_ranks_from_scores`.)
 
     Parameters
     ----------
@@ -534,7 +534,7 @@ def _ranks_from_scores(scores: Dict[str, float], descending: bool = True,
         tied scores share the smallest rank in their group and the next score
         skips (two tied for 2nd are both rank 2, the next is rank 4). Integer
         ranks, directly interpretable ("k−1 sources are strictly better"). This
-        is what every DISPLAYED rank and the pattern labels use.
+        is what every DISPLAYED rank uses.
     method="average" — FRACTIONAL / AVERAGE RANKING: a tied group shares the
         mean of the positions it spans (two tied for 2nd/3rd are both 2.5).
         Sum-preserving, which is the correct tie handling when ranks feed
@@ -570,16 +570,11 @@ def borda_verdict_per_source(
 
     Returns a list of dicts (one per source, in source order) with keys:
         source, loo_score, loo_rank, align_score, align_rank,
-        borda_count, borda_rank, pattern, lo_align_rank_delta
-
-    'pattern' is descriptive:
-        'influential_disagreer' — LOO rank ≪ alignment rank (high LOO, low Kendall)
-        'redundant_agreer'    — LOO rank ≫ alignment rank (low LOO, high Kendall)
-        'consistent'          — LOO and alignment ranks agree
+        borda_count, borda_rank, lo_align_rank_delta
     """
     names = list(loo_scores.keys())
-    # Hybrid tie handling: displayed ranks and the pattern labels use COMPETITION
-    # ranking (interpretable "1224"); the Borda COUNT alone uses average ranks
+    # Hybrid tie handling: displayed ranks use COMPETITION ranking
+    # (interpretable "1224"); the Borda COUNT alone uses average ranks
     # internally (via borda_count_resolution) for fair arithmetic. The Borda
     # RANK shown here is the competition rank OF that fairly-computed count.
     loo_rank    = _ranks_from_scores(loo_scores,   descending=True)
@@ -592,13 +587,6 @@ def borda_verdict_per_source(
         lr = loo_rank[name]
         ar = align_rank[name]
         delta = abs(lr - ar)
-        if lr < ar:
-            pattern = "influential_disagreer"   # high LOO, lower alignment
-        elif lr > ar:
-            pattern = "redundant_agreer"      # lower LOO, higher alignment
-        else:
-            pattern = "consistent"
-
         verdicts.append({
             "source":      name,
             "loo_score":   float(loo_scores[name]),
@@ -607,7 +595,6 @@ def borda_verdict_per_source(
             "align_rank":  ar,
             "borda_count": float(borda_count[name]),
             "borda_rank":  borda_rank[name],
-            "pattern":     pattern,
             "lo_align_rank_delta": float(delta),
         })
     return verdicts
@@ -884,12 +871,12 @@ def explain_rank_aggregation(
 
         f.write("\n--- Per-Source Ranks (1 = best by that criterion;"
                 " Borda rank IS the resolved ranking) ---\n")
-        f.write(f"{'Source':<22} {'LOO':>5} {'Align':>6} {'Borda':>6}  {'Pattern'}\n")
+        f.write(f"{'Source':<22} {'LOO':>5} {'Align':>6} {'Borda':>6}\n")
         f.write("-" * 70 + "\n")
         for v in verdicts:
             f.write(
                 f"{v['source']:<22} {v['loo_rank']:>5.0f} {v['align_rank']:>6.0f} "
-                f"{v['borda_rank']:>6.0f}  {v['pattern']}\n"
+                f"{v['borda_rank']:>6.0f}\n"
             )
 
         # Show the final Borda-voted ranking of sources explicitly.
@@ -911,7 +898,7 @@ def explain_rank_aggregation(
                 f.write(
                     f"{v['source']}: LOO rank {v['loo_rank']:.0f}, "
                     f"Alignment rank {v['align_rank']:.0f} "
-                    f"(delta={v['lo_align_rank_delta']:.0f}) → {v['pattern']}\n"
+                    f"(delta={v['lo_align_rank_delta']:.0f})\n"
                     f"   Borda resolution → rank {v['borda_rank']:.0f}"
                     f" (count {v['borda_count']:.2f})\n"
                 )
