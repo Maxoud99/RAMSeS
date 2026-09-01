@@ -49,7 +49,7 @@ set membership against values harvested from the IR. stdlib-only.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 # A number not embedded in an identifier (rejects the "1"s in "LOF_1" and
 # "machine-1-6") while still matching at sentence-final punctuation
@@ -425,9 +425,9 @@ def _required_names(atom: Dict[str, Any]) -> Set[str]:
     omission invisible:
 
       * `value` carries names that are not the atom's topic at all — a source
-        atom's `top_pick` is a detector, its `pattern` is an enum — so a
-        narrative that never mentioned GAN_PR_AUC still "conveyed" its atom
-        because "LOF_1" and "redundant_agreer" appear elsewhere in the text.
+        atom's `top_pick` is a detector, not the source — so a narrative that
+        never mentioned GAN_PR_AUC still "conveyed" its atom because "LOF_1"
+        appears elsewhere in the text.
       * A grouped atom names a SET ("NN_2, CBLOF_4, CBLOF_3, and CBLOF_1 were
         left out"), and one member stood in for all four, so dropping NN_2
         cost nothing.

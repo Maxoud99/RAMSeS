@@ -346,7 +346,6 @@ button.grp-graph:disabled {
 }
 .badge-ok { background: var(--ok-soft); color: var(--ok); }
 .badge-warn { background: var(--warn-soft); color: var(--warn); }
-.badge-error { background: var(--error-soft); color: var(--error); }
 .badge-muted { background: var(--surface-sunken); color: var(--text-muted); }
 
 /* ── Forms ────────────────────────────────────────────────────────────────── */
@@ -380,14 +379,12 @@ a.button { display: inline-block; text-decoration: none; color: var(--text); }
 button:hover:not(:disabled), .button:hover { background: var(--surface-sunken); }
 button:disabled { opacity: .5; cursor: not-allowed; }
 
-.button-primary, button.primary, a.button.primary {
+button.primary, a.button.primary {
   background: var(--accent); border-color: var(--accent); color: #fff;
 }
-:root[data-theme="dark"] .button-primary,
 :root[data-theme="dark"] button.primary,
 :root[data-theme="dark"] a.button.primary { color: #14161f; }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .button-primary,
   :root:not([data-theme="light"]) button.primary,
   :root:not([data-theme="light"]) a.button.primary { color: #14161f; }
 }
@@ -501,40 +498,56 @@ details[open] > summary::before { transform: rotate(90deg); }
   .terms dd { margin-bottom: var(--sp-2); }
 }
 
-/* ── Stage documentation ──────────────────────────────────────────────────── */
+/* ── Contents sidebar ─────────────────────────────────────────────────────── */
 
-/* The glossaries used to open every stage card as a tinted disclosure. They now
-   have a page, where they read as reference material rather than as something
-   standing between the reader and the finding. */
-.docs-layout {
+/* Shared by the stage documentation and the comprehensive report: both are one
+   column of long cards, so the way to the rest has to travel with the reader. */
+.sidenav-layout {
   display: grid; grid-template-columns: 260px minmax(0, 1fr);
   gap: var(--sp-5); align-items: start;
 }
 /* Collapsed, the column is only as wide as the button that reopens it — the
    contents leave, the way back does not. */
-.docs-layout.is-collapsed { grid-template-columns: auto minmax(0, 1fr); }
-.docs-layout.is-collapsed .docs-nav-title { display: none; }
+.sidenav-layout.is-collapsed { grid-template-columns: auto minmax(0, 1fr); }
+.sidenav-layout.is-collapsed .sidenav-title { display: none; }
 
 /* Sticky, because the sections run long and a contents list is worth least at
    the top of the page, where the reader can already see everything. */
-.docs-nav { position: sticky; top: 80px; max-height: calc(100vh - 96px); overflow: auto; }
-.docs-nav-head { gap: var(--sp-3); }
-.docs-nav-title { font-size: var(--fs-md); margin: 0; }
-.docs-nav-toggle { padding: 0 var(--sp-2); line-height: 1.6; font-family: var(--font-mono); }
-/* Two levels, numbered by the frontend. The list markers are suppressed because
-   the numbers are in the link text: a section inserted later renumbers itself,
-   and an <ol> marker beside "3.2" would be a second, contradicting count. */
-.docs-contents, .docs-subcontents { list-style: none; margin: var(--sp-3) 0 0; padding-left: 0; }
-.docs-contents > li { line-height: 1.6; margin-bottom: var(--sp-2); }
-.docs-subcontents { margin: 2px 0 0; padding-left: 1.5ch; font-size: var(--fs-sm); }
-.docs-subcontents li { line-height: 1.5; }
+.sidenav { position: sticky; top: 80px; max-height: calc(100vh - 96px); overflow: auto; }
+.sidenav-head { gap: var(--sp-3); }
+.sidenav-title { font-size: var(--fs-md); margin: 0; }
+.sidenav-toggle { padding: 0 var(--sp-2); line-height: 1.6; font-family: var(--font-mono); }
+/* The list markers are suppressed because the documentation puts its numbers in
+   the link text: an <ol> marker beside "3.2" would be a second, contradicting
+   count. The report's sections are unnumbered and simply read as a list. */
+.sidenav-list, .sidenav-sublist { list-style: none; margin: var(--sp-3) 0 0; padding-left: 0; }
+.sidenav-list > li { line-height: 1.6; margin-bottom: var(--sp-2); }
+.sidenav-sublist { margin: 2px 0 0; padding-left: 1.5ch; font-size: var(--fs-sm); }
+.sidenav-sublist li { line-height: 1.5; }
 /* The contents is a list of destinations, not prose with links in it, so the
    underlines are noise until you are pointing at one. */
-.docs-contents a, .docs-subcontents a { text-decoration: none; }
-.docs-contents a:hover, .docs-subcontents a:hover { text-decoration: underline; }
-.docs-subcontents a { color: var(--text-muted); }
-.docs-subcontents a:hover { color: var(--text); }
+.sidenav-list a, .sidenav-sublist a { text-decoration: none; }
+.sidenav-list a:hover, .sidenav-sublist a:hover { text-decoration: underline; }
+.sidenav-sublist a { color: var(--text-muted); }
+.sidenav-sublist a:hover { color: var(--text); }
 
+/* Clears the sticky site header, so a section scrolled to by fragment stops
+   below it rather than under it. */
+.sidenav-body > .card { scroll-margin-top: 80px; }
+/* A section arrived at by fragment says so: several sections look alike, and a
+   reader following a contents link should be able to see where they were sent. */
+.sidenav-body > .card.is-target { border-left: 3px solid var(--border-strong); }
+
+@media (max-width: 900px) {
+  .sidenav-layout, .sidenav-layout.is-collapsed { grid-template-columns: 1fr; }
+  .sidenav { position: static; max-height: none; }
+}
+
+/* ── Stage documentation ──────────────────────────────────────────────────── */
+
+/* The glossaries used to open every stage card as a tinted disclosure. They now
+   have a page, where they read as reference material rather than as something
+   standing between the reader and the finding. */
 #docs-root .card h2 { margin-bottom: var(--sp-3); }
 .docs-subhead {
   margin: var(--sp-5) 0 var(--sp-2);
@@ -568,18 +581,6 @@ details[open] > summary::before { transform: rotate(90deg); }
 .docs-formula code {
   font-family: var(--font-mono); font-size: var(--fs-sm);
   line-height: 1.7; white-space: pre; color: var(--text);
-}
-/* Clears the sticky site header, so a section scrolled to by fragment stops
-   below it rather than under it. */
-.docs-body > .card { scroll-margin-top: 80px; }
-/* A section arrived at by fragment says so: several sections look alike, and a
-   reader following "Stage description for the interested" should be able to see
-   which one they were sent to. */
-#docs-root .card.is-target { border-left: 3px solid var(--border-strong); }
-
-@media (max-width: 900px) {
-  .docs-layout, .docs-layout.is-collapsed { grid-template-columns: 1fr; }
-  .docs-nav { position: static; max-height: none; }
 }
 /* Sits with the stage's metadata rather than in the prose: pushed to the right
    edge of the title row, and set small so it reads as an aside next to the word
@@ -758,6 +759,10 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
   overflow-x: auto;
   white-space: pre;
 }
+/* The section title and the block of numbers under it are two things, not a
+   caption and its figure — the report separates its own headings with a rule and
+   a blank line, and at the stack's default gap the <pre> crowds the title. */
+#report-root .card > * + .report-body { margin-top: var(--sp-6); }
 
 .progress-track { height: 4px; background: var(--border); border-radius: 999px; overflow: hidden; }
 .progress-fill { height: 100%; background: var(--accent); transition: width 300ms ease-out; }
@@ -767,7 +772,6 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
   border-radius: var(--radius-sm); padding: var(--sp-3) var(--sp-4);
   font-size: var(--fs-sm);
 }
-.banner-info { background: var(--accent-soft); border-left-color: var(--accent); }
 .banner-warn { background: var(--warn-soft); border-left-color: var(--warn); }
 .banner-error { background: var(--error-soft); border-left-color: var(--error); }
 
@@ -824,9 +828,9 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
   :root { --bg: #fff; --surface: #fff; --surface-sunken: #fff;
           --text: #000; --text-dim: #333; --border: #bbb; --border-strong: #999; }
   .site-header, .console, .run-layout, .lightbox, .no-print,
-  .docs-nav, .variant-tabs, button, .gallery-controls { display: none !important; }
-  /* Without its sidebar the documentation is a single column. */
-  .docs-layout, .docs-layout.is-collapsed { display: block !important; }
+  .sidenav, .variant-tabs, button, .gallery-controls { display: none !important; }
+  /* Without its sidebar the page is a single column. */
+  .sidenav-layout, .sidenav-layout.is-collapsed { display: block !important; }
   /* The controls are gone on paper, so the space reserved to line them up is
      just a gap above every figure. */
   .figures > figure > img:first-child { margin-top: 0 !important; }

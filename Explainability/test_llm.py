@@ -389,10 +389,10 @@ class TestRepairSeesEveryViolation(unittest.TestCase):
 class TestVerifierCoverageIsConjunctive(unittest.TestCase):
     """Every name a required atom uses must appear — `any()` hid two classes.
 
-    A source atom's `value` carries a `top_pick` (a detector) and a `pattern`
-    (an enum). Harvesting those as coverage candidates and accepting any ONE
-    meant a narrative that never mentioned GAN_PR_AUC still "conveyed" its
-    atom, because LOF_1 and redundant_agreer appear elsewhere in the text.
+    A source atom's `value` carries a `top_pick`, which is a detector rather
+    than the source the atom is about. Harvesting it as a coverage candidate and
+    accepting any ONE meant a narrative that never mentioned GAN_PR_AUC still
+    "conveyed" its atom, because LOF_1 appears elsewhere in the text.
     """
 
     def _source_ir(self):
@@ -403,19 +403,18 @@ class TestVerifierCoverageIsConjunctive(unittest.TestCase):
                 {"id": "ra.source.GAN_PR_AUC.role", "type": "source_role",
                  "subject": "GAN_PR_AUC",
                  "value": {"influence_rank": 5, "agreement_rank": 2,
-                           "borda_rank": 2, "pattern": "redundant_agreer",
-                           "top_pick": "LOF_1"},
+                           "borda_rank": 2, "top_pick": "LOF_1"},
                  "text": "GAN_PR_AUC shaped the consensus second most (overall "
-                         "standing rank 2 of 6), ranking 5 for influence and 2 "
-                         "for agreement, a redundant_agreer pattern."},
+                         "rank 2 of 6), ranking 5 for influence and 2 "
+                         "for agreement."},
             ],
             "caveats": [], "required_atom_ids": ["ra.source.GAN_PR_AUC.role"],
             "confidence": {},
         }
 
     def test_value_names_cannot_stand_in_for_the_subject(self):
-        narrative = ("LOF_1 leads the consensus. One source was a "
-                     "redundant_agreer, ranking 2 for agreement.")
+        narrative = ("LOF_1 leads the consensus. One source ranked 2 "
+                     "for agreement.")
         v = verifier.verify_narrative(narrative, self._source_ir())
         self.assertEqual(v["missing_required_ids"], ["ra.source.GAN_PR_AUC.role"])
         self.assertEqual(v["omission_rate"], 1.0)
@@ -796,9 +795,9 @@ class TestNarrateEntity(unittest.TestCase):
         ra_result = {
             "verdicts": [
                 {"source": "S1", "loo_score": 0.3, "loo_rank": 1, "align_score": 0.6,
-                 "align_rank": 1, "borda_rank": 1, "pattern": "consistent"},
+                 "align_rank": 1, "borda_rank": 1},
                 {"source": "S2", "loo_score": 0.1, "loo_rank": 2, "align_score": 0.8,
-                 "align_rank": 2, "borda_rank": 2, "pattern": "redundant_agreer"}],
+                 "align_rank": 2, "borda_rank": 2}],
             "prominent_contradictions": [], "kendall_only": None}
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, "explanations_ir")

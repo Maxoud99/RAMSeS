@@ -164,12 +164,12 @@ class ArtifactTreeCase(unittest.TestCase):
                        {"id": "ra_robust.source.GAN_F1.role", "type": "source_role",
                         "subject": "GAN_F1",
                         "value": {"influence_rank": 1, "agreement_rank": 1,
-                                  "borda_rank": 1, "pattern": "consistent"},
+                                  "borda_rank": 1},
                         "text": "GAN_F1 shaped the consensus most."},
                        {"id": "ra_robust.source.GAN_PR_AUC.role", "type": "source_role",
                         "subject": "GAN_PR_AUC",
                         "value": {"influence_rank": 5, "agreement_rank": 2,
-                                  "borda_rank": 2, "pattern": "redundant_agreer"},
+                                  "borda_rank": 2},
                         "text": "GAN_PR_AUC shaped the consensus second most."},
                    ]))
         _write(self.nl_dir / "nl_rank_aggregation_robust_0.txt",
@@ -799,7 +799,7 @@ class TestCaveatsLeaveThePros(unittest.TestCase):
                   "evidence": [
                       {"id": "s1", "type": "source_role", "subject": "GAN_F1",
                        "value": {"influence_rank": 1, "agreement_rank": 1,
-                                 "borda_rank": 1, "pattern": "consistent"},
+                                 "borda_rank": 1},
                        "text": "GAN_F1 shaped the consensus most."}],
                   "caveats": [{"id": "c", "type": "caveat", "subject": "agg",
                                "value": None,
@@ -1170,21 +1170,21 @@ class TestSummaryTables(unittest.TestCase):
              "text": "Its first-ranked detector is LOF_1."},
             {"id": "s1", "type": "source_role", "subject": "GAN_F1",
              "value": {"influence_rank": 1, "agreement_rank": 1,
-                       "borda_rank": 1, "pattern": "consistent"},
+                       "borda_rank": 1},
              "text": "GAN_F1 shaped the consensus most."},
             {"id": "s2", "type": "source_role", "subject": "GAN_PR_AUC",
              "value": {"influence_rank": 5, "agreement_rank": 2,
-                       "borda_rank": 2, "pattern": "redundant_agreer"},
+                       "borda_rank": 2},
              "text": "GAN_PR_AUC shaped the consensus second most."},
         ])
         out = summarize.summarize("Its first-ranked detector is LOF_1. GAN_F1 "
                                   "shaped the consensus most.",
                                   stage="rank_aggregation_robust", ir_doc=ir_doc)
         table = out["table"]
-        self.assertEqual(table["columns"], ["Overall standing", "Source",
-                                            "Influence", "Agreement", "Pattern"])
-        self.assertEqual(table["rows"][0], [1, "GAN_F1", 1, 1, "consistent"])
-        self.assertEqual(table["rows"][1], [2, "GAN_PR_AUC", 5, 2, "redundant agreer"])
+        self.assertEqual(table["columns"], ["Overall Rank", "Source",
+                                            "Influence Rank", "Agreement Rank"])
+        self.assertEqual(table["rows"][0], [1, "GAN_F1", 1, 1])
+        self.assertEqual(table["rows"][1], [2, "GAN_PR_AUC", 5, 2])
         # The lead is the narrative's own stage-output sentence, not invented copy.
         self.assertEqual(out["summary"], "Its first-ranked detector is LOF_1.")
 

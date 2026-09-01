@@ -6,39 +6,8 @@ from Metrics.metrics import range_based_precision_recall_f1_auc, prauc, f1_score
 from Utils.model_selection_utils import evaluate_model
 from loguru import logger
 import matplotlib.pyplot as plt
-
-
-def _surrogate_fidelity_module():
-    """Import surrogate_fidelity.py, tolerating standalone by-path loading of this
-    module (e.g. via importlib in test harnesses) where the Model_Selection
-    package itself may not be on sys.path — falls back to loading the sibling
-    file directly by its own location, the same trick those harnesses use."""
-    try:
-        from Model_Selection.Sensitivity_robustness import surrogate_fidelity as _sf
-        return _sf
-    except ModuleNotFoundError:
-        import importlib.util
-        _here = os.path.dirname(os.path.abspath(__file__))
-        _spec = importlib.util.spec_from_file_location(
-            "surrogate_fidelity", os.path.join(_here, "surrogate_fidelity.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
-
-
-def _ir_module():
-    """Import Explainability.ir with the same standalone-tolerant fallback."""
-    try:
-        from Explainability import ir as _ir
-        return _ir
-    except ModuleNotFoundError:
-        import importlib.util
-        _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        _spec = importlib.util.spec_from_file_location(
-            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
+from Explainability import ir
+from Model_Selection.Sensitivity_robustness import surrogate_fidelity
 
 
 def add_noise_to_data(data, noise_level=0.1):
@@ -545,14 +514,14 @@ def _fit_noise_winner(noise, score_matrix, model_names, max_depth: int = 3, rand
     # reproduce; it is not, by itself, evidence that the tree generalizes
     # rather than having fit noise in this particular sweep. Report a
     # cross-validated estimate alongside it (see surrogate_fidelity.py).
-    cv = _surrogate_fidelity_module().held_out_classifier_fidelity(
+    cv = surrogate_fidelity.held_out_classifier_fidelity(
         X, y, max_depth=max_depth, random_state=random_state)
     rules = export_text(clf, feature_names=["noise_level"])
     root_thr = float(clf.tree_.threshold[0]) if clf.tree_.node_count > 1 else None
     # Structured (machine-readable) rules for the IR layer; non-fatal if the
     # Explainability package is unavailable in a stripped-down environment.
     try:
-        rules_structured = _ir_module().tree_to_rules(clf, ["noise_level"])
+        rules_structured = ir.tree_to_rules(clf, ["noise_level"])
     except Exception:
         rules_structured = []
     return clf, {"feasible": True, "rules_text": rules, "rules": rules_structured,
@@ -597,7 +566,7 @@ def train_noise_permodel_surrogates(noise, score_matrix, model_names,
         reg = DecisionTreeRegressor(max_depth=max_depth, random_state=random_state)
         reg.fit(X, ys)
         r2 = float(reg.score(X, ys))
-        cv = _surrogate_fidelity_module().held_out_regressor_fidelity(
+        cv = surrogate_fidelity.held_out_regressor_fidelity(
             X, ys, max_depth=max_depth, random_state=random_state)
         if np.std(noise[mask]) > 0 and np.std(ys) > 0:
             corr = float(np.corrcoef(noise[mask], ys)[0, 1])
@@ -929,10 +898,9 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
 
     # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
     try:
-        _ir = _ir_module()
         ranked_f1, ranked_pr = production_rankings if production_rankings else (None, None)
-        _ir.write_stage_ir(
-            _ir.build_monte_carlo_ir(dataset, entity, result, ranked_f1, ranked_pr),
+        ir.write_stage_ir(
+            ir.build_monte_carlo_ir(dataset, entity, result, ranked_f1, ranked_pr),
             dataset, entity, "ir_monte_carlo")
     except Exception as e:
         logger.error(f"Monte Carlo IR emission failed (non-fatal): {e}")

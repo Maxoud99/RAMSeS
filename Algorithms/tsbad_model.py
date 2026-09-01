@@ -92,20 +92,18 @@ _TSBAD_SPECS = {
     "TIMESFM":     ("TimesFM",     "TimesFM",     "input_c", "refit"),
     "CHRONOS":     ("Algorithms.chronos_detector", "Chronos", "input_c",
                     "decision_function"),
-    # The Graph Based group's two whole-series members. Both take the dotted
-    # form for the same reason CHRONOS does — they are written under
-    # `Algorithms/` rather than vendored — and both already present
-    # `fit(series)` / `decision_function(series)` with one score per timestep,
-    # so neither needs a scorer mode of its own.
+    # The Graph Based group's two members. Both take the dotted form for the
+    # same reason CHRONOS does — they are written under `Algorithms/` rather
+    # than vendored — and Series2Graph's adapter is also where the "not fetched
+    # yet" error lives, that one file being deliberately absent from here.
     #
-    # Series2Graph's adapter is what absorbs its three-call interface
-    # (`fit` -> `score(query_length, dataset)` -> read `decision_scores_`) and
-    # its short output, and it is also where the "not fetched yet" error lives:
-    # that one file is deliberately absent from this repository.
+    # 'refit' for Series2Graph: the vendored `score(query_length, dataset)`
+    # never reads `dataset`, so it re-reports the series `fit` built its graph
+    # from. See TRANSDUCTIVE_FAMILIES in Utils/pipeline_spec.py.
     "MTADGAT":     ("Algorithms.mtad_gat", "MTADGAT", "n_features",
                     "decision_function"),
     "Series2Graph": ("Algorithms.series2graph_detector",
-                     "Series2GraphDetector", None, "decision_function"),
+                     "Series2GraphDetector", None, "refit"),
 }
 
 # Families that cannot see more than one channel. Checked in `fit` so the
@@ -142,7 +140,8 @@ UNIVARIATE_ONLY = {
 # call, and its default. They spell it differently — POLY fits one polynomial
 # per `window`, TimesFM forecasts one step from each `win_size` context — and a
 # check reading the wrong key would compare against a number the detector never
-# uses.
+# uses. Series2Graph is absent deliberately: its minimum is 2 * pattern_length,
+# which no single key expresses, and it checks and reports its own.
 _MIN_LENGTH_KEYS = {
     "POLY": ("window", 200),
     "TIMESFM": ("win_size", 96),
@@ -240,7 +239,10 @@ class _TSBADEstimator:
         """
         if self._scorer != "refit":
             return
-        key, default = _MIN_LENGTH_KEYS.get(self.family, ("window", 200))
+        spec = _MIN_LENGTH_KEYS.get(self.family)
+        if spec is None:
+            return
+        key, default = spec
         window = int(self.detector_kwargs.get(key, default))
         if n_rows < window:
             raise ValueError(

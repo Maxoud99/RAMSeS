@@ -137,20 +137,11 @@ SYSTEM_PROMPT = (
     "6. Write ONE coherent paragraph of plain prose. No headings, lists, "
     "tables, or markdown."
 )
-# Four further rules were dropped when the narrator moved from qwen2.5:7b to
-# 14b. Measured on SKAB/7 across five stages, removing them changed no metric:
-#   - name compression ('CBLOF_1 to -4') was a 7b artifact; 14b writes the
-#     names out unprompted.
-#   - 'never cite fact 2' patched a hole that no longer exists: the facts are
-#     bulleted rather than numbered, so there is nothing to cite.
-#   - 'no invented conclusions' addressed padding forced by a word-budget floor
-#     that demanded more words than the facts contained; the budget now scales
-#     with content length.
-#   - 'name every detector in a list' is enforced by the verifier's conjunctive
-#     coverage check and repaired by the repair loop.
-# Rules 1-5 are the contract the verifier measures and are not a model-size
-# question; rule 6 is format. If the narrator is ever downgraded, restore the
-# four from git history before trusting the output.
+# Rules 1-5 are the contract the verifier measures; rule 6 is format. Four
+# further rules were dropped when the narrator moved to qwen2.5:14b — each is
+# now covered by the verifier, the scaling word budget, or the facts' format.
+# THEY ARE MODEL-SIZE DEPENDENT: if the narrator is ever downgraded, restore
+# them from git history before trusting the output.
 
 
 def _render_value(v: Any) -> str:
@@ -318,10 +309,23 @@ _STAGE_TASK_HINTS: Dict[str, str] = {
     "rank_aggregation_robust": (
         " Open by naming the consensus's own top-ranked detector and the source "
         "rankings being aggregated. Then describe each source in the order "
-        "given; for each one, state its overall standing rank, its influence "
-        "rank, its agreement rank, and its pattern. A rank is a position — rank "
+        "given; for each one, state its overall rank, its influence "
+        "rank, and its agreement rank. A rank is a position — rank "
         "1 is best — so give the rank number itself rather than calling it high "
         "or low."
+    ),
+    # The two facts here describe different KINDS of thing — one names a
+    # detector, the other a source ranking — and with nothing between them the
+    # narrator joined them into "LOF_3, which aligns more closely with
+    # Thompson_Sampling's ranking". On SKAB/7 that inverted the finding: LOF_3
+    # leads because Robust_Aggregated ranked it first and Thompson ranked it
+    # third. It scored 0.000 hallucination, every name in it being in the IR.
+    "rank_aggregation_final": (
+        " Say which of the two sources the consensus followed more closely, "
+        "with both agreement scores and the gap. Then, in a sentence of its "
+        "own, name the consensus's top-ranked detector. Agreement is a property "
+        "of a whole source ranking, never of one detector, so do not write that "
+        "a detector agrees with, aligns with or is closer to either source."
     ),
     "ga_combination": (
         " Describe each detector in the order given; for each one, state its "
@@ -519,14 +523,6 @@ def build_global_prompt(global_ir: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def narrate_stage(ir_doc: Dict[str, Any], client: LLMClient) -> str:
-    return client.chat(SYSTEM_PROMPT, build_stage_prompt(ir_doc)).strip()
-
-
-def narrate_global(global_ir: Dict[str, Any], client: LLMClient) -> str:
-    return client.chat(SYSTEM_PROMPT, build_global_prompt(global_ir)).strip()
-
-
 # ── Global narrative: deterministic merge ────────────────────────────────────
 #
 # Two interchangeable ways to produce the global document, selected by
@@ -535,7 +531,7 @@ def narrate_global(global_ir: Dict[str, Any], client: LLMClient) -> str:
 #                        Adds no new claims, so it inherits the per-stage
 #                        faithfulness and is not scored again.
 #   "llm"              — narrate the global IR's own atoms (build_global_prompt
-#                        / narrate_global / verify_global), the original path.
+#                        / verify_global), the original path.
 # Both are kept working; switching back is a one-argument change.
 GLOBAL_MODES = ("concat", "llm")
 

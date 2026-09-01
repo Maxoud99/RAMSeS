@@ -78,7 +78,6 @@ sys.modules["Utils"].__path__ = [os.path.join(_PROJECT_ROOT, "Utils")]
 from Metrics.Ensemble_GA import (
     compute_lofo_utility,
     compute_mean_marginal_contribution,
-    compute_friedman_h,
     compute_survival_rates,
     classify_detector_archetypes,
     explain_ga_selection,
@@ -156,66 +155,6 @@ class TestMeanMarginalContribution(unittest.TestCase):
         mm = compute_mean_marginal_contribution(ee, ["A", "B", "C"])
         self.assertTrue(np.isnan(mm["A"]["contribution"]))
         self.assertEqual(mm["A"]["n_absent"], 0)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 3.  compute_interaction_matrix
-# ════════════════════════════════════════════════════════════════════════════
-
-class TestFriedmanH(unittest.TestCase):
-    """Friedman H is verified by injecting a known surrogate F̂ (predict_fn), so
-    these tests are deterministic and need no real sklearn."""
-
-    # Reference set spanning both values of every variable over 3 detectors.
-    ALGOS = ["A", "B", "C"]
-
-    @staticmethod
-    def _ee_full():
-        # 6 distinct subsets so each detector appears both present and absent.
-        # Fitness values are placeholders — the injected predict_fn defines F̂.
-        keys = [("A", "B"), ("A", "C"), ("B", "C"),
-                ("A", "B", "C"), ("A",), ("B",)]
-        return {tuple(sorted(k)): (0.0, 0.0, 0.1 * i, None, None)
-                for i, k in enumerate(keys, 1)}
-
-    def test_additive_surrogate_has_zero_interaction(self):
-        # F̂(z) = 2*z_A + 3*z_B - 1*z_C  → purely additive → all H ≈ 0.
-        def predict_fn(Z):
-            return 2.0 * Z[:, 0] + 3.0 * Z[:, 1] - 1.0 * Z[:, 2]
-        fh = compute_friedman_h(self._ee_full(), self.ALGOS, predict_fn=predict_fn)
-        self.assertTrue(fh["feasible"])
-        for v in fh["H_two_way"].values():
-            self.assertAlmostEqual(v, 0.0, places=6)
-        for v in fh["H_total"].values():
-            self.assertAlmostEqual(v, 0.0, places=6)
-
-    def test_pure_interaction_surrogate(self):
-        # F̂(z) = z_A * z_B  → A,B interact; C is inert.
-        def predict_fn(Z):
-            return Z[:, 0] * Z[:, 1]
-        fh = compute_friedman_h(self._ee_full(), self.ALGOS, predict_fn=predict_fn)
-        self.assertTrue(fh["feasible"])
-        self.assertGreater(fh["H_two_way"][("A", "B")], 1e-6)
-        self.assertGreater(fh["H_total"]["A"], 1e-6)
-        self.assertGreater(fh["H_total"]["B"], 1e-6)
-        # C never enters F̂ → no interaction involving C.
-        self.assertAlmostEqual(fh["H_total"]["C"], 0.0, places=6)
-
-    def test_two_way_is_symmetric(self):
-        def predict_fn(Z):
-            return Z[:, 0] * Z[:, 1] + 0.5 * Z[:, 2]
-        fh = compute_friedman_h(self._ee_full(), self.ALGOS, predict_fn=predict_fn)
-        self.assertAlmostEqual(fh["H_two_way"][("A", "B")],
-                               fh["H_two_way"][("B", "A")])
-
-    def test_infeasible_with_too_few_subsets(self):
-        ee = {("A", "B"): (0.0, 0.0, 0.5, None, None)}   # only 1 subset
-        fh = compute_friedman_h(ee, self.ALGOS, predict_fn=lambda Z: Z[:, 0])
-        self.assertFalse(fh["feasible"])
-        for v in fh["H_total"].values():
-            self.assertTrue(np.isnan(v))
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # 4.  compute_survival_rates
 # ════════════════════════════════════════════════════════════════════════════
@@ -255,7 +194,6 @@ class TestArchetypes(unittest.TestCase):
 
     def test_all_four_cells_unique(self):
         # Every (U, S) high/low cell maps to its own 2-letter H/L code.
-        # (Complementarity axis is disabled.)
         from itertools import product
         codes = {(u, s): _assign_archetype(u, s, util_nan=False)
                  for u, s in product([True, False], repeat=2)}
@@ -699,22 +637,12 @@ class TestExplainGASelection(unittest.TestCase):
                             "survival",
                             "archetypes", "n_subsets_evaluated", "n_generations"):
                     self.assertIn(key, result)
-                # Old interaction keys must be gone.
-                self.assertNotIn("interaction", result)
-                self.assertNotIn("e_single", result)
-                # Complementarity (Friedman H) axis is disabled — its keys are gone.
-                self.assertNotIn("friedman_h", result)
-                self.assertNotIn("H_two_way", result)
-                self.assertNotIn("H_total", result)
 
                 out = os.path.join("myresults", "GA_Ens", "TEST", "e1")
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_explainability_TEST_e1.txt")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_utility_TEST_e1.png")))
-                # Complementarity (Friedman H) plots are disabled — must NOT be written.
-                self.assertFalse(os.path.exists(
-                    os.path.join(out, "ga_selection_interaction_TEST_e1.png")))
                 # Intermediate Representation JSON is emitted alongside.
                 import json
                 ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
@@ -723,9 +651,6 @@ class TestExplainGASelection(unittest.TestCase):
                 with open(ir_path) as fh:
                     ir_doc = json.load(fh)
                 self.assertEqual(ir_doc["stage"], "ga_selection")
-                self.assertNotIn("complementarity", json.dumps(ir_doc).lower())
-                self.assertFalse(os.path.exists(
-                    os.path.join(out, "ga_selection_total_interaction_TEST_e1.png")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_survival_TEST_e1.png")))
                 self.assertTrue(os.path.exists(
