@@ -118,15 +118,3 @@ def classify(line: str) -> Optional[Dict[str, Any]]:
 
     return None
 
-
-def is_important(line: str) -> bool:
-    """The "important lines only" filter for the log console.
-
-    Mirrors the marker set run_testbed_comprehensive.py already filters on, so
-    the console and the batch runner agree on what matters.
-    """
-    if classify(line) is not None:
-        return True
-    return any(token in line for token in
-               ("STAGE", "Sub-stage", "Generation", "Final Decision",
-                "Best ensemble", "WARNING", "ERROR"))

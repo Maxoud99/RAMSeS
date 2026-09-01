@@ -8,7 +8,6 @@ import importlib.util
 import json
 import os
 import re
-import sys
 import tempfile
 import unittest
 
@@ -67,10 +66,10 @@ def _rank_agg_result(two_sources=False):
     verdicts = [
         {"source": "S1", "loo_score": 0.3, "loo_rank": 1, "align_score": 0.6,
          "align_rank": 2, "borda_count": 3.0, "borda_rank": 1,
-         "pattern": "influential_disagreer", "lo_align_rank_delta": 1.0},
+         "lo_align_rank_delta": 1.0},
         {"source": "S2", "loo_score": 0.1, "loo_rank": 2, "align_score": 0.8,
          "align_rank": 1, "borda_count": 3.0, "borda_rank": 1,
-         "pattern": "redundant_agreer", "lo_align_rank_delta": 1.0},
+         "lo_align_rank_delta": 1.0},
     ]
     kendall = ({"align_scores": {"S1": 0.6, "S2": 0.8}, "winner": "S2",
                 "winner_tau": 0.8, "runner_up": "S1", "runner_up_tau": 0.6,
@@ -961,14 +960,15 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("S2", ctx["text"])
         # Friendly consensus naming + question + glossary footer.
         self.assertIn("robustness consensus", robust["question"])
-        # Prose spells the pattern out; the underscored form is an enum and
-        # stays in `value` for machine consumers, not in a human sentence.
-        self.assertIn("influential disagreer", robust["info_footer"])
-        self.assertNotIn("influential_disagreer", robust["info_footer"])
         role = next(a for a in robust["evidence"]
                     if a["id"] == "ra_robust.source.S1.role")
-        self.assertIn("an influential disagreer pattern", role["text"])
-        self.assertEqual(role["value"]["pattern"], "influential_disagreer")
+        # A source is described by its three ranks and nothing else.
+        self.assertIn("overall rank", role["text"])
+        self.assertIn("for influence", role["text"])
+        self.assertIn("for agreement", role["text"])
+        self.assertNotIn("pattern", role["text"])
+        self.assertNotIn("pattern", role["value"])
+        self.assertNotIn("pattern", robust["info_footer"])
 
         final = ir.build_rank_aggregation_ir(
             "DS", "e1", "final", 0, _rank_agg_result(True),
@@ -1011,10 +1011,10 @@ class TestBuilders(unittest.TestCase):
         self.assertLess(atoms["ra_robust.source.S2.role"]["order"],
                         atoms["ra_robust.source.S1.role"]["order"])
         # S2 is Borda #1 → "shaped ... most"; S1 is Borda #2 → "second most".
-        self.assertIn("shaped the robustness consensus most (overall standing rank 1 of 2),",
+        self.assertIn("shaped the robustness consensus most (overall rank 1 of 2),",
                       atoms["ra_robust.source.S2.role"]["text"])
         self.assertIn("shaped the robustness consensus second most "
-                      "(overall standing rank 2 of 2),",
+                      "(overall rank 2 of 2),",
                       atoms["ra_robust.source.S1.role"]["text"])
         # Both component ranks are stated for each source (never inferred).
         self.assertIn("ranking 1 for influence and 2 for agreement",
@@ -1039,7 +1039,7 @@ class TestBuilders(unittest.TestCase):
             ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
         lead = next(a for a in doc["evidence"]
                     if a["id"] == "ra_robust.source.S1.role")
-        self.assertIn("shaped the robustness consensus most (overall standing rank 1 of 2),", lead["text"])
+        self.assertIn("shaped the robustness consensus most (overall rank 1 of 2),", lead["text"])
         self.assertIn("ranking 1 for influence and 1 for agreement", lead["text"])
 
     def test_monte_carlo_lean(self):

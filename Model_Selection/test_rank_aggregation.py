@@ -191,19 +191,20 @@ class TestBordaVerdictPerSource(unittest.TestCase):
         self.assertEqual(len(verdicts), 4)
         for v in verdicts:
             for key in ("source", "loo_rank", "align_rank",
-                        "borda_count", "borda_rank", "pattern",
+                        "borda_count", "borda_rank",
                         "lo_align_rank_delta"):
                 self.assertIn(key, v)
-            # The dropped key from the old design must not reappear.
+            # Dropped keys from earlier designs must not reappear.
             self.assertNotIn("borda_verdict", v)
+            self.assertNotIn("pattern", v)
 
-    def test_pattern_labels(self):
+    def test_rank_delta_measures_the_two_components_disagreeing(self):
         loo   = {"hi_loo": 0.9, "lo_loo": 0.1, "tied": 0.5}
         align = {"hi_loo": 0.1, "lo_loo": 0.9, "tied": 0.5}
         verdicts = {v["source"]: v for v in borda_verdict_per_source(loo, align)}
-        self.assertEqual(verdicts["hi_loo"]["pattern"], "influential_disagreer")
-        self.assertEqual(verdicts["lo_loo"]["pattern"], "redundant_agreer")
-        self.assertEqual(verdicts["tied"]["pattern"], "consistent")
+        self.assertEqual(verdicts["hi_loo"]["lo_align_rank_delta"], 2.0)
+        self.assertEqual(verdicts["lo_loo"]["lo_align_rank_delta"], 2.0)
+        self.assertEqual(verdicts["tied"]["lo_align_rank_delta"], 0.0)
 
     def test_borda_rank_resolves_extreme_disagreement(self):
         """Two sources sharply contradict on LOO vs Kendall; a third is moderate.
@@ -260,10 +261,10 @@ class TestBordaVerdictPerSource(unittest.TestCase):
         self.assertEqual(verdicts["A"]["borda_rank"], 1)
         self.assertEqual(verdicts["B"]["borda_rank"], 2)
         self.assertEqual(verdicts["C"]["borda_rank"], 3)
-        # Patterns from competition ranks: A is tied-top on both → consistent;
-        # B is rank 1 influence but rank 2 agreement → influential_disagreer.
-        self.assertEqual(verdicts["A"]["pattern"], "consistent")
-        self.assertEqual(verdicts["B"]["pattern"], "influential_disagreer")
+        # Competition ranks: A is tied-top on both, B is rank 1 influence but
+        # rank 2 agreement.
+        self.assertEqual(verdicts["A"]["lo_align_rank_delta"], 0.0)
+        self.assertEqual(verdicts["B"]["lo_align_rank_delta"], 1.0)
 
     def test_ranks_from_scores_method_switch(self):
         scores = {"a": 0.9, "b": 0.5, "c": 0.5, "d": 0.1}  # b,c tie

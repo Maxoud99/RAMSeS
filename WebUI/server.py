@@ -18,7 +18,7 @@ from flask import (Flask, Response, abort, jsonify, render_template, request,
 
 from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES, DEFAULT_LLM_BASE_URL,
                                  DEFAULT_LLM_MODEL)
-from WebUI import artifacts, catalog, jobs, markers, ondemand, paths, plots
+from WebUI import artifacts, catalog, jobs, ondemand, paths, plots
 
 SSE_KEEPALIVE_SECONDS = 15
 SSE_LOG_BATCH = 40           # thousands of lines: one frame per line floods the tab

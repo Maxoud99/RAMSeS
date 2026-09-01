@@ -1,41 +1,38 @@
 name: RAMS
+
+# Conda supplies the interpreter and pip; every package pin lives in
+# requirements.txt, which this file installs. One source of truth, so the two
+# installation routes in the README cannot drift apart:
+#
+#   Option 1  conda env create -f environment.yml   (then: conda activate RAMS)
+#   Option 2  python -m venv .venv && pip install -r requirements.txt
+#
+# Why the pins are not translated into conda dependencies: they are exact and
+# tested as a set. numpy is pinned to 2.0.0 because `arch` and `torchinfo` build
+# against it; letting conda solve numpy/scipy/scikit-learn from conda-forge and
+# then installing pyod and torch over the top with pip gives two BLAS stacks and
+# an ABI mismatch risk, for no benefit this project needs.
+#
+# conda-forge only, no `defaults`: Anaconda's default channels now require a
+# paid licence for larger organisations, and shared or institutional clusters
+# increasingly block them.
+#
+# On a central Anaconda service, `name:` places the environment in whatever
+# `envs_dirs` the administrator configured — normally your own directory, since
+# the base environment is not writable. If it does not land there, override the
+# name with an explicit prefix:
+#
+#   conda env create -f environment.yml -p /your/env/dir/RAMS
+#   conda activate /your/env/dir/RAMS
+#
+# `conda env create --dry-run -f environment.yml` solves without writing
+# anything, which is worth running first on a machine that is not yours.
+
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
-  - defaults
+
 dependencies:
   - python=3.11
   - pip
-  - statsmodels
-  - jupyter
-  - joblib
-  - matplotlib
-  - numpy
-  - networkx
-  - pytables
-  - seaborn
-  - notebook
-  - lightgbm
-  - scipy
-  - tqdm
-  - xgboost
-  - scikit-learn
-  - openpyxl
-  - pandas
-  - ipython
-  - pytorch=2.*         # from pytorch channel
-  - torchvision=0.*     # from pytorch channel
-  - torchaudio=2.*      # from pytorch channel
-  - pytorch-cuda=11.8   # from nvidia channel (requires driver >= 520)
-  - typer
-  - ipykernel
-  - rich
-  - dash
-  - jupyterlab
-  - fastapi
-  - pydantic
-  - plotly
-  - cvxpy
   - pip:
-      - tensorflow-cpu==2.15.*
+      - -r requirements.txt

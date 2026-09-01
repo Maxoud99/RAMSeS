@@ -19,23 +19,7 @@ from Utils.plot_labels import draw_abbreviation_key
 from Metrics.Ensemble_GA import evaluate_individual_models
 from Metrics.Ensemble_GA import evaluate_model_consistently
 from Metrics.metrics import prauc, range_based_precision_recall_f1_auc
-
-
-def _ir_module():
-    """Import Explainability.ir, tolerating standalone by-path loading of this
-    module where the package root is not on sys.path — falls back to loading
-    ir.py directly by its file location."""
-    try:
-        from Explainability import ir as _ir
-        return _ir
-    except ModuleNotFoundError:
-        import importlib.util
-        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _spec = importlib.util.spec_from_file_location(
-            "explainability_ir", os.path.join(_root, "Explainability", "ir.py"))
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        return _mod
+from Explainability import ir
 
 
 def initialize_sliding_windows(data: np.ndarray, targets: np.ndarray, mask: np.ndarray, window_size: int,
@@ -766,36 +750,16 @@ def fit_linear_thompson_sampling(dataset,
             y_true, y_scores, y_true_dict, y_scores_dict = evaluate_model_consistently(dataset, chosen_model,
                                                                                        chosen_model_name)
 
-            # `f1_score` counts TP as `sum(predict * actual)`, so it is an F1 only
-            # when `predict` is 0/1. This line used to hand it raw `entity_scores`,
-            # and the arithmetic still ran — it just stopped measuring anything:
-            # `1 - predict` became `1 - 0.83`, and `precision` reduced to
-            # `sum(s*y) / sum(s)`, which has no bound once a score can be negative.
+            # MUST be the range-based metric, not `f1_score`. `f1_score` counts
+            # TP as `sum(predict * actual)`, so it is an F1 only when `predict`
+            # is 0/1; handed raw scores it still computes, but it is unbounded
+            # once a score can go negative — which LSTMVAE's Gaussian NLL does
+            # whenever sigma < 1. The range-based metric thresholds internally
+            # over its own sweep, so it never mistakes a score for a prediction.
+            # Costs one sweep per window for the chosen detector only.
             #
-            # LSTMVAE is the one detector that makes it negative. Its score is a
-            # Gaussian NLL, 0.5*(log(var) + (y-mu)^2/var), and the log term goes
-            # below zero whenever the predicted sigma is under 1 — measured on
-            # skab/1, sigma stays in [0.127, 0.657], so 71.9% of timesteps score
-            # negative. That drove sum(s) toward zero and the ratio through it:
-            # the "F1" reached 8.52 and the reward 4.32, where both belong in
-            # [0, 1]. LinTS absorbed the inflated reward, and `rank_models` scores
-            # by ||mu||^2, which squares it — LSTMVAE took the top four ranking
-            # slots on an entity where it is the worst of the twelve by every
-            # honest metric (full-series reward 0.023-0.029 vs RNN's 0.060-0.066).
-            #
-            # The range-based metric thresholds internally over its own sweep, so
-            # it never sees a raw score as a prediction, and it is what the other
-            # seven call sites use (Monte_Carlo_Simulation:99, off_by:200,
-            # GAN_test:251, Adversarial_testing:74, model_stress_testing:177,
-            # Ensemble_GA:269, ranking_metrics:83). Thompson was the only stage
-            # that did not. Cost is linear in window length and it runs once per
-            # window, for the chosen detector only: 44 ms/call on skab's 4-step
-            # windows (~5 s per run) and 488 ms on SMD's 47-step windows (~49 s).
-            #
-            # pr_auc is left on `prauc` — it was never affected by this, and it is
-            # a different (point-adjusted) metric, so moving it would shift results
-            # for a reason unrelated to the defect. Taking both from the one call
-            # would match the other stages exactly and save a sweep.
+            # pr_auc stays on `prauc`: a different (point-adjusted) metric, and
+            # moving it would shift results for an unrelated reason.
             _, _, f1, _range_pr_auc, _ = range_based_precision_recall_f1_auc(y_true, y_scores)
 
             pr_auc = prauc(y_true, y_scores)
@@ -1445,64 +1409,74 @@ def plot_shap_comparison(
     )
 
 
-def plot_shap_per_window(
+_REWARD_YLABEL = r'Contribution to expected reward  $\mu^\top x$'
+
+
+def _plot_per_regime(
     means: Dict[str, np.ndarray],
     shap_payload: Dict,
+    regime_shifts: List[Dict],
     dataset: str,
     entity: str,
     iterations: int,
+    *,
+    stem: str,
+    title_prefix: str,
+    per_channel_fn,
+    note_fn,
+    ylabel: Optional[str] = None,
     top_k_models: int = 3,
     top_n_channels: int = 9,
     all_models: bool = False,
-    sample_stride: Optional[int] = None,
 ) -> None:
-    """
-    One SHAP comparison plot per window (raw signed per-channel SHAP), in the
-    same style as shap_comparison.
+    """One grouped-bar plot per leadership regime, for ONE quantity.
 
-    all_models : bool
-        When False (default) each window's plot shows the top_k_models by
-        expected reward (mu·x) at that window's context; saved under
-        shap_per_window_{iterations}/. When True every model is shown; saved
-        under shap_per_window_all_{iterations}/.
-    sample_stride : Optional[int]
-        When set (e.g. 10) only every `sample_stride`-th window is plotted
-        (window 0, 10, 20, …), saved under shap_per_window_every{stride}_{iterations}/.
-        Useful for a quick overview without one plot per window.
+    Shared by the SHAP and expected-reward sets, which differ only in which
+    per-channel map they build, what they call it, and the footnote. Everything
+    that has to agree between them — the regime segmentation, the 0-based index
+    matching the report's "Regime 0" and the IR's `ts.regime.0.*` ids, and the
+    `regime_{NN}_w{start}-{end}_{leader}.png` filename the WebUI joiner parses
+    back — is written once here, so the two sets cannot drift apart and stop
+    pairing with the same regime sentence.
+
+    `per_channel_fn(sel_models, regime_ctx, regime_mu)` returns the map to plot;
+    `note_fn(n_windows)` returns the footnote.
     """
     if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
         return
     contexts = shap_payload.get("all_contexts", [])
     if not contexts or not means:
         return
-    baseline = shap_payload["baseline_context"]
     n_channels = shap_payload["n_channels"]
 
+    fallback = _top_k_models_by_norm(means, 1)[0]
+    segments = reconstruct_regime_segments(regime_shifts, len(contexts),
+                                           fallback_model=fallback)
     every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
-    base = "shap_per_window_all" if all_models else "shap_per_window"
-    if sample_stride and sample_stride > 1:
-        base = f"{base}_every{sample_stride}"
-    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
+    folder = f'{stem}_all_{iterations}' if all_models else f'{stem}_{iterations}'
+    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
     mu_hist = shap_payload.get("means_history") or []
-    for t, ctx in enumerate(contexts):
-        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
+    for i, (start, end, model, _duration) in enumerate(segments):
+        regime_ctx = contexts[start:end + 1]
+        if not regime_ctx:
             continue
-        # Beliefs held at window t, so the plot explains the decision that was
-        # actually made there rather than re-reading it with end-of-run knowledge.
-        means_t = ({m: v.reshape(-1, 1) for m, v in mu_hist[t].items()}
-                   if t < len(mu_hist) else means)
+        regime_mu = mu_hist[start:end + 1] if mu_hist else None
         if all_models:
             sel_models = every_model
-            title = f'SHAP — window {t} (all models)'
+            scope = 'all models'
         else:
-            sel_models = _top_k_models_by_expected_reward(means_t, [ctx], top_k_models)
-            title = f'SHAP — window {t} (top {top_k_models} by E[R] in window)'
-        per_channel = _per_channel_shap_map(means_t, sel_models, ctx, baseline, n_channels)
+            sel_models = _top_k_models_by_expected_reward(
+                means, regime_ctx, top_k_models, means_per_context=regime_mu)
+            scope = f'top {top_k_models} by E[R] in regime'
         _render_shap_comparison(
-            per_channel, sel_models, top_n_channels,
-            title=title,
-            save_path=os.path.join(directory, f'window_{t:03d}.png'),
+            per_channel_fn(sel_models, regime_ctx, regime_mu),
+            sel_models, top_n_channels,
+            title=(f'{title_prefix} — regime {i} ({model}, '
+                   f'windows {start}-{end}, {scope})'),
+            save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
+            ylabel=ylabel or 'Per-channel SHAP contribution',
             n_channels_total=n_channels,
+            note=note_fn(end - start + 1),
         )
 
 
@@ -1528,106 +1502,15 @@ def plot_shap_per_regime(
         shap_per_regime_{iterations}/. When True every model is shown; saved
         under shap_per_regime_all_{iterations}/.
     """
-    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
-        return
-    contexts = shap_payload.get("all_contexts", [])
-    if not contexts or not means:
-        return
-    baseline = shap_payload["baseline_context"]
-    n_channels = shap_payload["n_channels"]
-
-    fallback = _top_k_models_by_norm(means, 1)[0]
-    segments = reconstruct_regime_segments(regime_shifts, len(contexts),
-                                           fallback_model=fallback)
-    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
-    folder = f'shap_per_regime_all_{iterations}' if all_models else f'shap_per_regime_{iterations}'
-    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
-    mu_hist = shap_payload.get("means_history") or []
-    # 0-based to match the report's "Regime 0" and the IR's ts.regime.0.* ids;
-    # the filenames are what a reader cross-references against the prose.
-    for i, (start, end, model, _duration) in enumerate(segments):
-        regime_ctx = contexts[start:end + 1]
-        if not regime_ctx:
-            continue
-        regime_mu = mu_hist[start:end + 1] if mu_hist else None
-        if all_models:
-            sel_models = every_model
-            title = f'SHAP — regime {i} ({model}, windows {start}-{end}, all models)'
-        else:
-            sel_models = _top_k_models_by_expected_reward(
-                means, regime_ctx, top_k_models, means_per_context=regime_mu)
-            title = (f'SHAP — regime {i} ({model}, windows {start}-{end}, '
-                     f'top {top_k_models} by E[R] in regime)')
-        per_channel = _avg_per_channel_shap_map(
-            means, sel_models, regime_ctx, baseline, n_channels, absolute=False,
-            means_per_context=regime_mu)
-        _render_shap_comparison(
-            per_channel, sel_models, top_n_channels,
-            title=title,
-            save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
-            n_channels_total=n_channels,
-            note=(f'SHAP averaged over the {end - start + 1} windows of this regime.'),
-        )
-
-
-_REWARD_YLABEL = r'Contribution to expected reward  $\mu^\top x$'
-
-
-def plot_reward_per_window(
-    means: Dict[str, np.ndarray],
-    shap_payload: Dict,
-    dataset: str,
-    entity: str,
-    iterations: int,
-    top_k_models: int = 3,
-    top_n_channels: int = 9,
-    all_models: bool = False,
-    sample_stride: Optional[int] = None,
-) -> None:
-    """
-    Per-channel split of the expected reward, one plot per window — the sibling
-    of plot_shap_per_window, and the one whose bars sum to the prediction.
-
-    Same folders and same frame names as the SHAP sets so the two can be read
-    frame for frame: reward_per_window{,_all,_every{stride}}_{iterations}/.
-    """
-    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
-        return
-    contexts = shap_payload.get("all_contexts", [])
-    if not contexts or not means:
-        return
-    n_channels = shap_payload["n_channels"]
-
-    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
-    base = "reward_per_window_all" if all_models else "reward_per_window"
-    if sample_stride and sample_stride > 1:
-        base = f"{base}_every{sample_stride}"
-    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
-    mu_hist = shap_payload.get("means_history") or []
-    for t, ctx in enumerate(contexts):
-        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
-            continue
-        # Beliefs held at window t, so the plot explains the decision actually
-        # made there rather than re-reading it with end-of-run knowledge.
-        means_t = ({m: v.reshape(-1, 1) for m, v in mu_hist[t].items()}
-                   if t < len(mu_hist) else means)
-        if all_models:
-            sel_models = every_model
-            title = f'Expected-reward contribution — window {t} (all models)'
-        else:
-            sel_models = _top_k_models_by_expected_reward(means_t, [ctx], top_k_models)
-            title = (f'Expected-reward contribution — window {t} '
-                     f'(top {top_k_models} by E[R] in window)')
-        per_channel = _per_channel_reward_map(means_t, sel_models, ctx, n_channels)
-        _render_shap_comparison(
-            per_channel, sel_models, top_n_channels,
-            title=title,
-            save_path=os.path.join(directory, f'window_{t:03d}.png'),
-            ylabel=_REWARD_YLABEL,
-            n_channels_total=n_channels,
-            note=(f"Each detector's bars sum to its expected reward at window "
-                  f"{t}; no baseline is subtracted."),
-        )
+    _plot_per_regime(
+        means, shap_payload, regime_shifts, dataset, entity, iterations,
+        stem='shap_per_regime', title_prefix='SHAP',
+        per_channel_fn=lambda sel, ctx, mu: _avg_per_channel_shap_map(
+            means, sel, ctx, shap_payload["baseline_context"],
+            shap_payload["n_channels"], absolute=False, means_per_context=mu),
+        note_fn=lambda n: f'SHAP averaged over the {n} windows of this regime.',
+        top_k_models=top_k_models, top_n_channels=top_n_channels,
+        all_models=all_models)
 
 
 def plot_reward_per_regime(
@@ -1649,46 +1532,18 @@ def plot_reward_per_regime(
     Filenames match the SHAP set exactly (0-based index, window range, leader)
     so one joiner pairs either set with the same regime sentence.
     """
-    if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
-        return
-    contexts = shap_payload.get("all_contexts", [])
-    if not contexts or not means:
-        return
-    n_channels = shap_payload["n_channels"]
+    _plot_per_regime(
+        means, shap_payload, regime_shifts, dataset, entity, iterations,
+        stem='reward_per_regime', title_prefix='Expected-reward contribution',
+        per_channel_fn=lambda sel, ctx, mu: _avg_per_channel_reward_map(
+            means, sel, ctx, shap_payload["n_channels"], means_per_context=mu),
+        note_fn=lambda n: (f"Averaged over the {n} windows of this regime; "
+                           f"each detector's bars sum to its mean expected "
+                           f"reward here."),
+        ylabel=_REWARD_YLABEL,
+        top_k_models=top_k_models, top_n_channels=top_n_channels,
+        all_models=all_models)
 
-    fallback = _top_k_models_by_norm(means, 1)[0]
-    segments = reconstruct_regime_segments(regime_shifts, len(contexts),
-                                           fallback_model=fallback)
-    every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
-    folder = (f'reward_per_regime_all_{iterations}' if all_models
-              else f'reward_per_regime_{iterations}')
-    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
-    mu_hist = shap_payload.get("means_history") or []
-    for i, (start, end, model, _duration) in enumerate(segments):
-        regime_ctx = contexts[start:end + 1]
-        if not regime_ctx:
-            continue
-        regime_mu = mu_hist[start:end + 1] if mu_hist else None
-        if all_models:
-            sel_models = every_model
-            title = (f'Expected-reward contribution — regime {i} ({model}, '
-                     f'windows {start}-{end}, all models)')
-        else:
-            sel_models = _top_k_models_by_expected_reward(
-                means, regime_ctx, top_k_models, means_per_context=regime_mu)
-            title = (f'Expected-reward contribution — regime {i} ({model}, '
-                     f'windows {start}-{end}, top {top_k_models} by E[R] in regime)')
-        per_channel = _avg_per_channel_reward_map(
-            means, sel_models, regime_ctx, n_channels, means_per_context=regime_mu)
-        _render_shap_comparison(
-            per_channel, sel_models, top_n_channels,
-            title=title,
-            save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
-            ylabel=_REWARD_YLABEL,
-            n_channels_total=n_channels,
-            note=(f"Averaged over the {end - start + 1} windows of this regime; "
-                  f"each detector's bars sum to its mean expected reward here."),
-        )
 
 
 def plot_reward_average_all(
@@ -2143,8 +1998,7 @@ def explain_thompson_sampling(
     # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
     # Reuses regimes_data computed above — the report and the IR always match.
     try:
-        _ir = _ir_module()
-        ir_doc = _ir.build_thompson_ir(
+        ir_doc = ir.build_thompson_ir(
             dataset, entity, n_windows=T,
             final_ranking=ranking,
             regimes=regimes_data,
@@ -2160,7 +2014,7 @@ def explain_thompson_sampling(
             channel_names=(shap_payload or {}).get("channel_names"),
             n_channels=(shap_payload or {}).get("n_channels"),
         )
-        _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson")
+        ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson")
     except Exception as e:
         logger.error(f"Thompson IR emission failed (non-fatal): {e}")
 
@@ -2421,59 +2275,6 @@ def plot_ranking_gap(means: Dict[str, np.ndarray], n_channels: int,
     plt.savefig(os.path.join(directory, f'ranking_gap_{iterations}.png'),
                 format='png', dpi=300, bbox_inches='tight')
     plt.close()
-
-
-def plot_ranking_per_window(means_history: List[Dict[str, np.ndarray]],
-                            n_channels: int, dataset: str, entity: str,
-                            iterations: int, top_k_models: int = 3,
-                            top_n_channels: int = 9, all_models: bool = False,
-                            sample_stride: Optional[int] = None) -> None:
-    """
-    One per-channel ranking-score plot per window, the sibling of
-    plot_shap_per_window.
-
-    Answers "what did the ranking score look like at window t" without the
-    ambiguity a per-regime figure carries: a regime spans many windows, and the
-    score is cumulative, so a single regime plot can only show one moment of it.
-    Here that moment is named on every frame.
-
-    all_models : bool
-        When False (default) each frame shows the top_k_models by ||mu||^2 AT
-        THAT WINDOW — the ranking as it stood then, not the final one — saved
-        under ranking_per_window_{iterations}/. When True every detector is
-        shown, under ranking_per_window_all_{iterations}/.
-    sample_stride : Optional[int]
-        When set (e.g. 10) only every stride-th window is plotted, saved under
-        ranking_per_window_every{stride}_{iterations}/.
-    """
-    if not means_history or n_channels <= 0:
-        return
-    base = "ranking_per_window_all" if all_models else "ranking_per_window"
-    if sample_stride and sample_stride > 1:
-        base = f"{base}_every{sample_stride}"
-    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{base}_{iterations}/')
-    for t, at in enumerate(means_history):
-        if sample_stride and sample_stride > 1 and t % sample_stride != 0:
-            continue
-        if all_models:
-            sel_models = _top_k_models_by_norm(at, len(at))
-            title = f'Ranking score by channel — window {t} (all detectors)'
-        else:
-            sel_models = _top_k_models_by_norm(at, top_k_models)
-            title = (f'Ranking score by channel — window {t} '
-                     f'(top {top_k_models} by score at this window)')
-        per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
-                       for m in sel_models}
-        _render_shap_comparison(
-            per_channel, sel_models, top_n_channels,
-            title=title,
-            save_path=os.path.join(directory, f'window_{t:03d}.png'),
-            ylabel=r'Contribution to $\|\mu_k\|^2$',
-            n_channels_total=n_channels,
-            note=(f'Weights as they stood at window {t}. The score is '
-                  f'cumulative, so these bars are the total accumulated up to '
-                  f'this window.'),
-        )
 
 
 # ── Per-window channel aggregates, for on-demand rendering ──────────────────
@@ -2777,8 +2578,7 @@ def explain_thompson_ranking(
 
     # ── Intermediate Representation (grounded LLM input; non-fatal) ─────────
     try:
-        _ir = _ir_module()
-        ir_doc = _ir.build_thompson_ranking_ir(
+        ir_doc = ir.build_thompson_ranking_ir(
             dataset, entity, n_windows=T,
             final_ranking=ranking,
             winner_channels=winner_channels,
@@ -2797,7 +2597,7 @@ def explain_thompson_ranking(
                 for m, mu in means.items()
             } if n_channels > 0 else {},
         )
-        _ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson_ranking")
+        ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson_ranking")
     except Exception as e:
         logger.error(f"Thompson ranking IR emission failed (non-fatal): {e}")
 

@@ -7,7 +7,6 @@ can I run right now". Results in `myresults/` are a separate question, answered
 by artifacts.known_entities().
 """
 
-import os
 import pickle
 import time
 from pathlib import Path

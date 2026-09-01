@@ -767,12 +767,10 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
                          f"{runner_up}")
         if losses:
             c, _v = losses[0]
-            # Direction in words, no number and no sign to interpret. An earlier
-            # phrasing paired the signed value with "in NN_3's favour" and got
-            # read the other way round ("channel 8 had a negative impact on
-            # NN_3's score"), inverting the one claim this stage exists to make.
-            # Naming BOTH sides ("favoured X more than Y") is what makes the
-            # comparison unambiguous without a number.
+            # Direction in words, with BOTH sides named ("favoured X more than
+            # Y") and no signed number. A signed value plus "in X's favour" is
+            # read the other way round often enough to invert the one claim
+            # this stage exists to make.
             parts.append(f"while {_ch(c)} favoured {runner_up} more than "
                          f"{top_model}")
         if parts:
@@ -1594,8 +1592,8 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         # by Borda rank (the dominant combined rank), built from its two component
         # ranks — INFLUENCE (leave-one-out: how much the consensus moves when the
         # source is dropped) and AGREEMENT (Kendall tau of the source vs the
-        # consensus) — plus its pattern. Raw LOO/tau scores stay in `value` for
-        # provenance; the prose carries only the ranks.
+        # consensus). Raw LOO/tau scores stay in `value` for provenance; the
+        # prose carries only the ranks.
 
         # Required relational atom: names the source set explicitly and states
         # that the ranked detectors (incl. the winner) are NOT sources — the
@@ -1616,16 +1614,6 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
             br = v.get("borda_rank")
             return (float(br) if br is not None else float("inf"), str(v.get("source")))
 
-        def _pattern_phrase(p: Any) -> str:
-            """The pattern as prose. The underscore form is the enum, which
-            stays in `value` for machine consumers; a snake_case token reads as
-            code in a sentence written for a human."""
-            if not p or p == NOT_AVAILABLE:
-                return ""
-            words = str(p).replace("_", " ")
-            article = "an" if words[0].lower() in "aeiou" else "a"
-            return f", {article} {words} pattern"
-
         # "shaped the consensus [Nth] most" — the ordinal is the source's
         # combined Borda standing: rank 1 → "most", 2 → "second most", … Ties
         # share an ordinal (two sources at Borda rank 3 are both "third most").
@@ -1643,25 +1631,24 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
             name = v["source"]
             loo_rank, align_rank = v.get("loo_rank"), v.get("align_rank")
             br = v.get("borda_rank")
-            pp = _pattern_phrase(v.get("pattern"))
             # Every source is described exactly like the lead: how much it
             # "shaped the consensus" (its combined Borda standing) plus BOTH
-            # explicit component ranks and its pattern. The combined standing
-            # gets its own NAME and its own NUMBER ("overall standing rank N of
-            # M"): expressed only as a bare verb phrase it was the one ordinal
-            # in the sentence without a label, so narrators borrowed the nearest
-            # rank-noun and reported it as influence — the same value described
-            # twice, contradictorily ("ranked sixth for influence (rank 4)").
+            # explicit component ranks. The combined standing gets its own NAME
+            # and its own NUMBER ("overall rank N of M"): expressed only as a
+            # bare verb phrase it was the one ordinal in the sentence without a
+            # label, so narrators borrowed the nearest rank-noun and reported it
+            # as influence — the same value described twice, contradictorily
+            # ("ranked sixth for influence (rank 4)").
             standing = ("" if br is None or _is_nan(br)
-                        else f" (overall standing rank {int(br)} of {n_src})")
+                        else f" (overall rank {int(br)} of {n_src})")
             text = (f"{name} shaped the {stage_word} consensus "
                     f"{_shaped_prefix(br)}most{standing}, ranking "
-                    f"{loo_rank} for influence and {align_rank} for agreement{pp}.")
+                    f"{loo_rank} for influence and {align_rank} for agreement.")
             rid = f"{prefix}.source.{name}.role"
             evidence.append(make_atom(
                 rid, "source_role", name,
                 {"influence_rank": loo_rank, "agreement_rank": align_rank,
-                 "borda_rank": v.get("borda_rank"), "pattern": v.get("pattern"),
+                 "borda_rank": v.get("borda_rank"),
                  "influence_score": _val(v.get("loo_score"), 4),
                  "agreement_score": _val(v.get("align_score"), 4),
                  "top_pick": source_top_picks.get(name, NOT_AVAILABLE)},
@@ -1674,13 +1661,11 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
             "Influence measures how much a source moved the consensus: it compares "
             "the consensus ranking with the ranking that emerges when that source is "
             "left out. Agreement compares the consensus ranking with the source's own "
-            "ranking. The overall standing rank is a third, separate position: it is "
+            "ranking. The overall rank is a third, separate position: it is "
             "influence and agreement merged into one Borda order, and it is what 'shaped "
             "the consensus most, second most, and so on' reports. A source can stand "
             "high overall on the strength of one component while ranking low on the "
-            "other. An influential disagreer has high influence but low "
-            "agreement; a redundant agreer has high agreement but low influence; a "
-            "consistent source ranks similarly on both.")
+            "other.")
 
     ir = _envelope(f"rank_aggregation_{stage_name}", dataset, entity, output,
                    evidence, caveats, required, question=question,
@@ -2125,13 +2110,11 @@ def _build_exclusive_win_ir(stage: str, prefix: str, dataset: str, entity: str,
 
     # ── One atom per rival group: its rule(s) AND its win count together ──
     #
-    # These used to be two families — a rule atom per condition signature and a
-    # wins atom per (count, rate) — which expressed the SAME rivals twice, in
-    # two different groupings and two different orders. That redundancy is what
-    # let a narrator merge across them and emit one sentence carrying a rule
-    # from one group and names from another. Grouping by (rules, count, rate)
-    # means every rival set is named exactly once, with everything said about
-    # it in a single sentence: there is no second sentence to cross-contaminate.
+    # Grouped by (rules, count, rate) so every rival set is named exactly once,
+    # with everything about it in a single sentence. Splitting rules and wins
+    # into two atom families names the same rivals twice in two different
+    # orders, and a narrator will merge across them — emitting one sentence
+    # that carries a rule from one group and names from another.
     comp_sigs: Dict[str, List[str]] = {}
     for sig in sorted(rule_groups):
         for c in rule_groups[sig]["competitors"]:

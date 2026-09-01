@@ -4,6 +4,8 @@ import copy
 import logging
 import os
 import psutil
+import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -92,18 +94,112 @@ def get_memory_usage_mb():
     return process.memory_info().rss / (1024 * 1024)  # Convert bytes to MB
 
 def get_peak_memory_mb():
-    """Get peak memory usage in MB (platform-dependent)."""
+    """High-water RSS of this process in MB, or None if no peak is obtainable.
+
+    `resource` is Unix-only. This used to fall back through a bare `except:` to
+    `get_memory_usage_mb()` — a CURRENT reading, printed under the heading
+    "Peak Memory" with nothing to say it was not one. On Windows that made the
+    reported peak silently meaningless. The fallback is now the sampler's own
+    high-water mark, which is a real peak (sampled rather than exact); None
+    only when neither source can answer, and the report says so rather than
+    printing a number.
+    """
     try:
         import resource
-        rusage = resource.getrusage(resource.RUSAGE_SELF)
-        # macOS: ru_maxrss is in bytes, Linux: in kilobytes
-        if os.uname().sysname == 'Darwin':
-            return rusage.ru_maxrss / (1024 * 1024)
-        else:
-            return rusage.ru_maxrss / 1024
-    except:
-        # Fallback to current usage if resource module unavailable
-        return get_memory_usage_mb()
+    except ImportError:
+        return _MEM_TRACE.peak_all()
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports ru_maxrss in bytes, Linux in kilobytes.
+    return ru / (1024 * 1024) if sys.platform == "darwin" else ru / 1024
+
+
+# Processes that serve the local LLM. The model runs OUTSIDE this interpreter —
+# `narrate_entity` reaches it over HTTP — so `psutil.Process()` never sees the
+# 9 GB qwen2.5:14b holds, and the LLM stage used to be reported as ~20 MB.
+# Matched by name because the server is a plain OS process with no handle we
+# own; the runner subprocess that actually holds the weights matches too.
+_LLM_PROCESS_HINTS = ("ollama",)
+
+
+def llm_server_memory_mb():
+    """Summed RSS of the local LLM server processes, or None if none are up.
+
+    None rather than 0.0 on purpose: "the server was not running" and "the
+    server used no memory" are different claims, and the report says so.
+    """
+    total = None
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            cmd = " ".join(proc.info.get("cmdline") or ()).lower()
+            if any(h in name or h in cmd for h in _LLM_PROCESS_HINTS):
+                total = (total or 0.0) + proc.memory_info().rss / (1024 * 1024)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return total
+
+
+class _MemoryTrace:
+    """Background sampler of this process's RSS and the LLM server's.
+
+    A module's memory is a PEAK over its window, not the difference of two
+    endpoint samples. RSS at an instant is what the OS chose to keep resident,
+    so endpoint deltas go negative whenever pages are reclaimed — which is
+    exactly what a 9 GB model loading in another process causes. The delta is
+    still reported (it answers "what did this stage leave behind"), but the
+    peak is what answers "how much did this stage need".
+    """
+
+    def __init__(self, interval: float = 0.5):
+        self.interval = interval
+        self._samples = []          # (t, self_rss_mb, llm_rss_mb or None)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self._samples.append(
+                    (time.time(), get_memory_usage_mb(), llm_server_memory_mb()))
+            except Exception:
+                pass                # sampling must never break a run
+
+    def start(self):
+        if self._thread is None:
+            self._samples.append(
+                (time.time(), get_memory_usage_mb(), llm_server_memory_mb()))
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="memory-trace")
+            self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2 * self.interval)
+            self._thread = None
+
+    def _window(self, t0, t1):
+        return [s for s in self._samples if t0 <= s[0] <= t1]
+
+    def peak_between(self, t0, t1):
+        """Highest RSS of THIS process seen in [t0, t1]. None if unsampled."""
+        vals = [s[1] for s in self._window(t0, t1)]
+        return max(vals) if vals else None
+
+    def peak_all(self):
+        """Highest RSS of this process across the whole trace. None if unsampled."""
+        return max((x[1] for x in self._samples), default=None)
+
+    def llm_peak_between(self, t0, t1):
+        """Highest summed RSS of the LLM server in [t0, t1]. None if it was down."""
+        vals = [s[2] for s in self._window(t0, t1) if s[2] is not None]
+        return max(vals) if vals else None
+
+
+# One trace for the whole run; started in main() and read per module.
+_MEM_TRACE = _MemoryTrace()
+
 
 def write_comprehensive_results(output_file, dataset, entity, iteration, results_dict, timing_dict, memory_dict=None):
     """
@@ -158,16 +254,56 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
             f.write("="*80 + "\n\n")
             
             f.write("Per-Module Memory Usage:\n")
+            f.write("  Peak is the highest resident size sampled while the module ran —\n")
+            f.write("  what it needed. Delta is end minus start — what it left behind, and\n")
+            f.write("  negative whenever the OS reclaimed pages during the module.\n")
             f.write("-" * 50 + "\n")
+            shared_peak = False
             for module, mem_info in memory_dict.get('modules', {}).items():
                 f.write(f"  {module:<30} : {mem_info['after']:>10.2f} MB\n")
-                f.write(f"    Delta: +{mem_info['delta']:>10.2f} MB\n")
+                peak = mem_info.get('peak')
+                if peak is not None:
+                    mark = " (shared)" if mem_info.get('peak_shared') else ""
+                    shared_peak = shared_peak or bool(mem_info.get('peak_shared'))
+                    f.write(f"    Peak : {peak:>10.2f} MB{mark}\n")
+                f.write(f"    Delta: {mem_info['delta']:>+10.2f} MB\n")
+                llm_peak = mem_info.get('llm_server_peak')
+                if llm_peak is not None:
+                    f.write(f"    LLM server peak (separate process) "
+                            f": {llm_peak:>10.2f} MB\n")
+                elif 'llm_server_peak' in mem_info:
+                    f.write("    LLM server peak (separate process) "
+                            ":  not measured (server not running)\n")
+            if shared_peak:
+                f.write("  (shared) = stages ran concurrently in one process, so their\n")
+                f.write("            peaks are not separable; this is the parallel region's.\n")
             
             f.write("-" * 50 + "\n")
-            f.write(f"  {'Initial Memory':<30} : {memory_dict.get('initial', 0):>10.2f} MB\n")
-            f.write(f"  {'Final Memory':<30} : {memory_dict.get('final', 0):>10.2f} MB\n")
-            f.write(f"  {'Peak Memory':<30} : {memory_dict.get('peak', 0):>10.2f} MB\n")
-            f.write(f"  {'Total Increase':<30} : {memory_dict.get('final', 0) - memory_dict.get('initial', 0):>10.2f} MB\n\n")
+            initial = memory_dict.get('initial', 0)
+            final = memory_dict.get('final', 0)
+            peak = memory_dict.get('peak')
+            f.write(f"  {'Initial Memory':<30} : {initial:>10.2f} MB\n")
+            if peak is not None:
+                f.write(f"  {'Peak Memory':<30} : {peak:>10.2f} MB\n")
+                f.write(f"  {'Peak above start':<30} : {peak - initial:>+10.2f} MB\n")
+            else:
+                f.write(f"  {'Peak Memory':<30} :   unavailable on this platform\n")
+            final_alg = memory_dict.get('final_algorithms')
+            if final_alg is not None:
+                f.write(f"  {'Final Memory (algorithms)':<30} : {final_alg:>10.2f} MB\n")
+                f.write(f"  {'Final Memory (after LLM)':<30} : {final:>10.2f} MB\n")
+            else:
+                f.write(f"  {'Final Memory':<30} : {final:>10.2f} MB\n")
+            f.write(f"  {'Total Increase (final-start)':<30} : {final - initial:>+10.2f} MB\n")
+            llm_init = memory_dict.get('llm_server_initial')
+            llm_peaks = [m.get('llm_server_peak') for m in memory_dict.get('modules', {}).values()
+                         if m.get('llm_server_peak') is not None]
+            if llm_peaks:
+                f.write(f"  {'LLM server peak':<30} : {max(llm_peaks):>10.2f} MB"
+                        f"  (separate process, not in the figures above)\n")
+                if llm_init is not None:
+                    f.write(f"  {'LLM server at start':<30} : {llm_init:>10.2f} MB\n")
+            f.write("\n")
         
         # ============ GENETIC ALGORITHM (ENSEMBLE) ============
         f.write("="*80 + "\n")
@@ -444,9 +580,12 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     robust_agg = [None, []]
     full_aggregated = [None, []]
 
-    # Track initial memory
+    # Track initial memory. The sampler runs alongside from here, so every
+    # module gets a PEAK over its own window rather than two endpoint samples.
+    _MEM_TRACE.start()
     initial_memory = get_memory_usage_mb()
     memory_dict['initial'] = initial_memory
+    memory_dict['llm_server_initial'] = llm_server_memory_mb()
     logger.info(f"  💾 Initial memory usage: {initial_memory:.2f} MB")
 
     # -------------------------
@@ -471,7 +610,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['1_Genetic_Algorithm'] = {
             'before': mem_before,
             'after': mem_after,
-            'delta': mem_after - mem_before
+            'delta': mem_after - mem_before,
+            'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
         logger.info(
             "  ✓ [GA] Best ensemble=%s | F1=%.4f | PR-AUC=%.4f | fitness=%.4f | Time=%.4fs",
@@ -500,7 +640,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['2_Thompson_Sampling'] = {
             'before': mem_before,
             'after': mem_after,
-            'delta': mem_after - mem_before
+            'delta': mem_after - mem_before,
+            'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
         logger.info("  ✓ [Thompson] Top-5: %s | Time=%.4fs", thompson_model_names[:5],
                     timing_dict['2_Thompson_Sampling'])
@@ -524,7 +665,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['3_GAN_Robustness'] = {
             'before': mem_before,
             'after': mem_after,
-            'delta': mem_after - mem_before
+            'delta': mem_after - mem_before,
+            'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
         Gan_ranked_by_f1, Gan_ranked_by_pr_auc, \
         Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names = (
@@ -557,7 +699,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['4_Borderline_Sensitivity'] = {
             'before': mem_before,
             'after': mem_after,
-            'delta': mem_after - mem_before
+            'delta': mem_after - mem_before,
+            'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
         logger.info("  ✓ [Borderline] F1 names top-5: %s | Time=%.4fs", ranked_by_f1_names_sensitivity[:5],
                     timing_dict['4_Borderline_Sensitivity'])
@@ -581,7 +724,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['5_Monte_Carlo'] = {
             'before': mem_before,
             'after': mem_after,
-            'delta': mem_after - mem_before
+            'delta': mem_after - mem_before,
+            'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
         logger.info("  ✓ [MonteCarlo] F1 names top-5: %s | Time=%.4fs", monte_carlo_ranked_models_F1[:5],
                     timing_dict['5_Monte_Carlo'])
@@ -681,14 +825,19 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     memory_dict['modules']['6_Rank_Aggregation'] = {
         'before': mem_before,
         'after': mem_after,
-        'delta': mem_after - mem_before
+        'delta': mem_after - mem_before,
+        'peak': _MEM_TRACE.peak_between(start_time, time.time()),
     }
     logger.info("  ✓ [Aggregation] Time=%.4fs", timing_dict['6_Rank_Aggregation'])
     
     # Track final memory and peak
     memory_dict['final'] = get_memory_usage_mb()
     memory_dict['peak'] = get_peak_memory_mb()
-    logger.info(f"  💾 Final memory usage: {memory_dict['final']:.2f} MB (Peak: {memory_dict['peak']:.2f} MB)")
+    _pk = memory_dict['peak']
+    logger.info(f"  💾 Final memory usage: {memory_dict['final']:.2f} MB "
+                f"(Peak: {_pk:.2f} MB)" if _pk is not None
+                else f"  💾 Final memory usage: {memory_dict['final']:.2f} MB "
+                     f"(Peak: unavailable on this platform)")
 
     # -----------------------
     # Persist a concise report
@@ -751,9 +900,12 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
     memory_dict = {'modules': {}}
     overall_start = time.time()
     
-    # Track initial memory
+    # Track initial memory. The sampler runs alongside from here, so every
+    # module gets a PEAK over its own window rather than two endpoint samples.
+    _MEM_TRACE.start()
     initial_memory = get_memory_usage_mb()
     memory_dict['initial'] = initial_memory
+    memory_dict['llm_server_initial'] = llm_server_memory_mb()
     logger.info(f"  💾 Initial memory usage: {initial_memory:.2f} MB")
     
     # CRITICAL: Create independent copies of test_data for each algorithm
@@ -821,7 +973,11 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['1_GA'] = {
             'before': initial_memory,
             'after': mem_ga,
-            'delta': mem_ga - initial_memory
+            'delta': mem_ga - initial_memory,
+            # Concurrent stages share one process, so a per-stage peak is not
+            # separable here; this is the peak over the whole parallel region.
+            'peak': _MEM_TRACE.peak_between(overall_start, time.time()),
+            'peak_shared': True,
         }
         logger.info("     ✓ GA: ensemble=%s | F1=%.4f | PR-AUC=%.4f", best_ensemble, best_f1, best_pr_auc)
         
@@ -831,7 +987,9 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['2_Thompson'] = {
             'before': initial_memory,
             'after': mem_thompson,
-            'delta': mem_thompson - initial_memory
+            'delta': mem_thompson - initial_memory,
+            'peak': _MEM_TRACE.peak_between(overall_start, time.time()),
+            'peak_shared': True,
         }
         logger.info("     ✓ Thompson: top-5=%s", thompson_model_names[:5])
         
@@ -843,7 +1001,9 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             memory_dict['modules']['3_GAN'] = {
                 'before': initial_memory,
                 'after': mem_gan,
-                'delta': mem_gan - initial_memory
+                'delta': mem_gan - initial_memory,
+                'peak': _MEM_TRACE.peak_between(overall_start, time.time()),
+                'peak_shared': True,
             }
             logger.info("     ✓ GAN: F1 top-5=%s", Gan_ranked_by_f1_names[:5])
         else:
@@ -861,7 +1021,9 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['4_Borderline'] = {
             'before': initial_memory,
             'after': mem_borderline,
-            'delta': mem_borderline - initial_memory
+            'delta': mem_borderline - initial_memory,
+            'peak': _MEM_TRACE.peak_between(overall_start, time.time()),
+            'peak_shared': True,
         }
         logger.info("     ✓ Borderline: F1 top-5=%s", ranked_by_f1_names_sensitivity[:5])
         
@@ -871,7 +1033,9 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         memory_dict['modules']['5_MonteCarlo'] = {
             'before': initial_memory,
             'after': mem_mc,
-            'delta': mem_mc - initial_memory
+            'delta': mem_mc - initial_memory,
+            'peak': _MEM_TRACE.peak_between(overall_start, time.time()),
+            'peak_shared': True,
         }
         logger.info("     ✓ MonteCarlo: F1 top-5=%s", monte_carlo_ranked_models_F1[:5])
 
@@ -911,14 +1075,19 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
     memory_dict['modules']['6_Aggregation'] = {
         'before': mem_before_agg,
         'after': mem_after_agg,
-        'delta': mem_after_agg - mem_before_agg
+        'delta': mem_after_agg - mem_before_agg,
+        'peak': _MEM_TRACE.peak_between(agg_start, time.time()),
     }
     logger.info("  ✓ Aggregation: %.2fs", timing_dict['6_Aggregation'])
     
     # Track final memory and peak
     memory_dict['final'] = get_memory_usage_mb()
     memory_dict['peak'] = get_peak_memory_mb()
-    logger.info(f"  💾 Final memory usage: {memory_dict['final']:.2f} MB (Peak: {memory_dict['peak']:.2f} MB)")
+    _pk = memory_dict['peak']
+    logger.info(f"  💾 Final memory usage: {memory_dict['final']:.2f} MB "
+                f"(Peak: {_pk:.2f} MB)" if _pk is not None
+                else f"  💾 Final memory usage: {memory_dict['final']:.2f} MB "
+                     f"(Peak: unavailable on this platform)")
 
     # Persist results
     directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
@@ -1618,9 +1787,17 @@ def run_app(algorithm_list, algorithm_list_instances):
                     'before': explain_mem_before,
                     'after': explain_mem_after,
                     'delta': explain_mem_after - explain_mem_before,
+                    'peak': _MEM_TRACE.peak_between(explain_start, time.time()),
+                    # The model itself lives in the LLM server process, not
+                    # here. Without this the stage reads as ~20 MB.
+                    'llm_server_peak': _MEM_TRACE.llm_peak_between(
+                        explain_start, time.time()),
                 }
-                # The narration ran after the algorithms' final/peak snapshot;
-                # refresh so the report reflects the whole pipeline.
+                # The narration ran after the algorithms' final/peak snapshot.
+                # Keep that reading — it is the undistorted end of the compute
+                # pipeline — and record the post-narration one beside it, where
+                # the process has been paged out while blocked on the server.
+                memory_dict['final_algorithms'] = memory_dict.get('final')
                 memory_dict['final'] = get_memory_usage_mb()
                 memory_dict['peak'] = get_peak_memory_mb()
             e2e_time = time.time() - e2e_start_time
@@ -1633,6 +1810,7 @@ def run_app(algorithm_list, algorithm_list_instances):
         comp_results_file = os.path.join(
             comp_results_dir, f"comprehensive_results_{dataset}_{entity}_iter{iteration}.txt"
         )
+        _MEM_TRACE.stop()
         write_comprehensive_results(comp_results_file, dataset, entity, iteration, results_dict, timing_dict, memory_dict)
         logger.info(f"✓ Results written to: {comp_results_file}")
         logger.info("="*80)

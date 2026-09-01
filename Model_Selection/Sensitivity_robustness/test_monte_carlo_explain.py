@@ -262,7 +262,7 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
         with the constant_target method — never an astronomically negative
         R^2 from a near-zero-variance fold. The guard fires before the
         sklearn import, so this test needs no sklearn."""
-        sf = mc._surrogate_fidelity_module()
+        sf = mc.surrogate_fidelity
         X = np.linspace(0.0, 0.2, 20).reshape(-1, 1)
         y = np.full(20, 0.618)
         out = sf.held_out_regressor_fidelity(X, y)
@@ -281,7 +281,7 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
         import importlib
         if importlib.util.find_spec("sklearn") is None:
             self.skipTest("scikit-learn not installed")
-        sf = mc._surrogate_fidelity_module()
+        sf = mc.surrogate_fidelity
         X = np.linspace(0.0, 0.2, 20).reshape(-1, 1)
         y = np.full(20, 0.022) + np.random.RandomState(1).uniform(-1e-12, 1e-12, 20)
         y[3] = 0.024

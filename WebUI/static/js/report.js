@@ -7,7 +7,8 @@
  * changes nothing else.
  */
 
-import { $, el, getJSON, timeAgo } from "./dom.js";
+import { $, el, getJSON } from "./dom.js";
+import { jumpToHash, sideNavLayout } from "./sidenav.js";
 
 const root = $("#report-root");
 const dataset = root.dataset.dataset;
@@ -59,22 +60,9 @@ function sectionCard(section) {
 }
 
 function header(report, sections) {
-  const meta = [
-    report.iteration !== null && report.iteration !== undefined
-      ? `iteration ${report.iteration}` : null,
-    report.generated_at ? timeAgo(report.generated_at) : null,
-    report.name,
-  ].filter(Boolean).join(" · ");
-
-  const nav = (sections || [])
-    // The first block is the title page and the last is "END OF REPORT";
-    // neither is somewhere a reader wants to jump to.
-    .filter((s) => s.body)
-    .map((s) => el("a", { class: "button small", href: `#${slug(s.title)}`, text: s.title }));
-
-  // The title page carries the run's own stamp (dataset, iteration, the exact
-  // time it was written). It has no body, so it is not rendered as a section —
-  // keep its lines here rather than dropping them.
+  // The title page carries the run's own stamp — dataset, entity, iteration and
+  // the exact time it was written. It has no body, so it is not rendered as a
+  // section: keep its lines here rather than dropping them.
   const titlePage = (sections || []).find((s) => !s.body && s.subtitle.length);
 
   return el("section", { class: "stack" },
@@ -84,11 +72,9 @@ function header(report, sections) {
     el("p", { class: "muted", style: "max-width: 68ch;" },
       "The pipeline's comprehensive results — measured timings, memory, the ranking each " +
       "stage produced and the final decision. These numbers are the binding record; the " +
-      "explanation describes them but does not restate them."),
+      "explanation describes them but does not restate all of them."),
     titlePage
-      ? el("p", { class: "small muted mono", text: titlePage.subtitle.join(" · ") }) : null,
-    el("p", { class: "small muted mono", text: meta }),
-    nav.length ? el("div", { class: "row no-print" }, nav) : null);
+      ? el("p", { class: "small muted mono", text: titlePage.subtitle.join(" · ") }) : null);
 }
 
 async function render() {
@@ -105,17 +91,25 @@ async function render() {
   }
 
   const sections = parseSections(report.text);
+  // The first block is the title page and the last is "END OF REPORT"; neither
+  // is somewhere a reader wants to jump to, and neither has a body.
+  const shown = (sections || []).filter((s) => s.body);
   const children = [header(report, sections)];
-  if (sections) sections.filter((s) => s.body).forEach((s) => children.push(sectionCard(s)));
-  else children.push(el("section", { class: "card" },
-    el("pre", { class: "report-body", text: report.text })));
 
-  root.replaceChildren(el("div", { class: "stack-lg" }, children.filter(Boolean)));
-
-  if (location.hash) {
-    const target = document.querySelector(location.hash);
-    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (shown.length) {
+    children.push(sideNavLayout(root, {
+      title: "Sections",
+      items: shown.map((s) => ({ id: slug(s.title), label: s.title })),
+      storageKey: "ramses-report-nav-collapsed",
+      body: el("div", { class: "stack sidenav-body" }, shown.map(sectionCard)),
+    }));
+  } else {
+    children.push(el("section", { class: "card" },
+      el("pre", { class: "report-body", text: report.text })));
   }
+
+  root.replaceChildren(el("div", { class: "stack-lg" }, children));
+  jumpToHash(root);
 }
 
 render();
