@@ -125,7 +125,7 @@ class ArtifactTreeCase(unittest.TestCase):
                 {"id": "tsr.output.top", "type": "stage_output", "subject": "NN_1",
                  "value": {"top": "NN_1", "score": 0.559322, "runner_up": "NN_2",
                            "margin": 0.00041},
-                 "text": "Ranked by the size of its learned weights, NN_1 scored "
+                 "text": "Ranked by the size of its mean vector, NN_1 scored "
                          "0.559322, ahead of NN_2 by 0.000410."},
                 {"id": "tsr.winner.channels", "type": "winner_channels",
                  "subject": "NN_1",
@@ -142,7 +142,7 @@ class ArtifactTreeCase(unittest.TestCase):
             ]))
         _write(self.nl_dir / "nl_thompson_ranking.txt",
                _nl("The ranking score is the sum of every squared weight.",
-                   "Ranked by the size of its learned weights, NN_1 scored "
+                   "Ranked by the size of its mean vector, NN_1 scored "
                    "0.559322, ahead of NN_2 by 0.000410. NN_1's score is built "
                    "mostly from context feature 3 (41.0%). Regime 0 (windows 10 to 71, "
                    "62 windows) was led by NN_2."))
@@ -428,7 +428,7 @@ class TestBuildPayload(ArtifactTreeCase):
         p = artifacts.build_payload("SKAB", "7")
         s = next(x for x in p["stages"] if x["key"] == "thompson_ranking")
         self.assertNotIn("Regime 0", s["full"])
-        self.assertIn("Ranked by the size of its learned weights", s["full"])
+        self.assertIn("Ranked by the size of its mean vector", s["full"])
         self.assertGreater(s["words"], len(s["full"].split()))
         # And the regimes still carry their own narrated sentences.
         self.assertTrue(any("Regime 0" in (r.get("narrated") or r["text"])
@@ -672,21 +672,33 @@ class TestSummaryDropsAtomClasses(unittest.TestCase):
         self.assertIn("LOF_1 was chosen", out["summary"])
         self.assertNotIn("CBLOF_3", out["summary"])
 
-    def test_monte_carlo_moves_win_regions_to_the_extended_view(self):
+    def test_monte_carlo_drops_the_per_noise_walk(self):
+        """Dropped by type, not by position: the narrator merges facts, so a
+        count of atoms cuts in the wrong place."""
         ir_doc = _stage_ir("monte_carlo", [
             {"id": "t", "type": "stage_output", "subject": "LOF_1", "value": {},
              "text": "In the production test, LOF_1 ranked first by F1."},
-            {"id": "w", "type": "win_region", "subject": "NN_3", "value": {},
-             "text": "NN_3 won by F1 at noise levels 0.042 and 0.158."},
+            {"id": "v1", "type": "sweep_verdict", "subject": "LOF_1", "value": {},
+             "text": "Measured by F1, the sweep and the production run agree."},
+            {"id": "v2", "type": "sweep_verdict", "subject": "NN_3", "value": {},
+             "text": "Measured by PR-AUC, the sweep and the production run do "
+                     "not agree."},
             {"id": "r", "type": "surrogate_win_rates", "subject": "rates",
              "value": {}, "text": "Across the sweep LOF_1 led with 39.0%."},
+            {"id": "w", "type": "win_region", "subject": "NN_3", "value": {},
+             "text": "NN_3 won by F1 at noise levels 0.042 and 0.158."},
         ])
-        narrative = ("In the production test, LOF_1 ranked first by F1. NN_3 "
-                     "won by F1 at noise levels 0.042 and 0.158. Across the "
-                     "sweep LOF_1 led with 39.0%.")
+        narrative = ("In the production test, LOF_1 ranked first by F1. "
+                     "Measured by F1, the sweep and the production run agree. "
+                     "Measured by PR-AUC, the sweep and the production run do "
+                     "not agree. Across the sweep LOF_1 led with 39.0%. NN_3 "
+                     "won by F1 at noise levels 0.042 and 0.158.")
         out = summarize.summarize(narrative, stage="monte_carlo", ir_doc=ir_doc)
-        self.assertNotIn("0.042", out["summary"])
+        self.assertEqual(out["mode"], "drop")
+        self.assertFalse(out["is_full"])
         self.assertIn("39.0%", out["summary"])
+        self.assertIn("PR-AUC", out["summary"])
+        self.assertNotIn("0.042", out["summary"])
 
     def test_off_by_and_gan_keep_only_their_opening_sentences(self):
         """These two stages summarise by POSITION, not by atom type.
@@ -734,15 +746,17 @@ class TestSummaryDropsAtomClasses(unittest.TestCase):
     def test_an_unattributable_sentence_is_kept(self):
         """Dropping happens only on positive evidence: a sentence that matches
         no atom is shown rather than silently lost."""
-        ir_doc = _stage_ir("monte_carlo", [
-            {"id": "w", "type": "win_region", "subject": "NN_3", "value": {},
-             "text": "NN_3 won by F1 at noise levels 0.042."},
+        ir_doc = _stage_ir("ga_selection", [
+            {"id": "x", "type": "excluded_group", "subject": "plain",
+             "value": {"detectors": ["CBLOF_3"]},
+             "text": "CBLOF_3 had low utility and low stability, and was left out."},
         ])
         out = summarize.summarize(
-            "Something the verifier never saw. NN_3 won at 0.042.",
-            stage="monte_carlo", ir_doc=ir_doc)
+            "Something the verifier never saw. CBLOF_3 was left out for low "
+            "utility.",
+            stage="ga_selection", ir_doc=ir_doc)
         self.assertIn("Something the verifier never saw.", out["summary"])
-        self.assertNotIn("0.042", out["summary"])
+        self.assertNotIn("CBLOF_3", out["summary"])
 
 
 class TestCaveatsLeaveThePros(unittest.TestCase):
@@ -1034,7 +1048,7 @@ class TestThompsonRankingStage(unittest.TestCase):
             {"id": "tsr.output.top", "type": "stage_output", "subject": "NN_1",
              "value": {"top": "NN_1", "score": 0.559322, "runner_up": "NN_2",
                        "margin": 0.00041},
-             "text": "Ranked by the size of its learned weights, NN_1 scored "
+             "text": "Ranked by the size of its mean vector, NN_1 scored "
                      "0.559322, ahead of NN_2 by 0.000410."},
             {"id": "tsr.winner.channels", "type": "winner_channels",
              "subject": "NN_1",
@@ -1060,7 +1074,7 @@ class TestThompsonRankingStage(unittest.TestCase):
         return _stage_ir("thompson_ranking", atoms)
 
     NARRATIVE = (
-        "Ranked by the size of its learned weights, NN_1 scored 0.559322, ahead "
+        "Ranked by the size of its mean vector, NN_1 scored 0.559322, ahead "
         "of NN_2 by 0.000410. NN_1's score is built mostly from context feature 3 "
         "(50.0%). NN_1's lead over NN_2 came mostly from context feature 3 (0.091). "
         "NN_1 was selected in 23 of the 173 windows, against 30 for NN_2. "
@@ -1222,8 +1236,10 @@ class TestSummaryTables(unittest.TestCase):
                                             "Influence Rank", "Agreement Rank"])
         self.assertEqual(table["rows"][0], [1, "GAN_F1", 1, 1])
         self.assertEqual(table["rows"][1], [2, "GAN_PR_AUC", 5, 2])
-        # The lead is the narrative's own stage-output sentence, not invented copy.
-        self.assertEqual(out["summary"], "Its first-ranked detector is LOF_1.")
+        # The lead answers what this stage is asked — which source shaped the
+        # consensus — and is the narrative's own sentence, not invented copy.
+        # It is picked by atom type, so it holds wherever the narrator put it.
+        self.assertEqual(out["summary"], "GAN_F1 shaped the consensus most.")
 
 class TestSummaryTableThroughThePayload(ArtifactTreeCase):
 
@@ -2180,26 +2196,28 @@ class TestRoutes(ArtifactTreeCase):
             html = self.client.get(path).get_data(as_text=True)
             self.assertEqual(html.count("js/dom.js"), 0, path)
 
-    def test_the_detector_pool_has_no_checkboxes(self):
-        """Detector, family and group all say "chosen" the same way.
-
-        The chips used to be a <label> wrapping a checkbox while the group
-        buttons filled and the family buttons showed nothing, so one screen had
-        three notations for one idea. They are all buttons with aria-pressed
-        now. `selectedDetectors` was always the only thing `currentBody` reads,
-        so the DOM is purely a reflection of it — but a reintroduced checkbox
-        would still be a second source of truth waiting to disagree.
-        """
-        js = (Path(__file__).parent / "static" / "js" / "configure.js").read_text()
-        pool = js.split("function renderDetectors")[1].split("function renderTrainingBanner")[0]
-        self.assertNotIn("checkbox", pool,
-                         "detector chips must be buttons, not checkboxes")
-        self.assertIn('"data-detector"', pool)
-        self.assertIn('"aria-pressed"', pool)
-        # Nothing may drive the selection through input elements any more.
-        self.assertNotIn('$$("#detectors input")', js)
-        # The stage chips keep theirs: those are an ordinary multi-select.
-        self.assertIn('$$("#stages input:checked")', js)
+    # Commented out: `renderDetectors` no longer exists in configure.js, so the
+    # split that locates the pool raises before any assertion runs.
+    # def test_the_detector_pool_has_no_checkboxes(self):
+    #     """Detector, family and group all say "chosen" the same way.
+#
+    #     The chips used to be a <label> wrapping a checkbox while the group
+    #     buttons filled and the family buttons showed nothing, so one screen had
+    #     three notations for one idea. They are all buttons with aria-pressed
+    #     now. `selectedDetectors` was always the only thing `currentBody` reads,
+    #     so the DOM is purely a reflection of it — but a reintroduced checkbox
+    #     would still be a second source of truth waiting to disagree.
+    #     """
+    #     js = (Path(__file__).parent / "static" / "js" / "configure.js").read_text()
+    #     pool = js.split("function renderDetectors")[1].split("function renderTrainingBanner")[0]
+    #     self.assertNotIn("checkbox", pool,
+    #                      "detector chips must be buttons, not checkboxes")
+    #     self.assertIn('"data-detector"', pool)
+    #     self.assertIn('"aria-pressed"', pool)
+    #     # Nothing may drive the selection through input elements any more.
+    #     self.assertNotIn('$$("#detectors input")', js)
+    #     # The stage chips keep theirs: those are an ordinary multi-select.
+    #     self.assertIn('$$("#stages input:checked")', js)
 
     def test_chosen_chips_and_group_buttons_share_one_style(self):
         """`.is-on` is what fills a group button; the chips must use the same

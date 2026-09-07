@@ -53,6 +53,10 @@ _CARRY_MIN_COVERAGE = 0.5
 # from the IR in a section of their own.
 _STAGE_SUMMARY: Dict[str, Dict[str, Any]] = {
     "ga_selection": {"mode": "drop", "drop": ("excluded_detector", "excluded_group")},
+    # Cutting at a count of atoms put the per-noise walk in the summary: the
+    # narrator merges, so five facts arrived as three sentences and the cut
+    # landed two sentences into the walk. Dropping by type does not care.
+    # "monte_carlo": {"mode": "lead", "lead_trailing": ("win_region",)},
     "monte_carlo": {"mode": "drop", "drop": ("win_region",)},
     # One sentence per rival, all of the same atom type, so there is nothing to
     # drop BY TYPE that would not take every rival with it — dropping the two
@@ -85,12 +89,12 @@ _STAGE_SUMMARY: Dict[str, Dict[str, Any]] = {
     # and stays in view.
     "ga_combination": {"mode": "drop", "drop": ("detector_role",),
                        "table": "ga_combination"},
-    # `lead_first` takes the narrative's opening sentence literally instead of
-    # hunting for the atom type it should convey. This stage's opener merges two
-    # facts (the consensus winner AND the six sources), so attribution can land
-    # it on either one, and the summary would then open mid-walk.
+    # The summary is the sentence answering "which source shaped this most", so
+    # it is picked BY TYPE. Taking the narrative's first sentence literally put
+    # whatever the narrator opened with on the card, which on nine-source
+    # entities is reliably the consensus winner.
     "rank_aggregation_robust": {"mode": "table", "table": "rank_aggregation",
-                                "lead_first": True},
+                                "lead_types": ("source_role",)},
     # rank_aggregation_final is deliberately absent: two sources, a couple of
     # sentences, nothing to hold back.
 }
@@ -281,8 +285,43 @@ def strip_caveats(narrative: str, ir_doc: Dict[str, Any]) -> str:
 def _drop_summary(narrative: str, ir_doc: Dict[str, Any],
                   drop_types: Sequence[str]) -> str:
     drop = set(drop_types)
-    kept = [s for s, atom in attribute_sentences(narrative, ir_doc)
-            if not (atom and atom.get("type") in drop)]
+    pairs = attribute_sentences(narrative, ir_doc)
+    # A sentence may convey more than one fact and attribution names only the
+    # likeliest, so a merged sentence would take a kept fact down with the
+    # dropped one. For each kept atom, the sentence that best accounts for it is
+    # protected.
+    def _cov(atom_names, atom_numbers, size, toks):
+        s_names, s_numbers = toks
+        return (2 * len(s_names & atom_names) + len(s_numbers & atom_numbers)) / size
+
+    dropped = [(s, _tokens(s)) for s, atom in pairs
+               if atom and atom.get("type") in drop]
+    surviving = [_tokens(s) for s, atom in pairs
+                 if not (atom and atom.get("type") in drop)]
+    protected = set()
+    for atom in (ir_doc.get("evidence") or []):
+        if atom.get("type") in drop:
+            continue
+        a_names, a_numbers = _tokens(str(atom.get("text", "")))
+        size = 2 * len(a_names) + len(a_numbers)
+        if not size:
+            continue
+        # Only rescue a fact no surviving sentence carries. Rescuing on best
+        # coverage alone kept a regime sentence that happened to cover a short
+        # atom in full ("Regime 3 ... LOF_2" against "Across the regimes LOF_2
+        # led, context feature 3 ...") while the real carrier survived anyway.
+        if any(_cov(a_names, a_numbers, size, t) >= _CARRY_MIN_COVERAGE
+               for t in surviving):
+            continue
+        best, best_cov = None, 0.0
+        for sentence, toks in dropped:
+            cov = _cov(a_names, a_numbers, size, toks)
+            if cov > best_cov:
+                best, best_cov = sentence, cov
+        if best is not None and best_cov >= _CARRY_MIN_COVERAGE:
+            protected.add(best)
+    kept = [s for s, atom in pairs
+            if not (atom and atom.get("type") in drop) or s in protected]
     return " ".join(s.strip() for s in kept).strip()
 
 
@@ -311,7 +350,8 @@ def _ga_combination_table(ir_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     same qualification in two places.
     """
     rows = []
-    for atom in _atoms_of(ir_doc, "detector_role"):
+    for atom in (_atoms_of(ir_doc, "detector_role_lead")
+                 + _atoms_of(ir_doc, "detector_role")):
         v = atom["value"]
         rank = v.get("final_rank")
         rows.append({
@@ -504,6 +544,9 @@ def summarize(text: str, *, stage: Optional[str] = None,
                 if trimmed and trimmed != body:
                     extended = trimmed
             sentences = split_sentences(body)
+            # `lead_trailing` derived the count from the IR's atoms. Unused:
+            # sentences do not map one-to-one onto atoms any more.
+            # trailing = set(spec.get("lead_trailing") or ())
             n = int(spec.get("sentences", 4))
             if len(sentences) > n:
                 short = " ".join(s.strip() for s in sentences[:n]).strip()
@@ -521,9 +564,12 @@ def summarize(text: str, *, stage: Optional[str] = None,
         if spec["mode"] == "table":
             table = _TABLE_BUILDERS[spec["table"]](ir_doc)
             if table:
-                lead = (split_sentences(body)[0].strip() if spec.get("lead_first")
-                        and split_sentences(body)
-                        else _lead_sentence(body, ir_doc, ("stage_output",)))
+                # `lead_first` took the narrative's opening sentence literally.
+                # No stage uses it now that the lead is picked by atom type.
+                # lead = (split_sentences(body)[0].strip() if spec.get("lead_first")
+                #         and split_sentences(body) else ...)
+                lead = _lead_sentence(body, ir_doc,
+                                      spec.get("lead_types", ("stage_output",)))
                 return {"summary": lead, "body": body, "is_full": False,
                         "mode": "table", "table": table}
     except Exception:

@@ -10,12 +10,13 @@ llama.cpp server, vLLM) works via `base_url`. The pipeline never depends on
 this layer: narratives are generated on demand from the IR files an
 `--explain` run produced (see Explainability/narrate.py).
 
-The anti-hallucination contract lives in SYSTEM_PROMPT: the model may only
-restate the numbered fact sentences, must copy numbers and names verbatim,
-must convey every [REQUIRED] fact, and must respect the [CAVEAT] lines
-without restating them — the card renders those verbatim from the IR in a
-section of their own. The verifier then measures how well the output honoured
-that contract (hallucination + omission rates).
+The contract lives in SYSTEM_PROMPT. The model writes the facts as prose in
+its own words — merging, connecting and ordering them freely — but every
+number, name and relationship must come from a fact, nothing may be derived
+(no totals, no positions a fact does not give), a fact naming two detectors
+keeps each in its role, and [CAVEAT] lines are respected without being stated,
+since the card renders those verbatim from the IR in a section of their own.
+Facts marked [AS GIVEN] are lists of measured values and go in as written.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from Utils.pipeline_spec import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
@@ -92,6 +94,9 @@ class LLMClient:
             ],
             "temperature": self.temperature,
             "seed": self.seed,
+            # Qwen3-generation models think by default: without this the
+            # reasoning block alone exhausts the timeout.
+            "reasoning_effort": "none",
             "stream": False,
         }
         if self.transport is not None:
@@ -110,30 +115,59 @@ class LLMClient:
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You turn verified facts about an anomaly-detection model-selection run "
-    "into clear, plain-language prose for a reader who understands anomaly "
-    "detection but not this framework's internals.\n"
-    "Rules — follow every one strictly:\n"
-    "1. Use ONLY the fact sentences given to you. Do not add facts, "
-    "numbers, names, comparisons, or causes of your own.\n"
-    "2. Copy every number and every model/detector name EXACTLY as written in "
-    "the facts. Never re-round, convert, or estimate. A qualifier such as "
-    "'(rank 2)' or '(negative influence)' belongs ONLY to the value it "
-    "accompanies in the facts — never re-attach it to a different value.\n"
-    "3. Every fact marked [REQUIRED] must be conveyed. Unmarked facts may be "
-    "omitted if space demands.\n"
-    "4. Lines marked [CAVEAT] are limits on what the facts mean. Respect them "
-    "— never write a claim one of them rules out — but do NOT restate them: "
-    "they are shown to the reader separately, and a second, looser copy in "
-    "your paragraph is the same limitation said twice.\n"
-    "5. If a value reads 'not_available', either omit it or say the data is "
-    "not available — never fill it in.\n"
-    "6. Write ONE coherent paragraph of plain prose. No headings, lists, "
-    "tables, or markdown."
+    "You write the findings of an anomaly-detection model-selection run as "
+    "clear prose, for a researcher who knows anomaly detection but not this "
+    "framework. You are writing an explanation someone will actually read, not "
+    "a list.\n"
+    "\n"
+    "GROUNDING. Every number, name and relationship must come from the facts "
+    "given. Add no cause, no comparison and no characterisation the facts do "
+    "not state. Never print an internal field name, and never guess what one "
+    "means. Write a stage's name as words.\n"
+    "\n"
+    "DIGITS. Numbers appear exactly as given — never re-rounded, never spelled "
+    "as words.\n"
+    "\n"
+    "AS GIVEN. A fact marked [AS GIVEN] is a list of measured values. Put it in "
+    "your prose as written — do not reorder it, do not shorten it, do not give "
+    "anything in it a position, and do not move a named entry into a group the "
+    "fact sets aside. Everything else you may write freely.\n"
+    "\n"
+    "STATE, DO NOT DERIVE. Every figure you write must appear in a fact. Where a "
+    "winner is compared against several rivals one at a time, each count is its "
+    "own head-to-head comparison over the same injected points — the sets "
+    "overlap, so there is no total and adding them means nothing. Never say how "
+    "many points the winner handled altogether. More generally: do not "
+    "add counts together, do not work out a total or a share, and do not award a "
+    "position — 'second', 'third', 'the runner-up' — from a list unless a fact "
+    "says so. Where a fact sets a group aside ('the remaining 4.8% went to 3 "
+    "further detectors'), that group is separate from the ones already named; do "
+    "not fold a named one into it.\n"
+    "\n"
+    "ROLES. Where a fact names more than one detector or source, each keeps the "
+    "role that fact gives it — which one leads, which one was beaten, which one "
+    "was preferred instead. Swapping them reverses the finding:\n"
+    "  fact: 'A_1 shaped the consensus most, yet its own ranking put B_1 first "
+    "rather than the consensus's C_1.'\n"
+    "  WRONG: 'A_1 shaped it most, ranking C_1 first in its own ranking.'\n"
+    "  RIGHT: 'A_1 shaped it most, though it would itself have put B_1 on top "
+    "rather than C_1.'\n"
+    "\n"
+    "PROSE. Answer the stage's question first, then explain what supports it. "
+    "Connect your sentences — vary how they open, use 'Similarly', 'By "
+    "contrast', 'Notably' where they fit, and group related findings into one "
+    "sentence where that reads better. Continuous plain prose, no markdown and "
+    "no lists.\n"
+    "\n"
+    "SCOPE. Cover every fact marked [REQUIRED]. Facts not so marked are "
+    "optional. Lines marked [CAVEAT] are limits for you to respect while "
+    "writing; the reader is shown them separately, so no sentence of yours may "
+    "convey one:\n"
+    "  caveat: 'For A_1, B_1 most folds had near-constant F1, so the held-out R2 "
+    "is not a meaningful fidelity estimate'\n"
+    "  WRONG: 'A_1 was excluded from meaningful fidelity estimates.'\n"
+    "  RIGHT: (write nothing about it)"
 )
-# Rules 1-5 are the contract the verifier measures; rule 6 is format. Four
-# further rules were dropped for qwen2.5:14b and are MODEL-SIZE DEPENDENT:
-# restore them from git history if the narrator is ever downgraded.
 
 
 def _render_value(v: Any) -> str:
@@ -144,104 +178,115 @@ def _render_value(v: Any) -> str:
     return str(v)
 
 
+# Unused since build_stage_prompt stopped listing the stage output.
 def _output_lines(output: Dict[str, Any]) -> List[str]:
     return [f"- {k}: {_render_value(v)}" for k, v in sorted(output.items())]
 
 
-def _content_words(ir_doc: Dict[str, Any]) -> int:
-    """How many words of material the narrative actually has to convey.
-
-    REQUIRED evidence only: sizing to every atom left room for all of them, so
-    the optional ones were optional in name only. Caveats are excluded — they
-    are shown from the IR, and a floor above what there is to say forces
-    padding.
-    """
-    required = set(ir_doc.get("required_atom_ids") or ())
-    evidence = ir_doc.get("evidence", [])
-    marked = [a for a in evidence if a.get("id") in required]
-    # A required list naming no present atom is malformed, not empty: a 0 here
-    # would floor a 500-word stage at 40.
-    return sum(len(str(a.get("text", "")).split()) for a in (marked or evidence))
-
-
-# The floor is deliberately BELOW the content length: the narrative restates the
-# facts in connected prose, which compresses (shared subjects, pronouns) at least
-# as much as connectives add.
-_BUDGET_FLOOR_RATIO = 0.9
-_BUDGET_CEILING_RATIO = 2.2
-_BUDGET_MIN_FLOOR = 40
+# Unused since the v5 prompt: build_stage_prompt no longer sizes a word
+# budget or appends a per-stage hint. Kept commented rather than deleted —
+# these are model-size dependent and a smaller narrator would want them back.
+# def _content_words(ir_doc: Dict[str, Any]) -> int:
+#     """How many words of material the narrative actually has to convey.
+#
+#     REQUIRED evidence only: sizing to every atom left room for all of them, so
+#     the optional ones were optional in name only. Caveats are excluded — they
+#     are shown from the IR, and a floor above what there is to say forces
+#     padding.
+#     """
+#     required = set(ir_doc.get("required_atom_ids") or ())
+#     evidence = ir_doc.get("evidence", [])
+#     marked = [a for a in evidence if a.get("id") in required]
+#     # A required list naming no present atom is malformed, not empty: a 0 here
+#     # would floor a 500-word stage at 40.
+#     return sum(len(str(a.get("text", "")).split()) for a in (marked or evidence))
+#
+#
+# # The floor is deliberately BELOW the content length: the narrative restates the
+# # facts in connected prose, which compresses (shared subjects, pronouns) at least
+# # as much as connectives add.
+# _BUDGET_FLOOR_RATIO = 0.9
+# _BUDGET_CEILING_RATIO = 2.2
+# _BUDGET_MIN_FLOOR = 40
 # The default ceiling, and what the floor is clamped against so the two can
 # never cross.
-_BUDGET_HARD_CAP = 400
+# _BUDGET_HARD_CAP = 400
 
 
-def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220,
-                 content_words: Optional[int] = None) -> tuple:
-    """Word budget for the WHOLE narrative, scaled to how much there is to say.
-
-    Driven by the atoms' CONTENT LENGTH, not their count: consolidating
-    near-identical atoms cuts the count without cutting the material, and a
-    count-based floor then demands more words than the facts contain — which
-    the narrator supplies by inventing them.
-
-    Falls back to the count-based curve when the caller has no document.
-    """
-    if content_words:
-        floor = max(_BUDGET_MIN_FLOOR, int(content_words * _BUDGET_FLOOR_RATIO))
-        ceiling = max(floor + 40, int(content_words * _BUDGET_CEILING_RATIO))
-        # Clamped at BOTH ends. Capping the ceiling alone inverted the range
-        # past ~445 words of facts ("between 639 and 400 words"), and a model
-        # handed a contradictory range compresses by dropping the numbers.
-        if floor > _BUDGET_HARD_CAP - 40:
-            floor = _BUDGET_HARD_CAP - 40
-        return floor, min(_BUDGET_HARD_CAP, max(ceiling, floor + 40))
-    if n_atoms <= 3:
-        return 65, 120
-    return lo, min(_BUDGET_HARD_CAP, hi + 8 * max(0, n_atoms - 12))
-
-
-# Stages where the narrative must carry one statement per atom rather than a
-# summary, so the budget has to scale past the default 400-word ceiling.
-# (words_per_atom, base, ceiling), keyed by exact stage name.
-_STAGE_WORD_BUDGETS: Dict[str, tuple] = {
-    # Thompson narrates every regime individually; ~20 words each plus the
-    # lead, regime summary, winner context feature and state line.
-    "thompson_sampling": (20, 40, 700),
-    # The ranking sibling narrates regimes too, but plain run-length encoding of
-    # the ||mu||^2 leader yields a handful of them rather than a dozen, so it
-    # needs a lower ceiling than the stage above.
-    "thompson_ranking": (20, 40, 500),
-}
-# NEITHER point-injection stage gets an entry, deliberately. GAN had one —
-# (30, 40, 900) — and asked for 640-900 words it wrote 325 and dropped 36% of
-# its required atoms including the winner. A floor far above what the model
-# wants to write is not a nudge to write more, it makes it reorganise. The
-# ceiling does not bind either way: both stages routinely write past 400 with
-# zero omissions.
+# Unused since neither prompt sizes a word budget.
+# def _word_budget(n_atoms: int, lo: int = 120, hi: int = 220,
+#                  content_words: Optional[int] = None) -> tuple:
+#     """Word budget for the WHOLE narrative, scaled to how much there is to say.
+#
+#     Driven by the atoms' CONTENT LENGTH, not their count: consolidating
+#     near-identical atoms cuts the count without cutting the material, and a
+#     count-based floor then demands more words than the facts contain — which
+#     the narrator supplies by inventing them.
+#
+#     Falls back to the count-based curve when the caller has no document.
+#     """
+#     if content_words:
+#         floor = max(_BUDGET_MIN_FLOOR, int(content_words * _BUDGET_FLOOR_RATIO))
+#         ceiling = max(floor + 40, int(content_words * _BUDGET_CEILING_RATIO))
+#         # Clamped at BOTH ends. Capping the ceiling alone inverted the range
+#         # past ~445 words of facts ("between 639 and 400 words"), and a model
+#         # handed a contradictory range compresses by dropping the numbers.
+#         if floor > _BUDGET_HARD_CAP - 40:
+#             floor = _BUDGET_HARD_CAP - 40
+#         return floor, min(_BUDGET_HARD_CAP, max(ceiling, floor + 40))
+#     if n_atoms <= 3:
+#         return 65, 120
+#     return lo, min(_BUDGET_HARD_CAP, hi + 8 * max(0, n_atoms - 12))
 
 
-def _stage_word_budget(stage: Any, n_atoms: int,
-                       content_words: Optional[int] = None) -> Optional[tuple]:
-    """Per-atom allowance for the stages that narrate one statement per atom.
-
-    `content_words` widens the range when the per-atom allowance lands below
-    what the required facts run to. The curve counts atoms, not their length,
-    and Thompson's regime sentences are long enough that the two nearly cross:
-    seven required atoms buy 180-270 words against 252 of fact. Below that it is
-    the contradictory range `_word_budget` documents.
-    """
-    cfg = _STAGE_WORD_BUDGETS.get(str(stage))
-    if not cfg:
-        return None
-    per, base, cap = cfg
-    lo = min(cap - 60, base + per * max(0, n_atoms))
-    hi = min(cap, int(lo * 1.5))
-    if content_words:
-        floor = int(content_words * _BUDGET_FLOOR_RATIO)
-        if hi < floor:
-            lo = min(lo, floor)
-            hi = min(cap, max(floor + 60, int(floor * 1.4)))
-    return lo, hi
+# Unused since the v5 prompt: build_stage_prompt no longer sizes a word
+# budget or appends a per-stage hint. Kept commented rather than deleted —
+# these are model-size dependent and a smaller narrator would want them back.
+# # Stages where the narrative must carry one statement per atom rather than a
+# # summary, so the budget has to scale past the default 400-word ceiling.
+# # (words_per_atom, base, ceiling), keyed by exact stage name.
+# _STAGE_WORD_BUDGETS: Dict[str, tuple] = {
+#     # Thompson narrates every regime individually; ~20 words each plus the
+#     # lead, regime summary, winner context feature and state line.
+#     "thompson_sampling": (20, 40, 700),
+#     # The ranking sibling narrates regimes too, but plain run-length encoding of
+#     # the ||mu||^2 leader yields a handful of them rather than a dozen, so it
+#     # needs a lower ceiling than the stage above.
+#     "thompson_ranking": (20, 40, 500),
+# }
+# # NEITHER point-injection stage gets an entry, deliberately. GAN had one —
+# # (30, 40, 900) — and asked for 640-900 words it wrote 325 and dropped 36% of
+# # its required atoms including the winner. A floor far above what the model
+# # wants to write is not a nudge to write more, it makes it reorganise. The
+# # ceiling does not bind either way: both stages routinely write past 400 with
+# # zero omissions.
+#
+#
+# def _stage_word_budget(stage: Any, n_atoms: int,
+#                        content_words: Optional[int] = None) -> Optional[tuple]:
+#     """Per-atom allowance for the stages that narrate one statement per atom.
+#
+#     `content_words` widens the range when the per-atom allowance lands below
+#     what the required facts run to. The curve counts atoms, not their length,
+#     and Thompson's regime sentences are long enough that the two nearly cross:
+#     seven required atoms buy 180-270 words against 252 of fact. Below that it is
+#     the contradictory range `_word_budget` documents.
+#     """
+#     cfg = _STAGE_WORD_BUDGETS.get(str(stage))
+#     if not cfg:
+#         return None
+#     per, base, cap = cfg
+#     lo = min(cap - 60, base + per * max(0, n_atoms))
+#     hi = min(cap, int(lo * 1.5))
+#     if content_words:
+#         floor = int(content_words * _BUDGET_FLOOR_RATIO)
+#         if hi < floor:
+#             lo = min(lo, floor)
+#             hi = min(cap, max(floor + 60, int(floor * 1.4)))
+#     return lo, hi
+#
+#
+_LIST_FACT_RE = re.compile(r"\d+\.\d+%")
 
 
 def _fact_lines(ir_doc: Dict[str, Any]) -> List[str]:
@@ -279,188 +324,175 @@ def _caveat_lines(ir_doc: Dict[str, Any]) -> List[str]:
 # since the verifier scores an atom as covered from its subject and win count
 # alone and cannot see a missing threshold. The importance figures are
 # subordinated because they are optional yet crowded out the required rules.
-_POINT_INJECTION_HINT = (
-    " Open with one short sentence naming the highest-ranked model, then "
-    "give each fact about the models it beat as its OWN separate sentence. "
-    "The rival models named in a sentence must be EXACTLY the models that "
-    "fact lists. State every condition WITH ITS NUMBERS, copied exactly as "
-    "the fact writes them: never replace a threshold with 'specific ranges', "
-    "'certain conditions', 'specific values', 'certain constraints', "
-    "'specific criteria', 'conditions related to' or a bare list of property "
-    "names. A sentence that names a property without its number is wrong. "
-    "The importance figures come last, and only once every condition has "
-    "been stated with its numbers. If a fact says the highest-ranked model "
-    "never exclusively beat some models, state that too."
-)
-
-# Stage-specific rendering guidance appended to the prompt's TASK. A NARRATION
-# concern, so it lives here rather than in the grounded IR. Keyed by exact
-# stage name.
-_STAGE_TASK_HINTS: Dict[str, str] = {
-    # The opening sentence is load-bearing: without it the narrator went
-    # straight into the per-source walk and dropped both the consensus winner
-    # and the source list (omission 0.000 -> 0.250). One positive instruction
-    # replaced three defensive ones and scored better.
-    "rank_aggregation_robust": (
-        " Open by naming the source ranking that shaped the consensus most — "
-        "all of them, if several are tied at that rank — and the source "
-        "rankings being aggregated. Then, in a sentence of its own, name the "
-        "consensus's own top-ranked detector. That detector is the consensus's "
-        "pick, never a source's: do not attach it to any source's own ranking. "
-        "Then describe each source in the order "
-        "given; for each one, state its overall standing rank, its influence "
-        "rank, and its agreement rank. A rank is a position — rank "
-        "1 is best — so give the rank number itself. NEVER call a rank "
-        "'highest', 'lowest', 'best', 'worst', 'least', 'strongest' or "
-        "'weakest' — write the ordinal or the number instead. Keep the fact's "
-        "own wording for overall standing, such as 'shaped the consensus third "
-        "most', and never restate a standing as influence or agreement. Do not "
-        "compare one source's rank with another's unless a fact states that "
-        "comparison."
-    ),
-    # Two facts about different KINDS of thing. The narrator joined them into
-    # "LOF_3, which aligns more closely with Thompson_Sampling's ranking",
-    # inverting the finding on SKAB/7 at 0.000 hallucination.
-    "rank_aggregation_final": (
-        " Say which of the two sources the consensus followed more closely, "
-        "with both agreement scores and the gap. Then, in a sentence of its "
-        "own, name the consensus's top-ranked detector. Agreement is a property "
-        "of a whole source ranking, never of one detector, so do not write that "
-        "a detector agrees with, aligns with or is closer to either source."
-    ),
-    "ga_combination": (
-        " Describe each detector in the order given; for each one, state its "
-        "overall weight rank and its rank on absolute SHAP, PFI and total ALE "
-        "(rank 1 is strongest). Where a fact says a rank is a tie, say it is "
-        "tied. Finish with the sign summary, saying which detectors push "
-        "the meta-learner toward flagging an anomaly and which push the other "
-        "way. Report each sign exactly as the facts give it; how well a sign "
-        "is supported is a caveat, so leave it out of the paragraph. A detector "
-        "the facts give no sign at all keeps none — never assign it one of "
-        "your own."
-    ),
-    "ga_selection": (
-        " Open by naming the chosen ensemble. Then explain why the chosen "
-        "detectors were kept, following the facts in order and keeping the "
-        "detectors grouped exactly as the facts group them. Then explain why "
-        "the rest were left out, using the high/low utility and stability "
-        "wording the facts use."
-    ),
-    # Direction is the whole risk. Shares are sums of squares, so none can
-    # "drag the score down" — but that is what a narrator writes when a share
-    # is small, and the verifier cannot see it. Only the rival comparison has
-    # a sign.
-    "thompson_ranking": (
-        " Open with the winner and its score, then the context features its score is "
-        "built from. Describe those context features only as larger or smaller shares "
-        "of that detector's own score — a small share means a context feature "
-        "contributed little, never that it lowered the score or worked against "
-        "the detector. Only when comparing the winner with the named runner-up "
-        "may you say a context feature favoured one over the other, and there keep the "
-        "direction exactly as the fact states it. Then give the selection "
-        "counts, then how leadership divided into regimes and any fact comparing "
-        "that with the winner, then EVERY regime "
-        "its own sentence in the order listed, each naming its window range, "
-        "its leader and its context features. "
-        # The number or the window range is what pairs each sentence with its
-        # own figure in the disclosure. A word-ordinal cannot, and fails
-        # silently: the disclosure falls back to the IR's own wording.
-        "Begin each of those sentences with the literal words 'Regime N "
-        "(windows ...)', using the number the fact gives — never 'the first "
-        "regime', 'the second regime', or any other ordinal in place of it. "
-        "Name that leader outright — never "
-        "describe it by reference to the previous regime. Do not draw a conclusion "
-        "the facts do not state."
-    ),
-    # Describing a regime by reference to the previous one writes false
-    # continuity ("NN_3 continued as leader") that no metric can see, since the
-    # names and numbers are all correct.
-    "thompson_sampling": (
-        " Open with the winner and its margin, then how the run divided into "
-        "regimes. Then give EVERY regime its own sentence, in the order listed, "
-        "keeping each regime's window range, its leader and its context features "
-        "together. Begin each of those sentences with the literal words "
-        "'Regime N (windows ...)', then the detector that led it, then its "
-        "context features. Name that detector outright — never describe it by reference "
-        "to the previous regime. Three different things are said about context features "
-        "and they must not be merged or traded for one another: one context feature "
-        "SUPPLIES a share of a detector's expected reward, one GIVES IT AN EDGE "
-        "over the named rival, and one DEPARTS FURTHEST FROM ITS USUAL "
-        "contribution. The last is a separate sentence in the facts and must "
-        "stay separate clauses. Keep whichever wording the fact uses. "
-        # The rigidity IS the fidelity. Asking for varied openings cost half the
-        # content: SKAB/7 went 8/8 -> 1/8 regimes keeping all three claims.
-        "Keep each regime to a SINGLE sentence — never split a trailing clause "
-        "off into a sentence of its own, and never refer back with 'in this "
-        "regime' or 'here'. "
-        "Finish with the winner's overall context feature and the selection-state "
-        "percentages."
-    ),
-    "monte_carlo": (
-        " Open with one sentence restating the production-test result exactly "
-        "as the fact gives it — use the word 'first' — naming the top detector "
-        "for each metric. The F1 and PR-AUC leaders are not always the same "
-        "detector: if the fact names two different ones, keep them separate. "
-        "Then give each detector's winning noise ranges in the order listed, "
-        "one detector per statement. Finish with the win percentages. Copy each "
-        "noise range as it is written ('from 0.000 to 0.042') — never turn a "
-        "range into a hyphenated pair."
-    ),
-    "off_by_threshold": _POINT_INJECTION_HINT,
-    "gan": _POINT_INJECTION_HINT,
-}
-# Two clauses above must survive any future trim. monte_carlo's hyphenated-range
-# ban: the verifier's number extraction is sign-aware, so "0.000-0.042" reads as
-# -0.042 and is flagged unsupported. The degenerate clause: dropping it lost
-# ob.degenerate (omission 0.000 -> 0.200).
-
-
-def _stage_task_hint(stage: Any) -> str:
-    return _STAGE_TASK_HINTS.get(str(stage), "")
-
-
+# Unused since the v5 prompt: build_stage_prompt no longer sizes a word
+# budget or appends a per-stage hint. Kept commented rather than deleted —
+# these are model-size dependent and a smaller narrator would want them back.
+# _POINT_INJECTION_HINT = (
+#     " Open with one short sentence naming the highest-ranked model, then "
+#     "give each fact about the models it beat as its OWN separate sentence. "
+#     "The rival models named in a sentence must be EXACTLY the models that "
+#     "fact lists. State every condition WITH ITS NUMBERS, copied exactly as "
+#     "the fact writes them: never replace a threshold with 'specific ranges', "
+#     "'certain conditions', 'specific values', 'certain constraints', "
+#     "'specific criteria', 'conditions related to' or a bare list of property "
+#     "names. A sentence that names a property without its number is wrong. "
+#     "The importance figures come last, and only once every condition has "
+#     "been stated with its numbers. If a fact says the highest-ranked model "
+#     "never exclusively beat some models, state that too."
+# )
+#
+# # Stage-specific rendering guidance appended to the prompt's TASK. A NARRATION
+# # concern, so it lives here rather than in the grounded IR. Keyed by exact
+# # stage name.
+# _STAGE_TASK_HINTS: Dict[str, str] = {
+#     # The opening sentence is load-bearing: without it the narrator went
+#     # straight into the per-source walk and dropped both the consensus winner
+#     # and the source list (omission 0.000 -> 0.250). One positive instruction
+#     # replaced three defensive ones and scored better.
+#     "rank_aggregation_robust": (
+#         " Open by naming the source ranking that shaped the consensus most — "
+#         "all of them, if several are tied at that rank — and the source "
+#         "rankings being aggregated. Then, in a sentence of its own, name the "
+#         "consensus's own top-ranked detector. That detector is the consensus's "
+#         "pick, never a source's: do not attach it to any source's own ranking. "
+#         "Then describe each source in the order "
+#         "given; for each one, state its overall standing rank, its influence "
+#         "rank, and its agreement rank. A rank is a position — rank "
+#         "1 is best — so give the rank number itself. NEVER call a rank "
+#         "'highest', 'lowest', 'best', 'worst', 'least', 'strongest' or "
+#         "'weakest' — write the ordinal or the number instead. Keep the fact's "
+#         "own wording for overall standing, such as 'shaped the consensus third "
+#         "most', and never restate a standing as influence or agreement. Do not "
+#         "compare one source's rank with another's unless a fact states that "
+#         "comparison."
+#     ),
+#     # Two facts about different KINDS of thing. The narrator joined them into
+#     # "LOF_3, which aligns more closely with Thompson_Sampling's ranking",
+#     # inverting the finding on SKAB/7 at 0.000 hallucination.
+#     "rank_aggregation_final": (
+#         " Say which of the two sources the consensus followed more closely, "
+#         "with both agreement scores and the gap. Then, in a sentence of its "
+#         "own, name the consensus's top-ranked detector. Agreement is a property "
+#         "of a whole source ranking, never of one detector, so do not write that "
+#         "a detector agrees with, aligns with or is closer to either source."
+#     ),
+#     "ga_combination": (
+#         " Describe each detector in the order given; for each one, state its "
+#         "overall weight rank and its rank on absolute SHAP, PFI and total ALE "
+#         "(rank 1 is strongest). Where a fact says a rank is a tie, say it is "
+#         "tied. Finish with the sign summary, saying which detectors push "
+#         "the meta-learner toward flagging an anomaly and which push the other "
+#         "way. Report each sign exactly as the facts give it; how well a sign "
+#         "is supported is a caveat, so leave it out of the paragraph. A detector "
+#         "the facts give no sign at all keeps none — never assign it one of "
+#         "your own."
+#     ),
+#     "ga_selection": (
+#         " Open by naming the chosen ensemble. Then explain why the chosen "
+#         "detectors were kept, following the facts in order and keeping the "
+#         "detectors grouped exactly as the facts group them. Then explain why "
+#         "the rest were left out, using the high/low utility and stability "
+#         "wording the facts use."
+#     ),
+#     # Direction is the whole risk. Shares are sums of squares, so none can
+#     # "drag the score down" — but that is what a narrator writes when a share
+#     # is small, and the verifier cannot see it. Only the rival comparison has
+#     # a sign.
+#     "thompson_ranking": (
+#         " Open with the winner and its score, then the context features its score is "
+#         "built from. Describe those context features only as larger or smaller shares "
+#         "of that detector's own score — a small share means a context feature "
+#         "contributed little, never that it lowered the score or worked against "
+#         "the detector. Only when comparing the winner with the named runner-up "
+#         "may you say a context feature favoured one over the other, and there keep the "
+#         "direction exactly as the fact states it. Then give the selection "
+#         "counts, then how leadership divided into regimes and any fact comparing "
+#         "that with the winner, then EVERY regime "
+#         "its own sentence in the order listed, each naming its window range, "
+#         "its leader and its context features. "
+#         # The number or the window range is what pairs each sentence with its
+#         # own figure in the disclosure. A word-ordinal cannot, and fails
+#         # silently: the disclosure falls back to the IR's own wording.
+#         "Begin each of those sentences with the literal words 'Regime N "
+#         "(windows ...)', using the number the fact gives — never 'the first "
+#         "regime', 'the second regime', or any other ordinal in place of it. "
+#         "Name that leader outright — never "
+#         "describe it by reference to the previous regime. Do not draw a conclusion "
+#         "the facts do not state."
+#     ),
+#     # Describing a regime by reference to the previous one writes false
+#     # continuity ("NN_3 continued as leader") that no metric can see, since the
+#     # names and numbers are all correct.
+#     "thompson_sampling": (
+#         " Open with the winner and its margin, then how the run divided into "
+#         "regimes. Then give EVERY regime its own sentence, in the order listed, "
+#         "keeping each regime's window range, its leader and its context features "
+#         "together. Begin each of those sentences with the literal words "
+#         "'Regime N (windows ...)', then the detector that led it, then its "
+#         "context features. Name that detector outright — never describe it by reference "
+#         "to the previous regime. Three different things are said about context features "
+#         "and they must not be merged or traded for one another: one context feature "
+#         "SUPPLIES a share of a detector's expected reward, one GIVES IT AN EDGE "
+#         "over the named rival, and one DEPARTS FURTHEST FROM ITS USUAL "
+#         "contribution. The last is a separate sentence in the facts and must "
+#         "stay separate clauses. Keep whichever wording the fact uses. "
+#         # The rigidity IS the fidelity. Asking for varied openings cost half the
+#         # content: SKAB/7 went 8/8 -> 1/8 regimes keeping all three claims.
+#         "Keep each regime to a SINGLE sentence — never split a trailing clause "
+#         "off into a sentence of its own, and never refer back with 'in this "
+#         "regime' or 'here'. "
+#         "Finish with the winner's overall context feature and the selection-state "
+#         "percentages."
+#     ),
+#     "monte_carlo": (
+#         " Open with one sentence restating the production-test result exactly "
+#         "as the fact gives it — use the word 'first' — naming the top detector "
+#         "for each metric. The F1 and PR-AUC leaders are not always the same "
+#         "detector: if the fact names two different ones, keep them separate. "
+#         "Then give each detector's winning noise ranges in the order listed, "
+#         "one detector per statement. Finish with the win percentages. Copy each "
+#         "noise range as it is written ('from 0.000 to 0.042') — never turn a "
+#         "range into a hyphenated pair."
+#     ),
+#     "off_by_threshold": _POINT_INJECTION_HINT,
+#     "gan": _POINT_INJECTION_HINT,
+# }
+# # Two clauses above must survive any future trim. monte_carlo's hyphenated-range
+# # ban: the verifier's number extraction is sign-aware, so "0.000-0.042" reads as
+# # -0.042 and is flagged unsupported. The degenerate clause: dropping it lost
+# # ob.degenerate (omission 0.000 -> 0.200).
+#
+#
+# def _stage_task_hint(stage: Any) -> str:
+#     return _STAGE_TASK_HINTS.get(str(stage), "")
+#
+#
 def build_stage_prompt(ir_doc: Dict[str, Any]) -> str:
-    n_atoms = len(ir_doc.get("evidence", []))
-    # Both paths size to the REQUIRED atoms. `_stage_word_budget` is tried
-    # first, so passing the full count let the two Thompson stages buy room for
-    # every optional regime and never consult `_content_words` at all.
-    n_required = len(set(ir_doc.get("required_atom_ids") or ())
-                     & {a.get("id") for a in ir_doc.get("evidence", [])}) or n_atoms
-    content = _content_words(ir_doc)
-    lo, hi = (_stage_word_budget(ir_doc.get("stage", ""), n_required, content)
-              or _word_budget(n_required, content_words=content))
     question = ir_doc.get("question")
     lines: List[str] = []
-    lines.append(f"STAGE: {ir_doc.get('stage')}")
-    lines.append(f"DATASET: {ir_doc.get('dataset')}  |  ENTITY: {ir_doc.get('entity')}")
+    # Words, not the identifier: handed "rank_aggregation_robust" the narrator
+    # opens "The rank_aggregation_robust stage found that...".
+    lines.append(f"STAGE: {str(ir_doc.get('stage', '')).replace('_', ' ')}")
+    # Spelled out: "ENTITY: 7" was read as "seven entities".
+    lines.append(f"DATASET: {ir_doc.get('dataset')}   ENTITY: "
+                 f"{ir_doc.get('entity')} (one time series from that dataset)")
     if question:
         lines.append(f"QUESTION THIS STAGE ANSWERS: {question}")
     lines.append("")
-    lines.append("STAGE OUTPUT (context facts):")
-    lines.extend(_output_lines(ir_doc.get("output", {})))
-    lines.append("")
-    lines.append("FACTS (use only these; copy numbers and names exactly):")
-    lines.extend(_fact_lines(ir_doc))
+    # The stage output is not listed: labelled background it was still narrated,
+    # and everything that matters is an atom.
+    lines.append("FACTS:")
+    # A fact enumerating several measured values is where the narrator reranks
+    # and regroups, so those are marked to be reproduced as given.
+    for line in _fact_lines(ir_doc):
+        if len(_LIST_FACT_RE.findall(line)) >= 3:
+            line = line.replace("- ", "- [AS GIVEN] ", 1)
+        lines.append(line)
     lines.extend(_caveat_lines(ir_doc))
     lines.append("")
-    task = (f"TASK: Write ONE paragraph of {lo}-{hi} words")
-    if question:
-        # The stage card's short view is built by dropping sentences from this
-        # paragraph, so the opening had been whichever survived the filter.
-        task += (" that answers the question above. Open with ONE sentence that "
-                 "answers it outright, naming the detector or source the answer "
-                 "turns on; then present the facts in the order given as "
-                 "supporting evidence")
-    else:
-        task += " explaining this stage's result"
-    task += (". Convey every fact marked as required. A fact without that marker "
-             "is optional: include it only where it adds something the required "
-             "facts do not already say, and leave the rest out. Copy all numbers "
-             "and names verbatim, and keep each number attached to the exact "
-             "metric name it accompanies in the facts.")
-    task += _stage_task_hint(ir_doc.get("stage", ""))
-    lines.append(task)
+    lines.append("TASK: Explain what this stage found, as prose.")
     return "\n".join(lines)
+
 
 
 def build_global_prompt(global_ir: Dict[str, Any]) -> str:
@@ -470,7 +502,9 @@ def build_global_prompt(global_ir: Dict[str, Any]) -> str:
     and the agreement facts as atoms — no raw key:value dumps, which small
     models misread into invented relations.
     """
-    lo, hi = _word_budget(len(global_ir.get("evidence", [])), 150, 300)
+    # No word budget, as for the stage prompts: sized from the atoms it asked
+    # for more words than the facts contained, and the model supplied them.
+    # lo, hi = _word_budget(len(global_ir.get("evidence", [])), 150, 300)
     lines: List[str] = []
     lines.append("GLOBAL MODEL-SELECTION DECISION")
     lines.append(f"DATASET: {global_ir.get('dataset')}  |  ENTITY: {global_ir.get('entity')}")
@@ -485,7 +519,7 @@ def build_global_prompt(global_ir: Dict[str, Any]) -> str:
                      "never invent their results): " + ", ".join(unavailable))
     lines.extend(_caveat_lines(global_ir))
     lines.append("")
-    lines.append(f"TASK: Write ONE paragraph of {lo}-{hi} words. Lead with the "
+    lines.append("TASK: Write ONE paragraph. Lead with the "
                  "final framework decision, then summarize what each available "
                  "stage found and where the stages agreed or disagreed with the "
                  "final pick. Copy all numbers and names verbatim, and keep each "
@@ -576,89 +610,90 @@ def compose_global_narrative(stage_texts: Dict[str, str],
 
 # ── Verifier-guided repair ───────────────────────────────────────────────────
 
-def _violation_count(metrics: Dict[str, Any]) -> int:
-    return (len(metrics.get("unsupported_numbers", []))
-            + len(metrics.get("unsupported_entities", []))
-            + len(metrics.get("misattributed_numbers", []))
-            # False statements, not style notes: left out of this count they
-            # were measured and then ignored, and repair never ran.
-            + len(metrics.get("swapped_rivals", []))
-            + len(metrics.get("attribution_warnings", []))
-            + len(metrics.get("missing_required_ids", [])))
+# # Unused with repair off.
+# def _violation_count(metrics: Dict[str, Any]) -> int:
+#     return (len(metrics.get("unsupported_numbers", []))
+#             + len(metrics.get("unsupported_entities", []))
+#             + len(metrics.get("misattributed_numbers", []))
+#             # False statements, not style notes: left out of this count they
+#             # were measured and then ignored, and repair never ran.
+#             + len(metrics.get("swapped_rivals", []))
+#             + len(metrics.get("attribution_warnings", []))
+#             + len(metrics.get("missing_required_ids", [])))
 
 
 _PROFILE_WORD = {"H": "high", "L": "low"}
 
 
-def _violation_lines(metrics: Dict[str, Any], ir_doc: Dict[str, Any]) -> List[str]:
-    """Human-readable repair feedback for every hard violation the verifier
-    found, each naming the exact fact to go back to."""
-    lines: List[str] = []
-    for tok in metrics.get("unsupported_numbers", []):
-        lines.append(f"The number '{tok}' does not appear in the facts. Remove "
-                     f"it or use the exact value written in the facts. If it "
-                     f"came from splitting a detector name (e.g. 'LOFs 2 and "
-                     f"3'), write each full name instead.")
-    for tok in metrics.get("unsupported_entities", []):
-        lines.append(f"The name '{tok}' does not appear in the facts — remove it.")
-    for m in metrics.get("misattributed_numbers", []):
-        subjects = ", ".join(m.get("subjects", [])) or "the detectors it names"
-        lines.append(f"The number '{m.get('number')}' is used in a sentence "
-                     f"about {subjects}, but it does not belong to any of "
-                     f"them. Re-check the facts and attach it to the right "
-                     f"detector.")
-    atoms_by_id = {a.get("id"): a for a in ir_doc.get("evidence", [])}
-    for swap in metrics.get("swapped_rivals", []):
-        atom = atoms_by_id.get(swap.get("atom_id"))
-        expected = ", ".join(n.upper() for n in swap.get("expected", []))
-        wrong = ", ".join(n.upper() for n in swap.get("intruded", []))
-        detail = (f" You named {wrong}, which this fact does not mention."
-                  if wrong else "")
-        lines.append(f"This sentence names the wrong models: "
-                     f"\"{swap.get('sentence', '')}\"{detail} The fact it comes "
-                     f"from is about exactly {expected} — "
-                     f"\"{(atom or {}).get('text', '')}\". Use those names and "
-                     f"no others, and do not take model names from any other fact.")
-    for warn in metrics.get("attribution_warnings", []):
-        aspect = warn.get("aspect", "")
-        actual = _PROFILE_WORD.get(warn.get("actual", ""), warn.get("actual", ""))
-        claimed = ", ".join(_PROFILE_WORD.get(c, c) for c in warn.get("claimed", []))
-        if warn.get("contradictory"):
-            lines.append(f"This sentence calls {str(warn.get('subject', '')).upper()}'s "
-                         f"{aspect} both {claimed}: "
-                         f"\"{warn.get('sentence', '')}\". Its {aspect} is "
-                         f"{actual} — say that once and drop the other claim. "
-                         f"Do not add a reason for the outcome.")
-            continue
-        lines.append(f"{str(warn.get('subject', '')).upper()} is described with "
-                     f"{claimed} {aspect} in this sentence: "
-                     f"\"{warn.get('sentence', '')}\" — but the facts say its "
-                     f"{aspect} is {actual}. Restate it with the wording the "
-                     f"facts use, and do not group it with detectors that have a "
-                     f"different profile.")
-    for rid in metrics.get("missing_required_ids", []):
-        atom = atoms_by_id.get(rid)
-        if atom is not None:
-            lines.append(f"This required fact was not conveyed — every model "
-                         f"name in it must appear in your paragraph: "
-                         f"\"{atom.get('text', '')}\"")
-    return lines
+# def _violation_lines(metrics: Dict[str, Any], ir_doc: Dict[str, Any]) -> List[str]:
+#     """Human-readable repair feedback for every hard violation the verifier
+#     found, each naming the exact fact to go back to."""
+#     lines: List[str] = []
+#     for tok in metrics.get("unsupported_numbers", []):
+#         lines.append(f"The number '{tok}' does not appear in the facts. Remove "
+#                      f"it or use the exact value written in the facts. If it "
+#                      f"came from splitting a detector name (e.g. 'LOFs 2 and "
+#                      f"3'), write each full name instead.")
+#     for tok in metrics.get("unsupported_entities", []):
+#         lines.append(f"The name '{tok}' does not appear in the facts — remove it.")
+#     for m in metrics.get("misattributed_numbers", []):
+#         subjects = ", ".join(m.get("subjects", [])) or "the detectors it names"
+#         lines.append(f"The number '{m.get('number')}' is used in a sentence "
+#                      f"about {subjects}, but it does not belong to any of "
+#                      f"them. Re-check the facts and attach it to the right "
+#                      f"detector.")
+#     atoms_by_id = {a.get("id"): a for a in ir_doc.get("evidence", [])}
+#     for swap in metrics.get("swapped_rivals", []):
+#         atom = atoms_by_id.get(swap.get("atom_id"))
+#         expected = ", ".join(n.upper() for n in swap.get("expected", []))
+#         wrong = ", ".join(n.upper() for n in swap.get("intruded", []))
+#         detail = (f" You named {wrong}, which this fact does not mention."
+#                   if wrong else "")
+#         lines.append(f"This sentence names the wrong models: "
+#                      f"\"{swap.get('sentence', '')}\"{detail} The fact it comes "
+#                      f"from is about exactly {expected} — "
+#                      f"\"{(atom or {}).get('text', '')}\". Use those names and "
+#                      f"no others, and do not take model names from any other fact.")
+#     for warn in metrics.get("attribution_warnings", []):
+#         aspect = warn.get("aspect", "")
+#         actual = _PROFILE_WORD.get(warn.get("actual", ""), warn.get("actual", ""))
+#         claimed = ", ".join(_PROFILE_WORD.get(c, c) for c in warn.get("claimed", []))
+#         if warn.get("contradictory"):
+#             lines.append(f"This sentence calls {str(warn.get('subject', '')).upper()}'s "
+#                          f"{aspect} both {claimed}: "
+#                          f"\"{warn.get('sentence', '')}\". Its {aspect} is "
+#                          f"{actual} — say that once and drop the other claim. "
+#                          f"Do not add a reason for the outcome.")
+#             continue
+#         lines.append(f"{str(warn.get('subject', '')).upper()} is described with "
+#                      f"{claimed} {aspect} in this sentence: "
+#                      f"\"{warn.get('sentence', '')}\" — but the facts say its "
+#                      f"{aspect} is {actual}. Restate it with the wording the "
+#                      f"facts use, and do not group it with detectors that have a "
+#                      f"different profile.")
+#     for rid in metrics.get("missing_required_ids", []):
+#         atom = atoms_by_id.get(rid)
+#         if atom is not None:
+#             lines.append(f"This required fact was not conveyed — every model "
+#                          f"name in it must appear in your paragraph: "
+#                          f"\"{atom.get('text', '')}\"")
+#     return lines
 
 
-def _repair_prompt(base_prompt: str, draft: str, problems: List[str]) -> str:
-    # Repair is where invention spikes: told a statement is wrong, the model
-    # writes a justifying cause the facts never gave, carrying no number and no
-    # new name for a check to catch. The constraint is restated here.
-    return (base_prompt
-            + "\n\nYOUR PREVIOUS DRAFT:\n" + draft
-            + "\n\nPROBLEMS DETECTED IN THE DRAFT — fix ALL of them:\n"
-            + "\n".join(f"- {p}" for p in problems)
-            + "\n\nRewrite the paragraph, fixing every problem above while "
-              "still following all the rules and the original task. Correct "
-              "the wording only: do NOT add a reason, cause or justification "
-              "for anything, and do not explain why a result came out the way "
-              "it did — the facts say what happened, not why. Keep it to ONE "
-              "paragraph.")
+# def _repair_prompt(base_prompt: str, draft: str, problems: List[str]) -> str:
+#     # Repair is where invention spikes: told a statement is wrong, the model
+#     # writes a justifying cause the facts never gave, carrying no number and no
+#     # new name for a check to catch. The constraint is restated here.
+#     return (base_prompt
+#             + "\n\nYOUR PREVIOUS DRAFT:\n" + draft
+#             + "\n\nPROBLEMS DETECTED IN THE DRAFT — fix ALL of them:\n"
+#             + "\n".join(f"- {p}" for p in problems)
+#             + "\n\nRewrite the paragraph, fixing every problem above while "
+#               "still following all the rules and the original task. Correct "
+#               "the wording only: do NOT add a reason, cause or justification "
+#               "for anything, and do not explain why a result came out the way "
+#               "it did — the facts say what happened, not why. Keep it to ONE "
+#               "paragraph.")
 
 
 # ── Entity-level orchestration ───────────────────────────────────────────────
@@ -734,20 +769,23 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
             metrics = verify_fn(narrative, ir_doc)
             entry: Dict[str, Any] = {"status": "ok"}
 
-            # One bounded retry on hard violations, kept only if no worse;
-            # the pre-repair metrics stay as `verify_initial`.
-            problems = _violation_lines(metrics, ir_doc)
-            if problems:
-                entry["verify_initial"] = metrics
-                entry["repaired"] = True
-                repaired = client.chat(
-                    SYSTEM_PROMPT,
-                    _repair_prompt(base_prompt, narrative, problems)).strip()
-                repaired_metrics = verify_fn(repaired, ir_doc)
-                if _violation_count(repaired_metrics) <= _violation_count(metrics):
-                    narrative, metrics = repaired, repaired_metrics
-                else:
-                    entry["repair_discarded"] = True
+            # Repair is off. It fired on the verifier's coverage metrics, which
+            # assume the narrative reproduces the atom sentences: once the model
+            # merges and rewords them, omission reads high on correct prose
+            # (0.50 on a verified-correct stage) and the repair prompt's
+            # "correct the wording only" pushes the output back toward the atoms.
+            # problems = _violation_lines(metrics, ir_doc)
+            # if problems:
+            #     entry["verify_initial"] = metrics
+            #     entry["repaired"] = True
+            #     repaired = client.chat(
+            #         SYSTEM_PROMPT,
+            #         _repair_prompt(base_prompt, narrative, problems)).strip()
+            #     repaired_metrics = verify_fn(repaired, ir_doc)
+            #     if _violation_count(repaired_metrics) <= _violation_count(metrics):
+            #         narrative, metrics = repaired, repaired_metrics
+            #     else:
+            #         entry["repair_discarded"] = True
 
             path = os.path.join(nl_dir, f"{nl_name}.txt")
             with open(path, "w") as f:

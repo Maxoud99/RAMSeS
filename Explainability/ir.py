@@ -36,6 +36,7 @@ from __future__ import annotations
 import glob as _glob
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from Utils.pipeline_spec import (decision_metric_formula, decision_metric_label,
@@ -259,6 +260,16 @@ def rule_to_text(rule: Dict[str, Any], outcome_label: str = "the outcome is") ->
 
 # ── Envelope / writer ────────────────────────────────────────────────────────
 
+_ID_DIGITS = re.compile(r"(\d+)")
+
+
+def _id_key(atom_id: Any) -> Tuple[Any, ...]:
+    """Sort ids by number where they carry one: plain string order files
+    `regime.10` between `regime.1` and `regime.2`."""
+    return tuple(int(p) if p.isdigit() else p
+                 for p in _ID_DIGITS.split(str(atom_id)))
+
+
 def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
               evidence: List[Dict[str, Any]], caveats: List[Dict[str, Any]],
               required_atom_ids: List[str],
@@ -270,8 +281,8 @@ def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
         "dataset": str(dataset),
         "entity": str(entity),
         "output": _py(output),
-        "evidence": [_py(a) for a in sorted(evidence, key=lambda a: a["id"])],
-        "caveats": [_py(a) for a in sorted(caveats, key=lambda a: a["id"])],
+        "evidence": [_py(a) for a in sorted(evidence, key=lambda a: _id_key(a["id"]))],
+        "caveats": [_py(a) for a in sorted(caveats, key=lambda a: _id_key(a["id"]))],
         "required_atom_ids": sorted(required_atom_ids),
         "confidence": _py(confidence or {}),
     }
@@ -719,12 +730,12 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             margin = float(score) - float(top_pairs[1][1])
             lead_val = {"top": top_model, "score": _val(score, 6),
                         "runner_up": runner_up, "margin": _val(margin, 6)}
-            lead_txt = (f"Ranked by the size of its learned weights, {top_model} "
+            lead_txt = (f"Ranked first by the size of its mean vector, {top_model} "
                         f"scored {_fmt(score, 6)}, ahead of {runner_up} by "
                         f"{_fmt(margin, 6)}.")
         else:
             lead_val = {"top": top_model, "score": _val(score, 6)}
-            lead_txt = (f"Ranked by the size of its learned weights, {top_model} "
+            lead_txt = (f"Ranked first by the size of its mean vector, {top_model} "
                         f"scored {_fmt(score, 6)}.")
         evidence.append(make_atom("tsr.output.top", "stage_output", str(top_model),
                                   lead_val, lead_txt, order=1))
@@ -1389,21 +1400,25 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         n = len(detectors)
         evidence.append(make_atom(
             "ga_comb.output.subset", "stage_output", "best_ensemble", list(detectors),
-            # "this stage measures…" left the subject implicit and a narrator
-            # reattached it to the nearest noun ("This ensemble measures how
-            # each detector influences…"), which is nonsense the verifier
-            # cannot see — every name and number in it is correct. Naming the
-            # ranking gives the clause a referent it cannot slide off.
+            # No trailing "the ranking below measures…" clause: it said what
+            # this stage's own question says, and the narrator merged the two
+            # into the ensemble sentence ("selected the 5-detector ensemble {…}
+            # to determine which detectors the ensemble relies on most"). Each
+            # detector atom states its own weight rank, so nothing is lost.
             f"The genetic algorithm selected the {n}-detector ensemble "
-            f"{{{', '.join(detectors)}}}; the ranking below measures how much "
-            f"each of those detectors moves the trained meta-learner's output.",
+            f"{{{', '.join(detectors)}}}.",
             order=1))
         required.append("ga_comb.output.subset")
 
     for i, d in enumerate(detectors):
         rid = f"ga_comb.detector.{d}.role"
+        # The most-weighted detector answers half of what this stage is asked, so
+        # it carries its own type: the card drops the per-detector walk by type,
+        # and dropping this one with it left the summary never naming the winner.
+        role_type = ("detector_role_lead" if final_rank.get(d) == 1
+                     else "detector_role")
         evidence.append(make_atom(
-            rid, "detector_role", d,
+            rid, role_type, d,
             {"final_rank": final_rank.get(d),
              "final_rank_tied": rank_counts.get(final_rank.get(d), 1) > 1,
              "markov_score": _val(pi.get(d), 4),
@@ -1494,6 +1509,23 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
                      required, question=question)
 
 
+def _pick_verdict(prefix: str, stage_word: str, source: Any, pick: Any,
+                  top: Any) -> Optional[Dict[str, Any]]:
+    """Atom of its own: agreement is a rank correlation over the whole order and
+    says nothing about whether a source wanted the same winner."""
+    if pick == NOT_AVAILABLE or top == NOT_AVAILABLE or source is None:
+        return None
+    agrees = str(pick) == str(top)
+    text = (f"{source}'s own ranking put {top} first, matching the "
+            f"{stage_word} consensus." if agrees else
+            f"{source}'s own ranking put {pick} first rather than the "
+            f"{stage_word} consensus's {top}.")
+    return make_atom(f"{prefix}.verdict.top_pick", "source_verdict", str(source),
+                     {"source": source, "source_top_pick": pick,
+                      "consensus_top": top, "agrees": agrees},
+                     text, order=7)
+
+
 def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iteration: int,
                               result: Dict[str, Any], source_names: List[str],
                               source_top_picks: Dict[str, str],
@@ -1514,18 +1546,6 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         "n_sources": len(source_names),
         "sources": sorted(source_names),
     }
-    if full_ranking:
-        # "ranking of detectors, first-ranked detector is X" — the winner reads
-        # unmistakably as a DETECTOR (not one of the source rankings analysed
-        # below, which the narrator had conflated), and grounding "first-ranked"
-        # here means the narrator's natural "X ranked first" has the value 1 to
-        # match instead of reading as an ungrounded number.
-        evidence.append(make_atom(
-            f"{prefix}.output.top", "stage_output", top, top,
-            f"The {stage_word} consensus is a ranking of detectors; its "
-            f"first-ranked detector is {top}.", order=0))
-        required.append(f"{prefix}.output.top")
-
     caveats = [
         make_atom(f"{prefix}.caveat.consensus", "caveat", "aggregation", None,
                   "The consensus ranking is produced by Markov-chain rank aggregation "
@@ -1549,11 +1569,16 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
              "runner_up_agreement": _val(kendall_only.get("runner_up_tau"), 4),
              "gap": _val(kendall_only.get("alignment_gap"), 4)},
             f"{winner} agreed with the {stage_word} consensus more closely "
-            f"than {runner} (agreement "
+            f"than {runner} did (agreement "
             f"{_fmt(kendall_only.get('winner_tau'), 4)} vs "
             f"{_fmt(kendall_only.get('runner_up_tau'), 4)}, gap "
             f"{_fmt(kendall_only.get('alignment_gap'), 4)})."))
         required.append(kid)
+        verdict = _pick_verdict(prefix, stage_word, winner,
+                                source_top_picks.get(str(winner), NOT_AVAILABLE), top)
+        if verdict is not None:
+            evidence.append(verdict)
+            required.append(verdict["id"])
         caveats.append(make_atom(
             f"{prefix}.caveat.two_sources", "caveat", "loo", None,
             "With exactly two sources, influence (leave-one-out) and the combined "
@@ -1572,18 +1597,16 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         # consensus). Raw LOO/tau scores stay in `value` for provenance; the
         # prose carries only the ranks.
 
-        # Required relational atom: names the source set explicitly and states
-        # that the ranked detectors (incl. the winner) are NOT sources — the
-        # narrator had folded the winning detector into the list of sources.
+        # Required relational atom: names the source set explicitly. It used to
+        # add that the ranked detectors are NOT sources, which was aimed at the
+        # narrator and got printed as a sentence of its own.
         src_list = sorted(source_names)
         cid = f"{prefix}.context.sources"
         evidence.append(make_atom(
             cid, "stage_context", "sources",
             {"sources": src_list, "n_sources": len(src_list), "winner": top},
             f"The {len(src_list)} sources aggregated into this consensus are the "
-            f"rankings {', '.join(src_list)}. Every fact below describes one of "
-            f"these source rankings; the detectors they rank — including the "
-            f"winner {top} — are the items being ranked, not sources.",
+            f"rankings {', '.join(src_list)}.",
             order=5))
         required.append(cid)
 
@@ -1598,29 +1621,50 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
                      6: "sixth ", 7: "seventh ", 8: "eighth ", 9: "ninth ",
                      10: "tenth ", 11: "eleventh ", 12: "twelfth "}
 
+        def _ordinal(k: Any) -> str:
+            if k is None or _is_nan(k):
+                return str(k)
+            k = int(k)
+            return f"{k}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(k if k < 20 else k % 10, 'th') }"
+
         def _shaped_prefix(br: Any) -> str:
             if br is None or _is_nan(br):
                 return ""
             return _ORD_MOST.get(int(br), f"{int(br)}th ")
 
+        # The source that moved the consensus most need not have wanted its
+        # winner: influence measures how far the result shifts without a source,
+        # not whether it agreed. This rides ON the leading source's own sentence
+        # rather than in an atom of its own — as two sentences about one source
+        # the narrator kept welding them together and inverting which detector
+        # went where ("ranks X first in its own ranking despite putting Y at the
+        # top instead").
+        ranked = sorted(verdicts, key=_borda_key)
+        # Only when one source is strictly ahead: sources tie at Borda rank 1
+        # often enough, and "more than any other" is false when two share it.
+        alone = (len(ranked) > 1
+                 and _borda_key(ranked[0])[0] < _borda_key(ranked[1])[0])
+        lead_src = str(ranked[0].get("source")) if ranked else None
+        lead_pick = source_top_picks.get(lead_src, NOT_AVAILABLE)
+        lead_tension = (alone and lead_src and top != NOT_AVAILABLE
+                        and lead_pick != NOT_AVAILABLE and str(lead_pick) != str(top))
+
         n_src = len(src_list)
-        for i, v in enumerate(sorted(verdicts, key=_borda_key)):
+        for i, v in enumerate(ranked):
             name = v["source"]
             loo_rank, align_rank = v.get("loo_rank"), v.get("align_rank")
             br = v.get("borda_rank")
-            # Every source is described exactly like the lead: how much it
-            # "shaped the consensus" (its combined Borda standing) plus BOTH
-            # explicit component ranks. The combined standing gets its own NAME
-            # and its own NUMBER ("overall standing rank N of M"): expressed only as a
-            # bare verb phrase it was the one ordinal in the sentence without a
-            # label, so narrators borrowed the nearest rank-noun and reported it
-            # as influence — the same value described twice, contradictorily
-            # ("ranked sixth for influence (rank 4)").
-            standing = ("" if br is None or _is_nan(br)
-                        else f" (overall standing rank {int(br)} of {n_src})")
+            # The combined Borda standing is stated once, as the verb phrase.
+            # Repeating it as "(standing N of M)" put three "N of M" phrases in
+            # one sentence, two of them the same number, and the narrator glued
+            # the standing onto the component frame ("standing 2 of 6 for
+            # influence and 2 of 6 for agreement, placing 3rd of 6 for
+            # influence..."). The components carry their own ordinals and
+            # labels, which is what the parenthetical was there to supply.
             text = (f"{name} shaped the {stage_word} consensus "
-                    f"{_shaped_prefix(br)}most{standing}, ranking "
-                    f"{loo_rank} for influence and {align_rank} for agreement.")
+                    f"{_shaped_prefix(br)}most, placing "
+                    f"{_ordinal(loo_rank)} of {n_src} for influence and "
+                    f"{_ordinal(align_rank)} of {n_src} for agreement.")
             rid = f"{prefix}.source.{name}.role"
             evidence.append(make_atom(
                 rid, "source_role", name,
@@ -1629,31 +1673,21 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
                  "influence_score": _val(v.get("loo_score"), 4),
                  "agreement_score": _val(v.get("align_score"), 4),
                  "top_pick": source_top_picks.get(name, NOT_AVAILABLE)},
-                text, order=10 * (i + 1)))
+                # The leading source goes first: it is the answer this stage is
+                # asked for, and with it further down the narrator invents an
+                # opening sentence and then restates the fact verbatim.
+                text, order=0 if i == 0 else 10 * (i + 1)))
             if i < HEAD_REQUIRED:
                 required.append(rid)
 
-        # The source that moved the consensus most need not have wanted its
-        # winner: influence measures how far the result shifts without a source,
-        # not whether it agreed. Both facts are above under different subjects.
-        ranked = sorted(verdicts, key=_borda_key)
-        # Only when one source is strictly ahead: sources tie at Borda rank 1
-        # often enough, and "more than any other" is false when two share it.
-        alone = (len(ranked) > 1
-                 and _borda_key(ranked[0])[0] < _borda_key(ranked[1])[0])
-        lead_src = str(ranked[0].get("source")) if ranked else None
-        lead_pick = source_top_picks.get(lead_src, NOT_AVAILABLE)
-        if (alone and lead_src and top != NOT_AVAILABLE
-                and lead_pick != NOT_AVAILABLE and str(lead_pick) != str(top)):
-            tid = f"{prefix}.tension.top_source_pick"
-            evidence.append(make_atom(
-                tid, "stage_tension", lead_src,
-                {"source": lead_src, "source_top_pick": lead_pick,
-                 "consensus_top": top},
-                f"{lead_src} shaped the {stage_word} consensus more than any "
-                f"other source, yet its own ranking put {lead_pick} first, not "
-                f"{top}.", order=6))
-            required.append(tid)
+        # Only when one source is strictly ahead: under a Borda tie at rank 1
+        # "shaped the consensus most" does not identify whose pick this is.
+        if alone:
+            verdict = _pick_verdict(prefix, stage_word, lead_src,
+                                    source_top_picks.get(str(lead_src), NOT_AVAILABLE), top)
+            if verdict is not None:
+                evidence.append(verdict)
+                required.append(verdict["id"])
 
         question = (f"Which source rankings most shaped the {stage_word} consensus, "
                     f"and how much did each agree with it?")
@@ -1689,6 +1723,8 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
     curves_pr = result.get("curves_pr", {})
     curves_vus = result.get("curves_vus", {})
     winner_f1 = result.get("winner_f1", {})
+    winner_pr = result.get("winner_pr", {})
+    winner_vus = result.get("winner_vus", {})
     permodel_f1 = result.get("permodel_f1", {})
 
     evidence: List[Dict[str, Any]] = []
@@ -1720,7 +1756,7 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             "mc.output.top", "stage_output", str(tops[0][1]),
             {"top_f1": top_f1 or NOT_AVAILABLE, "top_pr": top_pr or NOT_AVAILABLE,
              "top_vus": top_vus or NOT_AVAILABLE},
-            lead, order=1))
+            lead, order=0))
         required.append("mc.output.top")
 
     # ONE atom per detector, covering BOTH metrics. Two atoms about the same
@@ -1754,20 +1790,29 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             wid, "win_region", m,
             {metric: [(_val(a), _val(b)) for a, b in rs]
              for metric, rs in per.items()},
-            f"{m} won {'; '.join(clauses)}.", order=10 + i))
+            f"{m} won {'; '.join(clauses)}.", order=30 + i))
         if i < HEAD_REQUIRED:
             required.append(wid)
 
     conf: Dict[str, Any] = {}
-    if winner_f1.get("feasible"):
-        cv_acc = winner_f1.get("cv_accuracy", float("nan"))
-        grade = fidelity_grade(cv_acc)
-        conf["winner_surrogate_f1"] = {
-            "train_accuracy": _val(winner_f1.get("train_accuracy"), 3),
+    # One surrogate per swept metric, but ONE atom for the sweep result and one
+    # per DISAGREEMENT, not per metric. A sentence each restated the same
+    # finding two or three times over — and metrics that disagree the same way,
+    # same sweep winner against the same production winner, are one fact.
+    sweeps = []
+    for suffix, label, winner, prod_top in (
+            ("f1", "F1", winner_f1, top_f1),
+            ("pr", "PR-AUC", winner_pr, top_pr),
+            ("vus", "VUS", winner_vus, top_vus)):
+        if not winner.get("feasible"):
+            continue
+        cv_acc = winner.get("cv_accuracy", float("nan"))
+        conf[f"winner_surrogate_{suffix}"] = {
+            "train_accuracy": _val(winner.get("train_accuracy"), 3),
             "cv_accuracy": _val(cv_acc, 3),
-            "grade": grade,
+            "grade": fidelity_grade(cv_acc),
         }
-        wr = winner_f1.get("win_rates", {})
+        wr = winner.get("win_rates", {})
         winners = sorted(((m, r) for m, r in wr.items() if r > 0),
                          key=lambda kv: kv[1], reverse=True)
         # One over the cut is named rather than summarised: "the remaining 1.0%
@@ -1776,6 +1821,13 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
         cut = len(winners) if len(winners) <= TOP_K + 1 else TOP_K
         top_wr, rest = winners[:cut], winners[cut:]
         if top_wr:
+            sweeps.append({"suffix": suffix, "label": label, "top": top_wr,
+                           "rest": rest, "prod_top": prod_top, "rates": wr})
+
+    if sweeps:
+        clauses, by_metric = [], []
+        for i, s in enumerate(sweeps):
+            label, top_wr, rest = s["label"], s["top"], s["rest"]
             wr_txt = ", ".join(f"{m} {_fmt(100.0 * r, 1)}%" for m, r in top_wr)
             # These are shares of the same trials, so they sum to 100% across
             # ALL winners. Listing only the top few left a reader adding up 96%
@@ -1787,34 +1839,50 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             if rest:
                 tail_txt = (f"; the remaining {_fmt(100.0 * tail, 1)}% went to "
                             f"{len(rest)} further detectors")
-            evidence.append(make_atom(
-                "mc.surrogate.win_rates", "surrogate_win_rates", "winner_surrogate",
-                {"listed": [(m, _val(r, 3)) for m, r in top_wr],
-                 "n_other": len(rest), "other_share": _val(tail, 3)},
-                f"Across the noise sweep the trials were won by: {wr_txt}"
-                f"{tail_txt}.", order=100))
-            required.append("mc.surrogate.win_rates")
+            lead = f"Measured by {label}" if i == 0 else f"while by {label}"
+            clauses.append(f"{lead}, the noise-sweep trials were won by: "
+                           f"{wr_txt}{tail_txt}")
+            by_metric.append({"metric": label,
+                              "listed": [(m, _val(r, 3)) for m, r in top_wr],
+                              "n_other": len(rest), "other_share": _val(tail, 3)})
+        evidence.append(make_atom(
+            "mc.surrogate.win_rates", "surrogate_win_rates", "winner_surrogate",
+            {"by_metric": by_metric}, "; ".join(clauses) + ".", order=20))
+        required.append("mc.surrogate.win_rates")
 
-            # A comparison between two facts belongs to neither of them, so
-            # without this the narrative listed both and left the disagreement
-            # for the reader to spot.
-            sweep_top = top_wr[0][0]
-            if top_f1 and str(sweep_top) != str(top_f1):
-                prod_share = _val(wr.get(top_f1, 0.0), 3)
-                evidence.append(make_atom(
-                    "mc.tension.production_vs_sweep", "stage_tension", sweep_top,
-                    {"production_top": top_f1, "sweep_top": sweep_top,
-                     "sweep_top_win_rate": _val(top_wr[0][1], 3),
-                     "production_top_win_rate": prod_share},
-                    f"The sweep and the production run do not agree: "
-                    f"{sweep_top} won most of the noise trials, while it was "
-                    f"{top_f1} that the production run ranked first.",
-                    order=101))
-                required.append("mc.tension.production_vs_sweep")
-        # The winner-surrogate RULES are deliberately not emitted as evidence:
-        # the tree is fitted on (noise level -> winner), so "the winner is X
-        # when noise <= Y" restates the win regions above in weaker, fitted
-        # form. Its held-out fidelity stays in `confidence` above.
+        # A comparison between two facts belongs to neither of them, so
+        # without this the narrative listed both and left the disagreement
+        # for the reader to spot.
+        grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for s in sweeps:
+            sweep_top, prod_top = s["top"][0][0], s["prod_top"]
+            if prod_top:
+                grouped.setdefault((str(sweep_top), str(prod_top)), []).append(s)
+        for i, ((sweep_top, prod_top), hits) in enumerate(grouped.items()):
+            labels = [h["label"] for h in hits]
+            agree = sweep_top == prod_top
+            vid = "mc.sweep_verdict." + "_".join(h["suffix"] for h in hits)
+            evidence.append(make_atom(
+                vid, "sweep_verdict", sweep_top,
+                {"metrics": labels, "agree": agree, "production_top": prod_top,
+                 "sweep_top": sweep_top,
+                 "sweep_top_win_rate": {h["label"]: _val(h["top"][0][1], 3)
+                                        for h in hits},
+                 "production_top_win_rate": {
+                     h["label"]: _val(h["rates"].get(prod_top, 0.0), 3)
+                     for h in hits}},
+                f"Measured by {_join_and(labels)}, the sweep and the production "
+                f"run {'agree' if agree else 'do not agree'}: {sweep_top} won "
+                f"most of the noise trials"
+                + (" and the production run ranked it first too." if agree else
+                   f", while it was {prod_top} that the production run "
+                   f"ranked first."),
+                order=10 + i))
+            required.append(vid)
+    # The winner-surrogate RULES are deliberately not emitted as evidence:
+    # the tree is fitted on (noise level -> winner), so "the winner is X
+    # when noise <= Y" restates the win regions above in weaker, fitted
+    # form. Its held-out fidelity stays in `confidence` above.
 
     # Per-model held-out R² as confidence data, each graded for trust. When a
     # majority of a model's CV folds had (near-)constant test targets the
@@ -1848,8 +1916,8 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             f"(near-)constant F1 across the sweep, so the held-out R² is not a "
             f"meaningful fidelity estimate (marked not_available); the number is "
             f"kept only for transparency."))
-    question = ("Which detector is most robust to noise, and does the best "
-                "detector change as the noise level rises?")
+    question = ("Which detector handles the injected noise best across "
+                "different noise levels?")
 
     return _envelope("monte_carlo", dataset, entity, output, evidence, caveats,
                      required, confidence=conf, question=question)

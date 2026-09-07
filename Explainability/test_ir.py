@@ -475,7 +475,7 @@ class TestBuilders(unittest.TestCase):
         # because the sibling's headline reports a ranking it never explains.
         self.assertEqual(
             by_id["tsr.output.top"]["text"],
-            "Ranked by the size of its learned weights, A scored 1.500000, "
+            "Ranked first by the size of its mean vector, A scored 1.500000, "
             "ahead of B by 0.800000.")
 
         # Shares are percentages of the winner's own score, computed from the
@@ -789,14 +789,14 @@ class TestBuilders(unittest.TestCase):
         """The GA picks the subset; this stage only measures. The atom used to
         say the 'combination step selected' the ensemble and that the
         meta-learner 'then weighted' it — two claims about steps that do not
-        happen."""
+        happen. It carries no trailing gloss on what the ranking means either:
+        that said what the stage question says, and the narrator merged the two
+        into the ensemble sentence."""
         doc = ir.build_ga_combination_ir("DS", "e1", _ga_combination_result())
         atom = next(a for a in doc["evidence"] if a["id"] == "ga_comb.output.subset")
         self.assertEqual(
             atom["text"],
-            "The genetic algorithm selected the 3-detector ensemble {A, B, C}; "
-            "the ranking below measures how much each of those detectors moves "
-            "the trained meta-learner's output.")
+            "The genetic algorithm selected the 3-detector ensemble {A, B, C}.")
 
     def test_ga_selection_no_archetype_codes_or_complementarity(self):
         doc = ir.build_ga_selection_ir("DS", "e1", _ga_selection_result())
@@ -1029,11 +1029,22 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("for agreement", blob)
         # Winner reads as a DETECTOR, not a source; a required context atom
         # names the source set and says the ranked detectors are not sources.
-        self.assertIn("first-ranked detector is A", blob)
+        # No standalone winner atom: the leading source's sentence carries it,
+        # and the card headline reads output["top_pick"].
+        self.assertNotIn("output.top", blob)
+        # Both sources tie at Borda rank 1 here, so no verdict atom: under a
+        # tie "shaped the consensus most" does not say whose pick it would be.
+        self.assertEqual([a for a in robust["evidence"]
+                          if a["type"] == "source_verdict"], [])
+        self.assertEqual(robust["output"]["top_pick"], "A")
         self.assertIn("ra_robust.context.sources", robust["required_atom_ids"])
         ctx = next(a for a in robust["evidence"]
                    if a["id"] == "ra_robust.context.sources")
-        self.assertIn("are the items being ranked, not sources", ctx["text"])
+        # The source set, and nothing aimed at the narrator: the clause telling
+        # it the ranked detectors are not sources was printed as prose.
+        self.assertEqual(
+            ctx["text"],
+            "The 2 sources aggregated into this consensus are the rankings S1, S2.")
         self.assertIn("S1", ctx["text"])
         self.assertIn("S2", ctx["text"])
         # Friendly consensus naming + question + glossary footer.
@@ -1041,7 +1052,7 @@ class TestBuilders(unittest.TestCase):
         role = next(a for a in robust["evidence"]
                     if a["id"] == "ra_robust.source.S1.role")
         # A source is described by its three ranks and nothing else.
-        self.assertIn("overall standing rank", role["text"])
+        self.assertIn("placing", role["text"])
         self.assertIn("for influence", role["text"])
         self.assertIn("for agreement", role["text"])
         self.assertNotIn("pattern", role["text"])
@@ -1063,6 +1074,9 @@ class TestBuilders(unittest.TestCase):
         # wrong word, and a claim/evidence pair split by a colon gave the
         # narrator a first half to strand ("drove the final consensus most
         # closely").
+        fv = next(a for a in final["evidence"] if a["type"] == "source_verdict")
+        self.assertIn("A", fv["text"])
+        self.assertIn("agrees", fv["value"])
         self.assertIn("agreed with the final consensus more closely than",
                       driver["text"])
         self.assertNotIn("most", driver["text"])
@@ -1076,9 +1090,10 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("follow more closely", final["question"])
 
     def test_rank_aggregation_presentation_order_by_borda(self):
-        """Sources are presented best Borda rank first, the consensus pick
-        leads (order 0), and the Borda-#1 source's role sentence says it
-        shaped the consensus most."""
+        """Sources are presented best Borda rank first, and the LEADING SOURCE
+        leads (order 0) — it answers what this stage is asked, and further down
+        the narrator invents an opener and then restates it verbatim. The
+        Borda-#1 source's role sentence says it shaped the consensus most."""
         result = _rank_agg_result(False)
         result["verdicts"][0]["borda_rank"] = 2  # S1 second
         result["verdicts"][1]["borda_rank"] = 1  # S2 first
@@ -1086,17 +1101,25 @@ class TestBuilders(unittest.TestCase):
             "DS", "e1", "robust", 0, result,
             ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
         atoms = {a["id"]: a for a in doc["evidence"]}
-        self.assertEqual(atoms["ra_robust.output.top"]["order"], 0)
+        # S2 leads outright, so its own pick is reported against the consensus.
+        verdict = next(a for a in doc["evidence"]
+                       if a["type"] == "source_verdict")
+        self.assertEqual(verdict["value"]["source"], "S2")
+        self.assertIs(verdict["value"]["agrees"], False)
+        self.assertEqual(verdict["text"],
+                         "S2's own ranking put B first rather than the "
+                         "robustness consensus's A.")
+        self.assertEqual(atoms["ra_robust.source.S2.role"]["order"], 0)
         self.assertLess(atoms["ra_robust.source.S2.role"]["order"],
                         atoms["ra_robust.source.S1.role"]["order"])
         # S2 is Borda #1 → "shaped ... most"; S1 is Borda #2 → "second most".
-        self.assertIn("shaped the robustness consensus most (overall standing rank 1 of 2),",
+        self.assertIn("shaped the robustness consensus most, placing",
                       atoms["ra_robust.source.S2.role"]["text"])
-        self.assertIn("shaped the robustness consensus second most "
-                      "(overall standing rank 2 of 2),",
+        self.assertIn("shaped the robustness consensus "
+                      "second most, placing",
                       atoms["ra_robust.source.S1.role"]["text"])
         # Both component ranks are stated for each source (never inferred).
-        self.assertIn("ranking 1 for influence and 2 for agreement",
+        self.assertIn("placing 1st of 2 for influence and 2nd of 2 for agreement",
                       atoms["ra_robust.source.S1.role"]["text"])
         # The combined (Borda) standing is carried by the ordinal, plus value.
         self.assertEqual(atoms["ra_robust.source.S2.role"]["value"]["borda_rank"], 1)
@@ -1118,8 +1141,9 @@ class TestBuilders(unittest.TestCase):
             ["S1", "S2"], {"S1": "A", "S2": "B"}, ["A", "B"])
         lead = next(a for a in doc["evidence"]
                     if a["id"] == "ra_robust.source.S1.role")
-        self.assertIn("shaped the robustness consensus most (overall standing rank 1 of 2),", lead["text"])
-        self.assertIn("ranking 1 for influence and 1 for agreement", lead["text"])
+        self.assertIn("shaped the robustness consensus most, placing", lead["text"])
+        self.assertIn("placing 1st of 2 for influence and 1st of 2 for agreement",
+                      lead["text"])
 
     def test_monte_carlo_lean(self):
         doc = ir.build_monte_carlo_ir("DS", "e1", _mc_result(), ["A", "B"], ["B", "A"])
@@ -1146,10 +1170,11 @@ class TestBuilders(unittest.TestCase):
         self.assertIn("mc.surrogate.win_rates", doc["required_atom_ids"])
         # All winners fit inside the top-K cut here, so there is no tail clause.
         wr = next(a for a in doc["evidence"] if a["id"] == "mc.surrogate.win_rates")
+        f1 = wr["value"]["by_metric"][0]
         self.assertEqual(
             wr["text"],
-            "Across the noise sweep the trials were won by: A 60.0%, B 40.0%.")
-        self.assertEqual(wr["value"]["n_other"], 0)
+            "Measured by F1, the noise-sweep trials were won by: A 60.0%, B 40.0%.")
+        self.assertEqual(f1["n_other"], 0)
         conf = doc["confidence"]
         self.assertEqual(conf["winner_surrogate_f1"]["grade"], "high")
         # Per-model cv R² is graded confidence data, number kept visible.
@@ -1377,15 +1402,95 @@ class TestBuilders(unittest.TestCase):
         }
         doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
         wr = next(a for a in doc["evidence"] if a["id"] == "mc.surrogate.win_rates")
+        f1 = wr["value"]["by_metric"][0]
         self.assertIn("the remaining 4.0% went to 2 further detectors", wr["text"])
-        self.assertEqual(wr["value"]["n_other"], 2)
-        self.assertEqual(wr["value"]["other_share"], 0.04)
+        self.assertEqual(f1["n_other"], 2)
+        self.assertEqual(f1["other_share"], 0.04)
         # The cut detectors are still not named — that is what the cut is for.
-        self.assertNotIn("F", [m for m, _ in wr["value"]["listed"]])
+        self.assertNotIn("F", [m for m, _ in f1["listed"]])
         # Listed shares plus the tail reach 100%.
         self.assertAlmostEqual(
-            sum(r for _, r in wr["value"]["listed"]) + wr["value"]["other_share"],
+            sum(r for _, r in f1["listed"]) + f1["other_share"],
             1.0, places=6)
+
+    def test_mc_sweep_is_reported_and_compared_per_metric(self):
+        """A metric's sweep winner is only ever set against that same metric's
+        production winner: across metrics there is nothing to disagree about."""
+        result = _mc_result()
+        result["curves_vus"] = result["curves_f1"]
+        result["winner_pr"] = {"feasible": True, "train_accuracy": 0.9,
+                               "cv_accuracy": 0.8,
+                               "win_rates": {"B": 0.7, "A": 0.3}}
+        result["winner_vus"] = {"feasible": True, "train_accuracy": 0.9,
+                                "cv_accuracy": 0.8,
+                                "win_rates": {"A": 0.8, "B": 0.2}}
+        # F1 ranks A first, PR-AUC ranks B first, VUS ranks B first.
+        doc = ir.build_monte_carlo_ir("DS", "e1", result,
+                                      ["A", "B"], ["B", "A"], ["B", "A"])
+        atoms = {a["id"]: a for a in doc["evidence"]}
+        # ONE sweep atom covering every metric, not one apiece: a sentence each
+        # restated the same finding three times over.
+        wr = atoms["mc.surrogate.win_rates"]
+        self.assertIn("mc.surrogate.win_rates", doc["required_atom_ids"])
+        self.assertEqual([b["metric"] for b in wr["value"]["by_metric"]],
+                         ["F1", "PR-AUC", "VUS"])
+        self.assertEqual(
+            wr["text"],
+            "Measured by F1, the noise-sweep trials were won by: A 60.0%, "
+            "B 40.0%; while by PR-AUC, the noise-sweep trials were won by: "
+            "B 70.0%, A 30.0%; while by VUS, the noise-sweep trials were won "
+            "by: A 80.0%, B 20.0%.")
+        # F1 and PR-AUC each agree with their own production winner; only VUS
+        # disagrees (sweep A, production B), so only VUS gets a tension atom.
+        # A verdict per metric whether or not it agrees: who won the sweep is
+        # the answer either way. F1 and PR-AUC agree with their own production
+        # winner; only VUS (sweep A, production B) does not.
+        self.assertEqual([i for i in atoms if "sweep_verdict" in i],
+                         ["mc.sweep_verdict.f1", "mc.sweep_verdict.pr",
+                          "mc.sweep_verdict.vus"])
+        self.assertTrue(atoms["mc.sweep_verdict.f1"]["value"]["agree"])
+        self.assertTrue(atoms["mc.sweep_verdict.pr"]["value"]["agree"])
+        verdict = atoms["mc.sweep_verdict.vus"]
+        self.assertEqual(verdict["value"],
+                         {"metrics": ["VUS"], "agree": False,
+                          "production_top": "B", "sweep_top": "A",
+                          "sweep_top_win_rate": {"VUS": 0.8},
+                          "production_top_win_rate": {"VUS": 0.2}})
+        self.assertEqual(
+            verdict["text"],
+            "Measured by VUS, the sweep and the production run do not agree: A "
+            "won most of the noise trials, while it was B that the production "
+            "run ranked first.")
+        self.assertEqual(
+            atoms["mc.sweep_verdict.f1"]["text"],
+            "Measured by F1, the sweep and the production run agree: A won most "
+            "of the noise trials and the production run ranked it first too.")
+        self.assertEqual(doc["confidence"]["winner_surrogate_vus"]["grade"],
+                         doc["confidence"]["winner_surrogate_pr"]["grade"])
+
+    def test_mc_metrics_that_disagree_the_same_way_share_one_atom(self):
+        """Same sweep winner against the same production winner is one fact,
+        however many metrics reach it."""
+        result = _mc_result()
+        result["curves_vus"] = result["curves_f1"]
+        for k, rates in (("winner_pr", {"A": 0.7, "B": 0.3}),
+                         ("winner_vus", {"A": 0.6, "B": 0.4})):
+            result[k] = {"feasible": True, "train_accuracy": 0.9,
+                         "cv_accuracy": 0.8, "win_rates": rates}
+        # Every metric's sweep picks A; production ranks B first throughout.
+        doc = ir.build_monte_carlo_ir("DS", "e1", result,
+                                      ["B", "A"], ["B", "A"], ["B", "A"])
+        atoms = {a["id"]: a for a in doc["evidence"]}
+        self.assertEqual([i for i in atoms if "sweep_verdict" in i],
+                         ["mc.sweep_verdict.f1_pr_vus"])
+        verdict = atoms["mc.sweep_verdict.f1_pr_vus"]
+        self.assertEqual(verdict["value"]["metrics"], ["F1", "PR-AUC", "VUS"])
+        self.assertFalse(verdict["value"]["agree"])
+        self.assertEqual(
+            verdict["text"],
+            "Measured by F1, PR-AUC and VUS, the sweep and the production run "
+            "do not agree: A won most of the noise trials, while it was B that "
+            "the production run ranked first.")
 
     def test_mc_win_rates_names_the_sixth_rather_than_summarising_it(self):
         """A tail of one spends a clause withholding a name it has room for."""
@@ -1394,10 +1499,11 @@ class TestBuilders(unittest.TestCase):
             "A": 0.39, "B": 0.20, "C": 0.13, "D": 0.12, "E": 0.12, "F": 0.04}
         doc = ir.build_monte_carlo_ir("DS", "e1", result, ["A", "B"], ["B", "A"])
         wr = next(a for a in doc["evidence"] if a["id"] == "mc.surrogate.win_rates")
+        f1 = wr["value"]["by_metric"][0]
         self.assertIn("F 4.0%", wr["text"])
         self.assertNotIn("further detector", wr["text"])
-        self.assertEqual(wr["value"]["n_other"], 0)
-        self.assertEqual([m for m, _ in wr["value"]["listed"]],
+        self.assertEqual(f1["n_other"], 0)
+        self.assertEqual([m for m, _ in f1["listed"]],
                          ["A", "B", "C", "D", "E", "F"])
 
     def test_mc_winner_surrogate_rules_not_emitted_but_fidelity_kept(self):

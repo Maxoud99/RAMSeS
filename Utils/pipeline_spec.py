@@ -307,7 +307,7 @@ MIN_DETECTORS = 2
 # The narrator. Owned here, not in Explainability/llm.py, because the web UI
 # reports which model produced a set of explanations and a second copy would
 # eventually name a model that never saw them.
-DEFAULT_LLM_MODEL = "qwen2.5:14b-instruct"
+DEFAULT_LLM_MODEL = "qwen3.5:9b-mlx"
 DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
 
 

@@ -357,7 +357,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         {"id": "lints-output", "title": "The final ranking by ‖μ‖²", "blocks": (
             {"text": "The offline phase runs until every window is processed. "
                      "Afterwards the detectors are ranked by the overall size of "
-                     "their learned weights, ‖μ‖². This ranking is the branch's "
+                     "their mean vector, ‖μ‖². This ranking is the branch's "
                      "output and is what goes into the final aggregation."},
         )},
         {"id": "lints-two-views", "title": "μᵀx versus ‖μ‖²", "blocks": (
