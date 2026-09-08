@@ -32,6 +32,19 @@ except ImportError:
     HAS_FLASK = False
 
 
+
+def _strip_js_comments(src: str) -> str:
+    """`src` with /* */ and // comments removed.
+
+    The assertions below ban DOM constructs, not vocabulary. The prose in
+    configure.js explains at length why the detector pool stopped using
+    checkboxes, so a bare substring check on the source would fail on the
+    explanation for the very rule it is enforcing.
+    """
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return re.sub(r"//[^\n]*", "", src)
+
+
 # ── Fixture builders ─────────────────────────────────────────────────────────
 
 def _ir(stage, **kw):
@@ -2104,8 +2117,11 @@ class TestRoutes(ArtifactTreeCase):
         would still be a second source of truth waiting to disagree.
         """
         js = (Path(__file__).parent / "static" / "js" / "configure.js").read_text()
-        pool = js.split("function renderDetectors")[1].split("function renderTrainingBanner")[0]
-        self.assertNotIn("checkbox", pool,
+        # renderDetectors was split into renderGroupButtons / syncGroupButtons /
+        # syncDetectorButtons / familyParams / refreshDetectors, which occupy the
+        # stretch from the first of them up to the training banner.
+        pool = js.split("function renderGroupButtons")[1].split("function renderTrainingBanner")[0]
+        self.assertNotIn("checkbox", _strip_js_comments(pool),
                          "detector chips must be buttons, not checkboxes")
         self.assertIn('"data-detector"', pool)
         self.assertIn('"aria-pressed"', pool)

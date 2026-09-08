@@ -12,23 +12,17 @@ __pycache__/
 
 # Outputs / results
 myresults/
-old/
 Mononito/
 Mononito
 output/
 Outputs/
 docs/
+# Consolidated 2026-09-08: archive/ also holds the former
+# results_{skab,skab-old,smd,ucr}/, testbed_results_{test,collected}/,
+# Plots/, important-new-graphs/ and old/.
 archive/
-results_smd/
-results_ucr/
-results_skab/
-results_skab-old/
-important-new-graphs/
 dataset_lists/
-Plots/
 testbed_results/
-testbed_results_test/
-testbed_results_collected/
 Misc/
 results/
 shells/
@@ -53,9 +47,7 @@ Algorithms/tsb_ad/models/Series2Graph.py
 .mypy_cache/
 .ruff_cache/
 
-# Editor state (tracked historically; untracked 2026-09-08)
-.idea/
-.venv/
+# Editor state; .idea/ and .venv/ are listed at the top of this file.
 venv/
 
 # Scratch and one-off debug output
@@ -64,3 +56,7 @@ output1.txt
 
 # Paper/demo working directory (large PDFs, drafts)
 demo_paper_prep/
+
+# Trained checkpoints for a single SMD entity; nothing in the codebase
+# loads them (grep for saved_models returns only this line).
+saved_models/
