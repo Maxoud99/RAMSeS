@@ -14,8 +14,8 @@ entity: '2'  # Can be a single entity '2' or list ['1', '2', '3']
 
 # Model training parameters
 downsampling: 10
-trained_model_path: "/home/maxoud/local-storage/projects/RAMSeS/Mononito/trained_models"
-dataset_path: "/home/maxoud/local-storage/projects/RAMSeS/Mononito/datasets"
+trained_model_path: "/raid0_ssd2/maxoud/projects/RAMSeS/Mononito/trained_models"
+dataset_path: "/raid0_ssd2/maxoud/projects/RAMSeS/Mononito/datasets"
 
 min_length: 256
 verbose: True
@@ -24,7 +24,7 @@ model_architectures: 'all'
 
 # Model evaluation parameters
 normalize: True
-results_path: "/home/maxoud/local-storage/projects/RAMSeS/Mononito/results"
+results_path: "/raid0_ssd2/maxoud/projects/RAMSeS/Mononito/results"
 
 n_repeats: 2
 split: 'test'

@@ -132,10 +132,20 @@ RAMSeS uses the **Mononito** time-series repository ([arXiv:2210.01078](https://
    └── trained_models/  # Created during training
    ```
 
-3. **Update configuration** in `Configs/config.yml`:
+3. **Symlink it into the repo** (recommended) so the relative paths baked into
+   the code — e.g. `Model_Training/train.py`'s `save_dir='Mononito/trained_models'`
+   — keep working, and the bulk data stays out of the repo tree:
+   ```bash
+   ln -s /path/to/Mononito Mononito   # Mononito/ is gitignored
+   ```
+
+4. **Update configuration** in `Configs/config.yml`. These values are used
+   verbatim (they are *not* resolved against the repo root), so use absolute
+   paths. Pointing them at the symlink means a future data move only requires
+   re-pointing the symlink:
    ```yaml
-   dataset_path: "/path/to/Mononito/datasets"
-   trained_model_path: "/path/to/Mononito/trained_models"
+   dataset_path: "/path/to/RAMSeS/Mononito/datasets"
+   trained_model_path: "/path/to/RAMSeS/Mononito/trained_models"
    ```
 
 > **Licensing Note:** Please follow the original dataset licenses and cite the appropriate papers when using these datasets.

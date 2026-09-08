@@ -14,6 +14,7 @@ __pycache__/
 myresults/
 old/
 Mononito/
+Mononito
 output/
 Outputs/
 docs/
@@ -41,3 +42,25 @@ RAMS-TSAD-Up-to-date.zip
 #   python -m Algorithms.tsb_ad.fetch_series2graph
 # See Algorithms/series2graph_detector.py for why.
 Algorithms/tsb_ad/models/Series2Graph.py
+
+# Model checkpoints and binaries (see also *.pkl above)
+*.pth
+*.pt
+*.ckpt
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor state (tracked historically; untracked 2026-09-08)
+.idea/
+.venv/
+venv/
+
+# Scratch and one-off debug output
+output1.txt
+*.pptx
+
+# Paper/demo working directory (large PDFs, drafts)
+demo_paper_prep/
