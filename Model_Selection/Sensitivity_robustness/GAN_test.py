@@ -9,10 +9,12 @@ import tensorflow as tf
 from loguru import logger
 from tensorflow.keras import layers, models
 
-from Metrics.metrics import range_based_precision_recall_f1_auc, prauc, f1_score
+from Metrics.metrics import (range_based_precision_recall_f1_auc, prauc, f1_score,
+                             rank_key, vus_score, vus_window)
 from Model_Selection.Sensitivity_robustness.plot_retention import (
     prune_superseded, prune_timestamped)
-from Utils.model_selection_utils import evaluate_model
+from Utils.model_selection_utils import evaluate_model, ScoringTimeout
+from Utils.pipeline_spec import DEFAULT_DECISION_METRICS, metrics_required
 from Explainability import ir
 from Model_Selection.Sensitivity_robustness import exclusive_win_surrogates as ews
 
@@ -293,7 +295,8 @@ def integrate_gan_with_dataset(data, labels, factor=0.1, return_records=False):
 
 
 
-def run_Gan(test_data, trained_models, model_names, dataset, entity, explain=False):
+def run_Gan(test_data, trained_models, model_names, dataset, entity, explain=False,
+            metrics=DEFAULT_DECISION_METRICS):
     # Validation: Check if data is too small for GAN testing
     data = test_data.entities[0].Y
     labels = test_data.entities[0].labels
@@ -307,13 +310,13 @@ def run_Gan(test_data, trained_models, model_names, dataset, entity, explain=Fal
     
     if data_size < min_data_size:
         logger.warning(f"GAN test skipped: data size {data_size} < minimum {min_data_size}")
-        return [], [], [], []
+        return [], [], [], [], []
     
     # Check if we have both classes (anomalies and normal points)
     unique_labels = np.unique(labels)
     if len(unique_labels) < 2:
         logger.warning(f"GAN test skipped: only one class present in labels (unique values: {unique_labels})")
-        return [], [], [], []
+        return [], [], [], [], []
     
     # Get the current date and time
     now = datetime.now()
@@ -335,30 +338,39 @@ def run_Gan(test_data, trained_models, model_names, dataset, entity, explain=Fal
                                    injected_anomaly_indices, dataset, entity)
     results = {}
     adjusted_y_pred_dict = {}
+    # One window for the whole stage, taken from the augmented series these
+    # detectors are actually scored on, so their VUS values compare.
+    want_vus = 'vus' in metrics_required(metrics)
+    vus_win = vus_window(test_data.entities[0].Y) if want_vus else None
     for model_name in model_names:
         model = trained_models.get(model_name)
-        results[model_name] = []
-        adjusted_y_pred_dict[model_name] = []
-        if model:
+        if not model:
+            continue
+        try:
             evaluation = evaluate_model(test_data, model, model_name)  # Assume this function returns a dict
-            y_true = evaluation['anomaly_labels'].flatten()
-            y_scores = evaluation['entity_scores'].flatten()
-            _, _, best_f1, pr_auc, adjusted_y_pred = range_based_precision_recall_f1_auc(y_true, y_scores)
-            adjusted_y_pred_dict[model_name].append(adjusted_y_pred)
-            results[model_name].append({'f1': best_f1, 'pr_auc': pr_auc})
-            logger.info(f"Evaluated {model_name}: F1={best_f1}, PR_AUC={pr_auc}")
+        except ScoringTimeout:
+            continue
+        y_true = evaluation['anomaly_labels'].flatten()
+        y_scores = evaluation['entity_scores'].flatten()
+        _, _, best_f1, pr_auc, adjusted_y_pred = range_based_precision_recall_f1_auc(y_true, y_scores)
+        vus = vus_score(y_scores, y_true, vus_win) if want_vus else float('nan')
+        adjusted_y_pred_dict[model_name] = [adjusted_y_pred]
+        results[model_name] = [{'f1': best_f1, 'pr_auc': pr_auc, 'vus': vus}]
+        logger.info(f"Evaluated {model_name}: F1={best_f1}, PR_AUC={pr_auc}, VUS={vus}")
 
     # Filter out models with no results before sorting
     valid_results = {k: v for k, v in results.items() if len(v) > 0}
     
     if not valid_results:
         logger.warning("No valid GAN test results found, skipping ranking")
-        return [], [], [], []
+        return [], [], [], [], []
     
     ranked_by_f1 = sorted(valid_results.items(), key=lambda x: x[1][0]['f1'], reverse=True)
     ranked_by_f1_names = [item[0] for item in ranked_by_f1]
     ranked_by_pr_auc = sorted(valid_results.items(), key=lambda x: x[1][0]['pr_auc'], reverse=True)
     ranked_by_pr_auc_names = [item[0] for item in ranked_by_pr_auc]
+    ranked_by_vus_names = [item[0] for item in sorted(
+        valid_results.items(), key=lambda x: rank_key(x[1][0]['vus']), reverse=True)] if want_vus else []
 
     true_values = np.array(test_data.entities[0].labels).flatten()  # 1 for anomaly, 0 for normal, FLATTEN to 1D
     print(10 * '=')
@@ -411,7 +423,8 @@ def run_Gan(test_data, trained_models, model_names, dataset, entity, explain=Fal
         except Exception as e:
             logger.error(f"GAN robustness explainability failed (non-fatal): {e}")
 
-    return ranked_by_f1, ranked_by_pr_auc, ranked_by_f1_names, ranked_by_pr_auc_names
+    return (ranked_by_f1, ranked_by_pr_auc, ranked_by_f1_names,
+            ranked_by_pr_auc_names, ranked_by_vus_names)
 
 def plot_data_with_injected_points(original_data, augmented_data, injected_normal_indices, injected_anomaly_indices,
                                    dataset, entity, feature_index=0):
@@ -496,7 +509,7 @@ def build_gan_point_table(point_records, adjusted_y_pred_dict, true_labels,
 
     Features (model-independent properties of the generated point), one row per
     injected point: ambiguity (|D(x) - tau|, paper Eq. 7), is_anomaly (the Eq. 9
-    label), signal_magnitude and signal_spread across channels, context_gap and
+    label), signal_magnitude and signal_spread across the injected point's features, context_gap and
     local_volatility at the injection site, and position (index / N).
     `correct[i, m]` = (model m's production prediction at the point's index ==
     the point's label). No model inference is run here.

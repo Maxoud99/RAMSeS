@@ -24,7 +24,10 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from Utils.pipeline_spec import ALL_DETECTORS, ALL_STAGES, OFFLINE_ITERATION
+from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES,
+                                 DEFAULT_ANOMALY_TYPE, DEFAULT_DECISION_METRICS,
+                                 format_decision_metrics, OFFLINE_ITERATION,
+                                 parse_decision_metrics)
 from WebUI import artifacts, markers, paths
 
 LOG_RING = 20000            # lines kept in memory; the full log also goes to disk
@@ -48,6 +51,23 @@ def build_argv(params: Dict[str, Any]) -> List[str]:
             "--dataset", dataset,
             "--entity", entity,
             "--parallel", "true" if params.get("parallel") else "false"]
+
+    anomaly_type = str(params.get("anomaly_type") or "").strip().lower()
+    if anomaly_type and anomaly_type != DEFAULT_ANOMALY_TYPE:
+        argv += ["--anomaly_type", anomaly_type]
+    if params.get("anomaly_rate") is not None:
+        argv += ["--anomaly_rate", str(float(params["anomaly_rate"]))]
+
+    metrics = params.get("decision_metrics") or params.get("decision_metric")
+    if isinstance(metrics, str):
+        metrics = [metrics]
+    if metrics:
+        try:
+            spec = parse_decision_metrics(metrics)
+        except ValueError:
+            spec = DEFAULT_DECISION_METRICS
+        if spec != DEFAULT_DECISION_METRICS:
+            argv += ["--decision_metric", format_decision_metrics(spec)]
 
     if params.get("iteration") is not None:
         argv += ["--iteration", str(int(params["iteration"]))]

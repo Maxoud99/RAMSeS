@@ -18,6 +18,10 @@ from Utils.plot_labels import draw_abbreviation_key
 
 from Metrics.Ensemble_GA import evaluate_individual_models
 from Metrics.Ensemble_GA import evaluate_model_consistently
+from Utils.model_selection_utils import timed_out_detectors
+from Utils.pipeline_spec import (DEFAULT_DECISION_METRICS, combine_metrics,
+                                 metrics_required)
+from Metrics.metrics import vus_score, vus_window
 from Metrics.metrics import prauc, range_based_precision_recall_f1_auc
 from Explainability import ir
 
@@ -276,90 +280,90 @@ def compute_shap_values(mean: np.ndarray, context: np.ndarray, baseline: np.ndar
     return mean.flatten() * (context.flatten() - baseline.flatten())
 
 
-def aggregate_shap_per_channel(shap_values: np.ndarray, n_channels: int) -> np.ndarray:
+def aggregate_shap_per_context_feature(shap_values: np.ndarray, n_context_features: int) -> np.ndarray:
     """
-    Sum SHAP values within each channel's window-of-timesteps slice.
+    Sum SHAP values within each context feature's window-of-timesteps slice.
 
-    The flattened feature vector is assumed to be reshape(n_channels, window_size)
-    flattened in C-order (numpy default), so feature i belongs to channel i // window_size.
+    The flattened feature vector is assumed to be reshape(n_context_features, window_size)
+    flattened in C-order (numpy default), so feature i belongs to context feature i // window_size.
 
-    If shap_values.size is not divisible by n_channels (should not happen after the
+    If shap_values.size is not divisible by n_context_features (should not happen after the
     n_features fix), trailing entries are dropped.
 
     Parameters
     ----------
     shap_values : np.ndarray
         Per-feature SHAP values, shape (d,).
-    n_channels : int
-        Number of sensor channels.
+    n_context_features : int
+        Number of context features.
 
     Returns
     -------
     np.ndarray
-        Per-channel contributions, shape (n_channels,).
+        Per-context-feature contributions, shape (n_context_features,).
     """
-    if n_channels <= 0:
+    if n_context_features <= 0:
         return np.zeros(0)
-    window_size = shap_values.size // n_channels
+    window_size = shap_values.size // n_context_features
     if window_size == 0:
-        return np.zeros(n_channels)
-    return shap_values[: n_channels * window_size].reshape(n_channels, window_size).sum(axis=1)
+        return np.zeros(n_context_features)
+    return shap_values[: n_context_features * window_size].reshape(n_context_features, window_size).sum(axis=1)
 
 
-def reward_contribution_per_channel(mean: np.ndarray, context: np.ndarray,
-                                    n_channels: int) -> np.ndarray:
+def reward_contribution_per_context_feature(mean: np.ndarray, context: np.ndarray,
+                                    n_context_features: int) -> np.ndarray:
     """
-    Split the expected reward mu^T x into one contribution per channel.
+    Split the expected reward mu^T x into one contribution per context feature.
 
-    contrib(c) = sum over channel c's timesteps of mu_i * x_i, so the parts sum
+    contrib(c) = sum over context feature c's timesteps of mu_i * x_i, so the parts sum
     to mu^T x EXACTLY — the model has no intercept, so there is no remainder.
 
-    This is the honest answer to "how much does this channel contribute to this
+    This is the honest answer to "how much does this context feature contribute to this
     detector's expected reward". SHAP answers a different question: it measures
-    each channel's deviation from a TYPICAL window, so it explains only
+    each context feature's deviation from a TYPICAL window, so it explains only
     mu^T x - mu^T baseline and discards the constant mu^T baseline, which is
     usually the bulk of the prediction. Worse for any averaged view, the signed
     SHAP average over all windows is identically zero by construction, because
     the baseline IS the mean of those windows.
 
     Signed: mu and the (L2-normalised) context can both be negative, so a
-    channel can pull the expected reward down.
+    context feature can pull the expected reward down.
     """
-    if n_channels <= 0:
+    if n_context_features <= 0:
         return np.zeros(0)
     mu, x = mean.flatten(), context.flatten()
     d = min(mu.size, x.size)
-    window_size = d // n_channels
+    window_size = d // n_context_features
     if window_size == 0:
-        return np.zeros(n_channels)
-    keep = n_channels * window_size
-    return (mu[:keep] * x[:keep]).reshape(n_channels, window_size).sum(axis=1)
+        return np.zeros(n_context_features)
+    keep = n_context_features * window_size
+    return (mu[:keep] * x[:keep]).reshape(n_context_features, window_size).sum(axis=1)
 
 
-def _per_channel_reward_map(
+def _per_context_feature_reward_map(
     means: Dict[str, np.ndarray],
     top_models: List[str],
     context: np.ndarray,
-    n_channels: int,
+    n_context_features: int,
 ) -> Dict[str, np.ndarray]:
-    """Per-channel expected-reward contribution for each model at one context."""
-    return {m: reward_contribution_per_channel(means[m], context, n_channels)
+    """Per-context-feature expected-reward contribution for each model at one context."""
+    return {m: reward_contribution_per_context_feature(means[m], context, n_context_features)
             for m in top_models}
 
 
-def _avg_per_channel_reward_map(
+def _avg_per_context_feature_reward_map(
     means: Dict[str, np.ndarray],
     top_models: List[str],
     contexts: List[np.ndarray],
-    n_channels: int,
+    n_context_features: int,
     means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Per-channel reward contribution averaged over a list of contexts.
+    Per-context-feature reward contribution averaged over a list of contexts.
 
     No `absolute` switch, unlike the SHAP version: this average is not
     structurally zero, so the signed mean is the meaningful quantity and there
-    is nothing to work around. Averaged over every window it is each channel's
+    is nothing to work around. Averaged over every window it is each context feature's
     share of the detector's expected reward on a typical window.
 
     `means_per_context` explains window t with the beliefs held at window t;
@@ -369,7 +373,7 @@ def _avg_per_channel_reward_map(
     n = max(len(contexts), 1)
     for m in top_models:
         mu_fixed = means[m].flatten() if means_per_context is None else None
-        acc = np.zeros(n_channels)
+        acc = np.zeros(n_context_features)
         for i, ctx in enumerate(contexts):
             if mu_fixed is not None:
                 mu = mu_fixed
@@ -377,24 +381,24 @@ def _avg_per_channel_reward_map(
                 if i >= len(means_per_context) or m not in means_per_context[i]:
                     continue
                 mu = np.asarray(means_per_context[i][m]).flatten()
-            acc += reward_contribution_per_channel(mu, ctx, n_channels)
+            acc += reward_contribution_per_context_feature(mu, ctx, n_context_features)
         out[m] = acc / n
     return out
 
 
-def aggregate_squared_per_channel(mean: np.ndarray, n_channels: int) -> np.ndarray:
+def aggregate_squared_per_context_feature(mean: np.ndarray, n_context_features: int) -> np.ndarray:
     """
-    Split the ranking score ||mu||^2 into one contribution per channel.
+    Split the ranking score ||mu||^2 into one contribution per context feature.
 
     The ranking criterion is mu^T mu = sum_i mu_i^2, and the flattened feature
-    vector lays channels out in contiguous blocks of window_size timesteps (the
-    same layout aggregate_shap_per_channel assumes), so channel c contributes
+    vector lays context features out in contiguous blocks of window_size timesteps (the
+    same layout aggregate_shap_per_context_feature assumes), so context feature c contributes
 
         contrib(c) = sum_{i in block c} mu_i^2
 
     and sum_c contrib(c) == ||mu||^2 exactly. Unlike a SHAP attribution this is
     a sum of squares, so **every contribution is non-negative**: it says how a
-    detector's score is divided among channels, never which channels pushed it
+    detector's score is divided among context features, never which context features pushed it
     down. Only a comparison between two detectors (rank_gap_decomposition) is
     signed.
 
@@ -402,41 +406,41 @@ def aggregate_squared_per_channel(mean: np.ndarray, n_channels: int) -> np.ndarr
     ----------
     mean : np.ndarray
         The posterior mean mu_k. May be 1-D (d,) or column (d, 1).
-    n_channels : int
-        Number of sensor channels.
+    n_context_features : int
+        Number of context features.
 
     Returns
     -------
     np.ndarray
-        Per-channel contributions to ||mu||^2, shape (n_channels,), all >= 0.
+        Per-context-feature contributions to ||mu||^2, shape (n_context_features,), all >= 0.
     """
-    if n_channels <= 0:
+    if n_context_features <= 0:
         return np.zeros(0)
     mu = mean.flatten()
-    window_size = mu.size // n_channels
+    window_size = mu.size // n_context_features
     if window_size == 0:
-        return np.zeros(n_channels)
-    block = mu[: n_channels * window_size].reshape(n_channels, window_size)
+        return np.zeros(n_context_features)
+    block = mu[: n_context_features * window_size].reshape(n_context_features, window_size)
     return np.square(block).sum(axis=1)
 
 
 def rank_gap_decomposition(mean_a: np.ndarray, mean_b: np.ndarray,
-                           n_channels: int) -> np.ndarray:
+                           n_context_features: int) -> np.ndarray:
     """
-    Split the ranking gap ||mu_a||^2 - ||mu_b||^2 into one term per channel.
+    Split the ranking gap ||mu_a||^2 - ||mu_b||^2 into one term per context feature.
 
-    This is the signed counterpart of aggregate_squared_per_channel: it sums to
-    the margin exactly, and a negative entry means that channel was worked in
+    This is the signed counterpart of aggregate_squared_per_context_feature: it sums to
+    the margin exactly, and a negative entry means that context feature was worked in
     B's favour, i.e. it cost A part of its lead. This — not the per-detector
-    split — is what answers "which channels put A ahead of B".
+    split — is what answers "which context features put A ahead of B".
 
     Returns
     -------
     np.ndarray
-        Per-channel signed contributions to the gap, shape (n_channels,).
+        Per-context-feature signed contributions to the gap, shape (n_context_features,).
     """
-    return (aggregate_squared_per_channel(mean_a, n_channels)
-            - aggregate_squared_per_channel(mean_b, n_channels))
+    return (aggregate_squared_per_context_feature(mean_a, n_context_features)
+            - aggregate_squared_per_context_feature(mean_b, n_context_features))
 
 
 def detect_regime_shifts(
@@ -656,7 +660,8 @@ def fit_linear_thompson_sampling(dataset,
                                  initial_epsilon: float = 0.2,
                                  epsilon_decay: float = 0.99, f1_weight: float = 0.7, pr_auc_weight: float = 0.3,
                                  iterations: int = 100,
-                                 explain: bool = False) -> Tuple[
+                                 explain: bool = False, metrics=DEFAULT_DECISION_METRICS,
+                                 vus_win=None) -> Tuple[
     Dict[str, np.ndarray], Dict[str, np.ndarray], List[Dict[str, float]]]:
     """
     Fit models using Linear Thompson Sampling.
@@ -688,8 +693,8 @@ def fit_linear_thompson_sampling(dataset,
     data_windows, targets_windows, New_mask, num_windows = initialize_sliding_windows(data, targets, mask, int(np.size(
         targets.flatten()) / iterations), int(np.size(targets.flatten()) / (2 * iterations)))
 
-    # n_features should be the flattened window length (n_channels * window_size)
-    # data_windows elements have shape (n_channels, window_size), so flatten to get full feature length
+    # n_features should be the flattened window length (n_context_features * window_size)
+    # data_windows elements have shape (n_context_features, window_size), so flatten to get full feature length
     n_features = data_windows[0].flatten().shape[0]
     means = {model_name: np.zeros((n_features, 1)) for model_name in models}
     covariances = {model_name: np.eye(n_features) for model_name in models}
@@ -709,13 +714,22 @@ def fit_linear_thompson_sampling(dataset,
 
     for iteration in range(num_windows):
         logger.info(f"Iteration {iteration + 1}")
+        # Offered to the sampler, but never removed from `models`: every
+        # per-model history keeps one entry per window, including the nan rows
+        # the error path below writes.
+        candidates = {m: v for m, v in models.items()
+                      if m not in timed_out_detectors()}
+        if not candidates:
+            logger.error("Every detector has been killed for slowness; "
+                         "no arm left to sample.")
+            break
         try:
             # Pass the current window as context so selection uses theta_tilde^T * x.
             # Normalise to unit length so that datasets with large sensor values
-            # (e.g. SMD with 38 channels) do not cause xxᵀ to explode and collapse Σ.
+            # (e.g. SMD with 38 context features) do not cause xxᵀ to explode and collapse Σ.
             context = data_windows[iteration].flatten()
             context = context / (np.linalg.norm(context) + 1e-10)
-            chosen_model_name, was_random = sample_model(models, means, covariances, epsilon, context)
+            chosen_model_name, was_random = sample_model(candidates, means, covariances, epsilon, context)
         except ValueError as e:
             logger.error(f"Error sampling model: {e}")
             continue  # Skip to the next iteration on error
@@ -763,7 +777,13 @@ def fit_linear_thompson_sampling(dataset,
             _, _, f1, _range_pr_auc, _ = range_based_precision_recall_f1_auc(y_true, y_scores)
 
             pr_auc = prauc(y_true, y_scores)
-            reward = calculate_reward(f1, pr_auc, f1_weight, pr_auc_weight)
+            # One vus_win for every window, so rewards stay on one scale.
+            vus = (vus_score(y_scores, y_true, vus_win)
+                   if 'vus' in metrics_required(metrics) and vus_win is not None
+                   else float('nan'))
+            reward = combine_metrics(metrics, {'f1': f1, 'pr_auc': pr_auc, 'vus': vus})
+            if np.isnan(reward):
+                reward = calculate_reward(f1, pr_auc, f1_weight, pr_auc_weight)
             # Normalise features to unit length — must match the normalisation applied
             # to context above so that θ̃ᵀx (selection) and the posterior update operate
             # in the same feature space.
@@ -821,7 +841,7 @@ def fit_linear_thompson_sampling(dataset,
         # processed (_window_contexts), which stays index-aligned with the regime
         # detection and the explainability histories. Each context is already
         # L2-normalised. all_contexts enables per-window / per-regime SHAP plots.
-        n_channels = data_windows[0].shape[0] if data_windows else 0
+        n_context_features = data_windows[0].shape[0] if data_windows else 0
         if _window_contexts:
             baseline_context = np.mean(_window_contexts, axis=0)
             explanation_context = _window_contexts[-1]
@@ -832,7 +852,7 @@ def fit_linear_thompson_sampling(dataset,
             "explanation_context": explanation_context,
             "baseline_context": baseline_context,
             "all_contexts": _window_contexts,
-            "n_channels": n_channels,
+            "n_channels": n_context_features,
             # Per-window pre-update means; SHAP uses means_history[t] with
             # all_contexts[t] so every attribution reflects the beliefs held
             # when that window was decided.
@@ -1136,17 +1156,17 @@ def _top_k_models_by_expected_reward(
     return [name for name, _ in ranked[:k]]
 
 
-def _per_channel_shap_map(
+def _per_context_feature_shap_map(
     means: Dict[str, np.ndarray],
     top_models: List[str],
     context: np.ndarray,
     baseline: np.ndarray,
-    n_channels: int,
+    n_context_features: int,
 ) -> Dict[str, np.ndarray]:
-    """Per-channel SHAP for each model at a single context (raw, signed)."""
+    """Per-context-feature SHAP for each model at a single context (raw, signed)."""
     return {
-        m: aggregate_shap_per_channel(
-            compute_shap_values(means[m].flatten(), context, baseline), n_channels)
+        m: aggregate_shap_per_context_feature(
+            compute_shap_values(means[m].flatten(), context, baseline), n_context_features)
         for m in top_models
     }
 
@@ -1172,21 +1192,21 @@ def _fresh_plot_dir(directory: str) -> str:
     return directory
 
 
-def _avg_per_channel_shap_map(
+def _avg_per_context_feature_shap_map(
     means: Dict[str, np.ndarray],
     top_models: List[str],
     contexts: List[np.ndarray],
     baseline: np.ndarray,
-    n_channels: int,
+    n_context_features: int,
     absolute: bool = False,
     means_per_context: Optional[List[Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Per-channel SHAP for each model, averaged over a list of contexts.
+    Per-context-feature SHAP for each model, averaged over a list of contexts.
 
     absolute=False : raw signed average (meaningful for a regime, whose mean
                      context differs from the global baseline).
-    absolute=True  : mean of |per-channel SHAP| — the standard SHAP global-
+    absolute=True  : mean of |per-context-feature SHAP| — the standard SHAP global-
                      importance measure. Required for the whole-data average,
                      where the raw signed average is identically zero because
                      the baseline IS the mean of all contexts.
@@ -1201,7 +1221,7 @@ def _avg_per_channel_shap_map(
     n = max(len(contexts), 1)
     for m in top_models:
         mu_fixed = means[m].flatten() if means_per_context is None else None
-        acc = np.zeros(n_channels)
+        acc = np.zeros(n_context_features)
         for i, ctx in enumerate(contexts):
             if mu_fixed is not None:
                 mu = mu_fixed
@@ -1209,35 +1229,35 @@ def _avg_per_channel_shap_map(
                 if i >= len(means_per_context) or m not in means_per_context[i]:
                     continue
                 mu = np.asarray(means_per_context[i][m]).flatten()
-            pc = aggregate_shap_per_channel(compute_shap_values(mu, ctx, baseline), n_channels)
+            pc = aggregate_shap_per_context_feature(compute_shap_values(mu, ctx, baseline), n_context_features)
             acc += np.abs(pc) if absolute else pc
         out[m] = acc / n
     return out
 
 
 def _render_shap_comparison(
-    per_channel_by_model: Dict[str, np.ndarray],
+    per_context_feature_by_model: Dict[str, np.ndarray],
     top_models: List[str],
-    top_n_channels: int,
+    top_n_context_features: int,
     title: str,
     save_path: str,
-    ylabel: str = 'Per-channel SHAP contribution',
-    n_channels_total: Optional[int] = None,
+    ylabel: str = 'Per-context-feature SHAP contribution',
+    n_context_features_total: Optional[int] = None,
     note: Optional[str] = None,
 ) -> None:
     """
-    Shared grouped-bar renderer for per-channel comparison plots. Channels shown
-    are the union of each model's top_n_channels by |per-channel value|. One bar
-    per model per channel; legend placed outside the plot area.
+    Shared grouped-bar renderer for per-context-feature comparison plots. Context features shown
+    are the union of each model's top_n_context_features by |per-context-feature value|. One bar
+    per model per context feature; legend placed outside the plot area.
 
     `ylabel` names the quantity: the SHAP stage leaves the default, the ranking
     stage passes the ||mu||^2 wording. Everything else about the two is identical,
     so they share this renderer rather than a near-copy of it.
 
-    A footnote stating the channel-selection rule is added automatically, and
+    A footnote stating the context feature-selection rule is added automatically, and
     `note` is prepended to it. Every one of these figures shows a SUBSET of the
-    channels — datasets here carry 9 to 38 — and a reader cannot tell from the
-    bars alone whether an absent channel was small or simply not plotted. The
+    context features — datasets here carry 9 to 38 — and a reader cannot tell from the
+    bars alone whether an absent context feature was small or simply not plotted. The
     rule is generated here rather than written out at each call site so it can
     never drift from the selection the code just performed.
     """
@@ -1250,40 +1270,40 @@ def _render_shap_comparison(
         "ytick.labelsize": 10,
     })
 
-    candidate_channels: set = set()
+    candidate_context_features: set = set()
     for m in top_models:
-        per_channel = per_channel_by_model[m]
-        order = np.argsort(np.abs(per_channel))[::-1][:top_n_channels]
-        candidate_channels.update(int(c) for c in order)
-    channels = sorted(candidate_channels)
-    if not channels:
+        per_context_feature = per_context_feature_by_model[m]
+        order = np.argsort(np.abs(per_context_feature))[::-1][:top_n_context_features]
+        candidate_context_features.update(int(c) for c in order)
+    selected = sorted(candidate_context_features)
+    if not selected:
         return
 
     n_models = len(top_models)
     bar_width = 0.8 / max(n_models, 1)
-    x_base = np.arange(len(channels))
+    x_base = np.arange(len(selected))
     colour_map = {name: plt.cm.tab20(i / max(n_models, 1)) for i, name in enumerate(top_models)}
 
-    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(channels) + 4), 5))
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(selected) + 4), 5))
     for i, m in enumerate(top_models):
-        vals = per_channel_by_model[m][channels]
+        vals = per_context_feature_by_model[m][selected]
         ax.bar(x_base + i * bar_width, vals, bar_width,
                label=m, color=colour_map[m])
 
     ax.axhline(0, color='black', linewidth=0.6)
     ax.set_xticks(x_base + bar_width * (n_models - 1) / 2)
-    ax.set_xticklabels([f"ch{c}" for c in channels], rotation=45, ha='right')
-    ax.set_xlabel('Channel')
+    ax.set_xticklabels([f"cf{c}" for c in selected], rotation=45, ha='right')
+    ax.set_xlabel('Context feature')
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, axis='y', linestyle='--', linewidth=0.5, alpha=0.6)
     ax.legend(loc='upper left', frameon=False, bbox_to_anchor=(1.01, 1), borderaxespad=0)
 
-    scope = (f"{len(channels)} of {n_channels_total}" if n_channels_total
-             else f"{len(channels)}")
-    rule = (f"Channels shown ({scope}): the union over the plotted detectors of "
-            f"each one's {top_n_channels} largest |values|. A channel absent "
-            f"here was outside every plotted detector's top {top_n_channels}, "
+    scope = (f"{len(selected)} of {n_context_features_total}" if n_context_features_total
+             else f"{len(selected)}")
+    rule = (f"Context features shown ({scope}): the union over the plotted detectors of "
+            f"each one's {top_n_context_features} largest |values|. A context feature absent "
+            f"here was outside every plotted detector's top {top_n_context_features}, "
             f"not necessarily zero.")
     ax.text(0.0, -0.17, ((note + "  ") if note else "") + rule,
             transform=ax.transAxes, fontsize=7.5, color='dimgrey',
@@ -1302,11 +1322,11 @@ def plot_shap_per_model(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 10,
+    top_n_context_features: int = 10,
 ) -> None:
     """
     For the top_k_models (by ||mu||^2), draw horizontal bar charts of the
-    top_n_channels with the largest |per-channel SHAP| contribution at the
+    top_n_context_features with the largest |per-context-feature SHAP| contribution at the
     explanation context. Bars are coloured by sign (green > 0, red < 0).
 
     Saves to myresults/Thomposon/{dataset}/{entity}/shap_per_model_{iterations}.png.
@@ -1325,7 +1345,7 @@ def plot_shap_per_model(
 
     context = shap_payload["explanation_context"]
     baseline = shap_payload["baseline_context"]
-    n_channels = shap_payload["n_channels"]
+    n_context_features = shap_payload["n_channels"]
 
     top_models = _top_k_models_by_norm(means, top_k_models)
     k = len(top_models)
@@ -1339,12 +1359,12 @@ def plot_shap_per_model(
     for ax, model_name in zip(axes, top_models):
         mu = means[model_name].flatten()
         shap_vals = compute_shap_values(mu, context, baseline)
-        per_channel = aggregate_shap_per_channel(shap_vals, n_channels)
+        per_context_feature = aggregate_shap_per_context_feature(shap_vals, n_context_features)
         e_r = float(np.dot(mu, context))
 
-        order = np.argsort(np.abs(per_channel))[::-1][:top_n_channels]
-        vals = per_channel[order]
-        labels = [f"ch{c}" for c in order]
+        order = np.argsort(np.abs(per_context_feature))[::-1][:top_n_context_features]
+        vals = per_context_feature[order]
+        labels = [f"cf{c}" for c in order]
         colours = ["#2ca02c" if v >= 0 else "#d62728" for v in vals]
 
         y_pos = np.arange(len(order))
@@ -1353,7 +1373,7 @@ def plot_shap_per_model(
         ax.set_yticklabels(labels)
         ax.invert_yaxis()
         ax.axvline(0, color='black', linewidth=0.6)
-        ax.set_xlabel('Per-channel SHAP contribution')
+        ax.set_xlabel('Per-context-feature SHAP contribution')
         ax.set_title(f"{model_name}  |  E[R | last] = {e_r:+.4f}")
         ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
 
@@ -1371,13 +1391,13 @@ def plot_shap_comparison(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 9,
+    top_n_context_features: int = 9,
     all_models: bool = False,
 ) -> None:
     """
-    Grouped bar chart comparing models on the channels most relevant to their
-    disagreement at the last window. Channels shown are the union of each model's
-    top_n_channels by |per-channel SHAP|.
+    Grouped bar chart comparing models on the context features most relevant to their
+    disagreement at the last window. Context features shown are the union of each model's
+    top_n_context_features by |per-context-feature SHAP|.
 
     all_models : bool
         When False (default) the top_k_models by ||mu||^2 are shown, saved as
@@ -1389,7 +1409,7 @@ def plot_shap_comparison(
 
     context = shap_payload["explanation_context"]
     baseline = shap_payload["baseline_context"]
-    n_channels = shap_payload["n_channels"]
+    n_context_features = shap_payload["n_channels"]
 
     if all_models:
         sel_models = _top_k_models_by_norm(means, len(means))
@@ -1400,12 +1420,12 @@ def plot_shap_comparison(
     if not sel_models:
         return
 
-    per_channel = _per_channel_shap_map(means, sel_models, context, baseline, n_channels)
+    per_context_feature = _per_context_feature_shap_map(means, sel_models, context, baseline, n_context_features)
     _render_shap_comparison(
-        per_channel, sel_models, top_n_channels,
+        per_context_feature, sel_models, top_n_context_features,
         title=title,
         save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_comparison{suffix}_{iterations}.png',
-        n_channels_total=n_channels,
+        n_context_features_total=n_context_features,
     )
 
 
@@ -1422,24 +1442,24 @@ def _plot_per_regime(
     *,
     stem: str,
     title_prefix: str,
-    per_channel_fn,
+    per_context_feature_fn,
     note_fn,
     ylabel: Optional[str] = None,
     top_k_models: int = 3,
-    top_n_channels: int = 9,
+    top_n_context_features: int = 9,
     all_models: bool = False,
 ) -> None:
     """One grouped-bar plot per leadership regime, for ONE quantity.
 
     Shared by the SHAP and expected-reward sets, which differ only in which
-    per-channel map they build, what they call it, and the footnote. Everything
+    per-context-feature map they build, what they call it, and the footnote. Everything
     that has to agree between them — the regime segmentation, the 0-based index
     matching the report's "Regime 0" and the IR's `ts.regime.0.*` ids, and the
     `regime_{NN}_w{start}-{end}_{leader}.png` filename the WebUI joiner parses
     back — is written once here, so the two sets cannot drift apart and stop
     pairing with the same regime sentence.
 
-    `per_channel_fn(sel_models, regime_ctx, regime_mu)` returns the map to plot;
+    `per_context_feature_fn(sel_models, regime_ctx, regime_mu)` returns the map to plot;
     `note_fn(n_windows)` returns the footnote.
     """
     if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
@@ -1447,7 +1467,7 @@ def _plot_per_regime(
     contexts = shap_payload.get("all_contexts", [])
     if not contexts or not means:
         return
-    n_channels = shap_payload["n_channels"]
+    n_context_features = shap_payload["n_channels"]
 
     fallback = _top_k_models_by_norm(means, 1)[0]
     segments = reconstruct_regime_segments(regime_shifts, len(contexts),
@@ -1469,13 +1489,13 @@ def _plot_per_regime(
                 means, regime_ctx, top_k_models, means_per_context=regime_mu)
             scope = f'top {top_k_models} by E[R] in regime'
         _render_shap_comparison(
-            per_channel_fn(sel_models, regime_ctx, regime_mu),
-            sel_models, top_n_channels,
+            per_context_feature_fn(sel_models, regime_ctx, regime_mu),
+            sel_models, top_n_context_features,
             title=(f'{title_prefix} — regime {i} ({model}, '
                    f'windows {start}-{end}, {scope})'),
             save_path=os.path.join(directory, f'regime_{i:02d}_w{start}-{end}_{model}.png'),
-            ylabel=ylabel or 'Per-channel SHAP contribution',
-            n_channels_total=n_channels,
+            ylabel=ylabel or 'Per-context-feature SHAP contribution',
+            n_context_features_total=n_context_features,
             note=note_fn(end - start + 1),
         )
 
@@ -1488,11 +1508,11 @@ def plot_shap_per_regime(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 9,
+    top_n_context_features: int = 9,
     all_models: bool = False,
 ) -> None:
     """
-    One SHAP comparison plot per regime, showing the raw signed per-channel SHAP
+    One SHAP comparison plot per regime, showing the raw signed per-context-feature SHAP
     averaged over that regime's windows. A regime's mean context differs from the
     global baseline, so the signed average is meaningful (and direction-bearing).
 
@@ -1505,11 +1525,11 @@ def plot_shap_per_regime(
     _plot_per_regime(
         means, shap_payload, regime_shifts, dataset, entity, iterations,
         stem='shap_per_regime', title_prefix='SHAP',
-        per_channel_fn=lambda sel, ctx, mu: _avg_per_channel_shap_map(
+        per_context_feature_fn=lambda sel, ctx, mu: _avg_per_context_feature_shap_map(
             means, sel, ctx, shap_payload["baseline_context"],
             shap_payload["n_channels"], absolute=False, means_per_context=mu),
         note_fn=lambda n: f'SHAP averaged over the {n} windows of this regime.',
-        top_k_models=top_k_models, top_n_channels=top_n_channels,
+        top_k_models=top_k_models, top_n_context_features=top_n_context_features,
         all_models=all_models)
 
 
@@ -1521,11 +1541,11 @@ def plot_reward_per_regime(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 9,
+    top_n_context_features: int = 9,
     all_models: bool = False,
 ) -> None:
     """
-    Per-channel expected-reward contribution averaged over each regime's
+    Per-context-feature expected-reward contribution averaged over each regime's
     windows — the sibling of plot_shap_per_regime, and the default view beside
     the regime prose.
 
@@ -1535,13 +1555,13 @@ def plot_reward_per_regime(
     _plot_per_regime(
         means, shap_payload, regime_shifts, dataset, entity, iterations,
         stem='reward_per_regime', title_prefix='Expected-reward contribution',
-        per_channel_fn=lambda sel, ctx, mu: _avg_per_channel_reward_map(
+        per_context_feature_fn=lambda sel, ctx, mu: _avg_per_context_feature_reward_map(
             means, sel, ctx, shap_payload["n_channels"], means_per_context=mu),
         note_fn=lambda n: (f"Averaged over the {n} windows of this regime; "
                            f"each detector's bars sum to its mean expected "
                            f"reward here."),
         ylabel=_REWARD_YLABEL,
-        top_k_models=top_k_models, top_n_channels=top_n_channels,
+        top_k_models=top_k_models, top_n_context_features=top_n_context_features,
         all_models=all_models)
 
 
@@ -1553,17 +1573,17 @@ def plot_reward_average_all(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 9,
+    top_n_context_features: int = 9,
     all_models: bool = True,
 ) -> None:
     """
-    One figure for the whole run: each channel's mean contribution to a
+    One figure for the whole run: each context feature's mean contribution to a
     detector's expected reward, averaged over every window.
 
     This replaces mean|SHAP| as the run-level summary. The signed SHAP average
     over all windows is identically zero — the baseline IS the mean of those
     windows — which forced the old figure onto absolute values, and mean|SHAP|
-    measures how much a channel's influence VARIES, not how much it contributes.
+    measures how much a context feature's influence VARIES, not how much it contributes.
     This average has no such defect: it is signed, non-degenerate, and its bars
     sum to the detector's expected reward on a typical window.
     """
@@ -1572,7 +1592,7 @@ def plot_reward_average_all(
     contexts = shap_payload.get("all_contexts", [])
     if not contexts or not means:
         return
-    n_channels = shap_payload["n_channels"]
+    n_context_features = shap_payload["n_channels"]
 
     if all_models:
         sel_models = _top_k_models_by_norm(means, len(means))
@@ -1581,16 +1601,16 @@ def plot_reward_average_all(
         sel_models = _top_k_models_by_expected_reward(means, contexts, top_k_models)
         suffix, scope = f'top{top_k_models}', f'top {top_k_models} by E[R]'
 
-    per_channel = _avg_per_channel_reward_map(
-        means, sel_models, contexts, n_channels,
+    per_context_feature = _avg_per_context_feature_reward_map(
+        means, sel_models, contexts, n_context_features,
         means_per_context=shap_payload.get("means_history") or None)
     _render_shap_comparison(
-        per_channel, sel_models, top_n_channels,
+        per_context_feature, sel_models, top_n_context_features,
         title=f'Mean expected-reward contribution across all windows — {scope}',
         save_path=(f'myresults/Thomposon/{dataset}/{entity}/'
                    f'reward_average_{suffix}_{iterations}.png'),
         ylabel=_REWARD_YLABEL,
-        n_channels_total=n_channels,
+        n_context_features_total=n_context_features,
         note=("Averaged over every window; each detector's bars sum to its "
               "expected reward on a typical window."),
     )
@@ -1603,12 +1623,12 @@ def plot_shap_average_all(
     entity: str,
     iterations: int,
     top_k_models: int = 3,
-    top_n_channels: int = 9,
+    top_n_context_features: int = 9,
     all_models: bool = True,
 ) -> None:
     """
     A single SHAP comparison plot summarising the whole run: the mean of
-    |per-channel SHAP| across all windows (the standard SHAP global-importance
+    |per-context-feature SHAP| across all windows (the standard SHAP global-importance
     measure). The raw signed average over all windows is identically zero — the
     baseline IS the mean of all contexts — so absolute values are used here.
 
@@ -1624,7 +1644,7 @@ def plot_shap_average_all(
     if not contexts or not means:
         return
     baseline = shap_payload["baseline_context"]
-    n_channels = shap_payload["n_channels"]
+    n_context_features = shap_payload["n_channels"]
 
     if all_models:
         # Every model, ordered by ||mu||^2 for a stable, meaningful legend order.
@@ -1637,14 +1657,14 @@ def plot_shap_average_all(
         title = (f'Mean |SHAP| Across All Windows — top {top_k_models} by E[R] '
                  '(global importance)')
 
-    per_channel = _avg_per_channel_shap_map(
-        means, sel_models, contexts, baseline, n_channels, absolute=True,
+    per_context_feature = _avg_per_context_feature_shap_map(
+        means, sel_models, contexts, baseline, n_context_features, absolute=True,
         means_per_context=shap_payload.get("means_history") or None)
     _render_shap_comparison(
-        per_channel, sel_models, top_n_channels,
+        per_context_feature, sel_models, top_n_context_features,
         title=title,
         save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_average_{suffix}_{iterations}.png',
-        n_channels_total=n_channels,
+        n_context_features_total=n_context_features,
     )
 
 
@@ -1706,7 +1726,7 @@ def explain_thompson_sampling(
     regime_segments = reconstruct_regime_segments(regime_shifts, T, fallback_model=first_dom)
 
     # Per-regime story blocks: regime-mean expected rewards (from the recorded
-    # pre-update beliefs), the leader's SHAP channels on the regime-aggregated
+    # pre-update beliefs), the leader's SHAP context features on the regime-aggregated
     # context, and the leader-vs-runner-up preference decomposition. Computed
     # ONCE here and consumed by BOTH the report below and the Intermediate
     # Representation, so the two always match.
@@ -1732,7 +1752,7 @@ def explain_thompson_sampling(
             leader = seg_m if seg_m in means else (top3[0][0] if top3 else None)
             runner = next((m for m, _ in top3 if m != leader), None)
 
-            # Channel contributions are split by SIGN before truncation: a
+            # Context feature contributions are split by SIGN before truncation: a
             # magnitude-sorted signed list invites "driven by" phrasings whose
             # top entries actually push the other way. Top-3 per direction.
             def _split_by_sign(vals: np.ndarray) -> Tuple[list, list]:
@@ -1752,7 +1772,7 @@ def explain_thompson_sampling(
                 # Per-window attribution with the beliefs held at that window,
                 # then averaged over the regime. SHAP is bilinear in (mu, x), so
                 # this is NOT the same as explaining the averaged mean at the
-                # averaged context — and only this order makes the channel
+                # averaged context — and only this order makes the context feature
                 # deltas sum to the regime's reported mean-reward gap.
                 win = range(seg_start, seg_end + 1)
                 mu_at = (lambda t, m: np.asarray(mu_hist[t][m]).flatten()
@@ -1769,14 +1789,14 @@ def explain_thompson_sampling(
                 for t in win:
                     ctx_t = np.asarray(all_ctx[t], dtype=float)
                     mu_l = mu_at(t, leader)
-                    pc_l += aggregate_shap_per_channel(
+                    pc_l += aggregate_shap_per_context_feature(
                         compute_shap_values(mu_l, ctx_t, base_ctx), n_ch)
-                    rc_l += reward_contribution_per_channel(mu_l, ctx_t, n_ch)
+                    rc_l += reward_contribution_per_context_feature(mu_l, ctx_t, n_ch)
                     if have_runner:
                         mu_r = mu_at(t, runner)
-                        pc_r += aggregate_shap_per_channel(
+                        pc_r += aggregate_shap_per_context_feature(
                             compute_shap_values(mu_r, ctx_t, base_ctx), n_ch)
-                        rc_r += reward_contribution_per_channel(mu_r, ctx_t, n_ch)
+                        rc_r += reward_contribution_per_context_feature(mu_r, ctx_t, n_ch)
                         gap_acc += float(np.dot(mu_l - mu_r, ctx_t - base_ctx))
                         edge_acc += float(np.dot(mu_l - mu_r, ctx_t))
                 pc_l /= n_win
@@ -1793,11 +1813,11 @@ def explain_thompson_sampling(
                     # minus the runner-up's. These deltas sum to the gap in
                     # expected reward the regime is actually decided by — the
                     # same quantity `reward_gap` reports — so the sentence's
-                    # channel and its headline number describe one thing.
+                    # context feature and its headline number describe one thing.
                     edge_gap = edge_acc / n_win
                     edge_favor_leader, edge_favor_runner = _split_by_sign(rc_l - rc_r)
                     delta = pc_l - pc_r
-                    # Baseline-relative, so the channel deltas sum to it exactly.
+                    # Baseline-relative, so the context feature deltas sum to it exactly.
                     pref_gap = gap_acc / n_win
                     pref_favor_leader, pref_favor_runner = _split_by_sign(delta)
 
@@ -1805,7 +1825,7 @@ def explain_thompson_sampling(
                 "index": seg_idx, "start": seg_start, "end": seg_end,
                 "duration": int(seg_dur), "leader": leader,
                 "rewards_top": top3, "reward_gap": gap, "runner_up": runner,
-                # The narrated channels: what the leader's expected reward is
+                # The narrated context features: what the leader's expected reward is
                 # made of here. SHAP's split rides along for the deviation
                 # clause and the alternate plot, but no longer leads.
                 "reward_raising": reward_raising, "reward_lowering": reward_lowering,
@@ -1869,9 +1889,9 @@ def explain_thompson_sampling(
         else:
             f.write("No blips detected.\n")
 
-        f.write("\n--- Per-Regime Expected Rewards & Channel Attribution ---\n")
+        f.write("\n--- Per-Regime Expected Rewards & Context-Feature Attribution ---\n")
         f.write("(Mean E[reward] over each regime's windows from the recorded pre-update\n")
-        f.write(" beliefs. Two channel splits, both averaged over the regime's windows\n")
+        f.write(" beliefs. Two context feature splits, both averaged over the regime's windows\n")
         f.write(" using the beliefs held at each one. CONTRIBUTION is the raw split of\n")
         f.write(" mu.x, whose parts sum to E[reward]; DEVIATION is the SHAP split, which\n")
         f.write(" measures departure from the run's average window and sums to nothing\n")
@@ -1891,17 +1911,17 @@ def explain_thompson_sampling(
                                     for c, v in (r["reward_raising"] or [])) or "none"
                 lower_s = ", ".join(f"ch {c} {v:+.4f}"
                                     for c, v in (r["reward_lowering"] or [])) or "none"
-                f.write(f"  CONTRIBUTION — channels supplying {r['leader']}'s "
+                f.write(f"  CONTRIBUTION — context features supplying {r['leader']}'s "
                         f"E[reward]: {raise_s}\n")
-                f.write(f"  CONTRIBUTION — channels reducing it: {lower_s}\n")
+                f.write(f"  CONTRIBUTION — context features reducing it: {lower_s}\n")
             if r["shap_raising"] or r["shap_lowering"]:
                 raise_s = ", ".join(f"ch {c} {v:+.4f}"
                                     for c, v in (r["shap_raising"] or [])) or "none"
                 lower_s = ", ".join(f"ch {c} {v:+.4f}"
                                     for c, v in (r["shap_lowering"] or [])) or "none"
-                f.write(f"  DEVIATION — channels above their usual contribution: "
+                f.write(f"  DEVIATION — context features above their usual contribution: "
                         f"{raise_s}\n")
-                f.write(f"  DEVIATION — channels below it: {lower_s}\n")
+                f.write(f"  DEVIATION — context features below it: {lower_s}\n")
             # The narrated edge, in contribution units: these deltas sum to the
             # leader-vs-runner-up gap in expected reward reported above.
             has_edge = r.get("edge_favor_leader") or r.get("edge_favor_runner")
@@ -1913,8 +1933,8 @@ def explain_thompson_sampling(
                                for c, d in (r["edge_favor_runner"] or [])) or "none"
                 f.write(f"  EDGE (contribution) {r['leader']} vs {r['runner_up']}: "
                         f"E[reward] favors {favored} by {abs(r['edge_gap']):.4f}\n")
-                f.write(f"    channels favoring {r['leader']}: {fl}\n")
-                f.write(f"    channels favoring {r['runner_up']}: {fr}\n")
+                f.write(f"    context features favoring {r['leader']}: {fl}\n")
+                f.write(f"    context features favoring {r['runner_up']}: {fr}\n")
             has_pref = r["pref_favor_leader"] or r["pref_favor_runner"]
             if has_pref and r["runner_up"] and not np.isnan(r["pref_gap"]):
                 favored = r["leader"] if r["pref_gap"] >= 0 else r["runner_up"]
@@ -1925,8 +1945,8 @@ def explain_thompson_sampling(
                 f.write(f"  EDGE (deviation) {r['leader']} vs {r['runner_up']}: linear "
                         f"preference score at the regime-average context favors "
                         f"{favored} by {abs(r['pref_gap']):.4f}\n")
-                f.write(f"    channels favoring {r['leader']}: {fl}\n")
-                f.write(f"    channels favoring {r['runner_up']}: {fr}\n")
+                f.write(f"    context features favoring {r['leader']}: {fl}\n")
+                f.write(f"    context features favoring {r['runner_up']}: {fr}\n")
 
         f.write("\n--- Selection State Summary ---\n")
         state_order = ["random", "exploitation", "informed_exploration"]
@@ -1946,39 +1966,39 @@ def explain_thompson_sampling(
             f.write("Explanation context : last window (L2-normalised)\n")
             f.write("Baseline            : mean over all L2-normalised windows\n")
             f.write("Per-feature phi_i   = mu_i * (x_i - baseline_i)\n")
-            f.write("Per-channel         = sum of phi_i over the channel's window timesteps\n\n")
+            f.write("Per-context-feature         = sum of phi_i over the context feature's window timesteps\n\n")
 
             top_models = _top_k_models_by_norm(means, 3)
-            per_channel_by_model: Dict[str, np.ndarray] = {}
+            per_context_feature_by_model: Dict[str, np.ndarray] = {}
             for rank, model_name in enumerate(top_models, 1):
                 mu = means[model_name].flatten()
                 shap_vals = compute_shap_values(mu, ctx, base)
-                per_ch = aggregate_shap_per_channel(shap_vals, n_ch)
-                per_channel_by_model[model_name] = per_ch
+                per_ch = aggregate_shap_per_context_feature(shap_vals, n_ch)
+                per_context_feature_by_model[model_name] = per_ch
                 e_r = float(np.dot(mu, ctx))
                 e_r_base = float(np.dot(mu, base))
                 delta = e_r - e_r_base
                 f.write(f"  {rank}. {model_name}  "
                         f"(E[R | last] = {e_r:+.4f},  baseline E[R] = {e_r_base:+.4f},  delta = {delta:+.4f})\n")
-                f.write(f"     Top 5 channels by |per-channel SHAP|:\n")
+                f.write(f"     Top 5 context features by |per-context-feature SHAP|:\n")
                 top_idx = np.argsort(np.abs(per_ch))[::-1][:5]
                 for c in top_idx:
-                    f.write(f"       channel {int(c):>3} : {per_ch[c]:+.4f}\n")
-                f.write(f"     Sum over all channels: {float(per_ch.sum()):+.4f}\n\n")
+                    f.write(f"       context feature {int(c):>3} : {per_ch[c]:+.4f}\n")
+                f.write(f"     Sum over all context features: {float(per_ch.sum()):+.4f}\n\n")
 
             if len(top_models) >= 2:
                 top, second = top_models[0], top_models[1]
                 gap = float(np.dot(means[top].flatten() - means[second].flatten(), ctx))
-                delta_per_ch = per_channel_by_model[top] - per_channel_by_model[second]
+                delta_per_ch = per_context_feature_by_model[top] - per_context_feature_by_model[second]
                 f.write("--- SHAP Preference Decomposition ---\n")
                 f.write(f"Top model: {top}  vs  2nd: {second}\n")
                 f.write(f"Preference gap at last window: (mu_{top} - mu_{second})^T x_last = {gap:+.4f}\n")
-                f.write("Top 5 channels driving the preference:\n")
+                f.write("Top 5 context features driving the preference:\n")
                 top_idx = np.argsort(np.abs(delta_per_ch))[::-1][:5]
                 for c in top_idx:
-                    a = per_channel_by_model[top][c]
-                    b = per_channel_by_model[second][c]
-                    f.write(f"  channel {int(c):>3} : "
+                    a = per_context_feature_by_model[top][c]
+                    b = per_context_feature_by_model[second][c]
+                    f.write(f"  context feature {int(c):>3} : "
                             f"{top}={a:+.4f}  {second}={b:+.4f}  delta={a - b:+.4f}\n")
 
         f.write("\n--- Final Model Ranking (by ||mu_k||^2) ---\n")
@@ -2009,10 +2029,10 @@ def explain_thompson_sampling(
             # rounded back to a window count can be one out on a long run.
             state_counts={s: int(state_counts[s]) for s in state_counts},
             final_state=selection_states[-1] if selection_states else "not_available",
-            # Channel names when the loader supplied them; the IR falls back to
-            # "channel N" for datasets whose sources have no column headers.
-            channel_names=(shap_payload or {}).get("channel_names"),
-            n_channels=(shap_payload or {}).get("n_channels"),
+            # Context feature names when the loader supplied them; the IR falls back to
+            # "context feature N" for datasets whose sources have no column headers.
+            context_feature_names=(shap_payload or {}).get("channel_names"),
+            n_context_features=(shap_payload or {}).get("n_channels"),
         )
         ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson")
     except Exception as e:
@@ -2024,16 +2044,16 @@ def explain_thompson_sampling(
 # The stage above explains mu^T x — the expected reward that drives per-window
 # selection. Everything below explains the quantity the detectors are actually
 # ranked by, mu^T mu, which is context-free and therefore decomposes over
-# channels on its own, with no baseline and no SHAP.
+# context features on its own, with no baseline and no SHAP.
 
 def _norm_scores_at(means_at: Dict[str, np.ndarray]) -> Dict[str, float]:
     """||mu||^2 for every detector at one window."""
     return {m: float(np.dot(mu.flatten(), mu.flatten())) for m, mu in means_at.items()}
 
 
-def _channel_pairs(values: np.ndarray, top_n: Optional[int] = None,
+def _context_feature_pairs(values: np.ndarray, top_n: Optional[int] = None,
                    by_magnitude: bool = False) -> List[Tuple[int, float]]:
-    """[(channel_index, value)] sorted for presentation, optionally truncated."""
+    """[(context_feature_index, value)] sorted for presentation, optionally truncated."""
     pairs = [(int(c), float(v)) for c, v in enumerate(values)]
     pairs.sort(key=lambda cv: -abs(cv[1]) if by_magnitude else -cv[1])
     return pairs[:top_n] if top_n else pairs
@@ -2041,8 +2061,8 @@ def _channel_pairs(values: np.ndarray, top_n: Optional[int] = None,
 
 def _regime_ranking_facts(means_history: List[Dict[str, np.ndarray]],
                           segments: List[Tuple[int, int, str, int]],
-                          n_channels: int,
-                          top_n_channels: int = 3) -> List[Dict[str, Any]]:
+                          n_context_features: int,
+                          top_n_context_features: int = 3) -> List[Dict[str, Any]]:
     """
     Per-regime facts, read at the regime's LAST window — the state the leader
     had accumulated by the time it handed over, which is what its lead over that
@@ -2060,18 +2080,18 @@ def _regime_ranking_facts(means_history: List[Dict[str, np.ndarray]],
         rivals = sorted(((s, m) for m, s in scores.items() if m != leader), reverse=True)
         runner = rivals[0][1] if rivals else None
 
-        top_channels = _channel_pairs(
-            aggregate_squared_per_channel(at[leader], n_channels), top_n_channels)
-        gap_channels = []
+        top_context_features = _context_feature_pairs(
+            aggregate_squared_per_context_feature(at[leader], n_context_features), top_n_context_features)
+        gap_context_features = []
         if runner is not None:
-            gap_channels = _channel_pairs(
-                rank_gap_decomposition(at[leader], at[runner], n_channels),
-                top_n_channels, by_magnitude=True)
+            gap_context_features = _context_feature_pairs(
+                rank_gap_decomposition(at[leader], at[runner], n_context_features),
+                top_n_context_features, by_magnitude=True)
 
         facts.append({
             "index": i, "start": int(start), "end": int(end),
             "duration": int(duration), "leader": leader, "runner_up": runner,
-            "top_channels": top_channels, "gap_channels": gap_channels,
+            "top_channels": top_context_features, "gap_channels": gap_context_features,
             "score": scores.get(leader),
             "runner_score": scores.get(runner) if runner else None,
         })
@@ -2209,48 +2229,48 @@ def plot_ranking_final(means: Dict[str, np.ndarray],
     plt.close()
 
 
-def plot_ranking_channels(means: Dict[str, np.ndarray], n_channels: int,
+def plot_ranking_channels(means: Dict[str, np.ndarray], n_context_features: int,
                           dataset: str, entity: str, iterations: int,
-                          top_k_models: int = 3, top_n_channels: int = 9,
+                          top_k_models: int = 3, top_n_context_features: int = 9,
                           all_models: bool = False) -> None:
-    """Per-channel split of the final ||mu||^2, top-k detectors or all of them."""
-    if not means or n_channels <= 0:
+    """Per-context-feature split of the final ||mu||^2, top-k detectors or all of them."""
+    if not means or n_context_features <= 0:
         return
     models = (_top_k_models_by_norm(means, len(means)) if all_models
               else _top_k_models_by_norm(means, top_k_models))
-    per_channel = {m: aggregate_squared_per_channel(means[m], n_channels)
+    per_context_feature = {m: aggregate_squared_per_context_feature(means[m], n_context_features)
                    for m in models}
     suffix = '_all' if all_models else ''
     scope = 'all models' if all_models else f'top {top_k_models} by score'
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
     os.makedirs(directory, exist_ok=True)
     _render_shap_comparison(
-        per_channel, models, top_n_channels,
+        per_context_feature, models, top_n_context_features,
         title=f'Where each detector\'s ranking score comes from ({scope})',
         save_path=os.path.join(directory,
                                f'ranking_channels{suffix}_{iterations}.png'),
         ylabel=r'Contribution to $\|\mu_k\|^2$',
-        n_channels_total=n_channels,
+        n_context_features_total=n_context_features,
         note='Final weights, at the end of the run.',
     )
 
 
-def plot_ranking_gap(means: Dict[str, np.ndarray], n_channels: int,
+def plot_ranking_gap(means: Dict[str, np.ndarray], n_context_features: int,
                      dataset: str, entity: str, iterations: int,
-                     top_n_channels: int = 12) -> None:
+                     top_n_context_features: int = 12) -> None:
     """
-    The winner's margin over the runner-up, split per channel and signed.
+    The winner's margin over the runner-up, split per context feature and signed.
 
     This is the plot that answers the ranking question directly: the bars sum
-    exactly to the gap between the two scores, so a green bar is a channel that
-    put the winner ahead and a red one is a channel the runner-up won.
+    exactly to the gap between the two scores, so a green bar is a context feature that
+    put the winner ahead and a red one is a context feature the runner-up won.
     """
-    if not means or n_channels <= 0 or len(means) < 2:
+    if not means or n_context_features <= 0 or len(means) < 2:
         return
     order = _top_k_models_by_norm(means, 2)
     winner, runner = order[0], order[1]
-    gap = rank_gap_decomposition(means[winner], means[runner], n_channels)
-    pairs = _channel_pairs(gap, top_n_channels, by_magnitude=True)
+    gap = rank_gap_decomposition(means[winner], means[runner], n_context_features)
+    pairs = _context_feature_pairs(gap, top_n_context_features, by_magnitude=True)
     if not pairs:
         return
     pairs = sorted(pairs, key=lambda cv: cv[1])
@@ -2260,7 +2280,7 @@ def plot_ranking_gap(means: Dict[str, np.ndarray], n_channels: int,
         "xtick.labelsize": 10, "ytick.labelsize": 10,
     })
     fig, ax = plt.subplots(figsize=(9, max(4, 0.42 * len(pairs) + 1.5)))
-    ax.barh([f'ch{c}' for c, _v in pairs], [v for _c, v in pairs],
+    ax.barh([f'cf{c}' for c, _v in pairs], [v for _c, v in pairs],
             color=['#2F9E44' if v >= 0 else '#C92A2A' for _c, v in pairs])
     ax.axvline(0, color='black', linewidth=0.7)
     total = float(np.sum(gap))
@@ -2277,11 +2297,11 @@ def plot_ranking_gap(means: Dict[str, np.ndarray], n_channels: int,
     plt.close()
 
 
-# ── Per-window channel aggregates, for on-demand rendering ──────────────────
+# ── Per-window context feature aggregates, for on-demand rendering ──────────────────
 # The three per-window families above (shap_, reward_, ranking_) each wrote one
 # PNG per window in three scopes — nine folders, ~1,100 frames and 167 MB for a
 # single 173-window entity — of which a reader opens a handful. What every one
-# of those frames draws is a per-model per-channel vector, and that is three
+# of those frames draws is a per-model per-context-feature vector, and that is three
 # orders of magnitude smaller than its own rendering: 173x11x9x3 floats is half
 # a megabyte against 167 MB of PNG.
 #
@@ -2316,7 +2336,7 @@ _PER_WINDOW_KINDS: Dict[str, Dict[str, Any]] = {
     },
     "shap": {
         "label": "Deviation from a typical window",
-        "ylabel": "Per-channel SHAP contribution",
+        "ylabel": "Per-context-feature SHAP contribution",
         "title_top": "SHAP — window {t} (top {k} by E[R] in window)",
         "title_all": "SHAP — window {t} (all models)",
         "note": None,
@@ -2328,8 +2348,8 @@ _PER_WINDOW_KINDS: Dict[str, Dict[str, Any]] = {
     "ranking": {
         "label": "Ranking score",
         "ylabel": r"Contribution to $\|\mu_k\|^2$",
-        "title_top": "Ranking score by channel — window {t} (top {k} by score at this window)",
-        "title_all": "Ranking score by channel — window {t} (all detectors)",
+        "title_top": "Ranking score by context feature — window {t} (top {k} by score at this window)",
+        "title_all": "Ranking score by context feature — window {t} (all detectors)",
         "note": ("Weights as they stood at window {t}. The score is cumulative, "
                  "so these bars are the total accumulated up to this window."),
         "rank_by": "ranking",
@@ -2339,7 +2359,7 @@ _PER_WINDOW_KINDS: Dict[str, Dict[str, Any]] = {
 
 
 def _json_row(values: np.ndarray) -> List[Optional[float]]:
-    """One channel vector at 6 significant digits; non-finite becomes null.
+    """One context feature vector at 6 significant digits; non-finite becomes null.
 
     Six digits is far beyond what a bar chart can show and keeps the file an
     order of magnitude smaller than full repr. `null` rather than NaN because
@@ -2350,7 +2370,7 @@ def _json_row(values: np.ndarray) -> List[Optional[float]]:
             for v in np.asarray(values, dtype=float).ravel()]
 
 
-def save_per_window_channels(
+def save_per_window_context_features(
     means: Dict[str, np.ndarray],
     shap_payload: Optional[Dict],
     dataset: str,
@@ -2360,16 +2380,16 @@ def save_per_window_channels(
     """Persist every per-window frame's numbers as one JSON file.
 
     Returns the path written, or None when the run carries nothing to write
-    (no explain payload, no channels, no windows) — the same conditions under
+    (no explain payload, no context features, no windows) — the same conditions under
     which the plot functions returned without drawing anything.
     """
     if not shap_payload or not means:
         return None
-    n_channels = int(shap_payload.get("n_channels") or 0)
+    n_context_features = int(shap_payload.get("n_channels") or 0)
     contexts = shap_payload.get("all_contexts") or []
     mu_hist = shap_payload.get("means_history") or []
     baseline = shap_payload.get("baseline_context")
-    if n_channels <= 0 or not contexts or baseline is None:
+    if n_context_features <= 0 or not contexts or baseline is None:
         return None
 
     # Appended in the same block of the bandit loop, so these are index-aligned
@@ -2390,11 +2410,11 @@ def save_per_window_channels(
         for m in models:
             mu = np.asarray(at[m]).flatten() if m in at else np.asarray(means[m]).flatten()
             reward_frame.append(_json_row(
-                reward_contribution_per_channel(mu, ctx, n_channels)))
-            shap_frame.append(_json_row(aggregate_shap_per_channel(
-                compute_shap_values(mu, ctx, baseline), n_channels)))
+                reward_contribution_per_context_feature(mu, ctx, n_context_features)))
+            shap_frame.append(_json_row(aggregate_shap_per_context_feature(
+                compute_shap_values(mu, ctx, baseline), n_context_features)))
             ranking_frame.append(_json_row(
-                aggregate_squared_per_channel(mu, n_channels)))
+                aggregate_squared_per_context_feature(mu, n_context_features)))
         sets["reward"].append(reward_frame)
         sets["shap"].append(shap_frame)
         sets["ranking"].append(ranking_frame)
@@ -2404,7 +2424,7 @@ def save_per_window_channels(
         "dataset": dataset,
         "entity": entity,
         "iterations": iterations,
-        "n_channels": n_channels,
+        "n_channels": n_context_features,
         "n_windows": n_windows,
         "top_k_models": 3,
         "top_n_channels": 9,
@@ -2421,28 +2441,28 @@ def save_per_window_channels(
     path = os.path.join(directory, f'per_window_channels_{iterations}.json')
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(document, handle, separators=(",", ":"))
-    logger.info(f"Per-window channel aggregates written to {path} "
-                f"({n_windows} windows x {len(models)} detectors x {n_channels} channels)")
+    logger.info(f"Per-window context feature aggregates written to {path} "
+                f"({n_windows} windows x {len(models)} detectors x {n_context_features} context features)")
     return path
 
 
 def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
                             segments: List[Tuple[int, int, str, int]],
-                            n_channels: int, dataset: str, entity: str,
-                            iterations: int, top_n_channels: int = 9) -> None:
+                            n_context_features: int, dataset: str, entity: str,
+                            iterations: int, top_n_context_features: int = 9) -> None:
     """
-    One figure per leadership regime: the leader's per-channel score beside that
+    One figure per leadership regime: the leader's per-context-feature score beside that
     regime's runner-up, read at the regime's last window.
 
     Filenames mirror shap_per_regime_{it}/ exactly — 0-based index, window range,
     leader — so the same WebUI joiner pairs each figure with its own sentence.
     """
-    if not means_history or not segments or n_channels <= 0:
+    if not means_history or not segments or n_context_features <= 0:
         return
     directory = _fresh_plot_dir(
         f'myresults/Thomposon/{dataset}/{entity}/ranking_per_regime_{iterations}/')
-    for fact in _regime_ranking_facts(means_history, segments, n_channels,
-                                      top_n_channels=n_channels):
+    for fact in _regime_ranking_facts(means_history, segments, n_context_features,
+                                      top_n_context_features=n_context_features):
         end, leader, runner = fact["end"], fact["leader"], fact["runner_up"]
         at = means_history[end]
         # Top three by ||mu||^2 at this window, which is the quantity the
@@ -2454,18 +2474,18 @@ def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
         for m in ([leader] + ([runner] if runner else [])):
             if m and m in at and m not in models:
                 models.append(m)
-        per_channel = {m: aggregate_squared_per_channel(at[m], n_channels)
+        per_context_feature = {m: aggregate_squared_per_context_feature(at[m], n_context_features)
                        for m in models}
         rng = f'{fact["start"]}-{end}'
         _render_shap_comparison(
-            per_channel, models, top_n_channels,
-            title=(f'Ranking score by channel — regime {fact["index"]} '
+            per_context_feature, models, top_n_context_features,
+            title=(f'Ranking score by context feature — regime {fact["index"]} '
                    f'({leader}, windows {rng}), as at window {end}'),
             save_path=os.path.join(
                 directory,
                 f'regime_{fact["index"]:02d}_w{rng}_{leader}.png'),
             ylabel=r'Contribution to $\|\mu_k\|^2$',
-            n_channels_total=n_channels,
+            n_context_features_total=n_context_features,
             # Says plainly what a per-regime figure of a cumulative quantity can
             # and cannot mean. Unlike the SHAP stage's per-regime plot, which
             # averages a per-window attribution over the regime, this is a
@@ -2502,7 +2522,7 @@ def explain_thompson_ranking(
     if not means:
         return
     payload = shap_payload or {}
-    n_channels = int(payload.get("n_channels") or 0)
+    n_context_features = int(payload.get("n_channels") or 0)
     means_history: List[Dict[str, np.ndarray]] = payload.get("means_history") or []
     T = len(means_history)
 
@@ -2511,17 +2531,17 @@ def explain_thompson_ranking(
     winner = ranking[0][0]
     runner_up = ranking[1][0] if len(ranking) > 1 else None
 
-    winner_channels = (_channel_pairs(aggregate_squared_per_channel(means[winner], n_channels))
-                       if n_channels > 0 else [])
-    gap_channels = (_channel_pairs(
-        rank_gap_decomposition(means[winner], means[runner_up], n_channels),
-        by_magnitude=True) if (runner_up and n_channels > 0) else [])
+    winner_context_features = (_context_feature_pairs(aggregate_squared_per_context_feature(means[winner], n_context_features))
+                       if n_context_features > 0 else [])
+    gap_context_features = (_context_feature_pairs(
+        rank_gap_decomposition(means[winner], means[runner_up], n_context_features),
+        by_magnitude=True) if (runner_up and n_context_features > 0) else [])
 
     counts: Dict[str, int] = {m: 0 for m in means}
     for m in list_of_chosen_models or []:
         counts[m] = counts.get(m, 0) + 1
 
-    regimes_data = _regime_ranking_facts(means_history, segments, n_channels)
+    regimes_data = _regime_ranking_facts(means_history, segments, n_context_features)
 
     directory = f'myresults/Thomposon/{dataset}/{entity}/'
     os.makedirs(directory, exist_ok=True)
@@ -2530,7 +2550,7 @@ def explain_thompson_ranking(
         f.write("Thompson Sampling — ranking criterion ||mu_k||^2\n")
         f.write("=" * 52 + "\n")
         f.write(f"Dataset: {dataset}   Entity: {entity}   Windows: {T}   "
-                f"Channels: {n_channels}\n")
+                f"Context features: {n_context_features}\n")
 
         f.write("\n--- Final Ranking (by ||mu_k||^2) ---\n")
         f.write(f"  {'Rank':>4}  {'Model':>12}  {'Score':>12}  {'Selections':>11}\n")
@@ -2538,21 +2558,21 @@ def explain_thompson_ranking(
         for rank, (m, score) in enumerate(ranking, 1):
             f.write(f"  {rank:>4}  {m:>12}  {score:>12.6f}  {counts.get(m, 0):>11}\n")
 
-        f.write(f"\n--- Per-Channel Decomposition of {winner}'s Score ---\n")
+        f.write(f"\n--- Per-Context-Feature Decomposition of {winner}'s Score ---\n")
         f.write("  Contributions are sums of squared weights: non-negative, and they\n"
                 "  add up to the score exactly.\n")
-        total = sum(v for _c, v in winner_channels) or 1.0
-        for c, v in winner_channels[:20]:
-            f.write(f"  channel {c:>3}  {v:>12.6f}  ({100.0 * v / total:>5.1f}%)\n")
-        f.write(f"  {'total':>11}  {sum(v for _c, v in winner_channels):>12.6f}\n")
+        total = sum(v for _c, v in winner_context_features) or 1.0
+        for c, v in winner_context_features[:20]:
+            f.write(f"  context feature {c:>3}  {v:>12.6f}  ({100.0 * v / total:>5.1f}%)\n")
+        f.write(f"  {'total':>11}  {sum(v for _c, v in winner_context_features):>12.6f}\n")
 
         if runner_up:
             f.write(f"\n--- {winner} vs {runner_up}: Gap Decomposition ---\n")
             f.write("  Signed, and sums to the difference between the two scores.\n")
-            for c, v in gap_channels[:20]:
+            for c, v in gap_context_features[:20]:
                 side = winner if v >= 0 else runner_up
-                f.write(f"  channel {c:>3}  {v:>+12.6f}  favours {side}\n")
-            f.write(f"  {'gap':>11}  {sum(v for _c, v in gap_channels):>+12.6f}\n")
+                f.write(f"  context feature {c:>3}  {v:>+12.6f}  favours {side}\n")
+            f.write(f"  {'gap':>11}  {sum(v for _c, v in gap_context_features):>+12.6f}\n")
 
         f.write("\n--- Leadership Regimes ---\n")
         f.write(f"  Warm-up windows excluded: {warmup_used}\n")
@@ -2563,16 +2583,16 @@ def explain_thompson_ranking(
                     f"({r['duration']:>3} windows)  leader {r['leader']:>12}"
                     f"  runner-up {str(r['runner_up']):>12}\n")
 
-        f.write("\n--- Per-Regime Channel Decomposition ---\n")
+        f.write("\n--- Per-Regime Context-Feature Decomposition ---\n")
         for r in regimes_data:
             f.write(f"  Regime {r['index']} ({r['leader']}, windows "
                     f"{r['start']}-{r['end']}):\n")
             for c, v in r["top_channels"]:
-                f.write(f"      channel {c:>3}  {v:>12.6f}\n")
+                f.write(f"      context feature {c:>3}  {v:>12.6f}\n")
             if r["runner_up"]:
                 f.write(f"    vs {r['runner_up']}:\n")
                 for c, v in r["gap_channels"]:
-                    f.write(f"      channel {c:>3}  {v:>+12.6f}\n")
+                    f.write(f"      context feature {c:>3}  {v:>+12.6f}\n")
 
     print(f"Ranking explainability report saved to {output_file}")
 
@@ -2581,21 +2601,21 @@ def explain_thompson_ranking(
         ir_doc = ir.build_thompson_ranking_ir(
             dataset, entity, n_windows=T,
             final_ranking=ranking,
-            winner_channels=winner_channels,
-            gap_channels=gap_channels,
+            winner_context_features=winner_context_features,
+            gap_context_features=gap_context_features,
             selection_counts=counts,
             regimes=regimes_data,
             warmup_windows=warmup_used,
-            channel_names=payload.get("channel_names"),
-            n_channels=n_channels,
-            # Every detector's per-channel shares, so the page can decompose
+            context_feature_names=payload.get("channel_names"),
+            n_context_features=n_context_features,
+            # Every detector's per-context-feature shares, so the page can decompose
             # ANY pair's gap without the run being present: the gap split is
             # exactly shares(a) - shares(b) (see rank_gap_decomposition), so
             # this is all the on-demand renderer needs.
-            channel_shares={
-                m: [float(v) for v in aggregate_squared_per_channel(mu, n_channels)]
+            context_feature_shares={
+                m: [float(v) for v in aggregate_squared_per_context_feature(mu, n_context_features)]
                 for m, mu in means.items()
-            } if n_channels > 0 else {},
+            } if n_context_features > 0 else {},
         )
         ir.write_stage_ir(ir_doc, dataset, entity, "ir_thompson_ranking")
     except Exception as e:
@@ -2696,7 +2716,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset, entity, iterations, iteration,
                                  initial_epsilon=0.2, epsilon_decay=0.99, f1_weight=0.5, pr_auc_weight=0.5,
-                                 explain=False):
+                                 explain=False, metrics=DEFAULT_DECISION_METRICS):
     """
     Run the entire Linear Thompson Sampling process.
 
@@ -2727,6 +2747,8 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         pr_auc_weight=pr_auc_weight,
         iterations=iterations,
         explain=explain,
+        metrics=metrics,
+        vus_win=vus_window(test_data.entities[0].Y),
     )
     if explain:
         (means, covariances, history, list_of_chosen_models,
@@ -2753,10 +2775,10 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         # pick, largest exactly where the early regimes form.
         regime_shifts, blip_windows = detect_regime_shifts(pre_exp_rewards_hist)
         # Written once for all three stages: the reward, SHAP and ranking frames
-        # are all per-model per-channel vectors over the same windows, and the
+        # are all per-model per-context-feature vectors over the same windows, and the
         # WebUI draws whichever one is asked for rather than the pipeline
         # writing every one of them.
-        save_per_window_channels(means, shap_payload, dataset, entity, iterations)
+        save_per_window_context_features(means, shap_payload, dataset, entity, iterations)
         plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
                               dataset, entity, iterations, smooth=False)
         plot_expected_rewards(exp_rewards_hist, regime_shifts, list(trained_models.keys()),
@@ -2769,13 +2791,13 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations)
         plot_shap_per_regime(means, shap_payload, regime_shifts, dataset, entity, iterations,
                              all_models=True)
-        # Kept, but demoted: mean|SHAP| measures how much a channel's influence
+        # Kept, but demoted: mean|SHAP| measures how much a context feature's influence
         # VARIES across windows, not how much it contributes on average. The
         # run-level summary is now plot_reward_average_all.
         plot_shap_average_all(means, shap_payload, dataset, entity, iterations)
         plot_shap_average_all(means, shap_payload, dataset, entity, iterations, all_models=False)
 
-        # ── Expected-reward contribution (mu^T x split per channel) ─────────
+        # ── Expected-reward contribution (mu^T x split per context feature) ─────────
         # Full parity with the SHAP sets above so the two can be read frame for
         # frame. These are the ones whose bars sum to the prediction; the SHAP
         # ones answer the narrower question of deviation from a typical window.
@@ -2798,16 +2820,16 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         # argmax. Segmented once here and handed to both the plots and the
         # report so a figure can never disagree with the sentence beside it.
         means_history = (shap_payload or {}).get("means_history") or []
-        n_channels_ranking = int((shap_payload or {}).get("n_channels") or 0)
+        n_context_features_ranking = int((shap_payload or {}).get("n_channels") or 0)
         regime_segments, warmup_used = leadership_regimes(means_history)
         plot_ranking_criterion(means_history, regime_segments, warmup_used,
                                dataset, entity, iterations)
         plot_ranking_final(means, list_of_chosen_models, dataset, entity, iterations)
-        plot_ranking_channels(means, n_channels_ranking, dataset, entity, iterations)
-        plot_ranking_channels(means, n_channels_ranking, dataset, entity, iterations,
+        plot_ranking_channels(means, n_context_features_ranking, dataset, entity, iterations)
+        plot_ranking_channels(means, n_context_features_ranking, dataset, entity, iterations,
                               all_models=True)
-        plot_ranking_gap(means, n_channels_ranking, dataset, entity, iterations)
-        plot_ranking_per_regime(means_history, regime_segments, n_channels_ranking,
+        plot_ranking_gap(means, n_context_features_ranking, dataset, entity, iterations)
+        plot_ranking_per_regime(means_history, regime_segments, n_context_features_ranking,
                                 dataset, entity, iterations)
         explain_thompson_ranking(means, list_of_chosen_models, shap_payload,
                                  regime_segments, warmup_used,

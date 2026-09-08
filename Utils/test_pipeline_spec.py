@@ -7,6 +7,7 @@ Utils/utils.py. Run with `pytest Utils/test_pipeline_spec.py` or
 """
 
 import importlib.util
+import math
 import os
 import unittest
 
@@ -46,6 +47,193 @@ class TestStages(unittest.TestCase):
         msg = str(cm.exception)
         self.assertIn("unknown stage 'nope'", msg)
         self.assertIn("all, robustness", msg)
+
+
+class TestAnomalies(unittest.TestCase):
+
+    def test_type_defaults_and_normalises(self):
+        self.assertEqual(spec.parse_anomaly_type(None), spec.DEFAULT_ANOMALY_TYPE)
+        self.assertEqual(spec.parse_anomaly_type(" Wander "), "wander")
+
+    def test_every_type_is_accepted(self):
+        for token in spec.ALL_ANOMALY_TYPES:
+            self.assertEqual(spec.parse_anomaly_type(token), token)
+
+    def test_unknown_type_names_the_valid_ones(self):
+        with self.assertRaises(ValueError) as cm:
+            spec.parse_anomaly_type("spike")
+        self.assertIn("unknown type 'spike'", str(cm.exception))
+
+    def test_rate_none_keeps_the_per_type_defaults(self):
+        self.assertIsNone(spec.parse_anomaly_rate(None))
+        self.assertIsNone(spec.parse_anomaly_rate(""))
+
+    def test_rate_bounds(self):
+        self.assertEqual(spec.parse_anomaly_rate("0.25"), 0.25)
+        self.assertEqual(spec.parse_anomaly_rate(1), 1.0)
+        for bad in ("0", "-0.1", "1.01"):
+            with self.assertRaises(ValueError):
+                spec.parse_anomaly_rate(bad)
+        with self.assertRaises(ValueError):
+            spec.parse_anomaly_rate("half")
+
+
+class TestDecisionMetric(unittest.TestCase):
+
+    def test_defaults_and_normalises(self):
+        self.assertEqual(spec.parse_decision_metrics(None), spec.DEFAULT_DECISION_METRICS)
+        self.assertEqual(spec.parse_decision_metrics(" PR-AUC "), ("pr_auc",))
+        self.assertEqual(spec.parse_decision_metrics("PR_AUC,f1"), ("f1", "pr_auc"))
+
+    def test_order_is_canonical_whatever_the_user_typed(self):
+        """Equivalent selections must produce identical argv and labels."""
+        self.assertEqual(spec.parse_decision_metrics("vus,f1,pr_auc"),
+                         spec.parse_decision_metrics("pr_auc,vus,f1"))
+
+    def test_duplicates_collapse(self):
+        self.assertEqual(spec.parse_decision_metrics("f1,f1"), ("f1",))
+
+    def test_every_metric_is_accepted_and_labelled(self):
+        for token in spec.DECISION_METRICS:
+            self.assertEqual(spec.parse_decision_metrics(token), (token,))
+            self.assertTrue(spec.decision_metric_label((token,)))
+
+    def test_unknown_metric_names_the_valid_ones(self):
+        with self.assertRaises(ValueError) as cm:
+            spec.parse_decision_metrics("auroc")
+        self.assertIn("auroc", str(cm.exception))
+
+    def test_at_least_one_metric_is_required(self):
+        with self.assertRaises(ValueError):
+            spec.parse_decision_metrics(",")
+
+    def test_default_is_f1_and_pr_auc(self):
+        self.assertEqual(spec.DEFAULT_DECISION_METRICS, ("f1", "pr_auc"))
+        self.assertEqual(spec.decision_metric_formula(spec.DEFAULT_DECISION_METRICS),
+                         "0.5 * F1 + 0.5 * PR-AUC")
+
+    def test_the_default_publishes_both_robustness_rankings(self):
+        self.assertEqual(spec.ranking_metrics_for(spec.DEFAULT_DECISION_METRICS),
+                         ("f1", "pr_auc"))
+
+    def test_a_single_metric_is_its_own_fitness(self):
+        scores = {"f1": 0.9, "pr_auc": 0.2, "vus": 0.99}
+        for token, want in scores.items():
+            self.assertEqual(spec.combine_metrics((token,), scores), want)
+
+    def test_several_metrics_are_equally_weighted(self):
+        scores = {"f1": 0.9, "pr_auc": 0.3, "vus": 0.6}
+        self.assertAlmostEqual(spec.combine_metrics(("f1", "pr_auc"), scores), 0.6)
+        self.assertAlmostEqual(spec.combine_metrics(("f1", "pr_auc", "vus"), scores), 0.6)
+
+    def test_the_formula_is_what_the_report_prints(self):
+        self.assertEqual(spec.decision_metric_formula(("f1",)), "F1")
+        self.assertEqual(spec.decision_metric_formula(("f1", "pr_auc")),
+                         "0.5 * F1 + 0.5 * PR-AUC")
+        self.assertIn("0.333", spec.decision_metric_formula(("f1", "pr_auc", "vus")))
+
+    def test_required_names_only_what_must_be_computed(self):
+        """The GA skips VUS unless the spec asks for it, so this is what keeps
+        an F1 run from paying for one."""
+        for token in spec.DECISION_METRICS:
+            self.assertEqual(spec.metrics_required((token,)), (token,))
+        self.assertNotIn("vus", spec.metrics_required(("f1", "pr_auc")))
+
+    def test_combine_needs_only_the_required_metrics(self):
+        """A caller that computed just the required ones must not KeyError."""
+        spec_ = ("f1", "pr_auc")
+        partial = {k: 0.5 for k in spec.metrics_required(spec_)}
+        self.assertEqual(spec.combine_metrics(spec_, partial), 0.5)
+
+    def test_robustness_rankings_follow_the_fitness(self):
+        """One published ranking per chosen metric, and no others."""
+        for chosen in (("f1",), ("pr_auc",), ("vus",), ("f1", "pr_auc"),
+                       ("f1", "vus"), ("f1", "pr_auc", "vus")):
+            self.assertEqual(spec.ranking_metrics_for(chosen), chosen)
+        self.assertEqual(spec.ranking_metrics_for({"f1": 0.7, "vus": 0.3}),
+                         ("f1", "vus"))
+
+
+class TestDecisionMetricWeights(unittest.TestCase):
+
+    def test_weights_are_parsed_and_kept(self):
+        self.assertEqual(spec.parse_decision_metrics("f1:0.5,pr_auc:0.3,vus:0.2"),
+                         {"f1": 0.5, "pr_auc": 0.3, "vus": 0.2})
+
+    def test_weights_need_not_sum_to_one(self):
+        self.assertEqual(spec.parse_decision_metrics("f1:2,pr_auc:2"), ("f1", "pr_auc"))
+        weights = spec.metric_weights(spec.parse_decision_metrics("f1:3,pr_auc:1"))
+        self.assertAlmostEqual(weights["f1"], 0.75)
+        self.assertAlmostEqual(weights["pr_auc"], 0.25)
+
+    def test_uniform_weights_collapse_to_the_plain_spelling(self):
+        """So an equally weighted run keeps producing the argv it always did."""
+        self.assertEqual(spec.parse_decision_metrics("f1:0.5,pr_auc:0.5"),
+                         ("f1", "pr_auc"))
+
+    def test_an_unweighted_metric_counts_one(self):
+        self.assertEqual(spec.parse_decision_metrics("f1:3,pr_auc"),
+                         {"f1": 0.75, "pr_auc": 0.25})
+
+    def test_a_zero_weight_drops_its_metric(self):
+        """Otherwise ranking_metrics_for publishes both rankings for a fitness
+        that is purely F1."""
+        self.assertEqual(spec.parse_decision_metrics("f1:1,pr_auc:0"), ("f1",))
+        self.assertEqual(spec.ranking_metrics_for({"f1": 1.0, "pr_auc": 0.0}), ("f1",))
+        self.assertEqual(spec.metrics_required({"f1": 1.0, "pr_auc": 0.0}), ("f1",))
+
+    def test_all_weights_zero_is_no_selection(self):
+        with self.assertRaises(ValueError):
+            spec.parse_decision_metrics("f1:0,pr_auc:0")
+
+    def test_negative_and_unparsable_weights_are_refused(self):
+        for text in ("f1:-1", "f1:x"):
+            with self.assertRaises(ValueError):
+                spec.parse_decision_metrics(text)
+
+    def test_fitness_is_the_weighted_mean(self):
+        weighted = {"f1": 0.5, "pr_auc": 0.3, "vus": 0.2}
+        scores = {"f1": 1.0, "pr_auc": 0.5, "vus": 0.0}
+        self.assertAlmostEqual(spec.combine_metrics(weighted, scores), 0.65)
+
+    def test_an_uncomputable_metric_renormalises_the_rest(self):
+        """VUS on a short window must narrow the fitness, not void it."""
+        weighted = {"f1": 0.5, "pr_auc": 0.3, "vus": 0.2}
+        scores = {"f1": 1.0, "pr_auc": 0.5, "vus": float("nan")}
+        self.assertAlmostEqual(spec.combine_metrics(weighted, scores), 0.8125)
+
+    def test_every_metric_missing_gives_nan(self):
+        value = spec.combine_metrics(("f1", "vus"),
+                                     {"f1": float("nan"), "vus": float("nan")})
+        self.assertTrue(math.isnan(value))
+
+    def test_the_formula_shows_the_weights(self):
+        self.assertEqual(
+            spec.decision_metric_formula({"f1": 0.5, "pr_auc": 0.3, "vus": 0.2}),
+            "0.5 * F1 + 0.3 * PR-AUC + 0.2 * VUS")
+
+    def test_format_round_trips_through_parse(self):
+        for text in ("f1", "f1,pr_auc", "f1:0.5,pr_auc:0.3,vus:0.2", "f1:3,pr_auc:1"):
+            parsed = spec.parse_decision_metrics(text)
+            self.assertEqual(
+                spec.parse_decision_metrics(spec.format_decision_metrics(parsed)),
+                parsed)
+
+    def test_restrict_keeps_the_relative_weights(self):
+        narrowed = spec.restrict_metrics({"f1": 0.5, "pr_auc": 0.3, "vus": 0.2},
+                                         ("f1", "pr_auc"))
+        self.assertAlmostEqual(narrowed["f1"], 0.625)
+        self.assertAlmostEqual(narrowed["pr_auc"], 0.375)
+
+    def test_restrict_collapses_to_a_tuple_when_it_can(self):
+        self.assertEqual(spec.restrict_metrics(("f1", "pr_auc", "vus"), ("f1", "vus")),
+                         ("f1", "vus"))
+
+    def test_a_weighted_spec_labels_and_orders_like_a_plain_one(self):
+        weighted = {"vus": 0.2, "f1": 0.5, "pr_auc": 0.3}
+        self.assertEqual(spec.metrics_required(weighted), ("f1", "pr_auc", "vus"))
+        self.assertEqual(spec.decision_metric_label(weighted), "F1 + PR-AUC + VUS")
+        self.assertEqual(list(spec.metric_weights(weighted)), ["f1", "pr_auc", "vus"])
 
 
 class TestDetectors(unittest.TestCase):
@@ -265,12 +453,15 @@ class TestSpecMatchesAppPy(unittest.TestCase):
         # Regression guard for the pre-existing bug: Thompson/GAN/off-by/MC in
         # the sequential path were handed the global detector list even when
         # run_app had already narrowed it to the models that loaded.
+        # `still_usable()` IS that narrowed list, minus anything a previous
+        # stage killed for slowness.
         src = self._app_source()
-        for fragment in ("model_names=models_to_use,",
-                         "test_data_for_gan, trained_models, models_to_use,",
-                         "test_data_for_borderline, trained_models, models_to_use,",
-                         "test_data_for_mc, trained_models, models_to_use,"):
+        for fragment in ("model_names=still_usable(),",
+                         "test_data_for_gan, trained_models, still_usable(),",
+                         "test_data_for_borderline, trained_models, still_usable(),",
+                         "test_data_for_mc, trained_models, still_usable(),"):
             self.assertIn(fragment, src)
+        self.assertIn("m for m in models_to_use if m not in slow", src)
 
 
 class TestTransductiveFamilies(unittest.TestCase):
@@ -727,6 +918,28 @@ class TestTSBADFamilies(unittest.TestCase):
         self.assertIn("TIMESFM", spec.UNIVARIATE_FAMILIES)
         self.assertIn("Series2Graph", spec.UNIVARIATE_FAMILIES)
         self.assertTrue(spec.UNIVARIATE_FAMILIES <= set(spec.DETECTOR_FAMILIES))
+
+    def test_the_multivariate_restriction_mirrors_the_univariate_one(self):
+        """ABOD is dropped on a 1-channel entity for the same reason POLY is
+        dropped on a 38-channel one: the method cannot mean what it says
+        there."""
+        self.assertIn("ABOD", spec.MULTIVARIATE_FAMILIES)
+        self.assertTrue(spec.MULTIVARIATE_FAMILIES <= set(spec.DETECTOR_FAMILIES))
+
+    def test_no_family_is_restricted_to_both_widths(self):
+        """A family in both sets would be droppable everywhere, leaving it
+        selectable in the UI and runnable nowhere."""
+        self.assertEqual(spec.MULTIVARIATE_FAMILIES & spec.UNIVARIATE_FAMILIES,
+                         frozenset())
+
+    def test_the_multivariate_restriction_is_enforced_by_dropping(self):
+        """Same requirement as the univariate drop: ABOD raises nothing on 1
+        channel, so nothing downstream would catch it."""
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, os.pardir, "app.py")) as f:
+            source = f.read()
+        self.assertIn("MULTIVARIATE_FAMILIES", source)
 
     def test_the_two_vocabularies_of_the_restriction_agree(self):
         """The UI reads `pipeline_spec`, the adapter enforces `tsbad_model`.

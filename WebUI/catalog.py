@@ -14,9 +14,11 @@ from typing import Any, Dict, List, Optional
 
 # Utils/__init__.py is empty and pipeline_spec is stdlib-only, so this import
 # stays cheap — it does not drag torch/matplotlib in the way Utils.utils would.
-from Utils.pipeline_spec import (ALL_DETECTORS, DATASET_LABELS, DETECTOR_FAMILIES,
-                                 DETECTOR_GROUPS, GROUP_LABELS, dataset_label,
-                                 family_of,
+from Utils.pipeline_spec import (ALL_DETECTORS, DATASET_LABELS, DECISION_METRICS,
+                                 DETECTOR_FAMILIES,
+                                 DETECTOR_GROUPS, GROUP_LABELS,
+                                 MULTIVARIATE_FAMILIES, UNIVARIATE_FAMILIES,
+                                 dataset_label, family_of,
                                  group_of)
 # hyperparameter_grids.py is plain dict literals with no imports at all, and
 # Model_Training/__init__.py is empty, so this reaches the grids without
@@ -186,6 +188,43 @@ def _read_meta(pth: Path, name: str) -> Optional[dict]:
             "window_step": model.get("window_step")}
 
 
+_CHANNELS: Dict[tuple, Optional[int]] = {}
+
+
+def channels_for(dataset: str, entity: str) -> Optional[int]:
+    """How many channels this entity has, or None if it cannot be read.
+
+    Loads through `Datasets.load` rather than counting columns per format, so
+    the answer is whatever the pipeline itself would see. 6-600 ms, cached
+    because the run page asks on every entity change. The import is local:
+    `WebUI` is deliberately importable without torch, and load_data pulls it.
+    """
+    key = (dataset, entity)
+    if key in _CHANNELS:
+        return _CHANNELS[key]
+    n = None
+    try:
+        from Datasets.load import load_data
+        data = load_data(dataset=dataset, group="train", entities=entity,
+                         downsampling=10, min_length=256,
+                         root_dir=paths.config().get("dataset_path"),
+                         normalize=True, verbose=False)
+        n = int(data.entities[0].Y.shape[0])
+    except Exception:
+        n = None
+    _CHANNELS[key] = n
+    return n
+
+
+def unusable_families(n_channels: Optional[int]) -> frozenset:
+    """Families that cannot mean anything at this width. Empty when the channel
+    count is unknown: hiding a usable detector is worse than showing one that
+    the run would drop anyway."""
+    if n_channels is None:
+        return frozenset()
+    return UNIVARIATE_FAMILIES if n_channels > 1 else MULTIVARIATE_FAMILIES
+
+
 def detectors_for(dataset: str, entity: str) -> List[Dict[str, Any]]:
     """The 11 canonical detectors, each flagged available or not for this entity.
 
@@ -198,8 +237,13 @@ def detectors_for(dataset: str, entity: str) -> List[Dict[str, Any]]:
     ent_dir = None
     if root:
         ent_dir = paths.resolve_entity_dir(Path(root), dataset, entity)
+    # Width-unsuitable families are omitted, not disabled: a missing checkpoint
+    # can be trained, but no run on this entity can ever use these.
+    unusable = unusable_families(channels_for(dataset, entity))
     out = []
     for name in ALL_DETECTORS:
+        if family_of(name) in unusable:
+            continue
         pth = (ent_dir / f"{name}.pth") if ent_dir else None
         available = bool(pth and pth.is_file())
         out.append({
@@ -370,6 +414,33 @@ def catalog(refresh: bool = False) -> Dict[str, Any]:
         ],
         "stage_groups": {"all": ["ga", "thompson", "gan", "offby", "montecarlo"],
                          "robustness": ["gan", "offby", "montecarlo"]},
+        # `symbol` is what the fitness formula is written with, taken from
+        # DECISION_METRICS so the preview and the run's report agree.
+        "decision_metrics": [
+            {"token": "f1", "label": "F1 score", "symbol": DECISION_METRICS["f1"]},
+            {"token": "pr_auc", "label": "PR-AUC", "symbol": DECISION_METRICS["pr_auc"]},
+            {"token": "vus", "label": "VUS-ROC", "symbol": DECISION_METRICS["vus"]},
+        ],
+        # `note` warns about types measured to behave poorly; see README.
+        "anomaly_types": [
+            {"token": "spikes", "label": "Spikes (scattered points)"},
+            {"token": "contextual", "label": "Contextual (affine shift)"},
+            {"token": "flip", "label": "Flip (time-reversed segment)"},
+            {"token": "speedup", "label": "Speedup (resampled segment)",
+             "note": "Resamples, so the series changes length and the realised "
+                     "rate runs above the target."},
+            {"token": "noise", "label": "Noise (additive Gaussian)",
+             "note": "Default noise_std=0.05 is below the step-to-step variation "
+                     "of some entities."},
+            {"token": "cutoff", "label": "Cutoff (constant segment)"},
+            {"token": "scale", "label": "Scale (amplified segment)"},
+            {"token": "wander", "label": "Wander (baseline drift)",
+             "note": "Shifts the whole series after the segment but labels only "
+                     "the segment."},
+            {"token": "average", "label": "Average (smoothed segment)",
+             "note": "Perturbation measures below the step-to-step variation on "
+                     "downsampled data."},
+        ],
         "warnings": warnings(),
         "config": {k: paths.config().get(k) for k in ("dataset_path", "trained_model_path")},
     }

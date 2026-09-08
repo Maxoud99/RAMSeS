@@ -40,12 +40,14 @@ from loguru import logger
 def windows_as_rows(Y_windows):
     """(n_windows, n_features, window_size) -> (n_windows, n_features*window_size).
 
-    Accepts a torch tensor or a numpy array and always returns numpy on the CPU,
-    which is what every PyOD estimator wants.
+    Accepts a torch tensor or a numpy array and always returns float64 numpy on
+    the CPU, which is what every PyOD estimator wants. The tensors arrive
+    float32, which underflows SOS to all-non-finite and CBLOF's Cython path
+    rejects outright.
     """
     if isinstance(Y_windows, t.Tensor):
         Y_windows = Y_windows.detach().cpu().numpy()
-    Y_windows = np.asarray(Y_windows)
+    Y_windows = np.asarray(Y_windows, dtype=np.float64)
     return Y_windows.reshape(len(Y_windows), -1)
 
 
@@ -136,7 +138,15 @@ def score_windows(model, Y, clip=None):
     detector named.
     """
     rows = windows_as_rows(Y)
-    scores = np.asarray(model.decision_function(X=rows), dtype=float)
+    try:
+        scores = np.asarray(model.decision_function(X=rows), dtype=float)
+    except ValueError as e:
+        # Estimators fitted on float32 keep float32 state; sklearn's Cython
+        # kernels then reject the float64 rows (CBLOF's KMeans centres).
+        if "dtype" not in str(e):
+            raise
+        scores = np.asarray(model.decision_function(X=rows.astype(np.float32)),
+                            dtype=float)
     # The TSB-AD adapter is one wrapper around many detectors, so its class name
     # would say `_TSBADEstimator` for all of them; it sets `detector_name` to the
     # family instead. PyOD estimators have no such attribute and keep their own.

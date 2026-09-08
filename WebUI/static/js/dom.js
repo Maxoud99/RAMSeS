@@ -94,7 +94,7 @@ export function proseNode(text, className = "prose") {
  *
  * Click a header to sort by it; click again to reverse; a third click restores
  * the order the table was built in. That third state matters here because the
- * default order is itself a finding — channels by contribution, stages in
+ * default order is itself a finding — context features by contribution, stages in
  * pipeline order — so a sort must be undoable without a reload.
  *
  * Headers are the <th> elements themselves, made focusable, rather than buttons
@@ -103,7 +103,7 @@ export function proseNode(text, className = "prose") {
  */
 
 const BLANK_CELLS = new Set(["", "—", "–", "-", "n/a", "not available", "null"]);
-/* Strict enough that "channel 7" is not mistaken for the number 7. */
+/* Strict enough that "context feature 7" is not mistaken for the number 7. */
 const STRICT_NUMBER = /^[+-]?[\d,]*\.?\d+(?:[eE][+-]?\d+)?\s*%?$/;
 
 function cellText(row, index) {
@@ -182,7 +182,7 @@ export function makeSortable(table) {
           const na = toNumber(ta), nb = toNumber(tb);
           cmp = (Number.isNaN(na) ? 0 : na) - (Number.isNaN(nb) ? 0 : nb);
         } else {
-          // Natural order, so channel 2 precedes channel 10.
+          // Natural order, so context feature 2 precedes context feature 10.
           cmp = ta.localeCompare(tb, undefined, { numeric: true, sensitivity: "base" });
         }
         return cmp * sign || a.i - b.i; // stable

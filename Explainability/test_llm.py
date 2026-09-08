@@ -76,10 +76,13 @@ def _mc_result():
 
 def _results_dict():
     return {
-        "thompson": {"best_model": "LOF_1"},
-        "gan_robustness": {"best_model": "LOF_1"},
-        "borderline": {"best_model": "NN_3"},
-        "monte_carlo": {"best_model_f1": "LOF_1"},
+        "thompson": {"best_model": "LOF_1", "top_models": ["LOF_1", "NN_3"]},
+        "gan_robustness": {"best_model": "LOF_1", "f1_names": ["LOF_1", "NN_3"],
+                           "pr_auc_names": ["NN_3", "LOF_1"]},
+        "borderline": {"best_model": "NN_3", "f1_names": ["NN_3", "LOF_1"],
+                       "pr_auc_names": ["NN_3", "LOF_1"]},
+        "monte_carlo": {"best_model_f1": "LOF_1", "f1_names": ["LOF_1", "NN_3"],
+                        "pr_auc_names": ["LOF_1", "NN_3"]},
         "aggregation": {"robust_agg": (0.5, ["LOF_1", "NN_3"]),
                         "final_agg": (0.4, ["LOF_1", "NN_3"])},
         "final_decision": {"framework_choice": "single_model",
@@ -109,18 +112,27 @@ def _tiny_ir():
 
 
 class FakeClient:
-    """Perfect-copy model: echoes the prompt's grounded content verbatim."""
+    """Test double that echoes the prompt's facts verbatim.
+
+    No longer how the narrator behaves — it now merges and rewords freely — but
+    a verbatim echo keeps these orchestration tests deterministic.
+    """
     model = "fake"
 
     def chat(self, system, user):
         out = []
         for line in user.splitlines():
+            # Everything past this is the repair prompt's own draft and problem
+            # list, not facts to echo.
+            if line.startswith("YOUR PREVIOUS DRAFT:"):
+                break
             m = re.match(r"^\d+\.\s+(?:\[REQUIRED\]\s+)?(.*)$", line)
             if m:
                 out.append(m.group(1))
                 continue
-            if line.startswith("- ") and ":" in line:
-                out.append(line[2:].replace("[CAVEAT] ", ""))
+            if line.startswith("- "):
+                out.append(line[2:].replace("[REQUIRED] ", "")
+                           .replace("[AS GIVEN] ", "").replace("[CAVEAT] ", ""))
         return " ".join(out)
 
 
@@ -342,50 +354,52 @@ def _rivals_ir():
     }
 
 
-class TestRepairSeesEveryViolation(unittest.TestCase):
-    """Repair is the one place the model is told what it specifically got
-    wrong. A finding the verifier measures but `_violation_count` ignores is a
-    finding that never reaches it: the swapped rival sets and wrong
-    utility/stability profiles were both scored and then silently dropped."""
-
-    def test_swapped_rivals_and_profile_claims_are_repairable(self):
-        metrics = {
-            "unsupported_numbers": [], "unsupported_entities": [],
-            "misattributed_numbers": [], "missing_required_ids": [],
-            "swapped_rivals": [
-                {"atom_id": "ob.edge.0", "expected": ["nn_2", "nn_3"],
-                 "found": ["cblof_2"], "intruded": ["cblof_2"],
-                 "dropped": ["nn_2", "nn_3"],
-                 "sentence": "CBLOF_4 beat CBLOF_2 on 90 points."}],
-            "attribution_warnings": [
-                {"subject": "lof_3", "aspect": "utility", "claimed": ["L"],
-                 "actual": "H", "sentence": "LOF_3 had low utility."}],
-        }
-        self.assertEqual(llm._violation_count(metrics), 2)
-
-        ir_doc = {"evidence": [
-            {"id": "ob.edge.0", "type": "exclusive_wins", "subject": "CBLOF_4",
-             "value": {"competitors": ["NN_2", "NN_3"]},
-             "text": "CBLOF_4 correctly handles 90 points that NN_2 and NN_3 miss."}]}
-        lines = llm._violation_lines(metrics, ir_doc)
-        self.assertEqual(len(lines), 2)
-        joined = " ".join(lines)
-        # Each message names the wrong thing AND the fact to go back to.
-        self.assertIn("CBLOF_2", joined)
-        self.assertIn("NN_2, NN_3", joined)
-        self.assertIn("LOF_3", joined)
-        # The H/L codes are spelled out — a bare letter means nothing to the model.
-        self.assertIn("its utility is high", joined)
-        self.assertNotIn("'H'", joined)
-
-    def test_a_clean_narrative_produces_no_repair(self):
-        clean = {"unsupported_numbers": [], "unsupported_entities": [],
-                 "misattributed_numbers": [], "missing_required_ids": [],
-                 "swapped_rivals": [], "attribution_warnings": []}
-        self.assertEqual(llm._violation_count(clean), 0)
-        self.assertEqual(llm._violation_lines(clean, {"evidence": []}), [])
-
-
+# Commented out with the repair loop: these exercise the retry that the
+# verifier's coverage metrics used to trigger.
+# class TestRepairSeesEveryViolation(unittest.TestCase):
+#     """Repair is the one place the model is told what it specifically got
+#     wrong. A finding the verifier measures but `_violation_count` ignores is a
+#     finding that never reaches it: the swapped rival sets and wrong
+#     utility/stability profiles were both scored and then silently dropped."""
+#
+#     def test_swapped_rivals_and_profile_claims_are_repairable(self):
+#         metrics = {
+#             "unsupported_numbers": [], "unsupported_entities": [],
+#             "misattributed_numbers": [], "missing_required_ids": [],
+#             "swapped_rivals": [
+#                 {"atom_id": "ob.edge.0", "expected": ["nn_2", "nn_3"],
+#                  "found": ["cblof_2"], "intruded": ["cblof_2"],
+#                  "dropped": ["nn_2", "nn_3"],
+#                  "sentence": "CBLOF_4 beat CBLOF_2 on 90 points."}],
+#             "attribution_warnings": [
+#                 {"subject": "lof_3", "aspect": "utility", "claimed": ["L"],
+#                  "actual": "H", "sentence": "LOF_3 had low utility."}],
+#         }
+#         self.assertEqual(llm._violation_count(metrics), 2)
+#
+#         ir_doc = {"evidence": [
+#             {"id": "ob.edge.0", "type": "exclusive_wins", "subject": "CBLOF_4",
+#              "value": {"competitors": ["NN_2", "NN_3"]},
+#              "text": "CBLOF_4 correctly handles 90 points that NN_2 and NN_3 miss."}]}
+#         lines = llm._violation_lines(metrics, ir_doc)
+#         self.assertEqual(len(lines), 2)
+#         joined = " ".join(lines)
+#         # Each message names the wrong thing AND the fact to go back to.
+#         self.assertIn("CBLOF_2", joined)
+#         self.assertIn("NN_2, NN_3", joined)
+#         self.assertIn("LOF_3", joined)
+#         # The H/L codes are spelled out — a bare letter means nothing to the model.
+#         self.assertIn("its utility is high", joined)
+#         self.assertNotIn("'H'", joined)
+#
+#     def test_a_clean_narrative_produces_no_repair(self):
+#         clean = {"unsupported_numbers": [], "unsupported_entities": [],
+#                  "misattributed_numbers": [], "missing_required_ids": [],
+#                  "swapped_rivals": [], "attribution_warnings": []}
+#         self.assertEqual(llm._violation_count(clean), 0)
+#         self.assertEqual(llm._violation_lines(clean, {"evidence": []}), [])
+#
+#
 class TestVerifierCoverageIsConjunctive(unittest.TestCase):
     """Every name a required atom uses must appear — `any()` hid two classes.
 
@@ -507,6 +521,70 @@ class TestVerifierProfileClaims(unittest.TestCase):
         self.assertEqual(v["attribution_warnings"], [])
 
 
+class TestVerifierRoleMixing(unittest.TestCase):
+    """Role mixing (verifier v4).
+
+    Agreement is a property of a SOURCE ranking; a detector only has a
+    position. On SKAB/7 the narrator hung the first on the second — "its
+    first-ranked detector is LOF_3, which aligns more closely with
+    Thompson_Sampling's ranking" — which inverted the finding, LOF_3 leading
+    because the OTHER source ranked it first. It scored 0.000: the sentence
+    carries no numbers, and `_ENTITY_RE` cannot even see a source name.
+    """
+
+    def _ir(self):
+        return {
+            "ir_version": "1.0", "stage": "rank_aggregation_final",
+            "dataset": "DS", "entity": "e1",
+            "output": {"top_pick": "LOF_3",
+                       "consensus_ranking_top_k": ["LOF_3", "CBLOF_1"],
+                       "sources": ["Robust_Aggregated", "Thompson_Sampling"]},
+            "evidence": [
+                {"id": "ra_final.output.top", "type": "stage_output",
+                 "subject": "LOF_3", "value": "LOF_3",
+                 "text": "The final consensus is a ranking of detectors; its "
+                         "first-ranked detector is LOF_3."},
+                {"id": "ra_final.kendall_only.winner", "type": "kendall_only",
+                 "subject": "Thompson_Sampling",
+                 "value": {"winner": "Thompson_Sampling",
+                           "runner_up": "Robust_Aggregated"},
+                 "text": "Thompson_Sampling drove the final consensus most."},
+            ],
+            "caveats": [], "required_atom_ids": [], "confidence": {},
+        }
+
+    def test_relation_hung_on_a_detector_is_caught(self):
+        bad = ("Thompson_Sampling drove the final consensus most. The "
+               "first-ranked detector in the final consensus is LOF_3, which "
+               "aligns more closely with Thompson_Sampling's ranking.")
+        v = verifier.verify_narrative(bad, self._ir())
+        self.assertEqual(v["n_role_mixups"], 1)
+        self.assertEqual(v["role_mixups"][0]["detectors"], ["LOF_3"])
+        self.assertGreater(v["hallucination_rate"], 0.0)
+
+    def test_both_vocabularies_in_one_sentence_is_not_itself_an_error(self):
+        """The relation must ATTACH to the detector. Naming a source and a
+        detector in one true sentence is ordinary prose, and flagging it would
+        make the check noisy enough to ignore."""
+        ok = ("The final consensus is driven most closely by Thompson_Sampling, "
+              "with LOF_3 ranked first.")
+        self.assertEqual(verifier.verify_narrative(ok, self._ir())["n_role_mixups"], 0)
+
+    def test_separate_sentences_are_clean(self):
+        good = ("The final consensus followed Thompson_Sampling more closely "
+                "than Robust_Aggregated. The first-ranked detector in the final "
+                "consensus ranking is LOF_3.")
+        v = verifier.verify_narrative(good, self._ir())
+        self.assertEqual(v["n_role_mixups"], 0)
+        self.assertEqual(v["hallucination_rate"], 0.0)
+
+    def test_stages_declaring_one_vocabulary_are_skipped(self):
+        ir = self._ir()
+        ir["output"].pop("sources")
+        bad = "its first-ranked detector is LOF_3, which aligns more closely."
+        self.assertEqual(verifier.verify_narrative(bad, ir)["n_role_mixups"], 0)
+
+
 class TestVerifierRivalSets(unittest.TestCase):
     """Rival-set attribution (verifier v3).
 
@@ -588,25 +666,27 @@ class TestVerifierRivalSets(unittest.TestCase):
 
 class TestPrompts(unittest.TestCase):
 
-    def test_stage_prompt_contains_all_atoms_and_markers(self):
-        result = _mc_result()
-        # MC's run-invariant notes now live in the info footer; force a
-        # run-specific caveat (majority-degenerate CV) to exercise [CAVEAT].
-        result["permodel_f1"] = {"A": {"cv_r2": 0.6, "cv_n_splits": 5,
-                                       "cv_degenerate_folds": 4}}
-        doc = ir.build_monte_carlo_ir("DS", "e1", result, ["LOF_1", "NN_3"],
-                                      ["NN_3", "LOF_1"])
-        self.assertTrue(doc["caveats"])  # guard: the marker test needs a caveat
-        prompt = llm.build_stage_prompt(doc)
-        for atom in doc["evidence"]:
-            self.assertIn(atom["text"], prompt)
-        self.assertEqual(prompt.count("[REQUIRED]"), len(doc["required_atom_ids"]))
-        for cav in doc["caveats"]:
-            self.assertIn(cav["text"], prompt)
-        self.assertIn("[CAVEAT]", prompt)
-        lo, hi = llm._word_budget(len(doc["evidence"]),
-                                  content_words=llm._content_words(doc))
-        self.assertIn(f"{lo}-{hi} words", prompt)
+    # Commented out with the helpers it exercises: the v5 prompt has no word
+    # budget and no per-stage task hint. Restore both together.
+    # def test_stage_prompt_contains_all_atoms_and_markers(self):
+    #     result = _mc_result()
+    #     # MC's run-invariant notes now live in the info footer; force a
+    #     # run-specific caveat (majority-degenerate CV) to exercise [CAVEAT].
+    #     result["permodel_f1"] = {"A": {"cv_r2": 0.6, "cv_n_splits": 5,
+    #                                    "cv_degenerate_folds": 4}}
+    #     doc = ir.build_monte_carlo_ir("DS", "e1", result, ["LOF_1", "NN_3"],
+    #                                   ["NN_3", "LOF_1"])
+    #     self.assertTrue(doc["caveats"])  # guard: the marker test needs a caveat
+    #     prompt = llm.build_stage_prompt(doc)
+    #     for atom in doc["evidence"]:
+    #         self.assertIn(atom["text"], prompt)
+    #     self.assertEqual(prompt.count("[REQUIRED]"), len(doc["required_atom_ids"]))
+    #     for cav in doc["caveats"]:
+    #         self.assertIn(cav["text"], prompt)
+    #     self.assertIn("[CAVEAT]", prompt)
+    #     lo, hi = llm._word_budget(len(doc["evidence"]),
+    #                               content_words=llm._content_words(doc))
+    #     self.assertIn(f"{lo}-{hi} words", prompt)
 
     def test_global_prompt_is_fact_based(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -621,63 +701,107 @@ class TestPrompts(unittest.TestCase):
         self.assertNotIn("- framework_choice:", prompt)
         self.assertEqual(prompt.count("[REQUIRED]"), len(gdoc["required_atom_ids"]))
         self.assertIn("STAGES WITHOUT DATA", prompt)
-        self.assertIn("150-300 words", prompt)
+        self.assertIn("TASK: Write ONE paragraph.", prompt)
 
-    def test_stage_task_hint_only_for_registered_stages(self):
-        doc = _tiny_ir()
-        doc["stage"] = "rank_aggregation_robust"
-        prompt = llm.build_stage_prompt(doc)
-        self.assertIn("rank is a position", prompt)
-        self.assertIn("rather than calling it high or low", prompt)
-        # Other stages get their own hint, not this one.
-        doc["stage"] = "monte_carlo"
-        self.assertNotIn("rank is a position", llm.build_stage_prompt(doc))
+    # Commented out with the helpers it exercises: the v5 prompt has no word
+    # budget and no per-stage task hint. Restore both together.
+    # def test_stage_task_hint_only_for_registered_stages(self):
+    #     doc = _tiny_ir()
+    #     doc["stage"] = "rank_aggregation_robust"
+    #     prompt = llm.build_stage_prompt(doc)
+    #     self.assertIn("rank is a position", prompt)
+    #     self.assertIn("NEVER call a rank", prompt)
+    #     # Other stages get their own hint, not this one.
+    #     doc["stage"] = "monte_carlo"
+    #     self.assertNotIn("rank is a position", llm.build_stage_prompt(doc))
 
-    def test_question_frames_the_prompt(self):
-        doc = _tiny_ir()
-        # No question → plain framing.
-        self.assertNotIn("QUESTION THIS STAGE ANSWERS", llm.build_stage_prompt(doc))
-        doc["question"] = "Why did LOF_1 rank first?"
-        prompt = llm.build_stage_prompt(doc)
-        self.assertIn("QUESTION THIS STAGE ANSWERS: Why did LOF_1 rank first?", prompt)
-        self.assertIn("answers the question above, leading with the answer", prompt)
+    # Commented out with the helpers it exercises: the v5 prompt has no word
+    # budget and no per-stage task hint. Restore both together.
+    # def test_question_frames_the_prompt(self):
+    #     doc = _tiny_ir()
+    #     # No question → plain framing.
+    #     self.assertNotIn("QUESTION THIS STAGE ANSWERS", llm.build_stage_prompt(doc))
+    #     doc["question"] = "Why did LOF_1 rank first?"
+    #     prompt = llm.build_stage_prompt(doc)
+    #     self.assertIn("QUESTION THIS STAGE ANSWERS: Why did LOF_1 rank first?", prompt)
+    #     self.assertIn("answers the question above", prompt)
+    #     # The opening sentence is the one thing the model decides; the stage
+    #     # card's short view is built from it.
+    #     self.assertIn("Open with ONE sentence that answers it outright", prompt)
+    #     # Optional facts must be offered AS optional, or the budget's headroom
+    #     # buys nothing: the model states them all and the narrative comes out at
+    #     # the length of its own facts.
+    #     self.assertIn("optional", prompt)
 
-    def test_word_budget_follows_content_length_not_atom_count(self):
-        """The floor must never exceed the material available.
+    # Commented out with the helpers it exercises: the v5 prompt has no word
+    # budget and no per-stage task hint. Restore both together.
+    # def test_word_budget_follows_content_length_not_atom_count(self):
+    #     """The floor must never exceed the material available.
+#
+    #     A 4-atom ga_selection carrying 74 words of facts was asked for at least
+    #     120 words, so ~46 had to be invented — and they arrived as an
+    #     unsupported concluding sentence. Consolidating near-identical atoms
+    #     (which is what stops a narrator shuffling names between them) cuts the
+    #     atom count without cutting the material, so the count is the wrong
+    #     driver."""
+    #     doc = _tiny_ir()
+    #     doc["evidence"] = [
+    #         {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
+    #          "text": "word " * 20} for i in range(4)
+    #     ]
+    #     doc["caveats"] = []
+    #     content = llm._content_words(doc)
+    #     self.assertEqual(content, 80)
+    #     lo, hi = llm._word_budget(4, content_words=content)
+    #     self.assertLess(lo, content)          # never demand more than exists
+    #     self.assertGreater(hi, content)       # but leave room for connectives
+    #     self.assertIn(f"{lo}-{hi} words", llm.build_stage_prompt(doc))
+#
+    #     # Half the atoms, same material → essentially the same budget. Under the
+    #     # old count-based curve this pair straddled the 120-word cliff.
+    #     merged = dict(doc)
+    #     merged["evidence"] = [
+    #         {"id": f"toy.b{i}", "type": "t", "subject": "LOF_1", "value": i,
+    #          "text": "word " * 40} for i in range(2)
+    #     ]
+    #     self.assertEqual(llm._word_budget(2, content_words=llm._content_words(merged)),
+    #                      (lo, hi))
 
-        A 4-atom ga_selection carrying 74 words of facts was asked for at least
-        120 words, so ~46 had to be invented — and they arrived as an
-        unsupported concluding sentence. Consolidating near-identical atoms
-        (which is what stops a narrator shuffling names between them) cuts the
-        atom count without cutting the material, so the count is the wrong
-        driver."""
-        doc = _tiny_ir()
-        doc["evidence"] = [
-            {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
-             "text": "word " * 20} for i in range(4)
-        ]
-        doc["caveats"] = []
-        content = llm._content_words(doc)
-        self.assertEqual(content, 80)
-        lo, hi = llm._word_budget(4, content_words=content)
-        self.assertLess(lo, content)          # never demand more than exists
-        self.assertGreater(hi, content)       # but leave room for connectives
-        self.assertIn(f"{lo}-{hi} words", llm.build_stage_prompt(doc))
+    # Commented out with the helpers it exercises: the v5 prompt has no word
+    # budget and no per-stage task hint. Restore both together.
+    # def test_budget_counts_required_atoms_only(self):
+    #     """Optional atoms must not buy themselves room.
+#
+    #     Sizing the budget to every atom made the optional ones optional in name
+    #     only: there was space for all of them, so all were stated and the
+    #     narrative came out at ~1.0x the length of its own facts. The headroom
+    #     above the required set is what the model spends on the optional facts it
+    #     judges worth including."""
+    #     doc = _tiny_ir()
+    #     doc["evidence"] = [
+    #         {"id": f"toy.a{i}", "type": "t", "subject": "LOF_1", "value": i,
+    #          "text": "word " * 20} for i in range(4)
+    #     ]
+    #     doc["caveats"] = []
+    #     doc["required_atom_ids"] = ["toy.a0", "toy.a1"]
+    #     self.assertEqual(llm._content_words(doc), 40)
 
-        # Half the atoms, same material → essentially the same budget. Under the
-        # old count-based curve this pair straddled the 120-word cliff.
-        merged = dict(doc)
-        merged["evidence"] = [
-            {"id": f"toy.b{i}", "type": "t", "subject": "LOF_1", "value": i,
-             "text": "word " * 40} for i in range(2)
-        ]
-        self.assertEqual(llm._word_budget(2, content_words=llm._content_words(merged)),
-                         (lo, hi))
+    # Commented out with the helpers it exercises: the v5 prompt has no word
+    # budget and no per-stage task hint. Restore both together.
+    # def test_a_required_list_naming_no_present_atom_falls_back(self):
+    #     """Malformed, not empty — a 0 budget would floor a 500-word stage at 40."""
+    #     doc = _tiny_ir()
+    #     doc["evidence"] = [{"id": "toy.a0", "type": "t", "subject": "LOF_1",
+    #                         "value": 1, "text": "word " * 20}]
+    #     doc["caveats"] = []
+    #     doc["required_atom_ids"] = ["nothing.here"]
+    #     self.assertEqual(llm._content_words(doc), 20)
 
-    def test_word_budget_falls_back_to_atom_count(self):
-        self.assertEqual(llm._word_budget(2), (65, 120))
-        self.assertEqual(llm._word_budget(7), (120, 220))
-        self.assertGreater(llm._word_budget(30)[1], 220)
+    # Commented out with `_word_budget`: neither prompt sizes a budget now.
+    # def test_word_budget_falls_back_to_atom_count(self):
+    #     self.assertEqual(llm._word_budget(2), (65, 120))
+    #     self.assertEqual(llm._word_budget(7), (120, 220))
+    #     self.assertGreater(llm._word_budget(30)[1], 220)
 
     def test_fact_lines_are_bulleted_never_numbered(self):
         """Numbering the facts handed the narrator a citation handle, and it
@@ -788,10 +912,9 @@ class TestNarrateEntity(unittest.TestCase):
                                         stages=["ga_combination"])
             self.assertEqual(list(report["stages"].keys()), ["ga_combination"])
 
-    def test_info_footer_leads_file_and_is_outside_verification(self):
-        """The glossary heads the .txt — the reader meets the terms before the
-        prose using them — but is written outside the model's output, so it
-        never enters the verified narrative or the metrics."""
+    def test_narrative_file_is_prose_only(self):
+        """The glossary used to lead every .txt. It now lives on the
+        documentation page, so the file is the narrative and nothing else."""
         ra_result = {
             "verdicts": [
                 {"source": "S1", "loo_score": 0.3, "loo_rank": 1, "align_score": 0.6,
@@ -802,11 +925,12 @@ class TestNarrateEntity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, "explanations_ir")
             out = os.path.join(tmp, "explanations_nl")
-            ir.write_stage_ir(
-                ir.build_rank_aggregation_ir("DS", "e1", "robust", 0, ra_result,
-                                             ["S1", "S2"], {"S1": "A", "S2": "B"},
-                                             ["A", "B"]),
-                "DS", "e1", "ir_rank_aggregation_robust_0", base_dir=base)
+            doc = ir.build_rank_aggregation_ir("DS", "e1", "robust", 0, ra_result,
+                                               ["S1", "S2"], {"S1": "A", "S2": "B"},
+                                               ["A", "B"])
+            self.assertNotIn("info_footer", doc)
+            ir.write_stage_ir(doc, "DS", "e1", "ir_rank_aggregation_robust_0",
+                              base_dir=base)
             report = llm.narrate_entity("DS", "e1", 0, FakeClient(),
                                         base_dir=base, out_dir=out,
                                         stages=["rank_aggregation_robust"])
@@ -814,52 +938,45 @@ class TestNarrateEntity(unittest.TestCase):
             self.assertEqual(info["status"], "ok")
             with open(info["narrative_path"]) as f:
                 content = f.read()
-            # Glossary first, then a blank line, then the narrative.
-            self.assertTrue(content.startswith("INFO: "), content[:40])
-            footer, _, body = content.partition("\n\n")
-            self.assertIn("Influence measures how much a source moved", footer)
-            # The narrative itself carries neither the marker nor the glossary.
-            self.assertTrue(body.strip())
-            self.assertNotIn("INFO:", body)
-            self.assertNotIn("Influence measures", body)
-            # Metrics are computed on the narrative alone.
-            self.assertEqual(info["words"], len(body.split()))
+            self.assertNotIn("INFO:", content)
+            self.assertEqual(info["words"], len(content.split()))
 
-    def test_repair_pass_fixes_violating_draft(self):
-        """A draft with a hallucinated number triggers ONE verifier-guided
-        retry; both metric sets are recorded and the clean rewrite is kept."""
-
-        class RepairingClient(FakeClient):
-            def __init__(self):
-                self.prompts = []
-
-            def chat(self, system, user):
-                self.prompts.append(user)
-                clean = FakeClient.chat(self, system, user)
-                if len(self.prompts) == 1:
-                    return clean + " A bogus extra value of 0.912345 appears."
-                return clean
-
-        client = RepairingClient()
-        with tempfile.TemporaryDirectory() as tmp:
-            base = os.path.join(tmp, "explanations_ir")
-            out = os.path.join(tmp, "explanations_nl")
-            ir.write_stage_ir(
-                ir.build_ga_combination_ir("DS", "e1", _ga_combination_result()),
-                "DS", "e1", "ir_ga_combination", base_dir=base)
-            report = llm.narrate_entity("DS", "e1", 0, client,
-                                        base_dir=base, out_dir=out,
-                                        stages=["ga_combination"])
-        info = report["stages"]["ga_combination"]
-        self.assertEqual(info["status"], "ok")
-        self.assertTrue(info["repaired"])
-        self.assertIn("0.912345", info["verify_initial"]["unsupported_numbers"])
-        self.assertEqual(info["verify"]["unsupported_numbers"], [])
-        self.assertEqual(info["verify"]["hallucination_rate"], 0.0)
-        # Exactly one retry, and it carried the violation feedback.
-        self.assertEqual(len(client.prompts), 2)
-        self.assertIn("PROBLEMS DETECTED IN THE DRAFT", client.prompts[1])
-        self.assertIn("0.912345", client.prompts[1])
+    # Commented out with the repair loop.
+    # def test_repair_pass_fixes_violating_draft(self):
+    #     """A draft with a hallucinated number triggers ONE verifier-guided
+    #     retry; both metric sets are recorded and the clean rewrite is kept."""
+#
+    #     class RepairingClient(FakeClient):
+    #         def __init__(self):
+    #             self.prompts = []
+#
+    #         def chat(self, system, user):
+    #             self.prompts.append(user)
+    #             clean = FakeClient.chat(self, system, user)
+    #             if len(self.prompts) == 1:
+    #                 return clean + " A bogus extra value of 0.912345 appears."
+    #             return clean
+#
+    #     client = RepairingClient()
+    #     with tempfile.TemporaryDirectory() as tmp:
+    #         base = os.path.join(tmp, "explanations_ir")
+    #         out = os.path.join(tmp, "explanations_nl")
+    #         ir.write_stage_ir(
+    #             ir.build_ga_combination_ir("DS", "e1", _ga_combination_result()),
+    #             "DS", "e1", "ir_ga_combination", base_dir=base)
+    #         report = llm.narrate_entity("DS", "e1", 0, client,
+    #                                     base_dir=base, out_dir=out,
+    #                                     stages=["ga_combination"])
+    #     info = report["stages"]["ga_combination"]
+    #     self.assertEqual(info["status"], "ok")
+    #     self.assertTrue(info["repaired"])
+    #     self.assertIn("0.912345", info["verify_initial"]["unsupported_numbers"])
+    #     self.assertEqual(info["verify"]["unsupported_numbers"], [])
+    #     self.assertEqual(info["verify"]["hallucination_rate"], 0.0)
+    #     # Exactly one retry, and it carried the violation feedback.
+    #     self.assertEqual(len(client.prompts), 2)
+    #     self.assertIn("PROBLEMS DETECTED IN THE DRAFT", client.prompts[1])
+    #     self.assertIn("0.912345", client.prompts[1])
 
     def test_no_repair_call_for_clean_draft(self):
         class CountingClient(FakeClient):
@@ -936,15 +1053,7 @@ class TestGlobalNarrativeModes(unittest.TestCase):
         self.assertEqual(a, b)
         for prose in texts.values():          # reused exactly, never paraphrased
             self.assertIn(prose, a)
-        # Footers are opt-in here; narrate_entity always supplies them.
         self.assertNotIn("INFO:", a)
-        with_footer = llm.compose_global_narrative(
-            texts, self._global_ir(), dataset="DS", entity="e1", iteration=3,
-            stage_footers={"monte_carlo": "Noise is Gaussian."})
-        self.assertIn("INFO: Noise is Gaussian.", with_footer)
-        # Glossary precedes the prose it explains, as in the per-stage files.
-        self.assertLess(with_footer.index("INFO: Noise is Gaussian."),
-                        with_footer.index("MC prose."))
 
     def _run(self, tmp, **kw):
         base = os.path.join(tmp, "explanations_ir")
@@ -967,14 +1076,10 @@ class TestGlobalNarrativeModes(unittest.TestCase):
             # Deterministic merge adds no claims, so it carries no metrics and
             # cannot double-count the stage prose in the micro-average.
             self.assertNotIn("verify", g)
-            # The merged document carries each stage's glossary too.
-            with open(os.path.join(nl_dir, "nl_global_iter3.txt")) as f:
-                merged = f.read()
-            self.assertIn("INFO: ", merged)
             with open(os.path.join(nl_dir, "nl_global_iter3.txt")) as f:
                 doc = f.read()
             with open(os.path.join(nl_dir, "nl_ga_combination.txt")) as f:
-                stage = f.read().split("\nINFO:")[0].strip()
+                stage = f.read().strip()
             self.assertIn(stage, doc)
 
     def test_llm_mode_still_narrates_and_verifies_the_global_ir(self):

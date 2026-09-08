@@ -361,6 +361,24 @@ select, input[type="text"], input[type="number"], input[type="search"] {
   min-width: 0;
 }
 
+/* Chrome sizes a select from the font's own line box, not the inherited 1.5,
+   leaving it 2px shorter than an input beside it. Scoped to the run form: the
+   result page's `.variant-tabs` pickers are deliberately compact. */
+#run-form select, #run-form input[type="text"],
+#run-form input[type="number"], #run-form input[type="search"] {
+  min-height: calc(1.5em + 2 * var(--sp-2) + 2px);
+}
+
+/* The fitness weight sits inside its metric's chip, so it takes the chip's
+   height rather than the run form's field height. */
+#run-form input.metric-weight {
+  width: 5ch; min-height: 0; padding: 0 var(--sp-1);
+  font-size: var(--fs-sm); text-align: right;
+}
+
+#decision_metrics { flex-wrap: nowrap; gap: var(--sp-2); }
+#decision_metrics .toggle { white-space: nowrap; padding: var(--sp-2); }
+
 .field { display: flex; flex-direction: column; gap: var(--sp-2); }
 
 button, .button {
@@ -704,7 +722,7 @@ th[aria-sort="ascending"]::after { content: " ↑"; opacity: 1; }
 th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
 
 /* Folded overflow rows: present in the DOM, revealed by the toggle. A table
-   with 38 channels is a wall in the default view but must stay reachable —
+   with 38 context features is a wall in the default view but must stay reachable —
    and must print in full, like every other disclosure. */
 .summary-table tbody tr.extra { display: none; }
 .summary-table.expanded tbody tr.extra { display: table-row; }
@@ -853,14 +871,24 @@ th[aria-sort="descending"]::after { content: " ↓"; opacity: 1; }
   .prose { max-width: none; }
 }
 
-/* Per-source orderings under the agreement strip. Laid out in columns so five
-   detector lists read side by side instead of as one long scroll. */
+/* The ordering of whichever agreement chip is open. */
 .ranking-list { margin: var(--sp-2) 0 0; padding-left: 3ch; }
 .ranking-list li { line-height: 1.5; }
-/* Narrow enough that five sources fit on one line — detector names are short,
-   so the old 14rem minimum was reserving space nothing used and wrapping the
-   fifth column onto a row of its own. The left padding is what keeps the first
-   column's list markers off the card edge. */
-.ranking-grid { display: grid; gap: var(--sp-3);
-                padding-left: var(--sp-2);
-                grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); }
+/* Five columns: the three robustness tests, then the two sources that have no
+   metric of their own. A stage keeps its column on every metric row, so
+   GAN_PR-AUC sits directly under GAN_F1. */
+.agreement-grid { display: grid; gap: var(--sp-2);
+                  grid-template-columns: repeat(5, max-content); }
+.badge-button { font: inherit; font-size: var(--fs-xs); font-weight: 550;
+                border: 1px solid transparent; cursor: pointer; text-align: left; }
+.badge-button:hover { filter: brightness(1.06); }
+.badge-button[aria-expanded="true"] { border-color: currentColor; }
+/* The open rankings, side by side so two sources can be read against each
+   other. Five fixed columns matching the chip grid above: a source's ranking
+   sits under its own chip's column whatever else is toggled on. */
+.agreement-rankings { display: grid; gap: var(--sp-3);
+                      padding-left: var(--sp-2);
+                      grid-template-columns: repeat(5, minmax(0, 1fr)); }
+@media (max-width: 900px) {
+  .agreement-grid { grid-template-columns: repeat(3, max-content); }
+}

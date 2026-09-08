@@ -97,11 +97,38 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                  "them."},
     ), "subsections": (
         {"id": "overview-pool", "title": "The base detector pool", "blocks": (
-            {"text": "By default different base detectors compete such as: "
-                     "LOF_1..LOF_4, NN_1..NN_3, CBLOF_1..CBLOF_4. Each is "
-                     "trained beforehand and, for every window of the series, "
-                     "emits an anomaly score. Every stage below consumes those "
-                     "scores, none of them retrains a base detector."},
+            {"text": "The detector pool is chosen from 107 detector instances "
+                     "across 34 families, consisting of statistical models, "
+                     "neural networks, foundation models and graph-based "
+                     "detectors. Each is trained beforehand and, for every "
+                     "window of the series, emits an anomaly score. Every stage "
+                     "below consumes those scores, and none of them retrains a "
+                     "base detector."},
+            {"text": "Not every detector fits every series. POLY, TimesFM and "
+                     "Series2Graph are univariate only, so they are dropped on SKAB (9 channels) and "
+                     "SMD (38). ABOD is the mirror case. Since angles need more than "
+                     "one dimension, it is dropped on the single-channel UCR "
+                     "entities. The run configuration hides what the chosen "
+                     "entity cannot use, and a detector named on the command "
+                     "line anyway is skipped with a warning rather than failing "
+                     "the run. Additionally, any detector that needs more than 120 "
+                     "seconds for a single scoring call is killed and excluded "
+                     "from the rest of that run."},
+        )},
+        {"id": "overview-injection", "title": "Synthetic anomalies", "blocks": (
+            {"text": "The framework's ground truth is not only the dataset's own "
+                     "labels. Before model selection begins, synthetic anomalies "
+                     "are injected into a copy of the series, and it is on those "
+                     "injected timesteps that the stages score detectors. This "
+                     "is what lets every stage judge detectors against a known "
+                     "answer on the same series."},
+            {"text": "Nine anomaly types are available: spikes (default), "
+                     "contextual, flip, speedup, noise, cutoff, scale, wander "
+                     "and average. --anomaly_rate sets how much of the series is "
+                     "labelled anomalous, as a fraction in (0, 1]. For spikes it "
+                     "is the per-timestep injection probability, and for the "
+                     "other types it sizes the injected segment. Omitting it "
+                     "keeps each type's own default."},
         )},
         {"id": "overview-branches", "title": "The ensemble and single-model branches", "blocks": (
             {"text": "From the shared pool the framework runs two branches with "
@@ -125,14 +152,16 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         )},
         {"id": "overview-decision",
          "title": "Two aggregations and the final decision", "blocks": (
-            {"text": "Rank aggregation runs twice. First it merges the six "
-                     "rankings the robustness tests produce (three tests, each "
-                     "ranking by F1 and by PR-AUC) into a robustness consensus. "
-                     "Then it merges that consensus with the Thompson ranking "
-                     "into the final single-model order. Finally the framework "
-                     "evaluates the winning ensemble and the winning single "
-                     "detector on the same data and deploys whichever scores "
-                     "higher on F1."},
+            {"text": "Rank aggregation runs twice. First it merges the rankings "
+                     "the robustness tests produce into a robustness consensus. "
+                     "Each of the three tests ranks the detectors by F1 and by "
+                     "PR-AUC, giving six rankings. When the fitness is F1 alone, "
+                     "or PR-AUC alone, each test ranks by that metric only and "
+                     "there are three. Then it merges that consensus with the "
+                     "Thompson ranking into the final single-model order. "
+                     "Finally the framework evaluates the winning ensemble and "
+                     "the winning single detector on the same data and deploys "
+                     "whichever scores higher on the fitness."},
         )},
         {"id": "overview-online", "title": "Online phase and re-optimisation", "blocks": (
             {"text": "The series is split 80% offline / 20% online. The online "
@@ -196,8 +225,10 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                 "Mutates some of the resulting new subsets, adding, removing or "
                 "replacing a detector.",
             )},
-            {"text": "Fitness is the ensemble's best-threshold F1 score, the "
-                     "objective the search maximises. After the last generation "
+            {"text": "Fitness is the ensemble's score on the run's chosen "
+                     "metric, which may be best-threshold F1, PR-AUC, VUS, or a "
+                     "weighted mean of them. That score is the objective the "
+                     "search maximises. After the last generation "
                      "the highest-scoring subset across all generations is the "
                      "chosen ensemble, and the meta-learner trained on it is "
                      "what runs in deployment."},
@@ -234,13 +265,13 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "pool, so \"high utility\" means above the other detectors "
                      "here rather than good in absolute terms. A third quantity, "
                      "LOFO, is reported for members of the final ensemble only: "
-                     "the ensemble's F1 score loss when that one detector is "
+                     "the ensemble's fitness loss when that one detector is "
                      "removed from it. Utility is a global average over the "
                      "whole search, LOFO is local to the one ensemble that was "
                      "chosen, and the two can disagree in sign."},
-            {"formula": "utility(d)   = mean{ F1(S) : d ∈ S } − mean{ F1(S) : d ∉ S }\n"
+            {"formula": "utility(d)   = mean{ fit(S) : d ∈ S } − mean{ fit(S) : d ∉ S }\n"
                         "stability(d) = (1/G) · Σ_g |{ individuals in generation g containing d }| / P\n"
-                        "LOFO(d)      = F1(Ŝ) − F1(Ŝ \\ {d}),    d ∈ Ŝ"},
+                        "LOFO(d)      = fit(Ŝ) − fit(Ŝ \\ {d}),    d ∈ Ŝ"},
             {"text": "where S ranges over the distinct subsets the GA evaluated, "
                      "Ŝ is the chosen ensemble, G is the number of generations "
                      "and P the size of the population in each generation."},
@@ -291,7 +322,8 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
     ), "subsections": (
         {"id": "lints-bayesian", "title": "The context vector and the posterior", "blocks": (
             {"text": "Every window is turned into a context vector x (its "
-                     "channel readings over the window's timesteps). Each "
+                     "readings over the window's timesteps, one block of "
+                     "entries per context feature). Each "
                      "detector holds a Bayesian linear model of its own reward, "
                      "E[r | x] = θᵀx, with a Gaussian posterior over θ "
                      "summarised by a mean vector μ and covariance Σ. The "
@@ -310,8 +342,9 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         )},
         {"id": "lints-reward", "title": "The reward and the posterior update", "blocks": (
             {"text": "The chosen detector is evaluated on that window based on "
-                     "injected timesteps and rewarded with a weighted "
-                     "combination of F1 and PR-AUC (default 0.5 each). Only the "
+                     "injected timesteps and rewarded with the run's fitness: "
+                     "the weighted mean of the metrics --decision_metric names, "
+                     "F1 and PR-AUC by default. Only the "
                      "chosen detector's posterior is updated, by Bayesian linear "
                      "regression on the pair (x, r): the covariance absorbs xxᵀ "
                      "and the mean moves toward the observed reward."},
@@ -324,7 +357,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         {"id": "lints-output", "title": "The final ranking by ‖μ‖²", "blocks": (
             {"text": "The offline phase runs until every window is processed. "
                      "Afterwards the detectors are ranked by the overall size of "
-                     "their learned weights, ‖μ‖². This ranking is the branch's "
+                     "their mean vector, ‖μ‖². This ranking is the branch's "
                      "output and is what goes into the final aggregation."},
         )},
         {"id": "lints-two-views", "title": "μᵀx versus ‖μ‖²", "blocks": (
@@ -340,7 +373,7 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         {"id": "lints-note", "title": "Why contexts are normalised", "blocks": (
             {"text": "Context vectors are normalised to unit length before use. "
                      "Without it, a series with large sensor values or many "
-                     "channels (SMD carries 38) makes xxᵀ dominate the "
+                     "context features (SMD carries 38) makes xxᵀ dominate the "
                      "covariance update and collapse Σ."},
         )},
         {"id": "lints-explained", "title": "What the two cards explain",
@@ -348,19 +381,21 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
             {"text": "The branch produces two quantities and both are explained, "
                      "which is why it has two cards."},
         )},
-        {"id": "lints-criterion", "title": "Splitting the score across channels", "blocks": (
+        {"id": "lints-criterion", "title": "Splitting the score across context features", "blocks": (
             {"text": "The score ‖μ‖² is a sum of squared weights, so it splits "
-                     "exactly into one number per channel with no approximation: "
-                     "a channel's contribution to a detector is the sum of the "
-                     "squares of that detector's mean-vector weights for that "
-                     "channel, and the contributions add up to the whole score. "
+                     "exactly into one number per context feature with no "
+                     "approximation: a context feature's contribution to a "
+                     "detector is the sum of the squares of that detector's "
+                     "mean-vector weights for that context feature, and the "
+                     "contributions add up to the whole score. "
                      "Its share is that contribution as a fraction of the score. "
                      "Because these are squares they are never negative, so a "
-                     "small share means a channel added little, not that it "
-                     "worked against the detector. Comparing two detectors does "
-                     "have direction: the difference of their contributions "
-                     "channel by channel sums exactly to the margin (difference) "
-                     "between their scores, and a negative term marks a channel "
+                     "small share means a context feature added little, not "
+                     "that it worked against the detector. Comparing two "
+                     "detectors does have direction: the difference of their "
+                     "contributions, taken one context feature at a time, sums "
+                     "exactly to the margin (difference) between their scores, "
+                     "and a negative term marks a context feature "
                      "the rival was stronger on. The stage also reports how "
                      "often each detector was actually selected, because μ only "
                      "moves in windows where the arm was pulled, so the score "
@@ -369,22 +404,22 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "straight off the leader at each window after a short "
                      "warm-up in which every score is still zero."},
             {"formula":
-                "contribution(k, c)     = Σ_{i ∈ channel c} μ_k[i]²\n"
+                "contribution(k, c)     = Σ_{i ∈ c} μ_k[i]²\n"
                 "Σ_c contribution(k, c) = ‖μ_k‖²\n"
                 "margin(a, b, c)        = contribution(a, c) − contribution(b, c)\n"
                 "Σ_c margin(a, b, c)    = ‖μ_a‖² − ‖μ_b‖²"},
-            {"text": "where k, a and b are detectors, c is a channel, and i runs "
+            {"text": "where k, a and b are detectors, c is a context feature, and i runs "
                      "over the entries of that detector's mean vector μ that "
-                     "belong to channel c."},
+                     "belong to context feature c."},
         )},
         {"id": "lints-dynamics", "title": "The reward split and the selection states", "blocks": (
-            {"text": "The expected reward μᵀx splits per channel the same way, "
+            {"text": "The expected reward μᵀx splits per context feature the same way, "
                      "and those contributions sum to the prediction exactly. A "
                      "second and narrower measure is also reported: SHAP, how "
-                     "far a channel's contribution departs from what that "
-                     "channel on average contributes, measured against the "
+                     "far a context feature's contribution departs from what that "
+                     "context feature on average contributes, measured against the "
                      "average window of the run. The two answer different "
-                     "questions, and a channel can supply most of a detector's "
+                     "questions, and a context feature can supply most of a detector's "
                      "reward while departing from its own norm not at all. "
                      "Regimes here are stretches of at least three consecutive "
                      "windows in which one detector held the highest expected "
@@ -407,11 +442,11 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "detectors stayed closely matched and the posteriors "
                      "uncertain."},
             {"formula":
-                "contribution(k, c)     = Σ_{i ∈ channel c} μ_k[i] · x[i]\n"
+                "contribution(k, c)     = Σ_{i ∈ c} μ_k[i] · x[i]\n"
                 "Σ_c contribution(k, c) = μ_kᵀx"},
-            {"text": "where k is a detector, c is a channel, x is the window's "
+            {"text": "where k is a detector, c is a context feature, x is the window's "
                      "context vector, and i runs over the entries belonging to "
-                     "channel c."},
+                     "context feature c."},
         )},
     )},
     {"id": "gan", "title": "GAN perturbation test", "stages": ("gan",), "blocks": (
@@ -462,8 +497,8 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                  "for the figures."},
         {"lead": "Evaluation and ranking.",
          "text": "Every detector is then re-evaluated on the GAN-augmented "
-                 "series and ranked by F1 and by PR-AUC. Those two rankings are "
-                 "among the six that feed the robustness consensus."},
+                 "series and ranked by F1 and by PR-AUC. Those rankings feed the "
+                 "robustness consensus."},
     ), "subsections": (
         {"id": "gan-explained", "title": "Exclusive wins and the surrogate trees",
          "blocks": (
@@ -480,7 +515,8 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "decision tree is fitted to predict those exclusive wins "
                      "from seven properties of the point, none of which depends "
                      "on any detector. Writing x for the generated point, x_c "
-                     "for its value in channel c over d channels, W for the "
+                     "for its value in feature c across the point's d "
+                     "features, W for the "
                      "window of the real series around the injection site, i for "
                      "the index the point was injected at and N for the length "
                      "of the augmented series:"},
@@ -495,22 +531,26 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "anomalous, 0 normal. The same boundary that selected it."},
             {"formula": "is_anomaly(x) = 1 [ D(x) >= tau ]"},
             {"lead": "signal_magnitude.",
-             "text": "The average size of the generated values across channels — "
-                     "how large the injected reading is, irrespective of sign."},
+             "text": "The average size of the generated values across the "
+                     "injected point's features, which is how large the "
+                     "injected reading is, irrespective of sign."},
             {"formula": "signal_magnitude(x) = (1/d) * sum_c | x_c |"},
             {"lead": "signal_spread.",
              "text": "How much those values differ from one another across "
-                     "channels. A low spread is a point that moved every channel "
-                     "together, a high one is a point that moved them apart."},
+                     "the injected point's features. A low spread is a "
+                     "point that moved every feature together, a high one "
+                     "is a point that moved them apart."},
             {"formula": "signal_spread(x) = std_c ( x_c )"},
             {"lead": "context_gap.",
              "text": "How far the generated point sits from the average of the "
-                     "real series around it, averaged over channels."},
+                     "real series around it, averaged over the injected "
+                     "point's features."},
             {"formula": "context_gap(x) = (1/d) * sum_c | x_c - mean(W_c) |"},
             {"lead": "local_volatility.",
              "text": "The standard deviation of the real series in that same "
-                     "neighbourhood, averaged over channels — how noisy the "
-                     "stretch the point landed in already was."},
+                     "neighbourhood, averaged over the injected point's "
+                     "features, which is how noisy the stretch the point "
+                     "landed in already was."},
             {"formula": "local_volatility = (1/d) * sum_c std( W_c )"},
             {"lead": "position.",
              "text": "Where the point falls in the series, from 0 at the start "
@@ -523,6 +563,41 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "fact. The tree's splits become plain rules, and the "
                      "average importance across all the rival trees shows which "
                      "property best explains the winner's edge."},
+            {"lead": "Importance.",
+             "text": "Each surrogate is a depth-3 decision tree, and its "
+                     "importances say how that tree spent its splits. A "
+                     "property's importance is the total drop in Gini impurity "
+                     "across every node that splits on it, each node weighted "
+                     "by how many points reach it, normalised so the properties "
+                     "sum to 1. A property the tree never splits on scores 0."},
+            {"formula": "imp(f) = SUM over nodes n splitting on f of\n"
+                        "             (N_n / N) * [ G(n) - (N_L/N_n) G(L) - (N_R/N_n) G(R) ]\n"
+                        "\n"
+                        "G(n) = 1 - p(n)^2 - (1 - p(n))^2"},
+            {"list": (
+                "f is one of the properties above.",
+                "n is a node of the tree, and L and R are its left and right "
+                "children.",
+                "N is the number of injected points the tree was fitted on. "
+                "N_n, N_L and N_R are how many of those reach n, L and R.",
+                "G(n) is the Gini impurity at n, where p(n) is the share of "
+                "exclusive wins among the points reaching it.",
+            )},
+            {"text": "Each rival gets its own tree and therefore its own "
+                     "importances. The figure reports the mean across the "
+                     "rivals whose comparison was not degenerate."},
+            {"text": "Three limits follow from how it is computed. It is "
+                     "relative within one tree, so a property's 0.55 says it "
+                     "outweighed the others there, not that it matters in any "
+                     "absolute sense. It describes the tree that was fitted, "
+                     "not the mechanism: two properties that move together "
+                     "split the credit between them arbitrarily, and at depth 3 "
+                     "there are at most seven splits to go round. Additionally, "
+                     "impurity-based importance favours properties that can be "
+                     "cut in many places over ones that cannot: is_anomaly is "
+                     "binary while position and local_volatility are "
+                     "continuous, so the binary property starts at a "
+                     "disadvantage against them."},
             {"text": "Each tree also reports a held-out, cross-validated "
                      "accuracy alongside the accuracy on the points it was "
                      "fitted to, because the second can look strong purely from "
@@ -551,8 +626,9 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
             {"text": "About one point is inserted for every ten already in the "
                      "series, at evenly spaced positions. To build the point at "
                      "a given position, the framework looks at a short stretch "
-                     "of the series around it and measures how much each channel "
-                     "varies there, its local standard deviation. That number is "
+                     "of the series around it and measures how much each feature "
+                     "of the series varies there, its local standard "
+                     "deviation. That number is "
                      "the series' own account of how much variation is ordinary "
                      "at this spot, and the injected point is drawn at roughly "
                      "that size, multiplied by a random factor drawn just above "
@@ -576,8 +652,10 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         )},
         {"id": "off-by-measured", "title": "Re-ranking on the augmented series", "blocks": (
             {"text": "Every detector is re-evaluated on the augmented series and "
-                     "ranked by F1 and by PR-AUC, contributing two of the six "
-                     "rankings. The augmented data is used nowhere else in the "
+                     "ranked by F1 and by PR-AUC, contributing two rankings to "
+                     "the robustness consensus. When the fitness is F1 alone, or "
+                     "PR-AUC alone, the test ranks by that metric only and "
+                     "contributes one. The augmented data is used nowhere else in the "
                      "framework. The test needs at least 100 points and both "
                      "classes present in the original labels, and is skipped "
                      "rather than run on data that cannot support it."},
@@ -597,7 +675,8 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "from four properties of the point, none of which depends "
                      "on any detector. Writing s for the random factor drawn for "
                      "the point, W for the contextual window of the real series "
-                     "around the injection site over d channels, i for the index "
+                     "around the injection site over the series' d features, i "
+                     "for the index "
                      "the point was injected at and N for the length of the "
                      "augmented series:"},
             {"lead": "boundary_distance.",
@@ -611,8 +690,9 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
             {"formula": "is_anomaly(x) = 1 [ s > 1 ]"},
             {"lead": "local_volatility.",
              "text": "The standard deviation of the real series in the "
-                     "neighbourhood the point landed in, averaged over channels "
-                     "— how noisy that stretch already was."},
+                     "neighbourhood the point landed in, averaged over the "
+                     "injected point's features, which is how noisy that "
+                     "stretch already was."},
             {"formula": "local_volatility = (1/d) * sum_c std( W_c )"},
             {"lead": "position.",
              "text": "Where the point falls in the series, from 0 at the start "
@@ -621,6 +701,41 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
             {"text": "The tree's splits become plain rules, and the average "
                      "importance across all the rival trees shows which property "
                      "best explains the winner's edge."},
+            {"lead": "Importance.",
+             "text": "Each surrogate is a depth-3 decision tree, and its "
+                     "importances say how that tree spent its splits. A "
+                     "property's importance is the total drop in Gini impurity "
+                     "across every node that splits on it, each node weighted "
+                     "by how many points reach it, normalised so the properties "
+                     "sum to 1. A property the tree never splits on scores 0."},
+            {"formula": "imp(f) = SUM over nodes n splitting on f of\n"
+                        "             (N_n / N) * [ G(n) - (N_L/N_n) G(L) - (N_R/N_n) G(R) ]\n"
+                        "\n"
+                        "G(n) = 1 - p(n)^2 - (1 - p(n))^2"},
+            {"list": (
+                "f is one of the properties above.",
+                "n is a node of the tree, and L and R are its left and right "
+                "children.",
+                "N is the number of injected points the tree was fitted on. "
+                "N_n, N_L and N_R are how many of those reach n, L and R.",
+                "G(n) is the Gini impurity at n, where p(n) is the share of "
+                "exclusive wins among the points reaching it.",
+            )},
+            {"text": "Each rival gets its own tree and therefore its own "
+                     "importances. The figure reports the mean across the "
+                     "rivals whose comparison was not degenerate."},
+            {"text": "Three limits follow from how it is computed. It is "
+                     "relative within one tree, so a property's 0.55 says it "
+                     "outweighed the others there, not that it matters in any "
+                     "absolute sense. It describes the tree that was fitted, "
+                     "not the mechanism: two properties that move together "
+                     "split the credit between them arbitrarily, and at depth 3 "
+                     "there are at most seven splits to go round. Additionally, "
+                     "impurity-based importance favours properties that can be "
+                     "cut in many places over ones that cannot: is_anomaly is "
+                     "binary while position and local_volatility are "
+                     "continuous, so the binary property starts at a "
+                     "disadvantage against them."},
             {"text": "Each tree also reports a held-out, cross-validated "
                      "accuracy alongside the accuracy on the points it was "
                      "fitted to, because the second can look strong purely from "
@@ -641,9 +756,8 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                  "signal degrades, so this measures whether a detector's "
                  "standing survives a dirtier version of the same series. Scores "
                  "are averaged across trials, so a detector that happens to win "
-                 "one trial does not carry the ranking. The averaged F1 and "
-                 "PR-AUC orderings are the last two of the six rankings entering "
-                 "the robustness consensus."},
+                 "one trial does not carry the ranking. The averaged orderings "
+                 "enter the robustness consensus."},
         {"text": "The noise level is the standard deviation of the injected "
                  "Gaussian noise, fixed for the production ranking."},
     ), "subsections": (
@@ -691,7 +805,9 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
      "stages": ("rank_aggregation_robust", "rank_aggregation_final"), "blocks": (
         {"text": "The single-model branch produces seven orderings of the same "
                  "detectors: six from the robustness tests and one from Thompson "
-                 "sampling. They may disagree, and each is about a different "
+                 "sampling. When the fitness is F1 alone, or PR-AUC alone, each "
+                 "test contributes one ranking instead of two and there are "
+                 "four. They may disagree, and each is about a different "
                  "thing, so none can simply be preferred. Aggregation turns them "
                  "into one consensus."},
     ), "subsections": (
@@ -709,12 +825,14 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
                      "places."},
         )},
         {"id": "agg-twice", "title": "The two aggregation stages", "blocks": (
-            {"text": "First to the six robustness rankings, producing the "
+            {"text": "First to the six robustness rankings, or three when the "
+                     "fitness is F1 alone or PR-AUC alone, producing the "
                      "robustness consensus. Then to that consensus together with "
                      "the Thompson ranking, producing the final single-model "
                      "order. The two-stage shape is deliberate: it keeps the "
                      "three robustness tests from outvoting the adaptive branch "
-                     "six to one."},
+                     "six to one, or three to one when each test contributes a "
+                     "single ranking."},
         )},
         {"id": "agg-explained", "title": "Influence, agreement and Borda", "blocks": (
             {"text": "The consensus is one ordering built from several possibly "
@@ -764,7 +882,7 @@ DOC_SECTION_BY_STAGE = {key: section["id"]
 # `Explainability.ir` into each stage's artifacts.
 STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "ga_selection": (
-        ("Utility", "The average change in an ensemble's F1 score when the "
+        ("Utility", "The average change in an ensemble's fitness when the "
                     "detector is added to it."),
         ("Stability", "The share of the subsets the algorithm evaluated that "
                       "included the detector."),
@@ -773,8 +891,8 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("SHAP", "How much the meta-learner's anomaly probability moves when a "
                  "detector's actual output is revealed in place of its average "
                  "output."),
-        ("PFI", "How far F1 drops when that detector's scores are shuffled; "
-                "label-based."),
+        ("PFI", "How far fitness drops when that detector's scores are "
+                "shuffled; label-based."),
         ("ALE", "The change in the meta-learner's anomaly probability as the "
                 "detector's own score is gradually increased."),
         ("Sign", "The direction of that change: positive means the probability "
@@ -782,10 +900,10 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
     ),
     "thompson_ranking": (
         ("Score", "The overall size ‖μ‖² of a detector's learned mean vector μ."),
-        ("Share", "The fraction of that score that came from a single channel."),
-        ("Contribution", "The exact amount a single channel added to that score."),
+        ("Share", "The fraction of that score that came from a single context feature."),
+        ("Contribution", "The exact amount a single context feature added to that score."),
         ("Margin", "The gap between two detectors' scores; it traces back to each "
-                   "channel, whose contributions sum to it exactly."),
+                   "context feature, whose contributions sum to it exactly."),
         ("Regime", "A stretch of windows in which one detector held the highest "
                    "score ‖μ‖²."),
     ),
@@ -800,7 +918,7 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
                                  "highest μᵀx."),
         ("Random exploration", "A forced exploration step fired, so the pick was "
                                "random rather than informed."),
-        ("SHAP", "How far a channel's contribution to the expected reward "
+        ("SHAP", "How far a context feature's contribution to the expected reward "
                  "departed from its average contribution over the run."),
     ),
     "gan": (
@@ -809,16 +927,19 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("Ambiguity", "How far the discriminator's score for the generated point "
                       "sits from the threshold separating normal from anomalous; "
                       "0 is the hardest point to place."),
-        ("Signal magnitude", "The average size of the generated point's values "
-                             "across channels."),
-        ("Signal spread", "How much the generated point's values differ from one "
-                          "another across channels."),
+        ("Signal magnitude", "The average size of the injected point's values "
+                             "across its features."),
+        ("Signal spread", "How much the injected point's values differ from one "
+                          "another across its features."),
         ("Context gap", "How far the generated point sits from the average of the "
                         "real series around it."),
         ("Local volatility", "The standard deviation of the series around the "
                              "injection site; how noisy that neighbourhood is."),
         ("Position", "Where the point falls in the series, from 0 at the start "
                      "to 1 at the end."),
+        ("Importance", "How much of the tree's separation between exclusive "
+                       "wins and the rest rests on that property, from 0 (never "
+                       "split on) to 1 (all of it)."),
     ),
     "monte_carlo": (
         ("Noise level", "The standard deviation of the Gaussian noise injected "
@@ -833,6 +954,9 @@ STAGE_TERMS: Dict[str, Tuple[Tuple[str, str], ...]] = {
                              "injection site; how noisy that neighbourhood is."),
         ("Position", "Where the point falls in the series, from 0 at the start "
                      "to 1 at the end."),
+        ("Importance", "How much of the tree's separation between exclusive "
+                       "wins and the rest rests on that property, from 0 (never "
+                       "split on) to 1 (all of it)."),
     ),
     # Both consensus cards get both: they are one stage, and the vocabulary is
     # the stage's. A two-source aggregation reports no influence — leave-one-out
@@ -850,8 +974,9 @@ STAGE_TERMS["rank_aggregation_final"] = STAGE_TERMS["rank_aggregation_robust"]
 def split_info(raw: str) -> Tuple[Optional[str], str]:
     """`"INFO: glossary\\n\\nnarrative"` -> `("glossary", "narrative")`.
 
-    The glossary leads the file (Explainability/llm.py writes it before the
-    narrative). Anything that does not start with the marker is all narrative.
+    Legacy: the glossary is no longer written — the documentation page carries
+    it — but files from earlier runs still lead with the marker, and without
+    this they would render as narrative. Anything without it is all narrative.
     """
     if raw is None:
         return None, ""
@@ -1106,7 +1231,7 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
         ir_doc, raw, nl_path, stale = _load_stage_files(ir_dir, nl_dir, stage)
         if ir_doc is None and raw is None:
             continue
-        info, narrative = split_info(raw or "")
+        _, narrative = split_info(raw or "")
         summary = summarize(narrative, stage=stage["key"], ir_doc=ir_doc)
         output = (ir_doc or {}).get("output") or {}
         entry: Dict[str, Any] = {
@@ -1135,10 +1260,8 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
             # not be a second, looser copy of them.
             "full": summary.get("extended") or summary.get("body") or narrative,
             "words": len(narrative.split()) if narrative else 0,
-            # The glossary itself now lives on the documentation page; the card
-            # keeps the one-line definitions and a pointer to the section
-            # holding the long form.
-            "info": info,
+            # The glossary lives on the documentation page; the card keeps the
+            # one-line definitions and a pointer to the section holding it.
             "terms": [list(pair) for pair in STAGE_TERMS.get(stage["key"], ())],
             "doc_section": DOC_SECTION_BY_STAGE.get(stage["key"]),
             "question": (ir_doc or {}).get("question"),
@@ -1183,8 +1306,15 @@ def build_payload(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
          # Absent on result trees written before rankings were carried; the
          # frontend simply renders no disclosure for those.
          "ranking": list(info.get("ranking") or []),
+         "stage": info.get("stage") or name,
+         "metric": info.get("metric"),
          "agrees": info.get("agrees_with_final_single")}
-        for name, info in sorted(((global_ir or {}).get("stage_agreement") or {}).items())
+        # `order` is the display order the IR laid out: one row per metric, the
+        # robustness stages in the same columns on every row. Trees written
+        # before it existed have none, and fall back to their key order.
+        for name, info in sorted(
+            ((global_ir or {}).get("stage_agreement") or {}).items(),
+            key=lambda kv: (kv[1].get("order") is None, kv[1].get("order"), kv[0]))
         if name != "final_consensus"
     ]
     decision_atom = next(

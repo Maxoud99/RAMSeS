@@ -16,7 +16,8 @@ from typing import Any, Dict, Iterator, Optional
 from flask import (Flask, Response, abort, jsonify, render_template, request,
                    send_file, url_for)
 
-from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES, DEFAULT_LLM_BASE_URL,
+from Utils.pipeline_spec import (ALL_ANOMALY_TYPES, ALL_DETECTORS, ALL_STAGES,
+                                 DECISION_METRICS, DEFAULT_LLM_BASE_URL,
                                  DEFAULT_LLM_MODEL)
 from WebUI import artifacts, catalog, jobs, ondemand, paths, plots
 
@@ -62,6 +63,38 @@ def _validate_run(body: Dict[str, Any]) -> Optional[str]:
             return f"unknown detector(s): {', '.join(sorted(unknown))}"
         if len(set(detectors)) < 2:
             return "select at least two detectors"
+    anomaly_type = body.get("anomaly_type")
+    if anomaly_type is not None and str(anomaly_type).lower() not in ALL_ANOMALY_TYPES:
+        return f"unknown anomaly type: {anomaly_type}"
+    rate = body.get("anomaly_rate")
+    if rate is not None:
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            return f"anomaly rate must be a number, got {rate!r}"
+        if not 0.0 < rate <= 1.0:
+            return f"anomaly rate must be greater than 0 and at most 1, got {rate}"
+    metrics = body.get("decision_metrics")
+    if metrics is None:
+        metrics = body.get("decision_metric")
+    if metrics is not None:
+        if isinstance(metrics, str):
+            metrics = [metrics]
+        unknown = [m for m in metrics
+                   if str(m).strip().lower().replace("-", "_") not in DECISION_METRICS]
+        if unknown:
+            return f"unknown decision metric(s): {', '.join(map(str, unknown))}"
+        if not metrics:
+            return "select at least one decision metric"
+        if isinstance(metrics, dict):
+            try:
+                weights = {m: float(w) for m, w in metrics.items()}
+            except (TypeError, ValueError):
+                return "decision metric weights must be numbers"
+            if any(w < 0 for w in weights.values()):
+                return "decision metric weights must not be negative"
+            if not any(w > 0 for w in weights.values()):
+                return "select at least one decision metric"
     return None
 
 
@@ -338,7 +371,7 @@ def create_app(**overrides) -> Flask:
 
         Eleven detectors is 55 unordered pairs per entity and a reader looks at
         one or two, so these are rendered rather than written by the pipeline.
-        Everything it needs is the IR's `channel_shares` block; nothing is
+        Everything it needs is the IR's `context_feature_shares` block; nothing is
         written to myresults/.
         """
         a = (request.args.get("a") or "").strip()
@@ -358,7 +391,7 @@ def create_app(**overrides) -> Flask:
         """One per-window frame of a Thompson set, drawn per request.
 
         These were nine folders of PNGs — over a thousand frames per entity, of
-        which a reader opens a handful — so the pipeline persists the per-channel
+        which a reader opens a handful — so the pipeline persists the per-context-feature
         numbers and the frame is rendered here. `scope` and the gallery's stride
         are arguments rather than separate sets.
         """
@@ -456,6 +489,9 @@ def _event_stream(job: "jobs.Job", start_cursor: int) -> Iterator[str]:
 def serve(host: str = "127.0.0.1", port: int = 5000) -> None:
     from werkzeug.serving import run_simple
     app = create_app()
+    # Templates recompile when the file changes, so markup edits need only a
+    # browser reload. Unlike the reloader below, this restarts nothing.
+    app.jinja_env.auto_reload = True
     print(f"RAMSeS Web UI → http://{host}:{port}")
     # threaded: each SSE connection holds a thread. No reloader: it would
     # restart the process and orphan a running pipeline. No debug: the Werkzeug

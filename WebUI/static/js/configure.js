@@ -29,6 +29,9 @@ function currentBody(extra = {}) {
   return {
     dataset: datasetOf(),
     entity: entityOf(),
+    anomaly_type: $("#anomaly_type").value,
+    anomaly_rate: Number($("#anomaly_rate").value) || null,
+    decision_metrics: metricWeights(),
     stages: selectedStages(),
     detectors: Array.from(selectedDetectors),
     explain: $("#explain").checked,
@@ -57,30 +60,125 @@ function renderDatasets() {
   // `value` stays the canonical key the CLI expects; only the label is pretty.
   select.replaceChildren(...catalog.datasets.map((d) =>
     el("option", { value: d.name, disabled: !d.runnable },
-      `${d.label || d.name} — ${d.n_entities} entities` +
-      (d.runnable ? "" : " (not supported)"))));
+      (d.label || d.name) + (d.runnable ? "" : " (not supported)"))));
   select.addEventListener("change", () => { renderEntities(); refreshDetectors(); });
   renderEntities();
 }
 
+function entitiesOf() {
+  const dataset = catalog.datasets.find((d) => d.name === datasetOf());
+  return dataset ? dataset.entities : [];
+}
+
+/* The browser filters the datalist as you type, so the field is both the filter
+ * and the choice. It also accepts free text, which a <select> could not — hence
+ * entityIsValid below, which is what now guards the run. */
 function renderEntities() {
   const dataset = catalog.datasets.find((d) => d.name === datasetOf());
-  const filter = ($("#entity-filter").value || "").toLowerCase();
   const trained = new Set((dataset && dataset.trained) || []);
-  const entities = (dataset ? dataset.entities : [])
-    .filter((e) => !filter || e.toLowerCase().includes(filter))
+  const entities = entitiesOf().slice()
     // Entities with checkpoints first: those run immediately, the rest have to
     // train from scratch. Junk files in the data directory sink to the bottom.
     .sort((a, b) => (trained.has(b) - trained.has(a)) || a.localeCompare(b, undefined, { numeric: true }));
 
-  const select = $("#entity");
-  const previous = select.value;
-  select.replaceChildren(...entities.map((e) => el("option", { value: e },
-    trained.has(e) ? e : `${e} — needs training`)));
-  if (entities.includes(previous)) select.value = previous;
-  // size must stay 1: any larger turns the <select> into an always-open
-  // listbox that never collapses after a choice.
-  select.size = 1;
+  $("#entity-options").replaceChildren(...entities.map((e) =>
+    el("option", { value: e }, trained.has(e) ? "" : "needs training")));
+  const input = $("#entity");
+  if (input.value && !entities.includes(input.value)) input.value = "";
+  syncEntityValidity();
+}
+
+function entityIsValid() {
+  const value = $("#entity").value.trim();
+  return !!value && entitiesOf().includes(value);
+}
+
+function syncEntityValidity() {
+  const input = $("#entity");
+  const empty = !input.value.trim();
+  const bad = !empty && !entityIsValid();
+  input.setAttribute("aria-invalid", bad ? "true" : "false");
+  $("#entity-error").hidden = !bad;
+  if (bad) $("#entity-error").textContent = `No entity named "${input.value.trim()}".`;
+}
+
+function renderAnomalyTypes() {
+  const select = $("#anomaly_type");
+  const types = catalog.anomaly_types || [];
+  select.replaceChildren(...types.map((t) =>
+    el("option", { value: t.token }, t.label || t.token)));
+  const showNote = () => {
+    const chosen = types.find((t) => t.token === select.value);
+    $("#anomaly-note").textContent = (chosen && chosen.note) || "";
+  };
+  select.addEventListener("change", showNote);
+  showNote();
+}
+
+function renderDecisionMetrics() {
+  $("#decision_metrics").replaceChildren(...(catalog.decision_metrics || []).map((m) =>
+    el("label", { class: "toggle" },
+      el("input", { type: "checkbox", value: m.token,
+                    checked: m.token === "f1" || m.token === "pr_auc",
+                    onchange: onChange }),
+      el("span", { text: m.label || m.token }),
+      el("input", { type: "number", class: "metric-weight", value: "1",
+                    min: "0", step: "0.05", "data-metric": m.token,
+                    title: "Weight in the fitness function", oninput: onChange }))));
+  syncMetricNotes();
+}
+
+function selectedMetrics() {
+  return $$("#decision_metrics input[type=checkbox]:checked").map((i) => i.value);
+}
+
+/* Sent as metric -> weight. The server normalises, so these need not sum to 1;
+ * an unchecked metric is simply absent. */
+function metricWeights() {
+  const out = {};
+  for (const token of selectedMetrics()) {
+    const box = $(`#decision_metrics input[data-metric="${token}"]`);
+    const weight = box ? Number(box.value) : 1;
+    out[token] = Number.isFinite(weight) && weight >= 0 ? weight : 1;
+  }
+  return out;
+}
+
+function fitnessFormula() {
+  const symbols = new Map((catalog.decision_metrics || [])
+    .map((m) => [m.token, m.symbol || m.token]));
+  const weights = metricWeights();
+  const tokens = Object.keys(weights);
+  const total = tokens.reduce((sum, t) => sum + weights[t], 0);
+  if (!tokens.length || !(total > 0)) return "";
+  if (tokens.length === 1) return symbols.get(tokens[0]);
+  return tokens
+    .map((t) => `${+(weights[t] / total).toFixed(3)} * ${symbols.get(t)}`)
+    .join(" + ");
+}
+
+/* VUS judges a detector over a range of buffer widths, which a short entity's
+ * Thompson windows cannot fill. Warn rather than refuse. */
+function syncMetricNotes() {
+  const chosen = selectedMetrics();
+  const picked = new Set(chosen);
+  $$("#decision_metrics input.metric-weight").forEach((box) => {
+    box.disabled = !picked.has(box.dataset.metric);
+    box.hidden = box.disabled;
+  });
+  const formula = fitnessFormula();
+  const formulaLine = $("#metric-formula");
+  if (formulaLine) formulaLine.textContent = formula ? `Fitness = ${formula}` : "";
+  $("#metric-error").hidden = chosen.length > 0 && !!formula;
+  $("#metric-error").textContent = chosen.length
+    ? "Give at least one metric a weight above zero."
+    : "Choose at least one metric.";
+  const entity = entityOf();
+  const short = (datasetOf() || "").toLowerCase() === "skab";
+  $("#metric-note").textContent =
+    (chosen.includes("vus") && short && entity)
+      ? "VUS performs poorly in Thompson Sampling in short entities."
+      : "";
 }
 
 /* Paper Table I group -> css suffix. Unknown or missing becomes "none", which
@@ -418,7 +516,9 @@ function onChange() {
   const tooFew = count < 2;
   $("#detector-error").hidden = !tooFew;
   if (tooFew) $("#detector-error").textContent = "Select at least two detectors.";
-  $("#start").disabled = tooFew || !selectedStages().length || !entityOf();
+  syncMetricNotes();
+  $("#start").disabled = tooFew || !selectedStages().length || !entityIsValid()
+    || !selectedMetrics().length || !fitnessFormula();
 
   syncGroupButtons();
   syncDetectorButtons();
@@ -429,7 +529,7 @@ function onChange() {
 }
 
 async function updatePreview() {
-  if (!entityOf()) return;
+  if (!entityIsValid() || !selectedMetrics().length) return;
   try {
     const data = await postJSON("/api/runs", currentBody({ dry_run: true }));
     $("#command").textContent = data.command;
@@ -457,13 +557,19 @@ async function init() {
   catalog = await getJSON("/api/catalog");
   renderWarnings();
   renderDatasets();
+  renderAnomalyTypes();
+  renderDecisionMetrics();
   renderStages();
   renderResults();
   renderHealth();
   await refreshDetectors();
 
-  $("#entity").addEventListener("change", refreshDetectors);
-  $("#entity-filter").addEventListener("input", renderEntities);
+  // `input` covers typing and picking from the list; the detector fetch waits
+  // for a name that exists, so a half-typed one costs no request.
+  $("#entity").addEventListener("input", () => {
+    syncEntityValidity();
+    if (entityIsValid()) refreshDetectors(); else onChange();
+  });
   $("#run-form").addEventListener("submit", submit);
   $$("#run-form input, #run-form select").forEach((node) =>
     node.addEventListener("change", onChange));

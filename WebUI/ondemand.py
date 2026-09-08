@@ -17,8 +17,8 @@ The contract that makes this safe:
     pipeline computed. The gap decomposition is exactly `shares(a) - shares(b)`
     (Thompson_Sampling.rank_gap_decomposition), so a pair drawn here matches the
     pipeline's own `ranking_gap_*.png`; the per-window rows come straight out of
-    reward_contribution_per_channel / aggregate_shap_per_channel /
-    aggregate_squared_per_channel. Nothing is re-derived here that could drift.
+    reward_contribution_per_context_feature / aggregate_shap_per_context_feature /
+    aggregate_squared_per_context_feature. Nothing is re-derived here that could drift.
   * Titles, axis labels and footnotes for the per-window frames travel IN the
     persisted file (`kinds`), written by the producer, so this module formats
     them rather than restating them.
@@ -40,7 +40,7 @@ from WebUI import paths
 # pipeline's own cannot disagree about which colour means what.
 _AHEAD = "#2F9E44"
 _BEHIND = "#C92A2A"
-TOP_N_CHANNELS = 12
+TOP_N_CONTEXT_FEATURES = 12
 
 
 def _ir_path(dataset: str, entity: str, stem: str):
@@ -52,8 +52,8 @@ def _ir_path(dataset: str, entity: str, stem: str):
     return candidate if candidate.is_file() else None
 
 
-def ranking_channel_shares(dataset: str, entity: str) -> Dict[str, List[float]]:
-    """Per-detector per-channel shares of the ranking score, or {} if absent.
+def ranking_context_feature_shares(dataset: str, entity: str) -> Dict[str, List[float]]:
+    """Per-detector per-context-feature shares of the ranking score, or {} if absent.
 
     Absent is the normal case for a result tree written before this block
     existed, so every caller treats {} as "offer nothing" rather than an error.
@@ -77,15 +77,15 @@ def ranking_channel_shares(dataset: str, entity: str) -> Dict[str, List[float]]:
     return out
 
 
-def _channel_label(index: int, names: Optional[List[str]]) -> str:
+def _context_feature_label(index: int, names: Optional[List[str]]) -> str:
     if names and 0 <= index < len(names):
         return str(names[index])
-    return f"ch{index}"
+    return f"cf{index}"
 
 
 def render_ranking_gap(dataset: str, entity: str, model_a: str, model_b: str,
-                       channel_names: Optional[List[str]] = None,
-                       top_n: int = TOP_N_CHANNELS) -> Optional[bytes]:
+                       context_feature_names: Optional[List[str]] = None,
+                       top_n: int = TOP_N_CONTEXT_FEATURES) -> Optional[bytes]:
     """PNG bytes for `model_a` vs `model_b`, or None if the pair is unavailable.
 
     Returns None rather than raising for every "cannot draw this" case — an
@@ -93,7 +93,7 @@ def render_ranking_gap(dataset: str, entity: str, model_a: str, model_b: str,
     itself — so the route answers 404 and the page falls back to its default
     pair instead of showing a traceback.
     """
-    shares = ranking_channel_shares(dataset, entity)
+    shares = ranking_context_feature_shares(dataset, entity)
     if model_a not in shares or model_b not in shares or model_a == model_b:
         return None
     a, b = shares[model_a], shares[model_b]
@@ -118,7 +118,7 @@ def render_ranking_gap(dataset: str, entity: str, model_a: str, model_b: str,
         "xtick.labelsize": 10, "ytick.labelsize": 10,
     })
     fig, ax = plt.subplots(figsize=(9, max(4, 0.42 * len(pairs) + 1.5)))
-    ax.barh([_channel_label(c, channel_names) for c, _v in pairs],
+    ax.barh([_context_feature_label(c, context_feature_names) for c, _v in pairs],
             [v for _c, v in pairs],
             color=[_AHEAD if v >= 0 else _BEHIND for _c, v in pairs])
     ax.axvline(0, color="black", linewidth=0.7)
@@ -128,7 +128,7 @@ def render_ranking_gap(dataset: str, entity: str, model_a: str, model_b: str,
     ax.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
     if len(pairs) < n:
         fig.text(0.5, -0.02,
-                 f"The {len(pairs)} channels with the largest difference, of {n}.",
+                 f"The {len(pairs)} context features with the largest difference, of {n}.",
                  ha="center", fontsize=9, alpha=0.8)
 
     buffer = io.BytesIO()
@@ -233,7 +233,7 @@ def render_per_window(dataset: str, entity: str, kind: str, t: int,
     indices, names = selection
     spec = (doc.get("kinds") or {}).get(kind) or {}
     top_n = max(1, int(doc.get("top_n_channels") or 9))
-    n_channels_total = int(doc.get("n_channels") or 0)
+    n_context_features_total = int(doc.get("n_channels") or 0)
 
     # The union of each plotted detector's `top_n` largest |values| — the same
     # rule _render_shap_comparison applies, and the same one the footnote states.
@@ -241,8 +241,8 @@ def render_per_window(dataset: str, entity: str, kind: str, t: int,
     for i in indices:
         magnitudes = sorted(range(len(rows[i])), key=lambda c: -abs(rows[i][c]))
         candidates.update(magnitudes[:top_n])
-    channels = sorted(candidates)
-    if not channels:
+    selected = sorted(candidates)
+    if not selected:
         return None
 
     title = (spec.get("title_all") if scope == "all" else spec.get("title_top")) or ""
@@ -261,25 +261,25 @@ def render_per_window(dataset: str, entity: str, kind: str, t: int,
     })
     n_models = len(indices)
     bar_width = 0.8 / max(n_models, 1)
-    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(channels) + 4), 5))
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(selected) + 4), 5))
     for slot, (i, name) in enumerate(zip(indices, names)):
-        ax.bar([c + slot * bar_width for c in range(len(channels))],
-               [rows[i][c] for c in channels], bar_width, label=name,
+        ax.bar([c + slot * bar_width for c in range(len(selected))],
+               [rows[i][c] for c in selected], bar_width, label=name,
                color=plt.cm.tab20(slot / max(n_models, 1)))
 
     ax.axhline(0, color="black", linewidth=0.6)
-    ax.set_xticks([c + bar_width * (n_models - 1) / 2 for c in range(len(channels))])
-    ax.set_xticklabels([f"ch{c}" for c in channels], rotation=45, ha="right")
-    ax.set_xlabel("Channel")
+    ax.set_xticks([c + bar_width * (n_models - 1) / 2 for c in range(len(selected))])
+    ax.set_xticklabels([f"cf{c}" for c in selected], rotation=45, ha="right")
+    ax.set_xlabel("Context feature")
     ax.set_ylabel(spec.get("ylabel") or "")
     ax.set_title(title)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
     ax.legend(loc="upper left", frameon=False, bbox_to_anchor=(1.01, 1), borderaxespad=0)
 
-    scope_text = (f"{len(channels)} of {n_channels_total}" if n_channels_total
-                  else f"{len(channels)}")
-    rule = (f"Channels shown ({scope_text}): the union over the plotted detectors "
-            f"of each one's {top_n} largest |values|. A channel absent here was "
+    scope_text = (f"{len(selected)} of {n_context_features_total}" if n_context_features_total
+                  else f"{len(selected)}")
+    rule = (f"Context features shown ({scope_text}): the union over the plotted detectors "
+            f"of each one's {top_n} largest |values|. A context feature absent here was "
             f"outside every plotted detector's top {top_n}, not necessarily zero.")
     ax.text(0.0, -0.17, ((note + "  ") if note else "") + rule,
             transform=ax.transAxes, fontsize=7.5, color="dimgrey",

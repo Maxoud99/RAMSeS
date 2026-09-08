@@ -39,14 +39,25 @@ from Model_Selection.rank_aggregation import (
     explain_rank_aggregation,
 )
 from Model_Training.train import TrainModels
+from Metrics.metrics import vus_score, vus_window
 from Utils.model_io import load_checkpoint
+from Utils.model_selection_utils import timed_out_detectors
 from Utils.pipeline_spec import (
     ALL_DETECTORS,
+    combine_metrics,
     dataset_label,
+    DEFAULT_ANOMALY_TYPE,
+    DEFAULT_DECISION_METRICS,
+    decision_metric_formula,
+    decision_metric_label,
+    metrics_required,
+    ranking_metrics_for,
+    restrict_metrics,
     DETECTOR_FAMILIES,
     MIN_DETECTORS,
     families_for,
     family_of,
+    MULTIVARIATE_FAMILIES,
     UNIVARIATE_FAMILIES,
 )
 from Utils.pipeline_spec import ALL_STAGES as _SPEC_ALL_STAGES
@@ -119,6 +130,16 @@ def get_peak_memory_mb():
 # Matched by name because the server is a plain OS process with no handle we
 # own; the runner subprocess that actually holds the weights matches too.
 _LLM_PROCESS_HINTS = ("ollama",)
+
+
+def _fmt_metric(value, digits=6):
+    """A metric that could not be computed reads as 'not available', not 0."""
+    try:
+        if value is None or np.isnan(float(value)):
+            return "not available"
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "not available"
 
 
 def llm_server_memory_mb():
@@ -426,7 +447,8 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
         f.write("-" * 50 + "\n")
         f.write(f"  Model       : {final_decision.get('single_model', 'N/A')}\n")
         f.write(f"  F1 Score    : {final_decision.get('single_model_f1', 0):.6f}\n")
-        f.write(f"  PR-AUC      : {final_decision.get('single_model_pr_auc', 0):.6f}\n\n")
+        f.write(f"  PR-AUC      : {final_decision.get('single_model_pr_auc', 0):.6f}\n")
+        f.write(f"  VUS         : {_fmt_metric(final_decision.get('single_model_vus'))}\n\n")
         
         f.write("Ensemble Option:\n")
         f.write("-" * 50 + "\n")
@@ -435,27 +457,35 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
         f.write(f"  Meta-Model  : {final_decision.get('meta_model_type', 'N/A')}\n")
         f.write(f"  F1 Score    : {final_decision.get('ensemble_f1', 0):.6f}\n")
         f.write(f"  PR-AUC      : {final_decision.get('ensemble_pr_auc', 0):.6f}\n")
+        f.write(f"  VUS         : {_fmt_metric(final_decision.get('ensemble_vus'))}\n")
         f.write(f"  Fitness     : {final_decision.get('ensemble_fitness', 0):.6f}\n\n")
         
-        # Make the choice based on F1 score
-        ensemble_f1 = final_decision.get('ensemble_f1', 0)
-        single_f1 = final_decision.get('single_model_f1', 0)
-        
+        # Reads the decision rather than re-deriving it, so the report cannot
+        # disagree with the choice the pipeline actually made.
+        metric = final_decision.get('decision_metric', ('f1',))
+        label = decision_metric_label(metric)
+        formula = decision_metric_formula(metric)
+        ensemble_score = final_decision.get('ensemble_score',
+                                            final_decision.get('ensemble_f1', 0))
+        single_score = final_decision.get('single_model_score',
+                                          final_decision.get('single_model_f1', 0))
+
         f.write("Final Choice:\n")
         f.write("-" * 50 + "\n")
-        if ensemble_f1 >= single_f1:
+        f.write(f"  Fitness    : {formula}\n")
+        if final_decision.get('framework_choice') == 'ensemble':
             f.write(f"  ✓ ENSEMBLE SELECTED\n")
-            f.write(f"    Reason: Ensemble F1 ({ensemble_f1:.6f}) >= Single Model F1 ({single_f1:.6f})\n")
-            if ensemble_f1 > single_f1:
-                improvement = ensemble_f1 - single_f1
-                f.write(f"    Improvement: +{improvement:.6f} ({improvement/max(single_f1, 0.0001)*100:.2f}%)\n")
+            f.write(f"    Reason: Ensemble fitness ({formula}, {ensemble_score:.6f}) >= Single Model fitness ({single_score:.6f})\n")
+            if ensemble_score > single_score:
+                improvement = ensemble_score - single_score
+                f.write(f"    Improvement: +{improvement:.6f} ({improvement/max(single_score, 0.0001)*100:.2f}%)\n")
             else:
-                f.write(f"    Note: F1 scores are equal\n")
+                f.write(f"    Note: fitness scores are equal\n")
         else:
             f.write(f"  ✓ SINGLE MODEL SELECTED\n")
-            f.write(f"    Reason: Single Model F1 ({single_f1:.6f}) > Ensemble F1 ({ensemble_f1:.6f})\n")
-            advantage = single_f1 - ensemble_f1
-            f.write(f"    Advantage: +{advantage:.6f} ({advantage/max(ensemble_f1, 0.0001)*100:.2f}%)\n")
+            f.write(f"    Reason: Single Model fitness ({formula}, {single_score:.6f}) > Ensemble fitness ({ensemble_score:.6f})\n")
+            advantage = single_score - ensemble_score
+            f.write(f"    Advantage: +{advantage:.6f} ({advantage/max(ensemble_score, 0.0001)*100:.2f}%)\n")
         f.write("\n")
         
         f.write("="*80 + "\n")
@@ -521,7 +551,7 @@ def load_trained_models(model_names, models_dir):
 # Model-Selection Pipelines
 # ------------------------------------------------------------------------------
 
-def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=False, stages=None):
+def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=False, stages=None, decision_metric=DEFAULT_DECISION_METRICS):
     """
     One-pass model selection pipeline in the order:
       1) GA (stacking ensemble search)
@@ -557,6 +587,11 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     # Use provided model list or fall back to global
     models_to_use = model_list if model_list is not None else algorithm_list_instances
 
+    def still_usable():
+        """The pool minus detectors killed for slowness by an earlier stage."""
+        slow = timed_out_detectors()
+        return [m for m in models_to_use if m not in slow]
+
     # Which sub-stages to run (a strict subset of ALL_STAGES is a "partial run":
     # those stages execute, then the function returns before rank aggregation).
     stages = set(ALL_STAGES) if stages is None else set(stages)
@@ -571,12 +606,15 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     base_model_predictions_train = base_model_predictions_test = None
     y_true_train = y_true_test = None
     meta_model_type = None
+    ensemble_scores = None
     thompson_model_names = []
     Gan_ranked_by_f1 = Gan_ranked_by_pr_auc = []
-    Gan_ranked_by_f1_names = Gan_ranked_by_pr_auc_names = []
+    Gan_ranked_by_f1_names = Gan_ranked_by_pr_auc_names = Gan_ranked_by_vus_names = []
     ranked_by_f1 = ranked_by_pr_auc = []
     ranked_by_f1_names_sensitivity = ranked_by_pr_auc_names_sensitivity = []
+    ranked_by_vus_names_sensitivity = []
     monte_carlo_ranked_models_F1 = monte_carlo_ranked_models_PR = []
+    monte_carlo_ranked_models_VUS = []
     robust_agg = [None, []]
     full_aggregated = [None, []]
 
@@ -598,12 +636,14 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         start_time = time.time()
         best_ensemble, best_f1, best_pr_auc, best_fitness, \
         individual_predictions, base_model_predictions_train, base_model_predictions_test, \
-        y_true_train, y_true_test, meta_model_type = genetic_algorithm(
+        y_true_train, y_true_test, meta_model_type, ensemble_scores = genetic_algorithm(
             dataset, entity, train_data, test_data,
-            models_to_use, trained_models,
+            still_usable(), trained_models,
             population_size=20, generations=20,
             meta_model_type='rf', mutation_rate=0.1,
             explain=explain,
+            metric=decision_metric,
+            vus_win=vus_window(test_data.entities[0].Y),
         )
         timing_dict['1_Genetic_Algorithm'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -628,12 +668,13 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         thompson_model_names = run_linear_thompson_sampling(
             test_data=test_data,
             trained_models=trained_models,
-            model_names=models_to_use,
+            model_names=still_usable(),
             dataset=dataset,
             entity=entity,
             iterations=50,
             iteration=iteration,
             explain=explain,
+            metrics=decision_metric,
         )
         timing_dict['2_Thompson_Sampling'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -657,8 +698,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         # GAN creates its own perturbations internally
         test_data_for_gan = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
         gan_results = run_Gan(
-            test_data_for_gan, trained_models, models_to_use, dataset, entity,
-            explain=explain
+            test_data_for_gan, trained_models, still_usable(), dataset, entity,
+            explain=explain, metrics=decision_metric
         )
         timing_dict['3_GAN_Robustness'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -669,8 +710,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
         Gan_ranked_by_f1, Gan_ranked_by_pr_auc, \
-        Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names = (
-            gan_results[0], gan_results[1], gan_results[2], gan_results[3]
+        Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names, Gan_ranked_by_vus_names = (
+            gan_results[0], gan_results[1], gan_results[2], gan_results[3], gan_results[4]
         )
         logger.info("  ✓ [GAN] F1 names top-5: %s | Time=%.4fs", Gan_ranked_by_f1_names[:5],
                     timing_dict['3_GAN_Robustness'])
@@ -690,9 +731,10 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         start_time = time.time()
         # Use original un-injected data so synthetic spike labels don't cause single-class skips
         test_data_for_borderline = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
-        ranked_by_f1, ranked_by_pr_auc, \
-        ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity = run_off_by_threshold(
-            test_data_for_borderline, trained_models, models_to_use, dataset, entity, explain=explain
+        ranked_by_f1, ranked_by_pr_auc, ranked_by_f1_names_sensitivity, \
+        ranked_by_pr_auc_names_sensitivity, ranked_by_vus_names_sensitivity = run_off_by_threshold(
+            test_data_for_borderline, trained_models, still_usable(), dataset, entity,
+            explain=explain, metrics=decision_metric
         )
         timing_dict['4_Borderline_Sensitivity'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -715,9 +757,10 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         start_time = time.time()
         # Use original un-injected data for the same reason
         test_data_for_mc = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
-        monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR = run_monte_carlo_simulation(
-            test_data_for_mc, trained_models, models_to_use, dataset, entity,
-            n_simulations=2, noise_level=0.1, explain=explain,
+        monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR, \
+        monte_carlo_ranked_models_VUS = run_monte_carlo_simulation(
+            test_data_for_mc, trained_models, still_usable(), dataset, entity,
+            n_simulations=2, noise_level=0.1, explain=explain, metrics=decision_metric,
         )
         timing_dict['5_Monte_Carlo'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -746,11 +789,13 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             y_true_test,
             meta_model_type,
             {
-                'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness},
+                'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness,
+                       'scores': ensemble_scores, 'y_true': y_true_test},
                 'thompson': thompson_model_names,
                 'gan': {
                     'f1_names': Gan_ranked_by_f1_names,
                     'pr_auc_names': Gan_ranked_by_pr_auc_names,
+                    'vus_names': Gan_ranked_by_vus_names,
                     'f1_scores': Gan_ranked_by_f1,
                     'pr_auc_scores': Gan_ranked_by_pr_auc,
                     'best_model': Gan_ranked_by_f1_names[0] if len(Gan_ranked_by_f1_names) > 0 else 'N/A',
@@ -760,6 +805,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
                 'borderline': {
                     'f1_names': ranked_by_f1_names_sensitivity,
                     'pr_auc_names': ranked_by_pr_auc_names_sensitivity,
+                    'vus_names': ranked_by_vus_names_sensitivity,
                     'f1_scores': ranked_by_f1,
                     'pr_auc_scores': ranked_by_pr_auc,
                     'best_model': ranked_by_f1_names_sensitivity[0] if len(ranked_by_f1_names_sensitivity) > 0 else 'N/A',
@@ -769,6 +815,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
                 'monte_carlo': {
                     'f1_names': monte_carlo_ranked_models_F1,
                     'pr_auc_names': monte_carlo_ranked_models_PR,
+                    'vus_names': monte_carlo_ranked_models_VUS,
                     'best_model_f1': monte_carlo_ranked_models_F1[0] if len(monte_carlo_ranked_models_F1) > 0 else 'N/A',
                     'best_model_pr_auc': monte_carlo_ranked_models_PR[0] if len(monte_carlo_ranked_models_PR) > 0 else 'N/A'
                 },
@@ -793,18 +840,30 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     logger.info("  📊 Sub-stage 6.6: Rank Aggregation...")
     mem_before = get_memory_usage_mb()
     start_time = time.time()
-    # Robust-only aggregation in the requested order: GAN → Borderline → Monte Carlo
-    test_for_rank = [
-        Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names,
-        ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity,
-        monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR,
-    ]
+    # Robust-only aggregation in the requested order: GAN → Borderline → Monte Carlo.
+    # A fitness of exactly one of F1 / PR-AUC contributes only that ranking.
+    _by_metric = {
+        "f1": [("GAN_F1", Gan_ranked_by_f1_names),
+               ("Borderline_F1", ranked_by_f1_names_sensitivity),
+               ("MonteCarlo_F1", monte_carlo_ranked_models_F1)],
+        "pr_auc": [("GAN_PR_AUC", Gan_ranked_by_pr_auc_names),
+                   ("Borderline_PR_AUC", ranked_by_pr_auc_names_sensitivity),
+                   ("MonteCarlo_PR_AUC", monte_carlo_ranked_models_PR)],
+        "vus": [("GAN_VUS", Gan_ranked_by_vus_names),
+                ("Borderline_VUS", ranked_by_vus_names_sensitivity),
+                ("MonteCarlo_VUS", monte_carlo_ranked_models_VUS)],
+    }
+    _sources = []
+    for _stage in range(3):
+        for _m in ranking_metrics_for(decision_metric):
+            _sources.append(_by_metric[_m][_stage])
+    rank_source_names = [n for n, _ in _sources]
+    test_for_rank = [r for _, r in _sources]
+    logger.info(f"  → Consensus sources ({len(test_for_rank)}): {', '.join(rank_source_names)}")
     robust_agg = enhanced_markov_chain_rank_aggregator_text(test_for_rank)
     explain_rank_aggregation(
         rankings=test_for_rank,
-        source_names=["GAN_F1", "GAN_PR_AUC",
-                      "Borderline_F1", "Borderline_PR_AUC",
-                      "MonteCarlo_F1", "MonteCarlo_PR_AUC"],
+        source_names=rank_source_names,
         full_ranking=robust_agg[1],
         stage_name="robust",
         dataset=dataset, entity=entity, iteration=iteration, explain=explain,
@@ -864,7 +923,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     return _result()
 
 
-def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, iteration, trained_models, model_list=None, test_data_gan=None, skip_gan=False, explain=False):
+def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, iteration, trained_models, model_list=None, test_data_gan=None, skip_gan=False, explain=False, decision_metric=DEFAULT_DECISION_METRICS):
     """
     PARALLEL VERSION: Runs model selection algorithms concurrently using ThreadPoolExecutor.
     
@@ -930,7 +989,9 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             dataset, entity, train_data, test_data_ga,
             models_to_use, trained_models,
             population_size=20, generations=20, meta_model_type='rf', mutation_rate=0.1,
-            explain=explain
+            explain=explain,
+            metric=decision_metric,
+            vus_win=vus_window(test_data_ga.entities[0].Y),
         )
         thompson_future = executor.submit(
             run_linear_thompson_sampling,
@@ -948,18 +1009,18 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             gan_future = executor.submit(
                 run_Gan,
                 test_data_gan_copy, trained_models, models_to_use,
-                dataset, entity, explain=explain
+                dataset, entity, explain=explain, metrics=decision_metric
             )
         
         borderline_future = executor.submit(
             run_off_by_threshold,
             test_data_borderline, trained_models, models_to_use,
-            dataset, entity, explain=explain
+            dataset, entity, explain=explain, metrics=decision_metric
         )
         monte_carlo_future = executor.submit(
             run_monte_carlo_simulation,
             test_data_montecarlo, trained_models, models_to_use,
-            dataset, entity, 2, 0.1, explain=explain
+            dataset, entity, 2, 0.1, explain=explain, metrics=decision_metric
         )
 
         # Collect results
@@ -967,7 +1028,7 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         
         best_ensemble, best_f1, best_pr_auc, best_fitness, \
         individual_predictions, base_model_predictions_train, base_model_predictions_test, \
-        y_true_train, y_true_test, meta_model_type = ga_future.result()
+        y_true_train, y_true_test, meta_model_type, ensemble_scores = ga_future.result()
         timing_dict['1_GA'] = time.time() - overall_start
         mem_ga = get_memory_usage_mb()
         memory_dict['modules']['1_GA'] = {
@@ -994,8 +1055,8 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         logger.info("     ✓ Thompson: top-5=%s", thompson_model_names[:5])
         
         if not skip_gan:
-            Gan_ranked_by_f1, Gan_ranked_by_pr_auc, \
-            Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names = gan_future.result()
+            Gan_ranked_by_f1, Gan_ranked_by_pr_auc, Gan_ranked_by_f1_names, \
+            Gan_ranked_by_pr_auc_names, Gan_ranked_by_vus_names = gan_future.result()
             timing_dict['3_GAN'] = time.time() - overall_start
             mem_gan = get_memory_usage_mb()
             memory_dict['modules']['3_GAN'] = {
@@ -1012,10 +1073,12 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             Gan_ranked_by_pr_auc = []
             Gan_ranked_by_f1_names = []
             Gan_ranked_by_pr_auc_names = []
+            Gan_ranked_by_vus_names = []
             timing_dict['3_GAN'] = 0.0
         
         ranked_by_f1, ranked_by_pr_auc, \
-        ranked_by_f1_names_sensitivity, ranked_by_pr_auc_names_sensitivity = borderline_future.result()
+        ranked_by_f1, ranked_by_pr_auc, ranked_by_f1_names_sensitivity, \
+        ranked_by_pr_auc_names_sensitivity, ranked_by_vus_names_sensitivity = borderline_future.result()
         timing_dict['4_Borderline'] = time.time() - overall_start
         mem_borderline = get_memory_usage_mb()
         memory_dict['modules']['4_Borderline'] = {
@@ -1027,7 +1090,8 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         }
         logger.info("     ✓ Borderline: F1 top-5=%s", ranked_by_f1_names_sensitivity[:5])
         
-        monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR = monte_carlo_future.result()
+        monte_carlo_ranked_models_F1, monte_carlo_ranked_models_PR, \
+        monte_carlo_ranked_models_VUS = monte_carlo_future.result()
         timing_dict['5_MonteCarlo'] = time.time() - overall_start
         mem_mc = get_memory_usage_mb()
         memory_dict['modules']['5_MonteCarlo'] = {
@@ -1121,11 +1185,13 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         y_true_test,
         meta_model_type,
         {
-            'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness},
+            'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness,
+                   'scores': ensemble_scores, 'y_true': y_true_test},
             'thompson': thompson_model_names,
             'gan': {
                 'f1_names': Gan_ranked_by_f1_names, 
                 'pr_auc_names': Gan_ranked_by_pr_auc_names,
+                'vus_names': Gan_ranked_by_vus_names,
                 'f1_scores': Gan_ranked_by_f1,
                 'pr_auc_scores': Gan_ranked_by_pr_auc,
                 'best_model': Gan_ranked_by_f1_names[0] if len(Gan_ranked_by_f1_names) > 0 else 'N/A',
@@ -1135,6 +1201,7 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             'borderline': {
                 'f1_names': ranked_by_f1_names_sensitivity, 
                 'pr_auc_names': ranked_by_pr_auc_names_sensitivity,
+                'vus_names': ranked_by_vus_names_sensitivity,
                 'f1_scores': ranked_by_f1,
                 'pr_auc_scores': ranked_by_pr_auc,
                 'best_model': ranked_by_f1_names_sensitivity[0] if len(ranked_by_f1_names_sensitivity) > 0 else 'N/A',
@@ -1144,6 +1211,7 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             'monte_carlo': {
                 'f1_names': monte_carlo_ranked_models_F1, 
                 'pr_auc_names': monte_carlo_ranked_models_PR,
+                'vus_names': monte_carlo_ranked_models_VUS,
                 'best_model_f1': monte_carlo_ranked_models_F1[0] if len(monte_carlo_ranked_models_F1) > 0 else 'N/A',
                 'best_model_pr_auc': monte_carlo_ranked_models_PR[0] if len(monte_carlo_ranked_models_PR) > 0 else 'N/A'
             },
@@ -1272,7 +1340,7 @@ def perform_reoptimization_task(
     anomaly_list, individual_predictions, base_model_predictions_train, 
     base_model_predictions_test, y_true_train, y_true_test, meta_model_type,
     use_parallel, test_data_before, logger, current_best_ensemble, current_best_single,
-    algorithm_list_instances
+    algorithm_list_instances, anomaly_rate=None
 ):
     """
     Background task for re-optimization.
@@ -1365,6 +1433,9 @@ def run_app(algorithm_list, algorithm_list_instances):
     explain = args.get('explain', False)  # Explainability OFF by default; --explain enables it
     stages = set(args.get('stages', ALL_STAGES))  # Which stage-6 sub-stages to run
     is_partial = stages != ALL_STAGES  # Strict subset → partial run (stop after selected stages)
+    anomaly_type = args.get('anomaly_type', DEFAULT_ANOMALY_TYPE)  # Synthetic anomaly injected at stage 4
+    anomaly_rate = args.get('anomaly_rate')  # None = the per-type defaults in anomaly_parameters.py
+    decision_metric = args.get('decision_metrics', DEFAULT_DECISION_METRICS)  # Fitness the run maximises
 
     # Which base detectors to select among. None (the default) means all of
     # them; only the families of the requested detectors get trained.
@@ -1424,6 +1495,22 @@ def run_app(algorithm_list, algorithm_list_instances):
                     f"entity has {n_channels} channels — nothing left to run. "
                     "Select a multivariate detector, or run on UCR.")
                 return
+    else:
+        dropped = [d for d in detectors_to_load
+                   if family_of(d) in MULTIVARIATE_FAMILIES]
+        if dropped:
+            detectors_to_load = [d for d in detectors_to_load if d not in dropped]
+            families_to_train = families_for(detectors_to_load)
+            logger.warning(
+                f"⚠ Skipping {len(dropped)} multivariate-only detector(s) on a "
+                f"1-channel entity: {', '.join(dropped)}. They score without "
+                f"raising here, but the scores are not what the method measures.")
+            if not detectors_to_load:
+                logger.error(
+                    "Every requested detector is multivariate-only and this "
+                    "entity has 1 channel — nothing left to run. "
+                    "Select a univariate detector, or run on SKAB or SMD.")
+                return
 
     logger.info("🔧 STAGE 3/7: Training/Loading Models...")
     model_trainer = TrainModels(
@@ -1474,13 +1561,14 @@ def run_app(algorithm_list, algorithm_list_instances):
 
         logger.info("💉 STAGE 4/7: Injecting Synthetic Anomalies...")
         # Inject anomalies
-        anomaly_list = ['spikes']
+        anomaly_list = [anomaly_type]
         test_data_before = copy.deepcopy(test_data)
         train_data_before = copy.deepcopy(train_data)
 
-        train_data, _ = Inject(train_data, anomaly_list)
-        test_data, anomaly_sizes = Inject(test_data, anomaly_list)
-        logger.info(f"✓ Injected anomalies: {anomaly_list}")
+        train_data, _ = Inject(train_data, anomaly_list, rate=anomaly_rate)
+        test_data, anomaly_sizes = Inject(test_data, anomaly_list, rate=anomaly_rate)
+        logger.info(f"✓ Injected anomalies: {anomaly_list}"
+                    + (f" at rate {anomaly_rate}" if anomaly_rate is not None else ""))
 
         logger.info("📊 STAGE 5/7: Preparing Data and Visualization...")
         # Simple visualization of injected region
@@ -1501,7 +1589,9 @@ def run_app(algorithm_list, algorithm_list_instances):
 
         out_dir = f"myresults/GA_Ens/{dataset}/{entity}/"
         os.makedirs(out_dir, exist_ok=True)
-        out_file = os.path.join(out_dir, f"ensemble_scores_{dataset}_{entity}_Data_vs_anomalies_{anomaly_list}.png")
+        # The anomaly type used to be in this name, so switching type accumulated
+        # variants in the gallery instead of replacing the previous run's figure.
+        out_file = os.path.join(out_dir, f"ensemble_scores_{dataset}_{entity}_Data_vs_anomalies.png")
         plt.savefig(out_file, dpi=300)
         logger.info(f"✓ Visualization saved to {out_file}")
 
@@ -1571,8 +1661,8 @@ def run_app(algorithm_list, algorithm_list_instances):
 
         test_data_new = copy.deepcopy(test_data)
         logger.info(f"  📏 Before Inject: test_data size = {test_data.entities[0].labels.shape[1] if test_data.entities[0].labels.ndim > 1 else test_data.entities[0].labels.shape[0]}")
-        test_data_new, _ = Inject(test_data_new, anomaly_list)
-        
+        test_data_new, _ = Inject(test_data_new, anomaly_list, rate=anomaly_rate)
+
         # Log data sizes for architecture verification
         test_data_before_size = test_data_before.entities[0].labels.shape[1] if test_data_before.entities[0].labels.ndim > 1 else test_data_before.entities[0].labels.shape[0]
         test_data_new_size = test_data_new.entities[0].labels.shape[1] if test_data_new.entities[0].labels.ndim > 1 else test_data_new.entities[0].labels.shape[0]
@@ -1593,7 +1683,8 @@ def run_app(algorithm_list, algorithm_list_instances):
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_2(
                 train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
                 trained_models=trained_models, model_list=loaded_model_names,
-                test_data_gan=test_data_before, explain=explain
+                test_data_gan=test_data_before, explain=explain,
+                decision_metric=decision_metric
             )
         else:
             mode = f"PARTIAL: {','.join(sorted(stages))}" if is_partial else "SEQUENTIAL mode"
@@ -1603,7 +1694,7 @@ def run_app(algorithm_list, algorithm_list_instances):
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_1(
                 train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
                 model_list=loaded_model_names, test_data_gan=test_data_before, explain=explain,
-                stages=stages
+                stages=stages, decision_metric=decision_metric
             )
 
         # Calculate end-to-end time
@@ -1656,11 +1747,20 @@ def run_app(algorithm_list, algorithm_list_instances):
         
         # Evaluate the best single model from final aggregation on the SAME injected data
         test_data_for_eval = copy.deepcopy(test_data_new_for_eval)
-        _, single_model_scores, single_f1_list, single_pr_list = evaluate_individual_models(
+        single_preds, _, single_f1_list, single_pr_list = evaluate_individual_models(
             [best_single_model], test_data_for_eval, trained_models
         )
         single_model_f1 = to_scalar(single_f1_list[0]) if len(single_f1_list) > 0 else 0.0
         single_model_pr_auc = to_scalar(single_pr_list[0]) if len(single_pr_list) > 0 else 0.0
+
+        # One window for both candidates, so their VUS values compare. The
+        # predictions dict carries the continuous scores VUS needs.
+        vus_win = vus_window(test_data_new_for_eval.entities[0].Y)
+        single_true, single_raw = single_preds.get(best_single_model, (None, None))
+        single_model_vus = (vus_score(single_raw, single_true, vus_win)
+                            if single_raw is not None else float("nan"))
+        ensemble_vus = vus_score(extra_results['ga'].get('scores'),
+                                 extra_results['ga'].get('y_true'), vus_win)
         
         # Evaluate Monte Carlo best models on the SAME injected data (Option B: symmetric eval)
         best_mc_f1_model = extra_results['monte_carlo'].get('best_model_f1', 'N/A')
@@ -1678,8 +1778,24 @@ def run_app(algorithm_list, algorithm_list_instances):
             _, _, _, mc_pr_list = evaluate_individual_models([best_mc_pr_model], test_data_for_mc2, trained_models)
             mc_pr_auc_score = to_scalar(mc_pr_list[0]) if len(mc_pr_list) > 0 else 0.0
         
-        # Framework decision: Choose ensemble if its F1 >= single model F1
-        framework_choice = 'ensemble' if ensemble_f1 >= single_model_f1 else 'single_model'
+        # Framework decision, on whichever metric --decision_metric names. Ties go
+        # to the ensemble, as they did when this was F1-only.
+        ensemble_metrics = {'f1': ensemble_f1, 'pr_auc': ensemble_pr_auc, 'vus': ensemble_vus}
+        single_metrics = {'f1': single_model_f1, 'pr_auc': single_model_pr_auc, 'vus': single_model_vus}
+        # A metric neither side could produce (VUS on a short window) drops out
+        # and the remaining weights are renormalised, so the formula the report
+        # prints is the one the comparison was actually made on.
+        wanted = metrics_required(decision_metric)
+        available = tuple(m for m in wanted
+                          if not (np.isnan(ensemble_metrics[m]) or np.isnan(single_metrics[m])))
+        if available != wanted:
+            decision_metric = (restrict_metrics(decision_metric, available)
+                               if available else DEFAULT_DECISION_METRICS)
+            logger.warning(f"{decision_metric_label(wanted)} unavailable for the final "
+                           f"decision; deciding on {decision_metric_formula(decision_metric)}")
+        ensemble_score = combine_metrics(decision_metric, ensemble_metrics)
+        single_model_score = combine_metrics(decision_metric, single_metrics)
+        framework_choice = 'ensemble' if ensemble_score >= single_model_score else 'single_model'
         
         # Prepare comprehensive results using captured data
         results_dict = {
@@ -1729,9 +1845,14 @@ def run_app(algorithm_list, algorithm_list_instances):
                 'meta_model_type': meta_model_type,
                 'single_model_f1': single_model_f1,
                 'single_model_pr_auc': single_model_pr_auc,
+                'single_model_vus': single_model_vus,
+                'ensemble_vus': ensemble_vus,
                 'ensemble_f1': ensemble_f1,
                 'ensemble_pr_auc': ensemble_pr_auc,
                 'ensemble_fitness': extra_results['ga']['fitness'],
+                'decision_metric': decision_metric,
+                'ensemble_score': ensemble_score,
+                'single_model_score': single_model_score,
                 'framework_choice': framework_choice,
                 'chosen_model': best_ensemble if framework_choice == 'ensemble' else best_single_model
             }
@@ -1975,7 +2096,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                         anomaly_list, individual_predictions, base_model_predictions_train,
                         base_model_predictions_test, y_true_train, y_true_test, meta_model_type,
                         use_parallel, test_data_before, logger, current_best_ensemble, current_best_single,
-                        loaded_model_names
+                        loaded_model_names, anomaly_rate
                     )
                     pending_reopt_window = i
                     logger.info(f"  🚀 Background re-optimization task submitted for window {i}")
@@ -2009,7 +2130,7 @@ def run_app(algorithm_list, algorithm_list_instances):
                         algorithm_list_new.append(model)
 
                     test_data_new = copy.deepcopy(test_data)
-                    test_data_new, _ = Inject(test_data_new, anomaly_list)
+                    test_data_new, _ = Inject(test_data_new, anomaly_list, rate=anomaly_rate)
 
                     # LIGHTWEIGHT: Evaluate current best single model on this window
                     test_data_new_copy = copy.deepcopy(test_data_new)

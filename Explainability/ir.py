@@ -36,7 +36,11 @@ from __future__ import annotations
 import glob as _glob
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from Utils.pipeline_spec import (decision_metric_formula, decision_metric_label,
+                                 metric_weights, ranking_metrics_for)
 
 import numpy as np
 
@@ -44,11 +48,11 @@ IR_VERSION = "1.0"
 NOT_AVAILABLE = "not_available"
 TOP_K = 5
 
-# Closing line of every stage glossary. The footer describes the methods a
-# stage used; this marks where those definitions stop and the narrative they
-# support begins. Appended centrally in _envelope, never per builder.
-FOOTER_CLOSING_SENTENCE = (
-    "Following claims are based on the aforementioned explanation methods.")
+# How many items of a ranked series are part of the answer rather than a
+# refinement of it. The head stays required, the tail is offered. Nothing is
+# hidden either way: WebUI.summarize tables come from the IR, not the prose.
+HEAD_REQUIRED = 3
+
 # Support gate for per-rule confidence: the fidelity estimate is stratified
 # 5-fold CV, and with fewer positives than folds the CV cannot place one
 # positive per fold, so the held-out accuracy for that rule is undefined or
@@ -256,36 +260,35 @@ def rule_to_text(rule: Dict[str, Any], outcome_label: str = "the outcome is") ->
 
 # ── Envelope / writer ────────────────────────────────────────────────────────
 
+_ID_DIGITS = re.compile(r"(\d+)")
+
+
+def _id_key(atom_id: Any) -> Tuple[Any, ...]:
+    """Sort ids by number where they carry one: plain string order files
+    `regime.10` between `regime.1` and `regime.2`."""
+    return tuple(int(p) if p.isdigit() else p
+                 for p in _ID_DIGITS.split(str(atom_id)))
+
+
 def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
               evidence: List[Dict[str, Any]], caveats: List[Dict[str, Any]],
               required_atom_ids: List[str],
               confidence: Optional[Dict[str, Any]] = None,
-              question: Optional[str] = None,
-              info_footer: Optional[str] = None) -> Dict[str, Any]:
+              question: Optional[str] = None) -> Dict[str, Any]:
     env = {
         "ir_version": IR_VERSION,
         "stage": stage,
         "dataset": str(dataset),
         "entity": str(entity),
         "output": _py(output),
-        "evidence": [_py(a) for a in sorted(evidence, key=lambda a: a["id"])],
-        "caveats": [_py(a) for a in sorted(caveats, key=lambda a: a["id"])],
+        "evidence": [_py(a) for a in sorted(evidence, key=lambda a: _id_key(a["id"]))],
+        "caveats": [_py(a) for a in sorted(caveats, key=lambda a: _id_key(a["id"]))],
         "required_atom_ids": sorted(required_atom_ids),
         "confidence": _py(confidence or {}),
     }
-    # `question` frames the narration prompt (the stage's headline question);
-    # `info_footer` is a fixed glossary written verbatim into the .txt outside
-    # the model's output, so definitions are never reworded and never count
-    # toward faithfulness metrics. The closing sentence is appended here rather
-    # than in each builder, so every stage — including ones added later — ends
-    # the glossary the same way.
+    # `question` frames the narration prompt (the stage's headline question).
     if question is not None:
         env["question"] = str(question)
-    if info_footer is not None:
-        footer = str(info_footer).rstrip()
-        if not footer.endswith(FOOTER_CLOSING_SENTENCE):
-            footer = (footer + " " if footer else "") + FOOTER_CLOSING_SENTENCE
-        env["info_footer"] = footer
     return env
 
 
@@ -297,6 +300,14 @@ def write_stage_ir(ir: Dict[str, Any], dataset: str, entity: str, filename: str,
     with open(path, "w") as f:
         json.dump(ir, f, sort_keys=True, indent=2)
     return path
+
+
+def _join_and(items: Sequence[str]) -> str:
+    """['a'] -> 'a'; ['a','b'] -> 'a and b'; ['a','b','c'] -> 'a, b and c'."""
+    parts = [str(i) for i in items]
+    if len(parts) < 3:
+        return " and ".join(parts)
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 def _top_k(seq: Sequence[Any], k: int = TOP_K) -> List[Any]:
@@ -355,17 +366,17 @@ def _full_ranking(value: Any) -> List[str]:
 
 # ── Stage builders ───────────────────────────────────────────────────────────
 
-def _ts_channel_label(idx: Any, channel_names: Optional[Sequence[str]]) -> str:
-    """Name a channel when the dataset supplies names, else fall back to its
+def _ts_context_feature_label(idx: Any, context_feature_names: Optional[Sequence[str]]) -> str:
+    """Name a context feature when the dataset supplies names, else fall back to its
     index. Names come from the loader, so datasets without column headers
     (SMD, SMAP/MSL) keep the numeric form."""
     try:
         i = int(idx)
     except (TypeError, ValueError):
         return str(idx)
-    if channel_names and 0 <= i < len(channel_names) and str(channel_names[i]).strip():
-        return str(channel_names[i]).strip()
-    return f"channel {i}"
+    if context_feature_names and 0 <= i < len(context_feature_names) and str(context_feature_names[i]).strip():
+        return str(context_feature_names[i]).strip()
+    return f"context feature {i}"
 
 
 def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
@@ -376,8 +387,8 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
                       state_fractions: Dict[str, float],
                       final_state: str,
                       state_counts: Optional[Dict[str, int]] = None,
-                      channel_names: Optional[Sequence[str]] = None,
-                      n_channels: Optional[int] = None) -> Dict[str, Any]:
+                      context_feature_names: Optional[Sequence[str]] = None,
+                      n_context_features: Optional[int] = None) -> Dict[str, Any]:
     """
     `regimes` entries are precomputed by explain_thompson_sampling (it owns the
     SHAP helpers): {"index","start","end","duration","leader",
@@ -390,7 +401,7 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     "pref_favor_leader": [(ch, delta)]|None,
     "pref_favor_runner": [(ch, delta)]|None,
     "pref_gap": float|None}.
-    Every channel list arrives pre-split by sign so no consumer ever has to
+    Every context feature list arrives pre-split by sign so no consumer ever has to
     infer direction from a signed list sorted by magnitude.
 
     Two comparisons against the runner-up are supplied and they are not
@@ -407,10 +418,31 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     required: List[str] = []
 
     def _ch(idx: Any) -> str:
-        return _ts_channel_label(idx, channel_names)
+        return _ts_context_feature_label(idx, context_feature_names)
 
     top_pairs = _top_k(final_ranking)
-    top_model = top_pairs[0][0] if top_pairs else NOT_AVAILABLE
+    counts: Dict[str, int] = {}
+    spans: Dict[str, int] = {}
+    for r in regimes:
+        if not r.get("leader"):
+            continue
+        lname = str(r.get("leader"))
+        counts[lname] = counts.get(lname, 0) + 1
+        try:
+            spans[lname] = spans.get(lname, 0) + int(r.get("duration") or 0)
+        except (TypeError, ValueError):
+            spans.setdefault(lname, 0)
+
+    # This stage explains the expected reward mu^T x, so its headline is the
+    # detector that held the highest expected reward longest — not the ranking
+    # by ||mu||^2, which is the sibling card's subject and was this atom's score.
+    # Carrying it here left the one sentence answering "which detector had the
+    # highest chance of being chosen" reporting a quantity that does not bear on
+    # the chance, and on SKAB/7 naming LOF_3 while the regime summary three
+    # sentences later gave CBLOF_4 nearly twice as many windows.
+    ranked_spans = sorted(spans.items(), key=lambda kv: (-kv[1], kv[0]))
+    top_model = (ranked_spans[0][0] if ranked_spans
+                 else (top_pairs[0][0] if top_pairs else NOT_AVAILABLE))
     output = {
         "top_pick": top_model,
         "final_ranking_top_k": [{"model": m, "score": _val(s, 6)} for m, s in top_pairs],
@@ -418,21 +450,27 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
         "n_regimes": len(regimes),
     }
 
-    # ── Lead: the forwarded ranking, with the margin over the runner-up ──
-    if top_pairs:
-        score = top_pairs[0][1]
-        if len(top_pairs) > 1 and not _is_nan(score) and not _is_nan(top_pairs[1][1]):
-            runner, r_score = top_pairs[1][0], top_pairs[1][1]
-            margin = float(score) - float(r_score)
-            lead_val = {"top": top_model, "score": _val(score, 6),
-                        "runner_up": runner, "margin": _val(margin, 6)}
-            lead_txt = (f"Thompson Sampling ranked {top_model} first with a final "
-                        f"score of {_fmt(score, 6)}, ahead of {runner} by "
-                        f"{_fmt(margin, 6)}.")
+    # ── Lead: who was best by expected reward, and for how much of the run ──
+    if ranked_spans:
+        held = ranked_spans[0][1]
+        tied = [m for m, w in ranked_spans if w == held]
+        lead_val = {"top": top_model, "windows_led": held,
+                    "n_windows": int(n_windows), "tied_with": tied[1:]}
+        if len(tied) > 1:
+            # "more than any other" is false when there is no other.
+            more = "" if len(tied) == len(ranked_spans) else \
+                ", more than any other detector"
+            lead_txt = (f"{_oxford(tied)} each held the highest expected reward "
+                        f"in {held} of the {int(n_windows)} windows{more}.")
         else:
-            lead_val = {"top": top_model, "score": _val(score, 6)}
-            lead_txt = (f"Thompson Sampling ranked {top_model} first with a final "
-                        f"score of {_fmt(score, 6)}.")
+            lead_txt = (f"{top_model} held the highest expected reward in {held} "
+                        f"of the {int(n_windows)} windows, more than any other "
+                        f"detector")
+            if len(ranked_spans) > 1:
+                runner, r_held = ranked_spans[1]
+                lead_val.update({"runner_up": runner, "runner_up_windows": r_held})
+                lead_txt += f" — {runner} held it in {r_held}"
+            lead_txt += "."
         evidence.append(make_atom("ts.output.top", "stage_output", str(top_model),
                                   lead_val, lead_txt, order=1))
         required.append("ts.output.top")
@@ -451,17 +489,6 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     # ── How the run divided into regimes ──
     leaders = [str(r.get("leader")) for r in regimes if r.get("leader")]
     if regimes:
-        counts: Dict[str, int] = {}
-        spans: Dict[str, int] = {}
-        for r in regimes:
-            if not r.get("leader"):
-                continue
-            lname = str(r.get("leader"))
-            counts[lname] = counts.get(lname, 0) + 1
-            try:
-                spans[lname] = spans.get(lname, 0) + int(r.get("duration") or 0)
-            except (TypeError, ValueError):
-                spans.setdefault(lname, 0)
         # Windows held, not regime count, and sorted by it — the same reasoning
         # as the ranking stage's summary: four short spells are not more of the
         # run than one long one, and a bare count reads as though they were.
@@ -487,7 +514,7 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
     for i, r in enumerate(sorted(regimes, key=lambda x: x.get("index", 0))):
         idx = r.get("index", i)
         leader = str(r.get("leader", NOT_AVAILABLE))
-        # Both narrated channel facts are now slices of the same total — the raw
+        # Both narrated context feature facts are now slices of the same total — the raw
         # split of mu.x, whose parts sum to the prediction. `edge_favor_leader`
         # is that same split differenced against the runner-up, so its parts sum
         # to the leader's margin in expected reward. Putting the edge in SHAP's
@@ -496,47 +523,33 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
         favor = [c for c, _ in (r.get("edge_favor_leader") or [])][:1]
         runner = r.get("runner_up")
 
-        # ONE sentence, carrying the regime index and every claim about it.
+        # The claims stay distinct clauses, in parallel participles. They are
+        # different quantities: a SHARE of the expected reward, an EDGE over the
+        # runner-up in those same units, and a DEPARTURE from what the context
+        # feature usually contributes, which is not a share of anything.
         #
-        # This is structural, not stylistic. summarize.attribute_sentences files
-        # a sentence under a regime only when it says "regime N" — the atoms
-        # otherwise share all their names and numbers and cannot be told apart.
-        # A trailing sentence carrying just a channel index therefore attributed
-        # to nothing, or was captured by whichever unrelated atom held that
-        # integer ("channel 4" landing on the regime summary's "4 different
-        # detectors"); either way it escaped the walk, survived the summary drop
-        # and piled up as a block of context-free sentences. Repeating "In
-        # regime N" to anchor it worked only while the narrator cooperated, and
-        # it stopped cooperating whenever the repetition read as redundant.
-        # Keeping everything in one sentence removes the anchor problem instead
-        # of policing it — and there is no second sentence to lose.
-        #
-        # The three claims stay three distinct clauses, in parallel participles.
-        # They are different quantities: a SHARE of the expected reward, an EDGE
-        # over the runner-up in those same units, and a DEPARTURE from what the
-        # channel usually contributes, which is not a share of anything.
+        # The departure leaves this sentence for an atom of its own, below: three
+        # participles were one too many, and the narrator elided the second
+        # supplying feature in 7 of 8 regimes on SKAB/7.
         deviating = ((r.get("shap_raising") or []) + (r.get("shap_lowering") or []))
+        worst = (max(deviating, key=lambda cv: abs(cv[1]) if not _is_nan(cv[1]) else -1)
+                 if deviating else None)
         clauses: List[str] = []
         if supplying:
             clauses.append(f"{_oxford([_ch(c) for c in supplying])} raising its "
                            f"expected reward the most")
         if favor and runner:
-            # One channel often does both jobs; "also" says so rather than
-            # presenting the same channel twice as two separate findings.
+            # One context feature often does both jobs; "also" says so rather than
+            # presenting the same context feature twice as two separate findings.
             also = "also " if favor[0] in supplying else ""
             clauses.append(f"{_ch(favor[0])} {also}giving it its biggest edge "
                            f"over {runner}")
-        if deviating:
-            c, v = max(deviating, key=lambda cv: abs(cv[1]) if not _is_nan(cv[1]) else -1)
-            direction = "above" if (not _is_nan(v) and float(v) >= 0) else "below"
-            clauses.append(f"{_ch(c)} departing furthest from its usual "
-                           f"contribution, running {direction} it")
 
         text = (f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
                 f"{r.get('duration')} windows) was led by {leader}")
         if len(clauses) == 2 and any(" and " in c for c in clauses):
             # _oxford drops the serial comma for two items, which collides with
-            # the "channel 8 and channel 3" inside the first clause and yields
+            # the "context feature 8 and context feature 3" inside the first clause and yields
             # two bare "and"s. The comma is what marks where one clause ends.
             text += f", with {clauses[0]}, and {clauses[1]}"
         elif clauses:
@@ -569,7 +582,23 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
             " ".join(parts), order=10 + i))
         required.append(rid)
 
-    # ── Which channel carried the winner, across the regimes it led ──
+        # Carries "regime N" so the disclosure can file it; the id keeps the
+        # suffix so artifacts._REGIME_RE, which anchors on the index, does not
+        # read it as an extra regime.
+        if worst is not None:
+            c, v = worst
+            direction = "above" if (not _is_nan(v) and float(v) >= 0) else "below"
+            did = f"{rid}.deviation"
+            evidence.append(make_atom(
+                did, "regime", leader,
+                {"index": idx, "leader": leader,
+                 "deviation_raising": [(c, _val(v, 4)) for c, v in (r.get("shap_raising") or [])],
+                 "deviation_lowering": [(c, _val(v, 4)) for c, v in (r.get("shap_lowering") or [])]},
+                f"In regime {idx}, {_ch(c)} departed furthest from its usual "
+                f"contribution, running {direction} it.", order=10 + i))
+            required.append(did)
+
+    # ── Which context feature carried the winner, across the regimes it led ──
     if top_model != NOT_AVAILABLE:
         totals: Dict[Any, float] = {}
         for r in regimes:
@@ -623,62 +652,37 @@ def build_thompson_ir(dataset: str, entity: str, *, n_windows: int,
         required.append("ts.states.summary")
 
     caveats: List[Dict[str, Any]] = []
-    if n_channels is not None and int(n_channels) == 1:
+    if n_context_features is not None and int(n_context_features) == 1:
         caveats.append(make_atom(
-            "ts.caveat.single_channel", "caveat", "channels", int(n_channels),
-            "This dataset has a single channel, so splitting a detector's "
-            "expected reward across channels carries no information — that one "
-            "channel necessarily accounts for all of it."))
+            "ts.caveat.single_channel", "caveat", "context features", int(n_context_features),
+            "This dataset has a single context feature, so splitting a detector's "
+            "expected reward across context features carries no information — that one "
+            "context feature necessarily accounts for all of it."))
 
     # Not "why did it rank the winner first" any more: the ranking criterion has
     # its own stage (build_thompson_ranking_ir), and this one never explained it
-    # — its regimes, its SHAP and its channels are all about the per-window
+    # — its regimes, its SHAP and its context features are all about the per-window
     # expected reward that drove selection. The question now names what the
     # evidence below actually answers.
     question = ("When did each detector have the highest chance of being chosen "
-                "— which channels raised its expected reward above its rivals, "
+                "— which context features raised its expected reward above its rivals, "
                 "and how much of the run was spent exploring rather than "
                 "exploiting?")
-    info_footer = (
-        "Thompson Sampling learns a mean vector μ for each detector and, at every "
-        "window, predicts that detector's reward as the weights applied to the "
-        "window's data μᵀx; that prediction is its expected reward. The score in "
-        "the resulting ranking is a different quantity and the ranking-criterion "
-        "stage is where it is explained; here it is only the headline, so a "
-        "detector can lead much of the run without finishing first. A regime is a "
-        "stretch of at least three consecutive windows in which one detector "
-        "holds the highest expected reward μᵀx; shorter changes are counted as "
-        "blips. These regimes need not line up with the ranking-criterion "
-        "stage's.  A channel's contribution is its own share of that expected "
-        "reward: the weights on that channel applied to that channel's readings, "
-        "and those shares add up to the whole prediction μᵀx. A second, narrower "
-        "measure also appears: how far a channel's contribution departs from what "
-        "that channel usually contributes, measured against the average of the "
-        "run. The three selection states describe each choice: exploitation means "
-        "the sampler picked the detector it already believed was best, informed "
-        "exploration means the random draw over its uncertainty steered it "
-        "elsewhere (a high share means the detectors stayed closely matched and "
-        "the beliefs uncertain), and random means a forced exploration step fired "
-        "(a high share means much of the run was spent sampling blindly). "
-        "Thompson Sampling is a seeded stochastic sampler, so a different seed "
-        "can produce a different trajectory, and the behavioural states are "
-        "observed labels rather than causes.")
 
     return _envelope("thompson_sampling", dataset, entity, output, evidence,
-                     caveats, required, question=question,
-                     info_footer=info_footer)
+                     caveats, required, question=question)
 
 
 def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
                               final_ranking: List[Tuple[str, float]],
-                              winner_channels: List[Tuple[Any, float]],
-                              gap_channels: List[Tuple[Any, float]],
+                              winner_context_features: List[Tuple[Any, float]],
+                              gap_context_features: List[Tuple[Any, float]],
                               selection_counts: Dict[str, int],
                               regimes: List[Dict[str, Any]],
                               warmup_windows: int,
-                              channel_names: Optional[Sequence[str]] = None,
-                              n_channels: Optional[int] = None,
-                              channel_shares: Optional[Dict[str, List[float]]] = None
+                              context_feature_names: Optional[Sequence[str]] = None,
+                              n_context_features: Optional[int] = None,
+                              context_feature_shares: Optional[Dict[str, List[float]]] = None
                               ) -> Dict[str, Any]:
     """
     The sibling of build_thompson_ir, for the ranking criterion rather than the
@@ -687,11 +691,11 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
     Thompson Sampling ranks detectors by ||mu_k||^2, but build_thompson_ir
     explains mu^T x — the expected reward that drove per-window selection. This
     builder explains the ranking itself: ||mu||^2 splits exactly into one
-    non-negative contribution per channel, and the winner's margin over the
-    runner-up splits exactly into one signed term per channel.
+    non-negative contribution per context feature, and the winner's margin over the
+    runner-up splits exactly into one signed term per context feature.
 
-    `winner_channels` is [(channel, contribution)] for the winner, descending;
-    `gap_channels` is [(channel, signed delta)] for winner-minus-runner-up,
+    `winner_context_features` is [(context feature, contribution)] for the winner, descending;
+    `gap_context_features` is [(context feature, signed delta)] for winner-minus-runner-up,
     sorted by descending magnitude. Both are precomputed by
     explain_thompson_ranking, which owns the decomposition helpers.
 
@@ -705,7 +709,7 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
     required: List[str] = []
 
     def _ch(idx: Any) -> str:
-        return _ts_channel_label(idx, channel_names)
+        return _ts_context_feature_label(idx, context_feature_names)
 
     top_pairs = _top_k(final_ranking)
     top_model = top_pairs[0][0] if top_pairs else NOT_AVAILABLE
@@ -715,7 +719,7 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
         "final_ranking_top_k": [{"model": m, "score": _val(s, 6)} for m, s in top_pairs],
         "n_windows": int(n_windows),
         "n_regimes": len(regimes),
-        "n_channels": None if n_channels is None else int(n_channels),
+        "n_channels": None if n_context_features is None else int(n_context_features),
         "warmup_windows": int(warmup_windows or 0),
     }
 
@@ -726,40 +730,40 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             margin = float(score) - float(top_pairs[1][1])
             lead_val = {"top": top_model, "score": _val(score, 6),
                         "runner_up": runner_up, "margin": _val(margin, 6)}
-            lead_txt = (f"Ranked by the size of its learned weights, {top_model} "
+            lead_txt = (f"Ranked first by the size of its mean vector, {top_model} "
                         f"scored {_fmt(score, 6)}, ahead of {runner_up} by "
                         f"{_fmt(margin, 6)}.")
         else:
             lead_val = {"top": top_model, "score": _val(score, 6)}
-            lead_txt = (f"Ranked by the size of its learned weights, {top_model} "
+            lead_txt = (f"Ranked first by the size of its mean vector, {top_model} "
                         f"scored {_fmt(score, 6)}.")
         evidence.append(make_atom("tsr.output.top", "stage_output", str(top_model),
                                   lead_val, lead_txt, order=1))
         required.append("tsr.output.top")
 
     # ── Where the winner's score came from ──
-    total = sum(float(v) for _, v in winner_channels if not _is_nan(v))
-    if winner_channels and total > 0:
-        lead_ch = winner_channels[:3]
+    total = sum(float(v) for _, v in winner_context_features if not _is_nan(v))
+    if winner_context_features and total > 0:
+        lead_ch = winner_context_features[:3]
         shares = [(c, 100.0 * float(v) / total) for c, v in lead_ch]
         listed = _oxford([f"{_ch(c)} ({_fmt(p, 1)}%)" for c, p in shares])
         evidence.append(make_atom(
             "tsr.winner.channels", "winner_channels", str(top_model),
             {"channel": lead_ch[0][0], "total": _val(total, 6),
-             "per_channel": [(c, _val(v, 6)) for c, v in winner_channels],
+             "per_channel": [(c, _val(v, 6)) for c, v in winner_context_features],
              "top_shares": [(c, _val(p, 1)) for c, p in shares]},
             f"{listed} contributed the majority of {top_model}'s score.",
             order=10))
         required.append("tsr.winner.channels")
 
     # ── What actually decided the top spot ──
-    if gap_channels and runner_up:
-        gains = [(c, v) for c, v in gap_channels if not _is_nan(v) and float(v) > 0][:2]
-        losses = [(c, v) for c, v in gap_channels if not _is_nan(v) and float(v) < 0][:1]
+    if gap_context_features and runner_up:
+        gains = [(c, v) for c, v in gap_context_features if not _is_nan(v) and float(v) > 0][:2]
+        losses = [(c, v) for c, v in gap_context_features if not _is_nan(v) and float(v) < 0][:1]
         parts = []
         if gains:
             # No raw values in the prose. The table and the gap plot carry the
-            # per-channel numbers, and quoting six-decimal figures mid-sentence
+            # per-context-feature numbers, and quoting six-decimal figures mid-sentence
             # only invites the narrator to gloss what they mean.
             labels = _oxford([_ch(c) for c, _v in gains])
             parts.append(f"{labels[:1].upper() + labels[1:]} contributed "
@@ -779,11 +783,12 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
                 # `rivals` is one of verifier._RIVAL_KEYS, so naming the key this
                 # way gets the rival set checked against the narrated sentence.
                 {"rivals": [runner_up], "runner_up": runner_up,
-                 "per_channel": [(c, _val(v, 6)) for c, v in gap_channels],
+                 "per_channel": [(c, _val(v, 6)) for c, v in gap_context_features],
                  "favouring_winner": [(c, _val(v, 6)) for c, v in gains],
                  "favouring_runner_up": [(c, _val(v, 6)) for c, v in losses]},
                 ", ".join(parts) + ".", order=20))
             required.append("tsr.gap.runner_up")
+
 
     # ── How much evidence each ranking score rests on ──
     if selection_counts and top_model != NOT_AVAILABLE:
@@ -842,19 +847,39 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             head = (f"Leadership on this score changed hands over the run: it "
                     f"splits into {len(regimes)} regimes led by {len(counts)} "
                     f"different detectors: {led}.")
+        longest = max(spans, key=lambda m: (spans[m], str(m))) if spans else None
         evidence.append(make_atom(
             "tsr.regimes.summary", "regime_summary", "regimes",
             {"n_regimes": len(regimes), "n_windows": int(n_windows),
              "n_leaders": len(counts), "regimes_led": counts,
-             "windows_led": spans, "warmup_windows": warm},
+             "windows_led": spans, "warmup_windows": warm,
+             "longest_leader": longest},
             head + warm_txt, order=40))
         required.append("tsr.regimes.summary")
+
+        # The score accumulates only in the windows a detector is picked, so
+        # whoever led longest need not finish first.
+        #
+        # Strictly longer, not merely a different name: on a tie the winner is
+        # as much "in front for longest" as anyone, and the claim would be false.
+        if longest is not None and top_model != NOT_AVAILABLE and \
+                str(longest) != str(top_model) and \
+                spans[longest] > spans.get(top_model, 0):
+            evidence.append(make_atom(
+                "tsr.tension.led_vs_won", "stage_tension", str(top_model),
+                {"winner": top_model, "longest_leader": longest,
+                 "winner_windows": spans.get(top_model, 0),
+                 "longest_windows": spans[longest]},
+                f"{top_model} finished first on this score without being the "
+                f"detector in front for longest — {longest} led for more "
+                f"windows.", order=41))
+            required.append("tsr.tension.led_vs_won")
 
     # ── One sentence per regime, chronological; every one required ──
     for i, r in enumerate(sorted(regimes, key=lambda x: x.get("index", 0))):
         idx = r.get("index", i)
         leader = str(r.get("leader", NOT_AVAILABLE))
-        top_channels = r.get("top_channels") or []
+        top_context_features = r.get("top_channels") or []
         runner = r.get("runner_up")
 
         dur = r.get("duration")
@@ -873,8 +898,8 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
         # comparison belongs anyway.
         text = (f"Regime {idx} (windows {r.get('start')} to {r.get('end')}, "
                 f"{dur} window{'' if dur == 1 else 's'}) was led by {leader}")
-        if top_channels:
-            labels = _oxford([_ch(c) for c, _ in top_channels[:2]])
+        if top_context_features:
+            labels = _oxford([_ch(c) for c, _ in top_context_features[:2]])
             text += f", with {labels} raising its score the most"
         parts = [text + "."]
 
@@ -884,7 +909,7 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             {"index": idx, "start": r.get("start"), "end": r.get("end"),
              "duration": r.get("duration"), "leader": leader,
              "runner_up": runner,
-             "top_channels": [(c, _val(v, 6)) for c, v in top_channels],
+             "top_channels": [(c, _val(v, 6)) for c, v in top_context_features],
              "gap_channels": [(c, _val(v, 6)) for c, v in (r.get("gap_channels") or [])],
              "score": _val(r.get("score"), 6),
              "runner_score": _val(r.get("runner_score"), 6)},
@@ -898,10 +923,10 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
     # real limit on what the ranking means.
     caveats: List[Dict[str, Any]] = [
         make_atom(
-            "tsr.caveat.nonnegative", "caveat", "channels", None,
-            "Each channel's share is a sum of squared weights, so it can never "
+            "tsr.caveat.nonnegative", "caveat", "context features", None,
+            "Each context feature's share is a sum of squared weights, so it can never "
             "be negative: the split shows how a detector's score is divided "
-            "among channels, not which channels pushed it down. Only the "
+            "among context features, not which context features pushed it down. Only the "
             "comparison against a rival has a direction."),
         make_atom(
             "tsr.caveat.exposure", "caveat", "selections", None,
@@ -910,44 +935,27 @@ def build_thompson_ranking_ir(dataset: str, entity: str, *, n_windows: int,
             "how well it did; a rarely selected detector ranks low on thin "
             "evidence rather than on a poor showing."),
     ]
-    if n_channels is not None and int(n_channels) == 1:
+    if n_context_features is not None and int(n_context_features) == 1:
         caveats.append(make_atom(
-            "tsr.caveat.single_channel", "caveat", "channels", int(n_channels),
-            "This dataset has a single channel, so splitting the score across "
-            "channels carries no information — that one channel necessarily "
+            "tsr.caveat.single_channel", "caveat", "context features", int(n_context_features),
+            "This dataset has a single context feature, so splitting the score across "
+            "context features carries no information — that one context feature necessarily "
             "accounts for all of it."))
 
     question = ("Why did Thompson Sampling rank the detectors as it did — which "
-                "channels drove each detector's ranking score up, and how much "
-                "of the winner's margin came from each channel?")
-    info_footer = (
-        "Thompson Sampling learns a mean vector μ for each detector, one weight "
-        "per channel per timestep of a window. It ranks the detectors by the "
-        "overall size of those weights μᵀμ (‖μ_k‖²). That total splits exactly "
-        "into one number per channel: each channel's share is the sum of its own "
-        "squared weights, and the shares add up to the whole score. Because they "
-        "are squares, shares are never negative, so a small share means a channel "
-        "contributed little, not that it worked against the detector. Comparing "
-        "two detectors channel by channel does have a direction: the difference "
-        "between their shares adds up exactly to the gap between their scores, "
-        "and a negative difference marks a channel on which the rival was "
-        "stronger. A regime here is a stretch of windows in which one detector "
-        "held the highest score; these are not the same regimes as the "
-        "selection-dynamics stage reports. Thompson Sampling is a seeded "
-        "stochastic sampler, so a different seed can produce a different "
-        "trajectory.")
+                "context features drove each detector's ranking score up, and how much "
+                "of the winner's margin came from each context feature?")
 
     env = _envelope("thompson_ranking", dataset, entity, output, evidence,
-                    caveats, required, question=question,
-                    info_footer=info_footer)
+                    caveats, required, question=question)
     # Kept OUT of `output` and out of `evidence` on purpose. It is display data,
     # not a claim: the narrator renders every `output` key into its prompt, and
-    # a detectors x channels matrix there would be a wall of floats the model
+    # a detectors x context features matrix there would be a wall of floats the model
     # must ignore. The page reads it to decompose any pair's gap on demand,
     # since that split is exactly shares(a) - shares(b).
-    if channel_shares:
+    if context_feature_shares:
         env["channel_shares"] = {str(m): [_val(v, 6) for v in vals]
-                                 for m, vals in channel_shares.items()}
+                                 for m, vals in context_feature_shares.items()}
     return env
 
 
@@ -1155,25 +1163,9 @@ def build_ga_selection_ir(dataset: str, entity: str, result: Dict[str, Any]) -> 
 
     question = ("Why were the detectors in the ensemble chosen, and why were the "
                 "rest left out?")
-    info_footer = (
-        "The genetic algorithm chooses the subset by searching for the ensemble "
-        "with the highest fitness; it never scores detectors individually. The "
-        "two properties below are measured afterwards, from the subsets that "
-        "search evaluated, to explain the ensemble it arrived at. Utility is a "
-        "detector's mean marginal contribution — the average lift in the "
-        "ensemble's F1 score when "
-        "it is added to a subset, across the subsets the genetic algorithm tried. "
-        "Stability is the fraction of generations in which the algorithm kept the "
-        "detector, so a high-stability detector is one it selected in most of its "
-        "ensembles. High and low are relative to this cohort — a median split "
-        "across the detectors evaluated together — so they mean above or below the "
-        "others, not absolute quality. Fitness is the ensemble's best-threshold F1 "
-        "score, the objective the algorithm maximises. LOFO is how much that "
-        "fitness drops when a single detector is removed from the final ensemble; "
-        "a positive value means the detector was pulling weight.")
 
     return _envelope("ga_selection", dataset, entity, output, evidence, caveats,
-                     required, question=question, info_footer=info_footer)
+                     required, question=question)
 
 
 # Markov scores that differ by less than this are one tie. The chain behind
@@ -1295,8 +1287,19 @@ def _rank_phrase(ranks: Sequence[Any]) -> str:
     return phrase
 
 
-def _sign_summary_text(members: Sequence[str], signs: Dict[str, str]) -> str:
+def _mark_heaviest(names: Sequence[str], heaviest: Optional[str]) -> List[str]:
+    return [f"{n} — the detector carrying the most weight —" if n == heaviest else n
+            for n in names]
+
+
+def _sign_summary_text(members: Sequence[str], signs: Dict[str, str],
+                       heaviest: Optional[str] = None) -> str:
     """One sentence naming each member's sign.
+
+    `heaviest` is named inline when it signs negative: weight says how much a
+    detector moves the meta-learner and sign says which way, and the two
+    pointing against each other is the one thing here a reader should not have
+    to assemble from two sentences.
 
     Names the sign and stops. What a sign MEANS — which way a rising score
     moves the meta-learner — is defined once in the info footer, so spelling it
@@ -1317,11 +1320,12 @@ def _sign_summary_text(members: Sequence[str], signs: Dict[str, str]) -> str:
     if pos and neg:
         # The second clause elides "signs" — the first has just supplied it.
         text = (f"{_oxford(pos)} had {_v(pos, 'a positive sign', 'positive signs')}, "
-                f"while {_oxford(neg)} had negative")
+                f"while {_oxford(_mark_heaviest(neg, heaviest))} had negative")
     elif pos:
         text = f"{_oxford(pos)} had {_v(pos, 'a positive sign', 'positive signs')}"
     elif neg:
-        text = f"{_oxford(neg)} had {_v(neg, 'a negative sign', 'negative signs')}"
+        text = (f"{_oxford(_mark_heaviest(neg, heaviest))} had "
+                f"{_v(neg, 'a negative sign', 'negative signs')}")
     elif na:
         return (f"No detector has a sign: {_oxford(na)} "
                 f"{_v(na, 'has', 'have')} no net effect.")
@@ -1396,21 +1400,25 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         n = len(detectors)
         evidence.append(make_atom(
             "ga_comb.output.subset", "stage_output", "best_ensemble", list(detectors),
-            # "this stage measures…" left the subject implicit and a narrator
-            # reattached it to the nearest noun ("This ensemble measures how
-            # each detector influences…"), which is nonsense the verifier
-            # cannot see — every name and number in it is correct. Naming the
-            # ranking gives the clause a referent it cannot slide off.
+            # No trailing "the ranking below measures…" clause: it said what
+            # this stage's own question says, and the narrator merged the two
+            # into the ensemble sentence ("selected the 5-detector ensemble {…}
+            # to determine which detectors the ensemble relies on most"). Each
+            # detector atom states its own weight rank, so nothing is lost.
             f"The genetic algorithm selected the {n}-detector ensemble "
-            f"{{{', '.join(detectors)}}}; the ranking below measures how much "
-            f"each of those detectors moves the trained meta-learner's output.",
+            f"{{{', '.join(detectors)}}}.",
             order=1))
         required.append("ga_comb.output.subset")
 
     for i, d in enumerate(detectors):
         rid = f"ga_comb.detector.{d}.role"
+        # The most-weighted detector answers half of what this stage is asked, so
+        # it carries its own type: the card drops the per-detector walk by type,
+        # and dropping this one with it left the summary never naming the winner.
+        role_type = ("detector_role_lead" if final_rank.get(d) == 1
+                     else "detector_role")
         evidence.append(make_atom(
-            rid, "detector_role", d,
+            rid, role_type, d,
             {"final_rank": final_rank.get(d),
              "final_rank_tied": rank_counts.get(final_rank.get(d), 1) > 1,
              "markov_score": _val(pi.get(d), 4),
@@ -1427,10 +1435,12 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
             f"{_weight_phrase(final_rank.get(d), len(detectors), tied=rank_counts.get(final_rank.get(d), 1) > 1)}, "
             f"{_rank_phrase((r_abs.get(d), r_pfi.get(d), r_ale.get(d)))}.",
             order=10 * (i + 1)))
-        required.append(rid)
+        if i < HEAD_REQUIRED:
+            required.append(rid)
 
     if detectors:
-        sign_text = _sign_summary_text(detectors, signs)
+        heaviest = next((d for d in detectors if final_rank.get(d) == 1), None)
+        sign_text = _sign_summary_text(detectors, signs, heaviest)
         if sign_text:
             evidence.append(make_atom(
                 "ga_comb.sign_summary", "sign_summary", "sign",
@@ -1444,7 +1454,7 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
         make_atom("ga_comb.caveat.methods", "caveat", "attribution", None,
                   "Absolute SHAP and ALE are label-free — they explain the "
                   "meta-learner's own output — while PFI is label-based, measuring "
-                  "the F1 drop when a detector's scores are shuffled."),
+                  "the fitness drop when a detector's scores are shuffled."),
         make_atom("ga_comb.caveat.aggregation", "caveat", "markov", None,
                   "The overall weighting is the stationary distribution of a Markov "
                   "chain over the pairwise preferences of the three magnitude "
@@ -1494,25 +1504,26 @@ def build_ga_combination_ir(dataset: str, entity: str, result: Dict[str, Any]) -
 
     question = ("Which detectors does the GA-selected ensemble rely on most, and "
                 "which way does each push the meta-learner's decision?")
-    info_footer = (
-        "Three measures rank how much weight a detector carries, each a position "
-        "where rank 1 is strongest. Absolute SHAP ranks detectors by the size of "
-        "their influence on the meta-learner's output; PFI by the F1 drop when "
-        "their scores are shuffled; total ALE by how far the meta-learner's "
-        "predicted anomaly probability moves in total as that detector sweeps "
-        "its own observed range. Absolute SHAP and ALE are label-free, PFI is "
-        "label-based. The overall weight rank is a fourth, separate position "
-        "that merges the three. "
-        "The sign is the sign of ALE's net accumulated effect, read as a "
-        "detector's score rises from its lowest to its highest observed value: "
-        "a detector whose rising score pushes the meta-learner toward flagging "
-        "the point as an anomaly has a positive sign, and one whose rising "
-        "score pushes it toward 'not an anomaly' has a negative sign. A sign is "
-        "called weakly supported when the effect changes direction across the "
-        "score range or when the detector barely moves the meta-learner at all.")
 
     return _envelope("ga_combination", dataset, entity, output, evidence, caveats,
-                     required, question=question, info_footer=info_footer)
+                     required, question=question)
+
+
+def _pick_verdict(prefix: str, stage_word: str, source: Any, pick: Any,
+                  top: Any) -> Optional[Dict[str, Any]]:
+    """Atom of its own: agreement is a rank correlation over the whole order and
+    says nothing about whether a source wanted the same winner."""
+    if pick == NOT_AVAILABLE or top == NOT_AVAILABLE or source is None:
+        return None
+    agrees = str(pick) == str(top)
+    text = (f"{source}'s own ranking put {top} first, matching the "
+            f"{stage_word} consensus." if agrees else
+            f"{source}'s own ranking put {pick} first rather than the "
+            f"{stage_word} consensus's {top}.")
+    return make_atom(f"{prefix}.verdict.top_pick", "source_verdict", str(source),
+                     {"source": source, "source_top_pick": pick,
+                      "consensus_top": top, "agrees": agrees},
+                     text, order=7)
 
 
 def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iteration: int,
@@ -1535,18 +1546,6 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         "n_sources": len(source_names),
         "sources": sorted(source_names),
     }
-    if full_ranking:
-        # "ranking of detectors, first-ranked detector is X" — the winner reads
-        # unmistakably as a DETECTOR (not one of the source rankings analysed
-        # below, which the narrator had conflated), and grounding "first-ranked"
-        # here means the narrator's natural "X ranked first" has the value 1 to
-        # match instead of reading as an ungrounded number.
-        evidence.append(make_atom(
-            f"{prefix}.output.top", "stage_output", top, top,
-            f"The {stage_word} consensus is a ranking of detectors; its "
-            f"first-ranked detector is {top}.", order=0))
-        required.append(f"{prefix}.output.top")
-
     caveats = [
         make_atom(f"{prefix}.caveat.consensus", "caveat", "aggregation", None,
                   "The consensus ranking is produced by Markov-chain rank aggregation "
@@ -1569,12 +1568,17 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
              "runner_up": runner,
              "runner_up_agreement": _val(kendall_only.get("runner_up_tau"), 4),
              "gap": _val(kendall_only.get("alignment_gap"), 4)},
-            f"{winner} drove the {stage_word} consensus most: it agreed with the "
-            f"consensus more closely than {runner} (agreement "
+            f"{winner} agreed with the {stage_word} consensus more closely "
+            f"than {runner} did (agreement "
             f"{_fmt(kendall_only.get('winner_tau'), 4)} vs "
             f"{_fmt(kendall_only.get('runner_up_tau'), 4)}, gap "
             f"{_fmt(kendall_only.get('alignment_gap'), 4)})."))
         required.append(kid)
+        verdict = _pick_verdict(prefix, stage_word, winner,
+                                source_top_picks.get(str(winner), NOT_AVAILABLE), top)
+        if verdict is not None:
+            evidence.append(verdict)
+            required.append(verdict["id"])
         caveats.append(make_atom(
             f"{prefix}.caveat.two_sources", "caveat", "loo", None,
             "With exactly two sources, influence (leave-one-out) and the combined "
@@ -1585,8 +1589,6 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         # Footer is a pure glossary DEFINITION only; the two-source rationale
         # (why influence is undefined here) is owned by caveat.two_sources, so
         # keeping it out of the footer avoids stating it twice in the output.
-        info_footer = (
-            "Agreement compares the consensus ranking with a source's own ranking.")
     else:
         # Multi-source case: one human-readable role sentence per source, ordered
         # by Borda rank (the dominant combined rank), built from its two component
@@ -1595,18 +1597,16 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
         # consensus). Raw LOO/tau scores stay in `value` for provenance; the
         # prose carries only the ranks.
 
-        # Required relational atom: names the source set explicitly and states
-        # that the ranked detectors (incl. the winner) are NOT sources — the
-        # narrator had folded the winning detector into the list of sources.
+        # Required relational atom: names the source set explicitly. It used to
+        # add that the ranked detectors are NOT sources, which was aimed at the
+        # narrator and got printed as a sentence of its own.
         src_list = sorted(source_names)
         cid = f"{prefix}.context.sources"
         evidence.append(make_atom(
             cid, "stage_context", "sources",
             {"sources": src_list, "n_sources": len(src_list), "winner": top},
             f"The {len(src_list)} sources aggregated into this consensus are the "
-            f"rankings {', '.join(src_list)}. Every fact below describes one of "
-            f"these source rankings; the detectors they rank — including the "
-            f"winner {top} — are the items being ranked, not sources.",
+            f"rankings {', '.join(src_list)}.",
             order=5))
         required.append(cid)
 
@@ -1621,29 +1621,50 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
                      6: "sixth ", 7: "seventh ", 8: "eighth ", 9: "ninth ",
                      10: "tenth ", 11: "eleventh ", 12: "twelfth "}
 
+        def _ordinal(k: Any) -> str:
+            if k is None or _is_nan(k):
+                return str(k)
+            k = int(k)
+            return f"{k}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(k if k < 20 else k % 10, 'th') }"
+
         def _shaped_prefix(br: Any) -> str:
             if br is None or _is_nan(br):
                 return ""
             return _ORD_MOST.get(int(br), f"{int(br)}th ")
 
+        # The source that moved the consensus most need not have wanted its
+        # winner: influence measures how far the result shifts without a source,
+        # not whether it agreed. This rides ON the leading source's own sentence
+        # rather than in an atom of its own — as two sentences about one source
+        # the narrator kept welding them together and inverting which detector
+        # went where ("ranks X first in its own ranking despite putting Y at the
+        # top instead").
+        ranked = sorted(verdicts, key=_borda_key)
+        # Only when one source is strictly ahead: sources tie at Borda rank 1
+        # often enough, and "more than any other" is false when two share it.
+        alone = (len(ranked) > 1
+                 and _borda_key(ranked[0])[0] < _borda_key(ranked[1])[0])
+        lead_src = str(ranked[0].get("source")) if ranked else None
+        lead_pick = source_top_picks.get(lead_src, NOT_AVAILABLE)
+        lead_tension = (alone and lead_src and top != NOT_AVAILABLE
+                        and lead_pick != NOT_AVAILABLE and str(lead_pick) != str(top))
+
         n_src = len(src_list)
-        for i, v in enumerate(sorted(verdicts, key=_borda_key)):
+        for i, v in enumerate(ranked):
             name = v["source"]
             loo_rank, align_rank = v.get("loo_rank"), v.get("align_rank")
             br = v.get("borda_rank")
-            # Every source is described exactly like the lead: how much it
-            # "shaped the consensus" (its combined Borda standing) plus BOTH
-            # explicit component ranks. The combined standing gets its own NAME
-            # and its own NUMBER ("overall rank N of M"): expressed only as a
-            # bare verb phrase it was the one ordinal in the sentence without a
-            # label, so narrators borrowed the nearest rank-noun and reported it
-            # as influence — the same value described twice, contradictorily
-            # ("ranked sixth for influence (rank 4)").
-            standing = ("" if br is None or _is_nan(br)
-                        else f" (overall rank {int(br)} of {n_src})")
+            # The combined Borda standing is stated once, as the verb phrase.
+            # Repeating it as "(standing N of M)" put three "N of M" phrases in
+            # one sentence, two of them the same number, and the narrator glued
+            # the standing onto the component frame ("standing 2 of 6 for
+            # influence and 2 of 6 for agreement, placing 3rd of 6 for
+            # influence..."). The components carry their own ordinals and
+            # labels, which is what the parenthetical was there to supply.
             text = (f"{name} shaped the {stage_word} consensus "
-                    f"{_shaped_prefix(br)}most{standing}, ranking "
-                    f"{loo_rank} for influence and {align_rank} for agreement.")
+                    f"{_shaped_prefix(br)}most, placing "
+                    f"{_ordinal(loo_rank)} of {n_src} for influence and "
+                    f"{_ordinal(align_rank)} of {n_src} for agreement.")
             rid = f"{prefix}.source.{name}.role"
             evidence.append(make_atom(
                 rid, "source_role", name,
@@ -1652,24 +1673,27 @@ def build_rank_aggregation_ir(dataset: str, entity: str, stage_name: str, iterat
                  "influence_score": _val(v.get("loo_score"), 4),
                  "agreement_score": _val(v.get("align_score"), 4),
                  "top_pick": source_top_picks.get(name, NOT_AVAILABLE)},
-                text, order=10 * (i + 1)))
-            required.append(rid)
+                # The leading source goes first: it is the answer this stage is
+                # asked for, and with it further down the narrator invents an
+                # opening sentence and then restates the fact verbatim.
+                text, order=0 if i == 0 else 10 * (i + 1)))
+            if i < HEAD_REQUIRED:
+                required.append(rid)
+
+        # Only when one source is strictly ahead: under a Borda tie at rank 1
+        # "shaped the consensus most" does not identify whose pick this is.
+        if alone:
+            verdict = _pick_verdict(prefix, stage_word, lead_src,
+                                    source_top_picks.get(str(lead_src), NOT_AVAILABLE), top)
+            if verdict is not None:
+                evidence.append(verdict)
+                required.append(verdict["id"])
 
         question = (f"Which source rankings most shaped the {stage_word} consensus, "
                     f"and how much did each agree with it?")
-        info_footer = (
-            "Influence measures how much a source moved the consensus: it compares "
-            "the consensus ranking with the ranking that emerges when that source is "
-            "left out. Agreement compares the consensus ranking with the source's own "
-            "ranking. The overall rank is a third, separate position: it is "
-            "influence and agreement merged into one Borda order, and it is what 'shaped "
-            "the consensus most, second most, and so on' reports. A source can stand "
-            "high overall on the strength of one component while ranking low on the "
-            "other.")
 
     ir = _envelope(f"rank_aggregation_{stage_name}", dataset, entity, output,
-                   evidence, caveats, required, question=question,
-                   info_footer=info_footer)
+                   evidence, caveats, required, question=question)
     ir["iteration"] = int(iteration)
     return ir
 
@@ -1693,10 +1717,14 @@ def _mc_region_phrase(regions: Sequence[Any]) -> str:
 
 def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
                          ranked_f1: Optional[List[str]] = None,
-                         ranked_pr: Optional[List[str]] = None) -> Dict[str, Any]:
+                         ranked_pr: Optional[List[str]] = None,
+                         ranked_vus: Optional[List[str]] = None) -> Dict[str, Any]:
     curves_f1 = result.get("curves_f1", {})
     curves_pr = result.get("curves_pr", {})
+    curves_vus = result.get("curves_vus", {})
     winner_f1 = result.get("winner_f1", {})
+    winner_pr = result.get("winner_pr", {})
+    winner_vus = result.get("winner_vus", {})
     permodel_f1 = result.get("permodel_f1", {})
 
     evidence: List[Dict[str, Any]] = []
@@ -1704,26 +1732,31 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
     output = {
         "production_ranking_f1_top_k": _top_k(ranked_f1 or []),
         "production_ranking_pr_top_k": _top_k(ranked_pr or []),
+        "production_ranking_vus_top_k": _top_k(ranked_vus or []),
         "top_pick_f1": (ranked_f1[0] if ranked_f1 else NOT_AVAILABLE),
         "top_pick_pr": (ranked_pr[0] if ranked_pr else NOT_AVAILABLE),
+        "top_pick_vus": (ranked_vus[0] if ranked_vus else NOT_AVAILABLE),
     }
     top_f1 = ranked_f1[0] if ranked_f1 else None
     top_pr = ranked_pr[0] if ranked_pr else None
-    if top_f1 or top_pr:
-        if top_f1 and top_pr and top_f1 == top_pr:
-            lead = (f"In the production Monte Carlo test, {top_f1} ranked first "
-                    f"both by F1 score and by PR-AUC.")
-        elif top_f1 and top_pr:
-            lead = (f"In the production Monte Carlo test, {top_f1} ranked first "
-                    f"by F1 score and {top_pr} ranked first by PR-AUC.")
-        else:
-            only, metric = (top_f1, "F1 score") if top_f1 else (top_pr, "PR-AUC")
-            lead = (f"In the production Monte Carlo test, {only} ranked first "
-                    f"by {metric}.")
+    top_vus = ranked_vus[0] if ranked_vus else None
+    # One clause per metric the run actually ranked by; metrics that agree on a
+    # winner share a clause rather than repeating the name.
+    tops = [(label, ranking[0]) for label, ranking in
+            (("F1 score", ranked_f1), ("PR-AUC", ranked_pr), ("VUS", ranked_vus))
+            if ranking]
+    if tops:
+        by_winner: Dict[str, List[str]] = {}
+        for label, winner in tops:
+            by_winner.setdefault(winner, []).append(label)
+        clauses = [f"{winner} ranked first by {_join_and(labels)}"
+                   for winner, labels in by_winner.items()]
+        lead = f"In the production Monte Carlo test, {_join_and(clauses)}."
         evidence.append(make_atom(
-            "mc.output.top", "stage_output", str(top_f1 or top_pr),
-            {"top_f1": top_f1 or NOT_AVAILABLE, "top_pr": top_pr or NOT_AVAILABLE},
-            lead, order=1))
+            "mc.output.top", "stage_output", str(tops[0][1]),
+            {"top_f1": top_f1 or NOT_AVAILABLE, "top_pr": top_pr or NOT_AVAILABLE,
+             "top_vus": top_vus or NOT_AVAILABLE},
+            lead, order=0))
         required.append("mc.output.top")
 
     # ONE atom per detector, covering BOTH metrics. Two atoms about the same
@@ -1733,7 +1766,8 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
     # both floods the prose with "at 0.042 ... at 0.053 ..." without adding a
     # single fact the regions do not already carry.
     regions_by_model: Dict[str, Dict[str, Any]] = {}
-    for metric, curves in (("F1", curves_f1), ("PR-AUC", curves_pr)):
+    for metric, curves in (("F1", curves_f1), ("PR-AUC", curves_pr),
+                           ("VUS", curves_vus)):
         for m, regions in sorted((curves.get("win_regions") or {}).items()):
             if regions:
                 regions_by_model.setdefault(m, {})[metric] = regions
@@ -1750,29 +1784,50 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
         # metric clauses visibly distinct (the narrator otherwise copies one
         # metric's ranges into the other) and avoids repeating the preamble.
         clauses = [f"by {metric} {_mc_region_phrase(per[metric])}"
-                   for metric in ("F1", "PR-AUC") if metric in per]
+                   for metric in ("F1", "PR-AUC", "VUS") if metric in per]
         wid = f"mc.win_region.{m}"
         evidence.append(make_atom(
             wid, "win_region", m,
             {metric: [(_val(a), _val(b)) for a, b in rs]
              for metric, rs in per.items()},
-            f"{m} won {'; '.join(clauses)}.", order=10 + i))
-        required.append(wid)
+            f"{m} won {'; '.join(clauses)}.", order=30 + i))
+        if i < HEAD_REQUIRED:
+            required.append(wid)
 
     conf: Dict[str, Any] = {}
-    if winner_f1.get("feasible"):
-        cv_acc = winner_f1.get("cv_accuracy", float("nan"))
-        grade = fidelity_grade(cv_acc)
-        conf["winner_surrogate_f1"] = {
-            "train_accuracy": _val(winner_f1.get("train_accuracy"), 3),
+    # One surrogate per swept metric, but ONE atom for the sweep result and one
+    # per DISAGREEMENT, not per metric. A sentence each restated the same
+    # finding two or three times over — and metrics that disagree the same way,
+    # same sweep winner against the same production winner, are one fact.
+    sweeps = []
+    for suffix, label, winner, prod_top in (
+            ("f1", "F1", winner_f1, top_f1),
+            ("pr", "PR-AUC", winner_pr, top_pr),
+            ("vus", "VUS", winner_vus, top_vus)):
+        if not winner.get("feasible"):
+            continue
+        cv_acc = winner.get("cv_accuracy", float("nan"))
+        conf[f"winner_surrogate_{suffix}"] = {
+            "train_accuracy": _val(winner.get("train_accuracy"), 3),
             "cv_accuracy": _val(cv_acc, 3),
-            "grade": grade,
+            "grade": fidelity_grade(cv_acc),
         }
-        wr = winner_f1.get("win_rates", {})
+        wr = winner.get("win_rates", {})
         winners = sorted(((m, r) for m, r in wr.items() if r > 0),
                          key=lambda kv: kv[1], reverse=True)
-        top_wr, rest = winners[:TOP_K], winners[TOP_K:]
+        # One over the cut is named rather than summarised: "the remaining 1.0%
+        # went to 1 further detector" spends a clause withholding a name it has
+        # room for. The tail therefore always stands for two or more.
+        cut = len(winners) if len(winners) <= TOP_K + 1 else TOP_K
+        top_wr, rest = winners[:cut], winners[cut:]
         if top_wr:
+            sweeps.append({"suffix": suffix, "label": label, "top": top_wr,
+                           "rest": rest, "prod_top": prod_top, "rates": wr})
+
+    if sweeps:
+        clauses, by_metric = [], []
+        for i, s in enumerate(sweeps):
+            label, top_wr, rest = s["label"], s["top"], s["rest"]
             wr_txt = ", ".join(f"{m} {_fmt(100.0 * r, 1)}%" for m, r in top_wr)
             # These are shares of the same trials, so they sum to 100% across
             # ALL winners. Listing only the top few left a reader adding up 96%
@@ -1783,19 +1838,51 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             tail_txt = ""
             if rest:
                 tail_txt = (f"; the remaining {_fmt(100.0 * tail, 1)}% went to "
-                            f"{len(rest)} further detector"
-                            f"{'' if len(rest) == 1 else 's'}")
+                            f"{len(rest)} further detectors")
+            lead = f"Measured by {label}" if i == 0 else f"while by {label}"
+            clauses.append(f"{lead}, the noise-sweep trials were won by: "
+                           f"{wr_txt}{tail_txt}")
+            by_metric.append({"metric": label,
+                              "listed": [(m, _val(r, 3)) for m, r in top_wr],
+                              "n_other": len(rest), "other_share": _val(tail, 3)})
+        evidence.append(make_atom(
+            "mc.surrogate.win_rates", "surrogate_win_rates", "winner_surrogate",
+            {"by_metric": by_metric}, "; ".join(clauses) + ".", order=20))
+        required.append("mc.surrogate.win_rates")
+
+        # A comparison between two facts belongs to neither of them, so
+        # without this the narrative listed both and left the disagreement
+        # for the reader to spot.
+        grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for s in sweeps:
+            sweep_top, prod_top = s["top"][0][0], s["prod_top"]
+            if prod_top:
+                grouped.setdefault((str(sweep_top), str(prod_top)), []).append(s)
+        for i, ((sweep_top, prod_top), hits) in enumerate(grouped.items()):
+            labels = [h["label"] for h in hits]
+            agree = sweep_top == prod_top
+            vid = "mc.sweep_verdict." + "_".join(h["suffix"] for h in hits)
             evidence.append(make_atom(
-                "mc.surrogate.win_rates", "surrogate_win_rates", "winner_surrogate",
-                {"listed": [(m, _val(r, 3)) for m, r in top_wr],
-                 "n_other": len(rest), "other_share": _val(tail, 3)},
-                f"Across the noise sweep the trials were won by: {wr_txt}"
-                f"{tail_txt}.", order=100))
-            required.append("mc.surrogate.win_rates")
-        # The winner-surrogate RULES are deliberately not emitted as evidence:
-        # the tree is fitted on (noise level -> winner), so "the winner is X
-        # when noise <= Y" restates the win regions above in weaker, fitted
-        # form. Its held-out fidelity stays in `confidence` above.
+                vid, "sweep_verdict", sweep_top,
+                {"metrics": labels, "agree": agree, "production_top": prod_top,
+                 "sweep_top": sweep_top,
+                 "sweep_top_win_rate": {h["label"]: _val(h["top"][0][1], 3)
+                                        for h in hits},
+                 "production_top_win_rate": {
+                     h["label"]: _val(h["rates"].get(prod_top, 0.0), 3)
+                     for h in hits}},
+                f"Measured by {_join_and(labels)}, the sweep and the production "
+                f"run {'agree' if agree else 'do not agree'}: {sweep_top} won "
+                f"most of the noise trials"
+                + (" and the production run ranked it first too." if agree else
+                   f", while it was {prod_top} that the production run "
+                   f"ranked first."),
+                order=10 + i))
+            required.append(vid)
+    # The winner-surrogate RULES are deliberately not emitted as evidence:
+    # the tree is fitted on (noise level -> winner), so "the winner is X
+    # when noise <= Y" restates the win regions above in weaker, fitted
+    # form. Its held-out fidelity stays in `confidence` above.
 
     # Per-model held-out R² as confidence data, each graded for trust. When a
     # majority of a model's CV folds had (near-)constant test targets the
@@ -1829,23 +1916,11 @@ def build_monte_carlo_ir(dataset: str, entity: str, result: Dict[str, Any],
             f"(near-)constant F1 across the sweep, so the held-out R² is not a "
             f"meaningful fidelity estimate (marked not_available); the number is "
             f"kept only for transparency."))
-    question = ("Which detector is most robust to noise, and does the best "
-                "detector change as the noise level rises?")
-    info_footer = (
-        "The production Monte Carlo test injects Gaussian noise whose standard "
-        "deviation is the noise level, fixed at 0.1, and ranks the detectors "
-        "over 100 such runs. This sweep repeats that same injection across 20 "
-        "noise levels from 0.0 to 0.2, five times each, only to show how the "
-        "ranking behaves as noise grows — it is explanatory and never feeds "
-        "model selection. The sweep scores with a fast point-wise best-threshold "
-        "F1 and PR-AUC, whereas the production ranking uses a range-based metric, "
-        "so sweep values are not directly comparable to production values. A win "
-        "percentage is the share of sweep trials in which that detector scored "
-        "best.")
+    question = ("Which detector handles the injected noise best across "
+                "different noise levels?")
 
     return _envelope("monte_carlo", dataset, entity, output, evidence, caveats,
-                     required, confidence=conf, question=question,
-                     info_footer=info_footer)
+                     required, confidence=conf, question=question)
 
 
 # Clause-shaped labels used inside a surrogate condition ("… when <label> is
@@ -1876,7 +1951,7 @@ _GAN_LABELS = {
     "local_volatility": "the local volatility",
     "ambiguity": "its distance from the discriminator's threshold",
     "signal_magnitude": "the generated point's magnitude",
-    "signal_spread": "its spread across channels",
+    "signal_spread": "the spread across the injected point's features",
     "context_gap": "its gap from the surrounding series",
     "is_anomaly:false": "the point was labelled normal",
     "is_anomaly:true": "the point was labelled anomalous",
@@ -1887,7 +1962,7 @@ _GAN_NOUNS = {
     "local_volatility": "the local volatility",
     "ambiguity": "the point's distance from the discriminator's threshold",
     "signal_magnitude": "the generated point's magnitude",
-    "signal_spread": "its spread across channels",
+    "signal_spread": "the spread across the injected point's features",
     "context_gap": "its gap from the surrounding series",
     "is_anomaly": "whether the point was labelled anomalous",
 }
@@ -1937,18 +2012,7 @@ def build_off_by_ir(dataset: str, entity: str, result: Dict[str, Any],
         points_text=lambda n: f"{n} borderline points were injected around the "
                               f"decision boundary.",
         question="Which model handled the injected borderline points best, and "
-                 "what distinguishes the points it uniquely got right?",
-        info_footer=(
-            "The surrogate rules describe each injected point with four properties. "
-            "is_anomaly is the point's true label - 1 for a real anomaly, 0 for a "
-            "normal point. boundary_distance is how far the point was scaled away "
-            "from the decision boundary, so 0 sits exactly on it. local_volatility "
-            "is the standard deviation of the series around the injection site - how "
-            "noisy that neighbourhood is. position is where the point falls in the "
-            "series, from 0 at the start to 1 at the end. An exclusive win is a "
-            "point the highest-ranked model classified correctly and the named rival "
-            "did not; the rules come from a decision tree fitted to those wins, so "
-            "they describe where the edge occurred, not why."))
+                 "what distinguishes the points it uniquely got right?")
 
 
 def build_gan_ir(dataset: str, entity: str, result: Dict[str, Any],
@@ -1967,33 +2031,15 @@ def build_gan_ir(dataset: str, entity: str, result: Dict[str, Any],
         points_text=lambda n: f"{n} generated points were injected near the "
                               f"discriminator's decision threshold.",
         question="Which model handled the injected GAN points best, and what "
-                 "distinguishes the points it uniquely got right?",
-        info_footer=(
-            "The surrogate rules describe each injected point with seven properties. "
-            "The GAN generates candidate points and its discriminator scores each "
-            "one; ambiguity is how far that score sits from the threshold separating "
-            "normal from anomalous, so 0 is a point the discriminator finds maximally "
-            "hard to place, and only the most ambiguous candidates are injected. "
-            "is_anomaly is the label the discriminator's verdict gave the point - 1 "
-            "anomalous, 0 normal. signal_magnitude is the average size of the "
-            "generated values across channels and signal_spread how much they differ "
-            "from one another. context_gap is how far the generated point sits from "
-            "the average of the real series around it - how large a jump the "
-            "injection makes. local_volatility is the standard deviation of the "
-            "series around that site - how noisy the neighbourhood is. position is "
-            "where the point falls in the series, from 0 at the start to 1 at the "
-            "end. An exclusive win is a point the highest-ranked model classified "
-            "correctly and the named rival did not; the rules come from a decision "
-            "tree fitted to those wins, so they describe where the edge occurred, "
-            "not why."))
+                 "distinguishes the points it uniquely got right?")
 
 
 def _build_exclusive_win_ir(stage: str, prefix: str, dataset: str, entity: str,
                             result: Dict[str, Any],
                             ranked_f1_names: Optional[List[str]],
                             *, labels: Dict[str, str], nouns: Dict[str, str],
-                            winner_text, points_text, question: str,
-                            info_footer: str) -> Dict[str, Any]:
+                            winner_text, points_text,
+                            question: str) -> Dict[str, Any]:
     """Shared IR builder for the two point-injection robustness stages.
 
     Both ask the same question of their own injected points — which points did
@@ -2225,9 +2271,9 @@ def _build_exclusive_win_ir(stage: str, prefix: str, dataset: str, entity: str,
             f"{_fmt(top[1], 2)}).", order=400))
         required.append(f"{prefix}.summary.top_feature")
 
+
     return _envelope(stage, dataset, entity, output, evidence,
-                     caveats, required, confidence=conf, question=question,
-                     info_footer=info_footer)
+                     caveats, required, confidence=conf, question=question)
 
 
 # ── Global assembly ──────────────────────────────────────────────────────────
@@ -2307,12 +2353,27 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     ens_f1 = fd.get("ensemble_f1", float("nan"))
     sng_f1 = fd.get("single_model_f1", float("nan"))
     margin = (ens_f1 - sng_f1) if not (_is_nan(ens_f1) or _is_nan(sng_f1)) else float("nan")
+    # The f1_* keys stay whatever they always were; the score_* ones carry the
+    # metric the run actually decided on. Result trees written before the metric
+    # was selectable have no score_*, so these fall back to F1.
+    metric = fd.get("decision_metric", ("f1",))
+    label = decision_metric_label(metric)
+    # The weighted formula, not just the metric names: a reader of the decision
+    # needs to know what each metric contributed. The weights also travel in the
+    # atom's value, which is what grounds those numbers for the verifier.
+    formula = decision_metric_formula(metric)
+    weights = {m: round(w, 4) for m, w in metric_weights(metric).items()}
+    ens_score = fd.get("ensemble_score", ens_f1)
+    sng_score = fd.get("single_model_score", sng_f1)
+    score_margin = ((ens_score - sng_score)
+                    if not (_is_nan(ens_score) or _is_nan(sng_score)) else float("nan"))
     if choice == "ensemble":
-        reason = (f"The ensemble was chosen because its F1 ({_fmt(ens_f1, 4)}) is greater "
-                  f"than or equal to the best single model's F1 ({_fmt(sng_f1, 4)}).")
+        reason = (f"The ensemble was chosen because its fitness ({formula}, {_fmt(ens_score, 4)}) "
+                  f"is greater than or equal to the best single model's fitness "
+                  f"({_fmt(sng_score, 4)}).")
     elif choice == "single_model":
-        reason = (f"The single model was chosen because its F1 ({_fmt(sng_f1, 4)}) exceeds "
-                  f"the ensemble's F1 ({_fmt(ens_f1, 4)}).")
+        reason = (f"The single model was chosen because its fitness ({formula}, {_fmt(sng_score, 4)}) "
+                  f"exceeds the ensemble's fitness ({_fmt(ens_score, 4)}).")
     else:
         reason = NOT_AVAILABLE
     decision = {
@@ -2324,40 +2385,54 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
         "single_model": fd.get("single_model", NOT_AVAILABLE),
         "single_model_f1": _val(sng_f1, 4),
         "single_model_pr_auc": _val(fd.get("single_model_pr_auc"), 4),
+        "ensemble_vus": _val(fd.get("ensemble_vus"), 4),
+        "single_model_vus": _val(fd.get("single_model_vus"), 4),
         "f1_margin_ensemble_minus_single": _val(margin, 4),
+        "decision_metric": metric,
+        "decision_metric_label": label,
+        "decision_metric_formula": formula,
+        "decision_metric_weights": weights,
+        "ensemble_score": _val(ens_score, 4),
+        "single_model_score": _val(sng_score, 4),
+        "score_margin_ensemble_minus_single": _val(score_margin, 4),
         "reason": reason,
     }
 
     # Cross-stage top-pick agreement (single-branch stages vs the final single pick).
+    # One entry per ranking that actually entered the robustness consensus, so
+    # the strip shows the sources the run voted with and no others.
     single_pick = fd.get("single_model", NOT_AVAILABLE)
-    stage_picks = {
-        "thompson": (results_dict.get("thompson", {}) or {}).get("best_model", NOT_AVAILABLE),
-        "gan": (results_dict.get("gan_robustness", {}) or {}).get("best_model", NOT_AVAILABLE),
-        "borderline": (results_dict.get("borderline", {}) or {}).get("best_model", NOT_AVAILABLE),
-        "monte_carlo": (results_dict.get("monte_carlo", {}) or {}).get("best_model_f1", NOT_AVAILABLE),
-    }
     agg = results_dict.get("aggregation", {}) or {}
-    # Only the robust consensus is compared. The final consensus IS the source
-    # of the single-model pick, so asking whether they agree is tautological —
-    # it would always report agreement and tell the reader nothing.
-    stage_picks["robust_consensus"] = _top_of_ranking(agg.get("robust_agg"))
-    # Each source's WHOLE ordering, not just its winner: a source that disagrees
-    # on first place may still have the consensus pick second, and the strip
-    # alone cannot tell that from having it last.
-    stage_rankings = {
-        "thompson": _full_ranking((results_dict.get("thompson", {}) or {}).get("top_models")),
-        "gan": _full_ranking((results_dict.get("gan_robustness", {}) or {}).get("f1_names")),
-        "borderline": _full_ranking((results_dict.get("borderline", {}) or {}).get("f1_names")),
-        "monte_carlo": _full_ranking((results_dict.get("monte_carlo", {}) or {}).get("f1_names")),
-        "robust_consensus": _full_ranking(agg.get("robust_agg")),
-    }
-    agreement = {
-        name: {"top_pick": _py(pick),
-               "ranking": stage_rankings.get(name) or [],
-               "agrees_with_final_single": (pick == single_pick)
-               if pick not in (NOT_AVAILABLE, "N/A") else NOT_AVAILABLE}
-        for name, pick in sorted(stage_picks.items())
-    }
+    _robust_stages = (("gan", "gan_robustness"), ("borderline", "borderline"),
+                      ("monte_carlo", "monte_carlo"))
+    sources = []
+    for i, m in enumerate(ranking_metrics_for(metric)):
+        for key, slot in _robust_stages:
+            sources.append((f"{key}_{m}", key, m, _full_ranking(
+                (results_dict.get(slot, {}) or {}).get(f"{m}_names"))))
+        if i == 0:
+            # Only the robust consensus is compared. The final consensus IS the
+            # source of the single-model pick, so asking whether they agree is
+            # tautological — it would always report agreement and say nothing.
+            sources.append(("robust_consensus", "robust_consensus", NOT_AVAILABLE,
+                            _full_ranking(agg.get("robust_agg"))))
+            sources.append(("thompson", "thompson", NOT_AVAILABLE, _full_ranking(
+                (results_dict.get("thompson", {}) or {}).get("top_models"))))
+    agreement = {}
+    for position, (name, stage, m, ranking) in enumerate(sources):
+        pick = ranking[0] if ranking else NOT_AVAILABLE
+        agreement[name] = {
+            "top_pick": _py(pick),
+            "ranking": ranking or [],
+            "stage": stage,
+            "metric": m,
+            # The document is written with sort_keys=True, so display order has
+            # to travel as a value: one row per metric, each stage in the same
+            # column on every row.
+            "order": position,
+            "agrees_with_final_single": (pick == single_pick)
+            if pick not in (NOT_AVAILABLE, "N/A") else NOT_AVAILABLE,
+        }
 
     seen = set()
     caveats = []
@@ -2372,19 +2447,21 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     ens = list(fd.get("ensemble", []) or [])
     single = fd.get("single_model", NOT_AVAILABLE)
     if choice == "ensemble":
-        dec_text = (f"The final decision is the ensemble {{{', '.join(ens)}}} "
-                    f"(F1 {_fmt(ens_f1, 4)}), chosen over the best single model "
-                    f"{single} (F1 {_fmt(sng_f1, 4)}).")
+        dec_text = (f"The final decision is the ensemble {{{', '.join(ens)}}}, whose fitness "
+                    f"({formula}) is {_fmt(ens_score, 4)}, chosen over the best single model "
+                    f"{single} at {_fmt(sng_score, 4)}.")
     elif choice == "single_model":
-        dec_text = (f"The final decision is the single model {single} "
-                    f"(F1 {_fmt(sng_f1, 4)}), chosen over the GA ensemble "
-                    f"(F1 {_fmt(ens_f1, 4)}).")
+        dec_text = (f"The final decision is the single model {single}, whose fitness "
+                    f"({formula}) is {_fmt(sng_score, 4)}, chosen over the GA ensemble "
+                    f"at {_fmt(ens_score, 4)}.")
     else:
         dec_text = "The final framework decision is not available."
     evidence.append(make_atom("global.decision", "decision", str(choice),
                               {"framework_choice": choice,
-                               "ensemble_f1": _val(ens_f1, 4),
-                               "single_model_f1": _val(sng_f1, 4)},
+                               "decision_metric": metric,
+                               "decision_metric_weights": weights,
+                               "ensemble_score": _val(ens_score, 4),
+                               "single_model_score": _val(sng_score, 4)},
                               dec_text))
     required.append("global.decision")
 

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -55,7 +56,10 @@ sys.modules["sklearn.linear_model"].LogisticRegression = type("LogisticRegressio
 sys.modules["sklearn.svm"].SVC = type("SVC", (), {})
 sys.modules["Metrics.metrics"].prauc = lambda *a, **k: 0.5
 sys.modules["Metrics.metrics"].f1_score = lambda *a, **k: (0.5,) * 7
+sys.modules["Metrics.metrics"].vus_score = lambda *a, **k: 0.5
 sys.modules["Utils.model_selection_utils"].evaluate_model = lambda *a, **k: None
+sys.modules["Utils.model_selection_utils"].ScoringTimeout = type(
+    "ScoringTimeout", (Exception,), {})
 
 
 # Add project root to sys.path so `from Metrics.Ensemble_GA import ...` works.
@@ -90,7 +94,50 @@ from Metrics.Ensemble_GA import (
     markov_aggregate_importances,
     explain_ga_combination,
 )
-from Metrics.Ensemble_GA import _assign_archetype, ARCHETYPE_ORDER, _competition_ranks
+from Metrics.Ensemble_GA import (_assign_archetype, ARCHETYPE_ORDER,
+                                 _competition_ranks, score_fn_for,
+                                 _best_threshold_f1)
+
+
+class TestScoreFnFollowsFitness(unittest.TestCase):
+    """PFI's scorer must be the same objective the GA maximises, or the
+    combination ranking mixes one metric's importance with another's fitness."""
+
+    def setUp(self):
+        rng = np.random.default_rng(0)
+        self.y = np.zeros(120)
+        self.y[40:70] = 1
+        self.s = rng.random(120)
+        self.s[self.y == 1] += 0.5
+        self.s = (self.s - self.s.min()) / np.ptp(self.s)
+
+    def test_f1_scorer_is_the_best_threshold_f1(self):
+        self.assertAlmostEqual(score_fn_for("f1")(self.y, self.s),
+                               _best_threshold_f1(self.y, self.s), places=9)
+
+    def test_pr_auc_scorer_reads_pr_auc_not_f1(self):
+        """Both stubs return 0.5, so the dispatch is checked by patching the
+        name Ensemble_GA bound at import time."""
+        import Metrics.Ensemble_GA as ga
+        with unittest.mock.patch.object(ga, "prauc", lambda *a, **k: 0.123):
+            self.assertAlmostEqual(score_fn_for("pr_auc")(self.y, self.s), 0.123, places=9)
+            self.assertNotAlmostEqual(score_fn_for("f1")(self.y, self.s), 0.123, places=3)
+
+    def test_vus_scorer_reads_vus_when_a_window_is_given(self):
+        import Metrics.Ensemble_GA as ga
+        with unittest.mock.patch.object(ga, "vus_score", lambda *a, **k: 0.777):
+            self.assertAlmostEqual(score_fn_for("vus", 50)(self.y, self.s), 0.777, places=9)
+
+    def test_vus_without_a_window_falls_back_rather_than_returning_nan(self):
+        """A nan importance would rank every detector equally and silently
+        flatten the Markov consensus."""
+        value = score_fn_for("vus", None)(self.y, self.s)
+        self.assertFalse(np.isnan(value))
+        self.assertAlmostEqual(value, _best_threshold_f1(self.y, self.s), places=9)
+
+    def test_every_metric_yields_a_finite_score(self):
+        for token in ("f1", "pr_auc"):
+            self.assertTrue(np.isfinite(score_fn_for(token)(self.y, self.s)), token)
 
 
 # ════════════════════════════════════════════════════════════════════════════

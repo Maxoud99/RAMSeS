@@ -2,38 +2,23 @@
 Canonical vocabulary of the model-selection pipeline: which detectors exist,
 which sub-stages exist, and how the CLI spellings of both are parsed.
 
-This module is deliberately **stdlib-only**. `Utils/utils.py` cannot host these
-definitions because it imports torch, matplotlib and PIL, and the web UI has to
-read the same vocabulary without dragging a 2 GB ML stack into a Flask process.
-Keeping one definition here also retires the duplicate stage sets that used to
-live in both `app.py` and `Utils/utils.py`.
+Deliberately **stdlib-only**: `Utils/utils.py` cannot host these definitions
+because it imports torch, matplotlib and PIL, and the web UI reads the same
+vocabulary without dragging a 2 GB ML stack into a Flask process.
 """
 
-from typing import Dict, FrozenSet, List, Optional, Sequence, Set
+import math
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
 
-# Base detector instances, in the order app.py loads them. Instance counts come
-# from Model_Training/hyperparameter_grids.py: NN varies k (3 instances), every
-# other family varies contamination over four values.
+# Base detector instances, in the order app.py loads them. Adding a family here
+# is what makes it selectable: --detectors validates against this tuple,
+# `families_for` turns it into what gets trained, and the UI chips are built
+# from it. Instance counts come from Model_Training/hyperparameter_grids.py.
 #
-# Three groups, and the difference between them is only how they are trained:
-#
-#   * LOF, NN, CBLOF have bespoke classes in Algorithms/ and their own grids.
-#   * ABOD and KDE also have bespoke classes and grids, and a branch each in
-#     TrainModels.train_models.
-#   * IFOREST, HBOS, PCA, OCSVM, MCD, SpectralResidual have none of that. They
-#     reach PyOD through the generic `train_pyod` fallback and
-#     `Algorithms/pyod_model.PyodModel`, which names its checkpoints
-#     `{FAMILY.upper()}_{i}` — which is why they are spelled in upper case here
-#     even though the PyOD classes are `IForest`, `HBOS`, `SpectralResidual` and
-#     so on. `Algorithms.pyod_model._class_in` resolves the case.
-#
-# Adding a family here is what makes it selectable: --detectors validates
-# against this tuple, `families_for` turns it into what gets trained, and the
-# web UI's chips are built from it.
-#
-# COF, SOS and SpectralResidual are TRANSDUCTIVE and are admitted on that
-# understanding — see TRANSDUCTIVE_FAMILIES below for what it costs and what
-# makes it safe.
+# The PyOD-fallback families are spelled UPPER CASE because
+# `Algorithms/pyod_model.PyodModel` names checkpoints `{FAMILY.upper()}_{i}`
+# even though the PyOD classes are `IForest`, `HBOS` and so on;
+# `_class_in` resolves the case.
 ALL_DETECTORS = (
     "LOF_1", "LOF_2", "LOF_3", "LOF_4",
     "NN_1", "NN_2", "NN_3",
@@ -45,118 +30,71 @@ ALL_DETECTORS = (
     "PCA_1", "PCA_2", "PCA_3", "PCA_4",
     "OCSVM_1", "OCSVM_2", "OCSVM_3", "OCSVM_4",
     "MCD_1", "MCD_2", "MCD_3", "MCD_4",
-    # The transductive three. Placed here, between the point-wise PyOD families
-    # and the framework's temporal models, because that is what they are: they
-    # judge a point against its neighbours, not against a fitted model. COF and
-    # SOS have bespoke classes in Algorithms/ and their own training branches;
-    # SpectralResidual reaches PyOD 3 through the generic `train_pyod` fallback
-    # (its module is mapped in `Algorithms.pyod_model._TS_MODULES`).
+    # The transductive three: they judge a point against its neighbours, not
+    # against a fitted model. See TRANSDUCTIVE_FAMILIES.
     "COF_1", "COF_2", "COF_3", "COF_4",
     "SOS_1", "SOS_2", "SOS_3", "SOS_4",
     "SpectralResidual_1", "SpectralResidual_2",
     "SpectralResidual_3", "SpectralResidual_4",
-    # RM and MD close out the Statistical group. They are the framework's own
-    # code rather than PyOD's, but what they compute — a moving average and a
-    # per-channel mean — is what the paper files under Stat, so they belong
-    # beside the rest of that group rather than among the neural networks.
+    # RM and MD are the framework's own code, grouped under Stat by what they
+    # compute (a moving average, a per-channel mean) rather than how.
     "RM_1", "RM_2", "RM_3",
     "MD_1",
-    # Table I's two remaining Statistical rows, which PyOD does not ship. They
-    # come from the vendored TSB-AD subset through `Algorithms.tsbad_model`.
-    # KMEANSAD is distance-to-centroid over sliding subsequences. POLY is local
-    # polynomial residuals and is UNIVARIATE ONLY — see UNIVARIATE_FAMILIES.
+    # Table I's remaining Stat rows, from the vendored TSB-AD subset. POLY is
+    # UNIVARIATE ONLY — see UNIVARIATE_FAMILIES.
     "KMEANSAD_1", "KMEANSAD_2", "KMEANSAD_3",
     "POLY_1", "POLY_2", "POLY_3",
-    # The framework's own implementations, and the only detectors here with a
-    # temporal model. Each was unusable until its own bug was fixed: RNN
-    # reassembled its windows with the raw `window_step = -1` instead of the
-    # step the loader had resolved it to, and LSTMVAE and DGHL pickled
-    # `device = cuda` as state, so they allocated CUDA tensors on a CPU-only
-    # machine. These are the detectors the paper's SKAB 1-1 example needs.
-    # Table I's first Neural Network row, and the only one of its ten that PyOD
-    # ships. No wrapper needed: `pyod.models.auto_encoder.AutoEncoder` is
-    # reachable through `Algorithms.pyod_model._module_for`'s underscore-
-    # insensitive fallback, so it trains on the generic `train_pyod` path. It is
-    # the pool's fourth subsequence detector (window_size 64), which is what
-    # Table I's AE means. Three instances, one per encoder shape in TSB-AD's own
-    # AutoEncoder sweep.
+    # AutoEncoder is the one Table I neural row PyOD ships, so it takes the
+    # generic `train_pyod` path. Three instances, one per encoder shape in
+    # TSB-AD's own sweep.
     "AutoEncoder_1", "AutoEncoder_2", "AutoEncoder_3",
     "RNN_1", "RNN_2", "RNN_3", "RNN_4",
     "LSTMVAE_1", "LSTMVAE_2", "LSTMVAE_3", "LSTMVAE_4",
     "DGHL_1", "DGHL_2", "DGHL_3", "DGHL_4",
-    # PyOD 3's LSTM prediction-error detector — the only one of that library's
-    # seven time-series models that survived vetting, and the only detector here
-    # that models a subsequence through the shared wrapper. It does its own
-    # windowing, so the framework hands it one row per timestep and its own
-    # subsequence length is `detector__window_size` in its grid.
-    #
-    # Five of PyOD 3's seven time-series models remain out. MatrixProfile
-    # raises NotImplementedError on decision_function by design. KShape and
-    # SAND take 13-14 minutes per entity on SMD for roughly half LOF's F1.
-    # TimeSeriesOD and AnomalyTransformer return DIFFERENT scores on two runs
-    # of identical input and expose no seed parameter, which no amount of
-    # batching fixes — AnomalyTransformer nearly slipped through the
-    # transductivity check too: at 200 rows both companion sets scored 0.000000
-    # and looked identical, and the dependence only showed at finer resolution
-    # (0.000001 vs 0.000702).
+    # The only one of PyOD 3's seven time-series models that survived vetting.
+    # The other five are out for reasons worth not re-testing: MatrixProfile
+    # raises NotImplementedError by design; KShape and SAND cost 13-14 min per
+    # SMD entity for ~half LOF's F1; TimeSeriesOD and AnomalyTransformer score
+    # identical input differently across runs and expose no seed.
     "LSTMAD_1", "LSTMAD_2", "LSTMAD_3",
-    # The six Neural Network rows of Table I that PyOD does not ship, from the
-    # vendored TSB-AD subset through `Algorithms.tsbad_model`. Like LSTMAD they
-    # cut their own subsequences, so the framework hands them one row per
-    # timestep and their own length is `detector__win_size`.
+    # Table I's six remaining neural rows, from the vendored TSB-AD subset. Each
+    # varies its own subsequence length rather than `contamination`: most TSB-AD
+    # constructors do not accept one, and where they do it moves a threshold
+    # this pipeline replaces with its own sweep.
     #
-    # Each varies that length rather than `contamination`: six of the eight
-    # TSB-AD constructors do not accept a contamination at all, and where one is
-    # accepted it moves a threshold this pipeline replaces with its own sweep.
-    #
-    # TIMESNET is Table I's "TimeNet [87] — temporal-variation features". The
-    # description is TimesNet's own and TSB-AD ships TimesNet.py with no
+    # TIMESNET is Table I's "TimeNet [87]"; TSB-AD ships TimesNet.py and no
     # TimeNet.py, so the table's spelling is taken to be a typo.
-    # Three instances, not two: DONUT's upstream sweep is [60, 90, 120], whose
-    # every value exceeds SMD's 37-row Thompson window, so on that entity the
-    # family scored nothing at all (posterior norm 0.000000, measured). DONUT_1
-    # is a 30-step instance added to give the family one arm Thompson can
-    # actually pull; 60 and 90 remain upstream's.
+    #
+    # DONUT_1 is a 30-step instance this project added: upstream's sweep is
+    # [60, 90, 120], every value of which exceeds SMD's 37-row Thompson window,
+    # so the family scored nothing there (posterior norm 0.000000, measured).
     "DONUT_1", "DONUT_2", "DONUT_3",
     "OmniAnomaly_1", "OmniAnomaly_2",
     "USAD_1", "USAD_2",
     "TRANAD_1", "TRANAD_2",
     "FITS_1", "FITS_2",
     "TIMESNET_1", "TIMESNET_2",
-    # Table I's Foundation Models, and the first members the FM group has had.
-    # The paper excludes FMs from the RAMSeS candidate pool ("they showed
-    # inconsistent performance") and reports them only in the TSB-AutoAD
-    # setting, so these make the pool a superset of the paper's rather than a
-    # match. Deliberate, and worth knowing when comparing numbers.
+    # Foundation Models. The paper EXCLUDES these from the RAMSeS pool ("they
+    # showed inconsistent performance"), so this pool is a superset of the
+    # paper's — worth knowing when comparing numbers.
     #
-    # All three are pretrained and frozen: fitting learns nothing, and training
-    # exists only so they checkpoint like every other detector. OFA runs GPT-2
-    # over patched windows; TIMESFM and CHRONOS forecast one step ahead and
-    # score the squared error. CHRONOS comes from `chronos-forecasting` rather
-    # than TSB-AD's autogluon route — 17 packages against 69 for the same model.
+    # All three are pretrained and frozen: fitting learns nothing and exists
+    # only so they checkpoint like everything else. CHRONOS comes from
+    # `chronos-forecasting`, not TSB-AD's autogluon route: 17 packages vs 69.
     "OFA_1", "OFA_2",
     "TIMESFM_1", "TIMESFM_2",
     "CHRONOS_1", "CHRONOS_2",
-    # The Graph Based group. Three detectors that differ in WHAT the graph is
-    # over, which is the axis worth having a group for:
-    #
-    #   LUNAR   — a graph over SAMPLES. A k-NN graph of the rows with a GNN
-    #             learning the message-passing that LOF, kNN and DBSCAN each
-    #             hard-code. PyOD's own taxonomy files it under Graph-based, and
-    #             it reaches the pool through the generic `train_pyod` path with
-    #             no wrapper. `detector__random_state` is NOT optional: unseeded
-    #             it scores 3.039 apart on two fits of identical input, which is
-    #             what TimeSeriesOD and AnomalyTransformer were refused for.
-    #   Series2Graph — a graph over SUBSEQUENCES. It embeds every
-    #             length-`pattern_length` subsequence, extracts nodes and edges
-    #             from that embedding, and scores a query by the degree of the
-    #             path it traces. UNIVARIATE ONLY, and the one detector here
-    #             that is NOT in the repository — see `Algorithms/tsb_ad/
-    #             models/README_Series2Graph.md` for why and how to fetch it.
-    #   MTADGAT — a graph over CHANNELS (and one over timestamps). The only
-    #             member that says anything about inter-sensor structure, which
-    #             is what makes the group non-degenerate on SKAB and SMD, where
-    #             Series2Graph cannot run at all.
+    # Graph Based, distinguished by WHAT the graph is over:
+    #   LUNAR   — over SAMPLES. `detector__random_state` is NOT optional:
+    #             unseeded it scores 3.039 apart on two fits of identical input,
+    #             the same fault TimeSeriesOD and AnomalyTransformer were
+    #             refused for.
+    #   Series2Graph — over SUBSEQUENCES. UNIVARIATE ONLY, and the one detector
+    #             not in the repository: see `Algorithms/tsb_ad/models/
+    #             README_Series2Graph.md` for how to fetch it.
+    #   MTADGAT — over CHANNELS. The only member saying anything about
+    #             inter-sensor structure, which is what keeps the group
+    #             non-degenerate on SKAB and SMD.
     "LUNAR_1", "LUNAR_2", "LUNAR_3", "LUNAR_4",
     "Series2Graph_1", "Series2Graph_2", "Series2Graph_3",
     "MTADGAT_1", "MTADGAT_2",
@@ -171,141 +109,83 @@ DETECTOR_FAMILIES = ("LOF", "NN", "CBLOF", "ABOD", "KDE",
                      "TIMESNET", "OFA", "TIMESFM", "CHRONOS",
                      "LUNAR", "Series2Graph", "MTADGAT")
 
-# Families reached through `Algorithms.tsbad_model.TSBADModel`, rather than
-# through PyOD. Single owner of the fact, so `TrainModels.train_models` can
-# route them and the tests can check that every one has a grid. AutoEncoder is
-# deliberately NOT here: PyOD ships it, and taking TSB-AD's fork instead would
-# add a second copy of the same idea.
-#
-# Most run over vendored code in `Algorithms/tsb_ad`, but the set is really
-# "detectors with TSB-AD's whole-series interface", not "detectors from that
-# directory" — CHRONOS and MTADGAT are written in `Algorithms/` and reached
-# through `_TSBAD_SPECS`'s dotted-path form, and Series2Graph is fetched rather
-# than vendored. What they share is the contract: `(n_timesteps, n_channels)`
-# in, one score per timestep out.
+# Families reached through `Algorithms.tsbad_model.TSBADModel` rather than PyOD.
+# The set is "detectors with TSB-AD's whole-series interface" — `(n_timesteps,
+# n_channels)` in, one score per timestep out — not "detectors vendored in
+# Algorithms/tsb_ad": CHRONOS and MTADGAT live in `Algorithms/` and
+# Series2Graph is fetched. AutoEncoder is deliberately absent; PyOD ships it.
 TSBAD_FAMILIES: FrozenSet[str] = frozenset({
     "KMEANSAD", "POLY", "DONUT", "OmniAnomaly", "USAD", "TRANAD", "FITS",
     "TIMESNET", "OFA", "TIMESFM", "CHRONOS", "Series2Graph", "MTADGAT"})
 
 # Families that cut their own subsequences out of whatever call they are given,
-# so a call shorter than that subsequence has nothing to cut. They are all
-# INDUCTIVE — the same row scores identically whatever it travels with — so
-# handing them the whole series in one batch changes no result, it only removes
-# the boundary. (Contrast TRANSDUCTIVE_FAMILIES, where one call is the
-# definition of the score rather than a convenience.)
+# so a call shorter than that subsequence has nothing to cut. All INDUCTIVE —
+# the same row scores identically whatever it travels with — so a whole-series
+# batch changes no result, it only removes the boundary. (Contrast
+# TRANSDUCTIVE_FAMILIES, where one call DEFINES the score.)
 #
-# Owned here because TWO places need the same answer and drifted apart when only
-# one of them knew it: `model_selection_utils` sizes the scoring batch, and
-# `TrainModels._diagnostic_batch_size` sizes the post-fit plotting loop. The
-# second knew about the transductive and TSB-AD families but not about LSTMAD,
-# whose plot loop therefore ran at batch_size 8 against a 50-150 step window and
-# raised "negative dimensions are not allowed" — before `logging_obj.save`, so
-# LSTMAD could not be trained on any entity at all.
+# Two places need this answer and drifted apart when only one had it:
+# `model_selection_utils` sizes the scoring batch, `TrainModels.
+# _diagnostic_batch_size` the post-fit plotting loop.
 WHOLE_SERIES_FAMILIES: FrozenSet[str] = (
     frozenset({"LSTMAD"}) | (TSBAD_FAMILIES - frozenset({"POLY", "Series2Graph"})))
 
-# Families offered on univariate entities only — usable on UCR, unavailable on
-# SKAB (9 channels) and SMD (38). Selecting one there fails with an explanation
-# naming the detector rather than a numpy error from four frames down. Declared
-# here, where the vocabulary lives, so the web UI can say so before a run starts
-# instead of after; the refusal itself, with a per-family reason, is in
-# `Algorithms.tsbad_model.UNIVARIATE_ONLY`.
-#
-# The two are here for different reasons, and the distinction matters if either
-# is ever revisited:
-#   POLY    — CANNOT. `np.polyfit` raises "Polynomial must be 1d only" on
-#             anything wider, which is what Table I's `U` marking records.
-#   TIMESFM — CAN, but must not. Its per-channel loop runs correctly; it just
-#             costs ~13 min per scoring call on 38 channels (~131 forecasts/s
-#             measured on CPU) against ~0.6 s for Chronos-Bolt, and the offline
-#             pipeline scores seven times. Table I marks it 'U' and TSB-AD lists
-#             it only in the univariate hyperparameter dicts, so multivariate
-#             was never the reported configuration. Chronos keeps its own
-#             per-channel loop because Bolt is ~20x faster and the cost never
-#             arises.
-#   Series2Graph — CANNOT, like POLY. TSB-AD's own wrapper opens with
-#             `data.squeeze()` and the method embeds a scalar subsequence into
-#             a 2-D phase space, so there is no multivariate reading of it. It
-#             is in TSB-AD's uni-variate pool for that reason. This is what
-#             makes MTADGAT worth having: without it the Graph Based group
-#             would be empty of anything runnable on SKAB and SMD.
+# Usable on UCR, dropped on SKAB (9 channels) and SMD (38). Declared here so the
+# web UI can hide them before a run rather than fail during one; `app.py` drops
+# them too, and `Algorithms.tsbad_model.UNIVARIATE_ONLY` carries the refusal.
+#   POLY    — CANNOT. `np.polyfit` raises "Polynomial must be 1d only".
+#   TIMESFM — CAN, but must not: ~13 min per scoring call on 38 channels
+#             (measured) against ~0.6 s for Chronos-Bolt, seven calls per run.
+#   Series2Graph — CANNOT. Its wrapper opens with `data.squeeze()` and embeds a
+#             scalar subsequence into a 2-D phase space. This is why MTADGAT is
+#             worth having: it keeps the Graph group runnable on SKAB and SMD.
 UNIVARIATE_FAMILIES: FrozenSet[str] = frozenset(
     {"POLY", "TIMESFM", "Series2Graph"})
 
-# Families whose `decision_function` scores each row against the OTHER ROWS OF
-# THE SAME CALL rather than against what `fit` saw. COF's scoring is literally
-# `distance_matrix(X, X)` and reads none of the state `fit` stored; measured,
-# all three score a row identically no matter what they were fitted on
-# (fit-on-X versus fit-on-unrelated-data: max difference 0.000000).
+# The mirror image, dropped on a 1-channel entity.
+#   ABOD — CAN, but must not. Angles need >1 dimension; at d=1 every difference
+#          vector is collinear, so only the magnitude denominator varies. It
+#          does not raise — measured spread runs 0.18 at d=5 to 2.7e10 at d=1,
+#          and 2.0e21 on UCR 028, while still ranking plausibly.
+MULTIVARIATE_FAMILIES: FrozenSet[str] = frozenset({"ABOD"})
+
+# Families whose score is a function of the CALL'S OWN ROWS, not of what `fit`
+# saw. COF, SOS and SpectralResidual score against their companions in the same
+# call (COF's is literally `distance_matrix(X, X)`); POLY and Series2Graph reach
+# it the other way, by ignoring the argument and scoring what they last fitted,
+# so the adapter refits per call.
 #
-# That has one hard consequence: a row's score depends on which other rows share
-# its call, so batching would make it depend on where `eval_batch_size` happened
-# to cut. The same window scored 1.003744 and 0.966958 under COF in two
-# different batches. `Utils/model_selection_utils` therefore hands these
-# families the WHOLE series in one call, which makes the score a deterministic
-# function of (entity, row) — and `Utils/test_pipeline_spec` asserts both that
-# they are routed that way and that they are still deterministic, since the two
-# models excluded for irreproducibility would otherwise look identical to these.
+# The consequence is the same either way: a row's score would depend on where
+# `eval_batch_size` happened to cut — the same window scored 1.003744 and
+# 0.966958 under COF in two batches. `Utils/model_selection_utils` therefore
+# hands these families the WHOLE series in one call, making the score a
+# deterministic function of (entity, row). `Utils/test_pipeline_spec` asserts
+# both the routing and the determinism, since the two models excluded for
+# irreproducibility would otherwise look identical to these.
 #
-# Two limits that follow from the estimators, not from this pipeline: COF raises
-# IndexError on any call holding fewer rows than its `n_neighbors` (20), and
-# SpectralResidual needs at least `score_window` (3) rows and returns three
-# scores for a single row. Both are fine on a whole-series call; in Thompson,
-# whose windows are `n_timesteps * 0.8 / iterations`, COF needs an entity of
-# ~1,250 timesteps before its windows clear 20 rows.
-# POLY joins them for a different mechanism with the same consequence. Its
-# `decision_function` needs a `measure` object the class never stores and scores
-# against the `estimation`/`n_train_` its last fit left behind, so it cannot
-# score data it was not just fitted on; the adapter therefore refits on whatever
-# it is handed. Measured: `fit(B)` then `fit(A)` gives byte-identical scores to
-# `fit(A)` alone (0.000e+00), i.e. fit state is fully replaced. So the score is
-# a function of the call's rows alone, which is the property this set names.
-#
-# Series2Graph joins them for the same reason as POLY. The vendored
-# `score(query_length, dataset)` accepts `dataset` and never reads it — every
-# value comes from the graph `fit` built — so it returns the TRAINING series'
-# scores whatever it is handed. Measured: fit on 3,000 rows, then score 9,000,
-# gives 2,900 scores identical to scoring the 3,000 back (`array_equal`). The
-# adapter therefore refits per call, which is also what the method is: an
-# unsupervised whole-series search, not a train/test one.
+# Estimator limits, not pipeline ones: COF raises IndexError below its
+# `n_neighbors` (20) rows, so Thompson — whose windows are `n_timesteps * 0.8 /
+# iterations` — needs a ~1,250-timestep entity before COF can compete.
+# SpectralResidual needs `score_window` (3) rows and returns three scores for
+# one row.
 TRANSDUCTIVE_FAMILIES: FrozenSet[str] = frozenset(
     {"COF", "SOS", "SpectralResidual", "POLY", "Series2Graph"})
 
-# The paper's Table I taxonomy: "Base models grouped by family: Neural Networks
-# (NN), Statistical (Stat) or Foundation Models (FM)". Keys are the paper's
-# short labels and are the identifier everything else keys off — the API value,
-# the CSS class suffix — so they stay short and slug-safe. GROUP_LABELS below
-# carries what a reader sees; the run page builds one select-all button per
-# entry here, so a group added here appears there with no UI change.
+# The paper's Table I taxonomy, EXTENDED with a fourth group — worth stating
+# plainly when the thesis reproduces Table I. Keys are the identifier everything
+# keys off (API value, CSS suffix); GROUP_LABELS carries what a reader sees.
 #
-# Two mappings are worth stating because the names invite the opposite guess:
+# Two mappings invite the opposite guess:
+#   * The NN FAMILY is k-Nearest Neighbors and belongs to the Stat GROUP; the
+#     group called NN is Neural Networks. So the Neural Networks button does not
+#     select the NN detector. The collision is the paper's.
+#   * MD is an nn.Module but learns one mean per channel, so it is grouped by
+#     what it computes, not how it is implemented.
 #
-#   * Our NN family is k-Nearest Neighbors, and the paper puts it in Stat as
-#     "(Sub)-KNN — kNN distance score". The group also called NN is Neural
-#     Networks. So the Neural Networks button does NOT select the NN detector.
-#     The collision is the paper's; the UI spells the group out in full for
-#     exactly this reason.
-#   * MD is an nn.Module trained by SGD, but what it learns is one mean per
-#     channel, which is the same kind of quantity the paper files under Stat as
-#     RM ("simple moving-average residuals"). Grouped by what it computes, not
-#     by what it is implemented with.
-#
-# FM is empty: the paper's foundation models (OFA, Lag-Llama, Chronos, TimesFM,
-# MOMENT) are none of them in this pool. It is listed anyway so the taxonomy is
-# visible and a future FM detector has an obvious home.
-#
-# `Graph` is a FOURTH group, and the paper has no such row — so this taxonomy is
-# the paper's EXTENDED, not the paper's. Worth stating plainly when the thesis
-# reproduces Table I. A detector earns the group by constructing an explicit
-# graph and reading the score off a graph quantity (degree, path, connectivity,
-# message passing), which is the criterion PyOD's own taxonomy applies when it
-# files LUNAR and R-Graph under "Graph-based".
-#
-# Under that criterion SOS and COF stay in Stat, though both are near misses and
-# the temptation to move them is real: SOS is defined over an affinity graph and
-# COF over a set-based nearest path. PyOD files them "Probabilistic" and
-# "Proximity-Based" respectively, and following upstream beats inventing a
-# second classification that only this repository would use.
+# A detector earns `Graph` by reading its score off a graph quantity (degree,
+# path, message passing) — PyOD's own criterion. SOS and COF are near misses
+# that stay in Stat because PyOD files them Probabilistic and Proximity-Based,
+# and following upstream beats a classification only this repo would use.
 DETECTOR_GROUPS: Dict[str, tuple] = {
     "NN": ("AutoEncoder", "RNN", "LSTMVAE", "DGHL", "LSTMAD", "DONUT",
            "OmniAnomaly", "USAD", "TRANAD", "FITS", "TIMESNET"),
@@ -329,31 +209,13 @@ GROUP_LABELS: Dict[str, str] = {
 
 # ── Abbreviations ───────────────────────────────────────────────────────────
 #
-# The pool name is the CANONICAL identifier: it is in every checkpoint filename,
-# every `--detectors` token, every IR atom, every result tree on disk. It is
-# also what the reader sees, everywhere, by default — so nothing has to be
-# expanded on the way out and no display path can forget to.
+# The pool name is CANONICAL — checkpoint filenames, `--detectors` tokens, IR
+# atoms, result trees — and is also what the reader sees by default. This map
+# runs the other way: a shortening for the two figures that cannot fit a full
+# name. NOTHING MAY JOIN ON IT; an abbreviation is ink, never a key.
 #
-# This map runs the OTHER way. It is a shortening applied by the two figures
-# that cannot fit a full name, and NOTHING MAY JOIN ON IT: an abbreviation is
-# ink, never a key.
-#
-# The names here are the upstream's own, which is what makes them canonical:
-#
-#     SpectralResidual -> pyod.models.ts_spectral_residual.SpectralResidual
-#     AutoEncoder      -> pyod.models.auto_encoder.AutoEncoder
-#     OmniAnomaly      -> Algorithms.tsb_ad.models.OmniAnomaly.OmniAnomaly
-#     Series2Graph     -> Boniol & Palpanas, PVLDB 2020
-#
-# These four were previously spelled SR/AE/OA/S2G, shortenings this project
-# invented; every other family already IS its published acronym (LOF, HBOS,
-# USAD, FITS, LUNAR, OFA) or the framework's own short name (RM, MD, NN), so
-# there is nothing to abbreviate and nothing to expand.
-#
-# The direction matters for what goes wrong. A figure that forgets to call
-# `abbreviate_detector` is slightly crowded; a figure that used to forget the
-# old `display_detector` showed the reader a name no other part of the system
-# used.
+# Only these four shorten. Every other family already IS its published acronym
+# (LOF, HBOS, USAD, FITS, LUNAR, OFA) or the framework's own short name.
 FAMILY_ABBREVIATIONS: Dict[str, str] = {
     "SpectralResidual": "SR",
     "AutoEncoder": "AE",
@@ -372,10 +234,8 @@ def family_abbrev(family: str) -> str:
 def abbreviate_detector(name: str) -> str:
     """'OmniAnomaly_2' -> 'OA_2'. The instance suffix is kept verbatim.
 
-    Total on any input: a name with no underscore, an unknown family, or a
-    string that is not a detector at all comes back unchanged. The callers are
-    figure labels that also carry non-detector text ("ensemble", a channel
-    name), and those must pass through untouched.
+    Total on any input: callers are figure labels that also carry non-detector
+    text ("ensemble", a channel name), which must pass through untouched.
     """
     text = str(name)
     family, sep, suffix = text.partition("_")
@@ -388,10 +248,8 @@ def abbreviate_detector(name: str) -> str:
 def abbreviation_legend(names) -> Dict[str, str]:
     """{'SR_1': 'SpectralResidual_1'}, for the names that actually shorten.
 
-    Short form to long, because that is the direction the key is READ: a
-    reader meets "SR_1" on the figure and wants to know what it stands for.
-    Empty when nothing in `names` abbreviates, so a caller can skip drawing the
-    note entirely rather than printing an empty box.
+    Short to long, the direction the key is READ. Empty when nothing shortens,
+    so a caller can skip the note rather than draw an empty box.
     """
     out = {}
     for name in names or ():
@@ -417,6 +275,26 @@ STAGE_GROUPS: Dict[str, FrozenSet[str]] = {
     "robustness": frozenset({"gan", "offby", "montecarlo"}),
 }
 
+# Synthetic anomalies injectable at pipeline stage 4, mirroring
+# InjectAnomalies._VALID_ANOMALY_TYPES, which is the authority on what injects.
+ALL_ANOMALY_TYPES: Tuple[str, ...] = (
+    "spikes", "contextual", "flip", "speedup", "noise", "cutoff",
+    "scale", "wander", "average",
+)
+
+DEFAULT_ANOMALY_TYPE = "spikes"
+
+# Metrics the fitness function is built from. One or more may be chosen, each
+# with a weight; the fitness is their weighted mean, and it is what the GA,
+# Thompson and the final ensemble-vs-single comparison all maximise.
+#
+# A spec is either a sequence of metric names (equal weights) or a
+# name -> weight mapping. Everything downstream goes through `metrics_required`
+# and `metric_weights`, which accept both.
+DECISION_METRICS: Dict[str, str] = {"f1": "F1", "pr_auc": "PR-AUC", "vus": "VUS"}
+
+DEFAULT_DECISION_METRICS: Tuple[str, ...] = ("f1", "pr_auc")
+
 # Iteration number the explainability artifacts are written under. Deliberately
 # distinct from the CLI --iteration (which sizes the online windows), so IR/NL
 # filenames stay stable across online configurations.
@@ -426,22 +304,17 @@ OFFLINE_ITERATION = 0
 # aggregation and the off-by pairwise surrogates are all vacuous with one.
 MIN_DETECTORS = 2
 
-# The narrator. Owned here rather than in Explainability/llm.py because the web
-# UI reports which model produced a set of explanations, and a second copy of
-# the string would eventually disagree with the one that actually ran — telling
-# the reader their narratives came from a model that never saw them.
-DEFAULT_LLM_MODEL = "qwen2.5:14b-instruct"
+# The narrator. Owned here, not in Explainability/llm.py, because the web UI
+# reports which model produced a set of explanations and a second copy would
+# eventually name a model that never saw them.
+DEFAULT_LLM_MODEL = "qwen3.5:9b-mlx"
 DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
 
 
-# How a dataset is SHOWN. The CLI, the directory names and every path keep the
-# real key; this is presentation only.
-#
-# Owned here rather than in `WebUI/catalog.py` because two sides need the same
-# answer and disagreed: the pipeline writes "Dataset: skab" into the
-# comprehensive report from the raw `--dataset` argument, while the web UI
-# showed "SKAB" from the directory name — the same run named two ways on two
-# pages. `anomaly_archive` is why this is a table and not `.upper()`.
+# How a dataset is SHOWN; the CLI, directories and paths keep the real key.
+# Owned here rather than in `WebUI/catalog.py` because the report and the web UI
+# disagreed, naming one run two ways. `anomaly_archive` is why this is a table
+# and not `.upper()`.
 DATASET_LABELS: Dict[str, str] = {
     "skab": "SKAB", "smd": "SMD", "anomaly_archive": "UCR",
     "msl": "MSL", "smap": "SMAP", "apple": "Apple",
@@ -466,6 +339,189 @@ def families_for(detectors: Sequence[str]) -> List[str]:
     """
     wanted = {family_of(d) for d in detectors}
     return [f for f in DETECTOR_FAMILIES if f in wanted]
+
+
+def parse_anomaly_type(text: Optional[str]) -> str:
+    """One anomaly type name -> its canonical spelling."""
+    if text is None:
+        return DEFAULT_ANOMALY_TYPE
+    tok = str(text).strip().lower()
+    if tok not in ALL_ANOMALY_TYPES:
+        raise ValueError(
+            f"--anomaly_type: unknown type '{text}'. Valid types: "
+            f"{', '.join(ALL_ANOMALY_TYPES)}")
+    return tok
+
+
+def parse_anomaly_rate(text) -> Optional[float]:
+    """Target fraction of timesteps to label anomalous, or None for the
+    per-type defaults in Model_Selection/anomaly_parameters.py."""
+    if text is None or str(text).strip() == "":
+        return None
+    try:
+        rate = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"--anomaly_rate: '{text}' is not a number")
+    if not 0.0 < rate <= 1.0:
+        raise ValueError(
+            f"--anomaly_rate: must be greater than 0 and at most 1, got {rate}")
+    return rate
+
+
+def parse_decision_metrics(text) -> Union[Tuple[str, ...], Dict[str, float]]:
+    """Metric names, optionally weighted -> a fitness spec.
+
+    Accepts 'f1', 'f1,pr_auc' and 'f1:0.5,pr_auc:0.3,vus:0.2'. A metric with no
+    explicit weight counts 1; weights are normalised, so they need not sum to 1.
+    A zero weight drops its metric, which is what keeps `ranking_metrics_for`
+    honest. Uniform weights collapse back to a plain tuple so the common case
+    stays one spelling.
+    """
+    if text is None or (isinstance(text, str) and not text.strip()):
+        return DEFAULT_DECISION_METRICS
+    if isinstance(text, str):
+        tokens = text.split(",")
+    elif isinstance(text, dict):
+        tokens = [f"{k}:{v}" for k, v in text.items()]
+    else:
+        tokens = list(text)
+    weights: Dict[str, float] = {}
+    unknown = []
+    for raw in tokens:
+        tok = str(raw).strip()
+        if not tok:
+            continue
+        name, sep, weight = tok.partition(":")
+        name = name.strip().lower().replace("-", "_")
+        if name not in DECISION_METRICS:
+            unknown.append(tok)
+            continue
+        if sep:
+            try:
+                value = float(weight)
+            except ValueError:
+                raise ValueError(
+                    f"--decision_metric: '{weight.strip()}' is not a weight for {name}")
+            if value < 0:
+                raise ValueError(
+                    f"--decision_metric: weight for {name} must not be negative")
+        else:
+            value = 1.0
+        weights[name] = weights.get(name, 0.0) + value
+    if unknown:
+        raise ValueError(
+            f"--decision_metric: unknown metric(s) {', '.join(unknown)}. "
+            f"Valid metrics: {', '.join(DECISION_METRICS)}")
+    chosen = {m: weights[m] for m in DECISION_METRICS if weights.get(m, 0.0) > 0}
+    if not chosen:
+        raise ValueError("--decision_metric: choose at least one metric")
+    if len(set(chosen.values())) == 1:
+        return tuple(chosen)
+    total = sum(chosen.values())
+    return {m: w / total for m, w in chosen.items()}
+
+
+def format_decision_metrics(spec) -> str:
+    """A spec -> the --decision_metric spelling that parses back to it."""
+    weights = metric_weights(spec)
+    if len(set(weights.values())) == 1:
+        return ",".join(weights)
+    return ",".join(f"{m}:{round(w, 4):g}" for m, w in weights.items())
+
+
+def decision_metric_label(spec) -> str:
+    """('f1','pr_auc') -> 'F1 + PR-AUC'."""
+    chosen = metrics_required(spec)
+    return " + ".join(DECISION_METRICS.get(m, m) for m in chosen)
+
+
+def decision_metric_formula(spec) -> str:
+    """('f1','pr_auc') -> '0.5 * F1 + 0.5 * PR-AUC'; a single metric is itself."""
+    weights = metric_weights(spec)
+    if len(weights) == 1:
+        name = next(iter(weights))
+        return DECISION_METRICS.get(name, name)
+    return " + ".join(f"{round(w, 3):g} * {DECISION_METRICS.get(m, m)}"
+                      for m, w in weights.items())
+
+
+def metrics_required(spec) -> Tuple[str, ...]:
+    """The raw metrics a fitness spec needs computed, in canonical order.
+
+    Single choke point with `combine_metrics`, so callers that skip expensive
+    metrics (VUS) stay correct without knowing what the spec is.
+    """
+    if isinstance(spec, str):
+        spec = [spec]
+    if isinstance(spec, dict):
+        # A zero weight means "not chosen", so it must not reach
+        # `ranking_metrics_for` as a metric the run cares about.
+        chosen = {str(m).lower().replace("-", "_")
+                  for m, w in spec.items() if float(w) > 0}
+    else:
+        chosen = {str(m).lower().replace("-", "_") for m in spec}
+    return tuple(m for m in DECISION_METRICS if m in chosen)
+
+
+def metric_weights(spec) -> Dict[str, float]:
+    """A fitness spec -> metric -> normalised weight, in canonical order.
+
+    A sequence of names weights them equally; a mapping is normalised, so
+    {'f1': 2, 'pr_auc': 1} and {'f1': 0.667, 'pr_auc': 0.333} mean the same.
+    """
+    chosen = metrics_required(spec)
+    if not chosen:
+        raise ValueError("no metric chosen")
+    if isinstance(spec, dict):
+        given = {str(k).lower().replace("-", "_"): float(v) for k, v in spec.items()}
+        raw = {m: given[m] for m in chosen}
+        if any(w < 0 for w in raw.values()):
+            raise ValueError("decision metric weights must not be negative")
+    else:
+        raw = {m: 1.0 for m in chosen}
+    total = sum(raw.values())
+    if total <= 0:
+        raise ValueError("decision metric weights must not all be zero")
+    return {m: w / total for m, w in raw.items()}
+
+
+def restrict_metrics(spec, metrics) -> Union[Tuple[str, ...], Dict[str, float]]:
+    """The same spec over `metrics` only, keeping the relative weights."""
+    keep = metrics_required(metrics)
+    if not keep:
+        raise ValueError("no metric chosen")
+    weights = metric_weights(spec)
+    kept = {m: weights[m] for m in keep if m in weights}
+    if not kept:
+        raise ValueError("no metric chosen")
+    if len(set(kept.values())) == 1:
+        return tuple(kept)
+    total = sum(kept.values())
+    return {m: w / total for m, w in kept.items()}
+
+
+def combine_metrics(spec, scores: Dict[str, float]) -> float:
+    """Raw metric values -> the single number every search maximises.
+
+    A metric that could not be computed drops out and the remaining weights are
+    renormalised, so one unavailable term (VUS on a short window) narrows the
+    fitness instead of voiding it. All of them missing gives nan.
+    """
+    weights = metric_weights(spec)
+    usable = {}
+    for m, w in weights.items():
+        value = float(scores[m])
+        if not math.isnan(value):
+            usable[m] = w
+    total = sum(usable.values())
+    if total <= 0:
+        return float("nan")
+    return sum(w * float(scores[m]) for m, w in usable.items()) / total
+
+
+def ranking_metrics_for(spec) -> Tuple[str, ...]:
+    """Which rankings the robustness stages publish: one per chosen metric."""
+    return metrics_required(spec)
 
 
 def parse_stages(text: Optional[str]) -> Set[str]:

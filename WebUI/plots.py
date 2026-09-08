@@ -50,9 +50,9 @@ def _dir_for(tree: str, dataset: str, entity: str) -> Optional[Path]:
 def _ls(directory: Optional[Path], pattern: str = "*.png") -> List[Path]:
     """Files matching `pattern`, with the directory part glob-escaped.
 
-    Escaping matters: one real filename is
-    `ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png`, and the brackets
-    would otherwise be read as a glob character class.
+    Escaping matters: result trees written before the anomaly type became
+    selectable hold `ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png`,
+    and the brackets would otherwise be read as a glob character class.
     """
     if directory is None or not directory.is_dir():
         return []
@@ -178,13 +178,13 @@ def _ga_combination(ds, ent):
     return headline, []
 
 
-# Every grouped-bar channel figure in both Thompson stages plots a subset —
-# entities here carry 9 to 38 channels — and the bars alone cannot tell a reader
-# whether a missing channel was small or simply not selected. The rule is stated
+# Every grouped-bar context feature figure in both Thompson stages plots a subset —
+# entities here carry 9 to 38 context features — and the bars alone cannot tell a reader
+# whether a missing context feature was small or simply not selected. The rule is stated
 # on the figures themselves too (Thompson_Sampling._render_shap_comparison);
 # this is the same sentence for the page.
-CHANNEL_RULE = ("Channels shown are the union over the plotted detectors of "
-                "each one's 9 largest values; a channel missing here was "
+CONTEXT_FEATURE_RULE = ("Context features shown are the union over the plotted detectors of "
+                "each one's 9 largest values; a context feature missing here was "
                 "outside every plotted detector's top 9, not necessarily zero.")
 
 
@@ -217,25 +217,25 @@ def _thompson(ds, ent):
         avg = _variants(d, [f"reward_average_top3_{it}.png", f"reward_average_all_{it}.png"],
                         ["Top 3 detectors", "All detectors"])
         if avg:
-            headline.append({"title": "Mean channel contribution across all windows",
-                             "caption": "Each channel's own share of a detector's expected "
+            headline.append({"title": "Mean context feature contribution across all windows",
+                             "caption": "Each context feature's own share of a detector's expected "
                                         "reward, averaged over every window.",
                              "variants": avg, "default": 0})
         # Only the two mean|SHAP| figures browse. The posterior history, the
-        # per-model panels and the two channel comparisons all restate what the
+        # per-model panels and the two context feature comparisons all restate what the
         # headline reward figures and the per-regime disclosure already show.
         for pattern, title, caption in (
             # Demoted from the headline rather than dropped. mean|SHAP| measures
-            # how much a channel's influence VARIES between windows — the signed
+            # how much a context feature's influence VARIES between windows — the signed
             # average is zero by construction, which is why it had to take
             # absolute values — so it is a dispersion measure, not an average
             # share, and nothing else on the card reports dispersion.
-            (f"shap_average_top3_{it}.png", "Channel influence variability (top 3)",
-             "Mean |SHAP|: how much each channel's influence varies from window "
-             "to window. Not an average contribution. " + CHANNEL_RULE),
-            (f"shap_average_all_{it}.png", "Channel influence variability (all)",
-             "Mean |SHAP|: how much each channel's influence varies from window "
-             "to window. Not an average contribution. " + CHANNEL_RULE),
+            (f"shap_average_top3_{it}.png", "Context feature influence variability (top 3)",
+             "Mean |SHAP|: how much each context feature's influence varies from window "
+             "to window. Not an average contribution. " + CONTEXT_FEATURE_RULE),
+            (f"shap_average_all_{it}.png", "Context feature influence variability (all)",
+             "Mean |SHAP|: how much each context feature's influence varies from window "
+             "to window. Not an average contribution. " + CONTEXT_FEATURE_RULE),
         ):
             for path in _ls(d, pattern):
                 gallery.append(_fig(path, title, caption))
@@ -245,7 +245,7 @@ def _thompson(ds, ent):
 def _ranking_pair_picker(ds, ent) -> Optional[Dict[str, Any]]:
     """The gap decomposition as a PAIR PICKER rather than a fixed figure.
 
-    Every detector's per-channel shares are in the IR, and the gap between any
+    Every detector's per-context-feature shares are in the IR, and the gap between any
     two is exactly the difference of their shares, so the page can ask for a
     pair and get it drawn. Returns None when the IR predates that block, and
     the caller then falls back to the pipeline's static winner-vs-runner-up
@@ -255,13 +255,13 @@ def _ranking_pair_picker(ds, ent) -> Optional[Dict[str, Any]]:
     winner and the runner-up and the initial view matches the static figure.
     """
     from WebUI import ondemand
-    shares = ondemand.ranking_channel_shares(ds, ent)
+    shares = ondemand.ranking_context_feature_shares(ds, ent)
     if len(shares) < 2:
         return None
     order = sorted(shares, key=lambda m: -sum(shares[m]))
     return {
         "title": "What decided the top spot",
-        "caption": "The margin between two detectors, split channel by channel; "
+        "caption": "The margin between two detectors, split context feature by context feature; "
                    "these bars sum to the margin exactly.",
         "pair_picker": {
             "detectors": order,
@@ -300,12 +300,12 @@ def _ts_ranking(ds, ent):
     pair = _ranking_pair_picker(ds, ent)
     if pair:
         headline.append(pair)
-    channels = _variants(d, [f"ranking_channels_{it}.png", f"ranking_channels_all_{it}.png"],
+    ranking_variants = _variants(d, [f"ranking_channels_{it}.png", f"ranking_channels_all_{it}.png"],
                          ["Top 3 detectors", "All detectors"])
-    if channels:
+    if ranking_variants:
         headline.append({"title": "Where each detector's score comes from",
-                         "caption": "Per-channel shares of the final score.",
-                         "variants": channels, "default": 0})
+                         "caption": "Per-context-feature shares of the final score.",
+                         "variants": ranking_variants, "default": 0})
     return headline, gallery
 
 
@@ -315,11 +315,11 @@ def _ts_ranking(ds, ent):
 _REGIME_SET_LABELS = {
     "reward_per_regime": (
         "Expected-reward contribution",
-        " Each channel's own share of the leader's expected reward, averaged "
+        " Each context feature's own share of the leader's expected reward, averaged "
         "over the regime; the bars sum to that reward."),
     "shap_per_regime": (
         "Deviation from a typical window",
-        " How far each channel's contribution departs from what it usually "
+        " How far each context feature's contribution departs from what it usually "
         "contributes. This is what separates one detector from another, but it "
         "is not a share of the reward and does not sum to it."),
     "ranking_per_regime": (
@@ -373,11 +373,14 @@ def _monte_carlo(ds, ent):
     headline, gallery = [], []
     # Plain is the default: the un-annotated figure is the one that belongs in a
     # thesis, and the annotated version is a click away.
+    # One variant per metric the run swept: a metric its fitness did not name
+    # writes no figure, and `_variants` drops the patterns that match nothing.
     curve_variants = _variants(
         d,
         ["*_MonteCarlo_noise_curves_F1_plain.png",
-         "*_MonteCarlo_noise_curves_PRAUC_plain.png"],
-        ["F1", "PR-AUC"])
+         "*_MonteCarlo_noise_curves_PRAUC_plain.png",
+         "*_MonteCarlo_noise_curves_VUS_plain.png"],
+        ["F1", "PR-AUC", "VUS"])
     if curve_variants:
         headline.append({"title": "Score against noise level",
                          "caption": "Each detector's score as injected noise grows.",
@@ -396,7 +399,8 @@ def _monte_carlo(ds, ent):
              "F1 at a fixed threshold"),
             ("*_MonteCarlo_ranking_stability.png", "Ranking stability"),
             ("*_MonteCarlo_surrogate_tree_F1.png", "Surrogate tree (F1)"),
-            ("*_MonteCarlo_surrogate_tree_PRAUC.png", "Surrogate tree (PR-AUC)")):
+            ("*_MonteCarlo_surrogate_tree_PRAUC.png", "Surrogate tree (PR-AUC)"),
+            ("*_MonteCarlo_surrogate_tree_VUS.png", "Surrogate tree (VUS)")):
         for path in _ls(d, pattern):
             gallery.append(_fig(path, title))
     # The per-detector *_MonteCarloResults.png set is not listed. One figure per

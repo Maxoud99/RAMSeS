@@ -36,7 +36,12 @@ sys.modules["Metrics.metrics"].range_based_precision_recall_f1_auc = lambda *a, 
 sys.modules["Metrics.metrics"].prauc = lambda *a, **k: 0.5
 sys.modules["Metrics.metrics"].f1_score = lambda *a, **k: (0.5,) * 7
 sys.modules["Metrics.metrics"].f1_soft_score = lambda *a, **k: (0.5,) * 7
+sys.modules["Metrics.metrics"].rank_key = lambda v: v
+sys.modules["Metrics.metrics"].vus_score = lambda *a, **k: 0.5
+sys.modules["Metrics.metrics"].vus_window = lambda *a, **k: 8
 sys.modules["Utils.model_selection_utils"].evaluate_model = lambda *a, **k: {}
+sys.modules["Utils.model_selection_utils"].ScoringTimeout = type(
+    "ScoringTimeout", (Exception,), {})
 
 
 class _Logger:
@@ -353,3 +358,118 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestVusRanking(unittest.TestCase):
+    """The production summary publishes a VUS ranking only when one was asked for."""
+
+    @staticmethod
+    def _results(vus):
+        return {
+            "A": {"f1_scores": [0.9], "pr_auc_scores": [0.5], "vus_scores": vus and [0.2]},
+            "B": {"f1_scores": [0.5], "pr_auc_scores": [0.9], "vus_scores": vus and [0.8]},
+        }
+
+    def test_vus_ranking_orders_by_mean_vus(self):
+        s = mc.summarize_results(self._results(True))
+        self.assertEqual(s["ranked_by_vus"], ["B", "A"])
+        self.assertEqual(s["ranked_by_f1"], ["A", "B"])
+
+    def test_no_vus_scores_means_no_vus_ranking(self):
+        s = mc.summarize_results(self._results(False))
+        self.assertEqual(s["ranked_by_vus"], [])
+        self.assertEqual(s["ranked_by_f1"], ["A", "B"])
+
+    def test_an_uncomputable_vus_sorts_last(self):
+        results = self._results(True)
+        results["C"] = {"f1_scores": [0.7], "pr_auc_scores": [0.7],
+                        "vus_scores": [float("nan")]}
+        self.assertEqual(mc.summarize_results(results)["ranked_by_vus"][-1], "C")
+
+    def test_ranking_keys_cover_every_ranking_the_summary_adds(self):
+        """Whatever walks the summary must skip all of them, not two of three."""
+        s = mc.summarize_results(self._results(True))
+        added = [k for k, v in s.items() if isinstance(v, list)]
+        self.assertEqual(set(added), set(mc.RANKING_KEYS))
+
+
+class TestSweepMetricGating(unittest.TestCase):
+    """The explain-only sweep computes what the run's fitness names, no more."""
+
+    @staticmethod
+    def _sweep(metrics):
+        return mc.monte_carlo_noise_sweep(
+            _fake_data(), {}, ["A", "B"], noise_levels=np.linspace(0.0, 0.2, 3),
+            repeats=2, evaluate_fn=lambda m, l: (0.8, 0.6, 0.7, 0.55),
+            metrics=metrics)
+
+    def test_the_sweep_reports_which_metrics_it_ran(self):
+        self.assertEqual(self._sweep(("f1", "vus"))["metrics"], ("f1", "vus"))
+
+    def test_every_column_is_present_whatever_was_asked_for(self):
+        """Shapes stay rectangular so nothing downstream has to branch."""
+        out = self._sweep(("f1",))
+        for key in ("F1", "F1_fixed", "PR", "VUS"):
+            self.assertEqual(out[key].shape, (3 * 2, 2), key)
+
+    def test_an_injected_evaluator_can_supply_a_vus_column(self):
+        out = self._sweep(("f1", "pr_auc", "vus"))
+        self.assertTrue(np.allclose(out["VUS"], 0.55))
+        self.assertTrue(np.allclose(out["PR"], 0.6))
+
+
+class TestExplainMetricGating(unittest.TestCase):
+    """Only the chosen metrics produce curves, surrogates and report sections."""
+
+    def _run(self, metrics, tmp):
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            return mc.explain_monte_carlo(
+                _fake_data(), {}, ["A", "B"], "DS", "e1",
+                noise_levels=np.linspace(0.0, 0.2, 3), repeats=2, explain=True,
+                evaluate_fn=lambda m, l: (0.9 - l if m == "A" else 0.2 + l, 0.6, 0.7, 0.55),
+                metrics=metrics)
+        finally:
+            os.chdir(cwd)
+
+    def test_f1_only_computes_no_pr_auc_structures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(("f1",), tmp)
+            self.assertTrue(res["curves_f1"])
+            self.assertEqual(res["curves_pr"], {})
+            self.assertEqual(res["curves_vus"], {})
+            self.assertEqual(res["stability_pr"], {})
+            report = _read_report(tmp)
+        self.assertIn("Method A · F1 curves", report)
+        self.assertNotIn("PR-AUC curves", report)
+        self.assertNotIn("VUS curves", report)
+
+    def test_vus_only_computes_no_f1_structures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(("vus",), tmp)
+            self.assertTrue(res["curves_vus"])
+            self.assertEqual(res["curves_f1"], {})
+            self.assertEqual(res["curves_f1_fixed"], {})
+            report = _read_report(tmp)
+        self.assertIn("Method A · VUS curves", report)
+        self.assertNotIn("Method A · F1 curves", report)
+
+    def test_only_the_chosen_metrics_write_curve_figures(self):
+        """The result page's metric switcher is built from what is on disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(("f1", "vus"), tmp)
+            figs = os.listdir(os.path.join(tmp, "myresults", "robustness",
+                                           "MonteCarlo", "DS", "e1"))
+        names = " ".join(figs)
+        self.assertIn("noise_curves_F1_plain.png", names)
+        self.assertIn("noise_curves_VUS_plain.png", names)
+        self.assertNotIn("noise_curves_PRAUC", names)
+        self.assertNotIn("surrogate_tree_PRAUC", names)
+
+
+def _read_report(tmp):
+    directory = os.path.join(tmp, "myresults", "robustness", "MonteCarlo", "DS", "e1")
+    name = [f for f in os.listdir(directory) if f.endswith("_explainability.txt")][0]
+    with open(os.path.join(directory, name)) as f:
+        return f.read()

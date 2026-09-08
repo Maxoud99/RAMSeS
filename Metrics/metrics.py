@@ -344,6 +344,43 @@ def get_range_vus_roc(score, labels, slidingWindow):
     return metrics
 
 
+def vus_score(scores, labels, window):
+    """VUS-ROC for one score vector, or nan when it cannot be computed.
+
+    Scores are min-max scaled first and VUS_ROC is the reported figure, both
+    following Metrics/ranking_metrics.py.
+    """
+    try:
+        y = np.asarray(labels).flatten()
+        s = np.asarray(scores, dtype=float).flatten()
+        n = min(len(y), len(s))
+        y, s = y[:n], s[:n]
+        if n == 0 or len(np.unique(y)) < 2:
+            return float("nan")
+        if np.ptp(s) > 0:
+            s = (s - s.min()) / np.ptp(s)
+        return float(get_range_vus_roc(s, y, int(window))["VUS_ROC"])
+    except Exception:
+        return float("nan")
+
+
+def rank_key(value):
+    """Descending-sort key that leaves an uncomputable score last."""
+    v = float(value)
+    return float("-inf") if np.isnan(v) else v
+
+
+def vus_window(series):
+    """One sliding window for every candidate, so their VUS values compare."""
+    from Utils.vus_utils import find_length
+    try:
+        arr = np.asarray(series)
+        row = arr[0] if arr.ndim > 1 else arr
+        return max(int(find_length(np.asarray(row).flatten())), 2)
+    except Exception:
+        return 100
+
+
 # For centrality
 def kendalltau_topk(a: np.array, b: np.array, k: int = 60):
     """Kendall's Tau correlation between the top-k elements according to a

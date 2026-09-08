@@ -38,6 +38,14 @@ is satisfied by the subject alone. A narrative that replaced every NN_* with
 the CBLOF_* of the same index scored 0.000 on both rates while asserting the
 exact negation of the run's findings.
 
+Role mixing (v4): the aggregation stages declare their source rankings and the
+detectors those sources rank in `output`. Agreement is a property of a source,
+never of a detector, so a sentence hanging that relation off a detector name —
+"its first-ranked detector is LOF_3, which aligns more closely with
+Thompson_Sampling's ranking" — is a `role_mixup` and counts toward the
+hallucination rate. Nothing earlier could see it: the sentence carries no
+numbers, and `_ENTITY_RE` does not match a source name.
+
 Known limitation: when a sentence names BOTH detectors of a swapped value
 pair ("A and B scored x and y respectively", values exchanged), the union
 over named subjects still covers both numbers and the swap is not caught.
@@ -332,13 +340,9 @@ def _attribution_checks(text: str, subject_numbers: Dict[str, Set[float]],
 # ── Rival-set attribution (v3) ───────────────────────────────────────────────
 #
 # Atoms whose `value` carries one of these keys name a SET of other detectors
-# the atom's claim is about — the rivals a winner beat, the competitors a rule
-# separates. The set is the load-bearing part of the claim, and nothing else
-# checks it: the rivals are not the atom's subject, so the sentence-scoped
-# number check never sees them, and `_atom_covered` is satisfied by the
-# subject alone. A narrator that swapped every NN_* for the CBLOF_* of the same
-# index scored 0.000 hallucination and 0.000 omission while asserting the exact
-# negation of the run's findings.
+# the claim is about. Nothing else checks it — the rivals are not the atom's
+# subject — so a narrator that swapped every NN_* for the CBLOF_* of the same
+# index scored 0.000 on both rates while asserting the exact negation.
 _RIVAL_KEYS = ("competitors", "rivals", "beaten", "against")
 
 
@@ -361,6 +365,57 @@ def _rival_atoms(ir_doc: Dict[str, Any]) -> List[Tuple[Dict[str, Any], Set[str],
     return out
 
 
+# ── Role mixing (v4) ─────────────────────────────────────────────────────────
+#
+# Agreement and influence are properties of a SOURCE ranking; a detector only
+# has a position. Nothing above notices the swap, so "its first-ranked detector
+# is LOF_3, which aligns more closely with Thompson_Sampling's ranking" scored
+# 0.000 while inverting the finding. Naming both in one sentence is not the
+# error; the relation ATTACHING to the detector is, as a relative clause or
+# participle off its name.
+_ROLE_RELATION_RE = re.compile(
+    r"\b(agree\w*|align\w*|follow\w*|driv\w*|drove|shap\w*|influenc\w*|"
+    r"closely|closer)\b", re.I)
+_ROLE_ATTACH_RE = re.compile(
+    r"^[\s,;:—-]*(which|that|reflecting|showing|leaning|aligning|agreeing|"
+    r"following|driving|shaping)\b", re.I)
+
+
+def _role_vocabularies(ir_doc: Dict[str, Any]) -> Tuple[Set[str], Set[str]]:
+    """(source names, detector names) for a stage that declares both."""
+    output = ir_doc.get("output") or {}
+    sources = {str(s) for s in (output.get("sources") or []) if s}
+    items = {str(d) for d in (output.get("consensus_ranking_top_k") or []) if d}
+    top = output.get("top_pick")
+    if top:
+        items.add(str(top))
+    return sources, items - sources
+
+
+def _role_mixing_checks(text: str, ir_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Sentences that give a detector a source's relation to the consensus."""
+    sources, items = _role_vocabularies(ir_doc)
+    if not sources or not items:
+        return []
+    problems: List[Dict[str, Any]] = []
+    for sentence in _SENT_SPLIT_RE.split(text or ""):
+        if not sentence.strip() or not _ROLE_RELATION_RE.search(sentence):
+            continue
+        low = sentence.lower()
+        for item in sorted(items):
+            match = re.search(rf"(?<!\w){re.escape(item.lower())}(?!\w)", low)
+            if not match:
+                continue
+            tail = sentence[match.end():]
+            if not _ROLE_ATTACH_RE.match(tail) or not _ROLE_RELATION_RE.search(tail):
+                continue
+            named = sorted(s for s in sources if _word_present(tail.lower(), s))
+            if named:
+                problems.append({"sources": named, "detectors": [item],
+                                 "sentence": sentence.strip()})
+    return problems
+
+
 def _rival_checks(text: str, ir_doc: Dict[str, Any],
                   rounded_decimals: int) -> List[Dict[str, Any]]:
     """
@@ -373,6 +428,11 @@ def _rival_checks(text: str, ir_doc: Dict[str, Any],
     measured) rather than a swap. Atoms whose numbers are ambiguous — shared
     with another rival-set atom — are skipped: without a unique anchor the
     sentence cannot be attributed with confidence.
+
+    Uniqueness is judged at the precision the match uses. Counting exact values
+    while matching rounded ones made off-by's thresholds ambiguous — 0.106 and
+    0.108 both match at two decimals — and flagged every correct narrative with
+    two swapped rival sets, a spurious 0.178 hallucination.
     """
     atoms = _rival_atoms(ir_doc)
     if not atoms:
@@ -380,13 +440,13 @@ def _rival_checks(text: str, ir_doc: Dict[str, Any],
     # Numbers that identify more than one rival-set atom cannot anchor either.
     seen: Dict[float, int] = {}
     for _, _, numbers in atoms:
-        for n in numbers:
+        for n in {round(v, rounded_decimals) for v in numbers}:
             seen[n] = seen.get(n, 0) + 1
 
     sentences = [s for s in _SENT_SPLIT_RE.split(text or "") if s.strip()]
     problems: List[Dict[str, Any]] = []
     for atom, rivals, numbers in atoms:
-        anchors = {n for n in numbers if seen.get(n, 0) == 1}
+        anchors = {n for n in numbers if seen.get(round(n, rounded_decimals), 0) == 1}
         if not anchors:
             continue
         for sentence in sentences:
@@ -509,6 +569,9 @@ def verify_narrative(text: str, ir_doc: Dict[str, Any],
     # ── Rival-set attribution (v3) ───────────────────────────────────────────
     swapped_rivals = _rival_checks(text, ir_doc, rounded_decimals)
 
+    # ── Role mixing (v4) ─────────────────────────────────────────────────────
+    role_mixups = _role_mixing_checks(text, ir_doc)
+
     # ── Omissions ────────────────────────────────────────────────────────────
     required_ids = list(ir_doc.get("required_atom_ids", []))
     atoms_by_id = {a.get("id"): a for a in ir_doc.get("evidence", [])}
@@ -529,7 +592,8 @@ def verify_narrative(text: str, ir_doc: Dict[str, Any],
     n_swapped_names = len({(p["sentence"], name) for p in swapped_rivals
                            for name in p["intruded"] + p["dropped"]})
     n_unsupported = (len(unsupported_numbers) + len(unsupported_entities)
-                     + len(misattributed_numbers) + n_swapped_names)
+                     + len(misattributed_numbers) + n_swapped_names
+                     + len(role_mixups))
     return {
         "n_required": len(required_ids),
         "missing_required_ids": missing_required,
@@ -548,6 +612,8 @@ def verify_narrative(text: str, ir_doc: Dict[str, Any],
         "n_swapped_rival_names": n_swapped_names,
         "attribution_warnings": attribution_warnings,
         "n_attribution_warnings": len(attribution_warnings),
+        "role_mixups": role_mixups,
+        "n_role_mixups": len(role_mixups),
         "n_claims": n_claims,
         "hallucination_rate": (n_unsupported / n_claims) if n_claims else 0.0,
     }

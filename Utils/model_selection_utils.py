@@ -7,7 +7,11 @@
 # Modified by the RAMSeS project. This file is NOT identical to the original
 # in mononitogoswami/tsad-model-selection, from which it is derived.
 
+import signal
+import threading
+from contextlib import contextmanager
 from typing import Tuple, Union, List
+from loguru import logger
 import numpy as np
 import torch as t
 from tqdm import tqdm, trange
@@ -116,11 +120,88 @@ _WHOLE_SERIES_MODELS = WHOLE_SERIES_FAMILIES
 _TRANSDUCTIVE_MODELS = TRANSDUCTIVE_FAMILIES
 
 
+SCORING_TIMEOUT_SECONDS = 120
+
+
+class ScoringTimeout(Exception):
+    """One scoring call exceeded SCORING_TIMEOUT_SECONDS and was killed."""
+
+
+_TIMED_OUT: set = set()
+
+
+def timed_out_detectors() -> frozenset:
+    """Detectors killed for slowness so far in this run."""
+    return frozenset(_TIMED_OUT)
+
+
+def reset_timed_out() -> None:
+    _TIMED_OUT.clear()
+
+
+@contextmanager
+def _score_deadline(model_name: str, seconds: int = None):
+    """Kill the enclosed call after `seconds`.
+
+    SIGALRM only exists on the main thread, so `--parallel` runs (stages in a
+    ThreadPoolExecutor) get no deadline. The alarm lands inside a C extension
+    for some detectors and surfaces as SystemError rather than our own
+    exception, hence the `fired` flag.
+    """
+    seconds = SCORING_TIMEOUT_SECONDS if seconds is None else seconds
+    if seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    fired = {"v": False}
+
+    def _fire(signum, frame):
+        fired["v"] = True
+        raise ScoringTimeout(model_name)
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    except ScoringTimeout:
+        raise
+    except Exception:
+        if fired["v"]:
+            raise ScoringTimeout(model_name) from None
+        raise
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def evaluate_model(data: Union[Dataset, Entity],
                    model: PyMADModel,
                    model_name: str,
                    padding_type: str = 'right',
                    eval_batch_size: int = 128) -> dict:
+    """Score one detector, or raise ScoringTimeout if it takes too long.
+
+    A detector that times out once is refused immediately thereafter, so the
+    cost is paid at most once per run.
+    """
+    if model_name in _TIMED_OUT:
+        raise ScoringTimeout(model_name)
+    try:
+        with _score_deadline(model_name):
+            return _evaluate_model(data, model, model_name, padding_type,
+                                   eval_batch_size)
+    except ScoringTimeout:
+        _TIMED_OUT.add(model_name)
+        logger.warning(
+            f"⚠ {model_name} exceeded {SCORING_TIMEOUT_SECONDS}s for one scoring "
+            f"call and was killed; it is skipped for the rest of this run.")
+        raise
+
+
+def _evaluate_model(data: Union[Dataset, Entity],
+                    model: PyMADModel,
+                    model_name: str,
+                    padding_type: str = 'right',
+                    eval_batch_size: int = 128) -> dict:
     """Compute observations necessary to evaluate a model on a given dataset.
 
     Description

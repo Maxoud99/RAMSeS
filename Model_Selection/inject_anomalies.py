@@ -25,7 +25,7 @@ def moving_average(x, w):
     return np.convolve(x, np.ones(w), 'same') / w
 
 
-def Inject(data, anomaly_types):
+def Inject(data, anomaly_types, rate=None):
     random_state = np.random.randint(1, 10000)
 
     anomaly_obj = InjectAnomalies(random_state=random_state,
@@ -43,6 +43,8 @@ def Inject(data, anomaly_types):
                 ParameterGrid(ANOMALY_PARAM_GRID[anomaly])):
             anomaly_params['T'] = T
             anomaly_params['scale'] = anomaly_params['scale'] * data_std
+            if rate is not None:
+                anomaly_params['anomaly_rate'] = rate
 
             # Inject synthetic anomalies to the data
             T_a, anomaly_sizes, anomaly_labels = anomaly_obj.inject_anomalies(
@@ -270,7 +272,7 @@ class InjectAnomalies:
         b = norm.rvs(loc=0, scale=scale)
         return a * window + b - window
 
-    def compute_anomaly_properties(self, T):
+    def compute_anomaly_properties(self, T, anomaly_rate=None):
         """Compute properties of the random anomaly
         """
         if T.ndim > 1:
@@ -283,33 +285,38 @@ class InjectAnomalies:
         self.anomaly_length = np.random.randint(
             1, self.max_anomaly_length)  # Length of anomaly
 
+        if anomaly_rate is None:
+            span = self.anomaly_length * self.estimated_window_size
+        else:
+            # Labels are padded by min_window_size on each side further down, so
+            # the segment is shortened by that padding to land on the rate asked for.
+            span = max(1, int(round(anomaly_rate * n_time)) - 2 * self.min_window_size)
+
         self.anomaly_start = -1
         self.anomaly_end = n_time + 1
 
         # Find a suitable anomaly start and end time
         n_peaks = len(self.peaks)
-        
+
         # Handle case where there are too few peaks
         if n_peaks == 0:
             # No peaks detected - use random position in middle 80% of data
             self.anomaly_start = int(0.1 * n_time)
-            self.anomaly_end = min(
-                self.anomaly_start + self.anomaly_length * self.estimated_window_size, 
-                n_time
-            )
         else:
             # Calculate safe range for peak selection
             min_peak_idx = int(np.ceil(0.1 * n_peaks))
             if min_peak_idx >= n_peaks:
                 min_peak_idx = 0  # Use first peak if 10% threshold is too high
-            
+
             first_peak_idx = self.peaks[np.random.randint(min_peak_idx, n_peaks)]
             self.anomaly_start = max(
                 first_peak_idx - self.estimated_window_size // 2, 0)
-            self.anomaly_end = min(
-                self.anomaly_start + self.anomaly_length * self.estimated_window_size, 
-                n_time
-            )
+
+        if anomaly_rate is not None:
+            # Without this the segment would be truncated by the end of the
+            # series and the rate silently under-delivered.
+            self.anomaly_start = min(self.anomaly_start, max(0, n_time - span))
+        self.anomaly_end = min(self.anomaly_start + span, n_time)
 
         if self.verbose:
             print(
@@ -347,7 +354,8 @@ class InjectAnomalies:
                          constant_type: str = 'noisy_0',
                          constant_quantile: float = 0.75,
                          baseline: float = 0.2,
-                         ma_window: int = 2):
+                         ma_window: int = 2,
+                         anomaly_rate: float = None):
         """Function to inject different kinds of anomalies.
         
         Parameters
@@ -408,6 +416,12 @@ class InjectAnomalies:
             Parameter for `wander` anomaly injection. Induces a baseline wander. The 
             exent of the positive or negative elevation gain is specified by the 
             baseline parameter. By default, it is set to 0.2.
+
+        anomaly_rate: float
+            Target fraction of timesteps to label anomalous, in (0, 1]. For
+            `spikes` it replaces `anomaly_propensity`; for the eight segment
+            types it sizes the injected segment. None keeps the per-type
+            defaults, so callers that omit it are unaffected.
         """
         if random_parameters:
             self.set_random_anomaly_parameters()
@@ -463,7 +477,7 @@ class InjectAnomalies:
             print(f'Correlation scaling vector: {correlation_vec}')
 
         # Compute properties of the injected anomaly
-        self.compute_anomaly_properties(T)
+        self.compute_anomaly_properties(T, anomaly_rate=anomaly_rate)
         if self.verbose:
             print(
                 f'Length of anomaly for flip, speedup, noise, cutoff, scale and wander anomalies: {self.anomaly_length}'
@@ -471,7 +485,8 @@ class InjectAnomalies:
 
         if anomaly_type == 'spikes':
             spikes = self.inject_spikes(n=T.shape[1],
-                                        p=anomaly_propensity,
+                                        p=anomaly_propensity
+                                        if anomaly_rate is None else anomaly_rate,
                                         scale=scale)
             timeseries_with_anomalies = timeseries_with_anomalies + np.tile(
                 spikes, (len(T), 1)) * correlation_vec[:, None]

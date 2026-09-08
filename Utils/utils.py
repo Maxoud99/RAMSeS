@@ -3,7 +3,9 @@ import torch as t
 import matplotlib.pyplot as plt
 from argparse import ArgumentParser
 from Utils.config import Config
-from Utils.pipeline_spec import parse_detectors, parse_stages
+from Utils.pipeline_spec import (parse_anomaly_rate, parse_anomaly_type,
+                                 parse_decision_metrics, parse_detectors,
+                                 parse_stages)
 from pathlib import Path
 import os
 from loguru import logger
@@ -95,6 +97,30 @@ def get_args_from_cmdline():
                              "any strict subset runs only those stages + their explainability, then stops "
                              "(no rank aggregation / final decision / online phase) and runs sequentially.")
 
+    parser.add_argument('--anomaly_type',
+                        type=str,
+                        default=None,
+                        help="Synthetic anomaly injected at stage 4. One of: "
+                             "spikes, contextual, flip, speedup, noise, cutoff, scale, "
+                             "wander, average. Default 'spikes'.")
+    parser.add_argument('--anomaly_rate',
+                        type=str,
+                        default=None,
+                        help="Target fraction of timesteps to label anomalous, in (0, 1]. "
+                             "For 'spikes' this is the per-timestep injection probability; "
+                             "for the other types it sizes the injected segment. Omit to "
+                             "keep the per-type defaults.")
+
+    parser.add_argument('--decision_metric',
+                        type=str,
+                        default=None,
+                        help="Comma-separated metrics the fitness function is built "
+                             "from: f1, pr_auc (both by default), vus. Each may carry a weight "
+                             "('f1:0.5,pr_auc:0.3,vus:0.2'); unweighted metrics count "
+                             "equally and weights are normalised. The fitness is their "
+                             "weighted mean, and it is what the GA, Thompson Sampling "
+                             "and the final ensemble-vs-single comparison all maximise.")
+
     parser.add_argument('--overwrite',
                         type=str,
                         default=None,
@@ -169,6 +195,12 @@ def get_args_from_cmdline():
         parser.error(str(e))
     try:
         args['detectors'] = parse_detectors(cmd_args.detectors)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        args['anomaly_type'] = parse_anomaly_type(cmd_args.anomaly_type)
+        args['anomaly_rate'] = parse_anomaly_rate(cmd_args.anomaly_rate)
+        args['decision_metrics'] = parse_decision_metrics(cmd_args.decision_metric)
     except ValueError as e:
         parser.error(str(e))
 

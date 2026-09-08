@@ -30,6 +30,8 @@ _make_mock_module("Metrics", "Metrics.Ensemble_GA", "Metrics.metrics")
 sys.modules["Metrics.Ensemble_GA"].evaluate_individual_models   = lambda *a, **kw: None
 sys.modules["Metrics.Ensemble_GA"].evaluate_model_consistently  = lambda *a, **kw: None
 sys.modules["Metrics.metrics"].prauc    = lambda *a, **kw: 0.5
+sys.modules["Metrics.metrics"].vus_score  = lambda *a, **kw: 0.5
+sys.modules["Metrics.metrics"].vus_window = lambda *a, **kw: 10
 sys.modules["Metrics.metrics"].f1_score = lambda *a, **kw: (0.5, 0.5, 0.5, 0, 0, 0, 0)
 # The reward's F1 half comes from the range-based metric, as in every other
 # stage; the module imports it at file scope, so the stub has to exist before
@@ -49,10 +51,10 @@ from Thompson_Sampling import (
     detect_regime_shifts,
     classify_selection,
     compute_shap_values,
-    aggregate_shap_per_channel,
+    aggregate_shap_per_context_feature,
     reconstruct_regime_segments,
-    reward_contribution_per_channel,
-    aggregate_squared_per_channel,
+    reward_contribution_per_context_feature,
+    aggregate_squared_per_context_feature,
     rank_gap_decomposition,
     leadership_regimes,
     _top_k_models_by_expected_reward,
@@ -232,7 +234,7 @@ class TestUpdatePosteriors(unittest.TestCase):
 
     def test_no_svd_failure_on_high_dimensional_data(self):
         """
-        Simulate SMD-scale data (38 channels × 20 time steps = d=760) for 100
+        Simulate SMD-scale data (38 context features × 20 time steps = d=760) for 100
         iterations. The old double-inv code crashed with 'SVD did not converge'
         around iteration 40. Sherman-Morrison must complete all rounds without error.
         """
@@ -535,18 +537,18 @@ class TestSHAP(unittest.TestCase):
         phi      = compute_shap_values(mean, context, baseline)
         np.testing.assert_array_almost_equal(phi, [+1.0, -1.0, 0.0])
 
-    def test_per_channel_aggregation_correctness(self):
-        """shap = [1, 2, 3, 4], n_channels = 2 → per_channel = [1+2, 3+4] = [3, 7]."""
+    def test_per_context_feature_aggregation_correctness(self):
+        """shap = [1, 2, 3, 4], n_context_features = 2 → per_context_feature = [1+2, 3+4] = [3, 7]."""
         shap = np.array([1.0, 2.0, 3.0, 4.0])
-        per_channel = aggregate_shap_per_channel(shap, n_channels=2)
-        np.testing.assert_array_almost_equal(per_channel, [3.0, 7.0])
+        per_context_feature = aggregate_shap_per_context_feature(shap, n_context_features=2)
+        np.testing.assert_array_almost_equal(per_context_feature, [3.0, 7.0])
 
-    def test_per_channel_aggregation_handles_uneven_division(self):
-        """If shap.size is not divisible by n_channels, trailing entries are dropped."""
-        shap = np.array([1.0, 2.0, 3.0, 4.0, 5.0])  # 5 elements, n_channels=2
-        per_channel = aggregate_shap_per_channel(shap, n_channels=2)
+    def test_per_context_feature_aggregation_handles_uneven_division(self):
+        """If shap.size is not divisible by n_context_features, trailing entries are dropped."""
+        shap = np.array([1.0, 2.0, 3.0, 4.0, 5.0])  # 5 elements, n_context_features=2
+        per_context_feature = aggregate_shap_per_context_feature(shap, n_context_features=2)
         # window_size = 5 // 2 = 2; uses shap[:4] = [1, 2, 3, 4] → [3, 7]
-        np.testing.assert_array_almost_equal(per_channel, [3.0, 7.0])
+        np.testing.assert_array_almost_equal(per_context_feature, [3.0, 7.0])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -592,57 +594,57 @@ class TestReconstructRegimeSegments(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 11b. Expected-reward decomposition (mu^T x per channel)
+# 11b. Expected-reward decomposition (mu^T x per context feature)
 # ════════════════════════════════════════════════════════════════════════════
 
 class TestRewardContribution(unittest.TestCase):
-    """The claim this decomposition makes, and SHAP cannot: the per-channel
+    """The claim this decomposition makes, and SHAP cannot: the per-context-feature
     parts ARE the prediction. SHAP explains only the deviation from a typical
     window, discarding the mu.baseline term."""
 
     def test_parts_sum_to_the_expected_reward(self):
         rng = np.random.default_rng(4)
         mu, x = rng.normal(size=(24, 1)), rng.normal(size=24)
-        parts = reward_contribution_per_channel(mu, x, n_channels=6)
+        parts = reward_contribution_per_context_feature(mu, x, n_context_features=6)
         self.assertEqual(parts.shape, (6,))
         self.assertAlmostEqual(float(parts.sum()),
                                float(np.dot(mu.flatten(), x)), places=12)
 
     def test_signed_both_ways(self):
-        # mu and the normalised context can each be negative, so a channel can
+        # mu and the normalised context can each be negative, so a context feature can
         # pull the expected reward down. An all-positive split would be a bug.
         mu = np.array([1.0, 1.0, -1.0, -1.0])
         x = np.array([1.0, 1.0, 1.0, 1.0])
         np.testing.assert_array_almost_equal(
-            reward_contribution_per_channel(mu, x, n_channels=2), [2.0, -2.0])
+            reward_contribution_per_context_feature(mu, x, n_context_features=2), [2.0, -2.0])
 
     def test_differs_from_shap_by_the_discarded_baseline_term(self):
-        """SHAP per channel = this, minus what the channel contributes at the
+        """SHAP per context feature = this, minus what the context feature contributes at the
         baseline. That difference is exactly the term SHAP throws away."""
         rng = np.random.default_rng(5)
         mu, x, b = rng.normal(size=12), rng.normal(size=12), rng.normal(size=12)
-        raw = reward_contribution_per_channel(mu, x, 3)
-        shap = aggregate_shap_per_channel(compute_shap_values(mu, x, b), 3)
-        at_baseline = reward_contribution_per_channel(mu, b, 3)
+        raw = reward_contribution_per_context_feature(mu, x, 3)
+        shap = aggregate_shap_per_context_feature(compute_shap_values(mu, x, b), 3)
+        at_baseline = reward_contribution_per_context_feature(mu, b, 3)
         np.testing.assert_array_almost_equal(shap, raw - at_baseline)
 
-    def test_degenerate_channel_counts(self):
+    def test_degenerate_context_feature_counts(self):
         mu = x = np.array([1.0, 2.0])
-        self.assertEqual(reward_contribution_per_channel(mu, x, 0).size, 0)
+        self.assertEqual(reward_contribution_per_context_feature(mu, x, 0).size, 0)
         np.testing.assert_array_almost_equal(
-            reward_contribution_per_channel(mu, x, 4), np.zeros(4))
+            reward_contribution_per_context_feature(mu, x, 4), np.zeros(4))
 
     def test_leader_minus_runner_sums_to_the_expected_reward_gap(self):
         """The regime prose's edge clause. Differencing two contribution splits
-        gives channel terms that sum EXACTLY to the gap in expected reward the
-        same regime reports — so the sentence's channel and its headline number
+        gives context feature terms that sum EXACTLY to the gap in expected reward the
+        same regime reports — so the sentence's context feature and its headline number
         describe one quantity. SHAP's version of the comparison sums to a
         baseline-relative gap instead, which is a different number."""
         rng = np.random.default_rng(11)
         mu_l, mu_r, x = (rng.normal(size=15), rng.normal(size=15),
                          rng.normal(size=15))
-        delta = (reward_contribution_per_channel(mu_l, x, 5)
-                 - reward_contribution_per_channel(mu_r, x, 5))
+        delta = (reward_contribution_per_context_feature(mu_l, x, 5)
+                 - reward_contribution_per_context_feature(mu_r, x, 5))
         self.assertAlmostEqual(float(delta.sum()),
                                float(np.dot(mu_l - mu_r, x)), places=12)
 
@@ -689,37 +691,37 @@ class TestRankingDecomposition(unittest.TestCase):
     margin. If either stopped summing, the explanation would be quietly wrong
     while still looking plausible."""
 
-    def test_per_channel_squares_sum_to_the_score(self):
+    def test_per_context_feature_squares_sum_to_the_score(self):
         mu = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-        per_channel = aggregate_squared_per_channel(mu, n_channels=3)
-        # channel c owns a contiguous block: [1,2], [3,4], [5,6].
-        np.testing.assert_array_almost_equal(per_channel, [5.0, 25.0, 61.0])
-        self.assertAlmostEqual(float(per_channel.sum()), float(np.dot(mu, mu)))
+        per_context_feature = aggregate_squared_per_context_feature(mu, n_context_features=3)
+        # context feature c owns a contiguous block: [1,2], [3,4], [5,6].
+        np.testing.assert_array_almost_equal(per_context_feature, [5.0, 25.0, 61.0])
+        self.assertAlmostEqual(float(per_context_feature.sum()), float(np.dot(mu, mu)))
 
     def test_contributions_are_never_negative(self):
         rng = np.random.default_rng(3)
         mu = rng.normal(size=(60, 1))          # column vector, as means are stored
-        per_channel = aggregate_squared_per_channel(mu, n_channels=6)
-        self.assertTrue((per_channel >= 0).all())
-        self.assertAlmostEqual(float(per_channel.sum()),
+        per_context_feature = aggregate_squared_per_context_feature(mu, n_context_features=6)
+        self.assertTrue((per_context_feature >= 0).all())
+        self.assertAlmostEqual(float(per_context_feature.sum()),
                                float(np.dot(mu.flatten(), mu.flatten())))
 
     def test_uneven_division_drops_the_tail_like_the_shap_helper(self):
-        mu = np.array([1.0, 2.0, 3.0, 4.0, 5.0])       # 5 // 2 = 2 per channel
+        mu = np.array([1.0, 2.0, 3.0, 4.0, 5.0])       # 5 // 2 = 2 per context feature
         np.testing.assert_array_almost_equal(
-            aggregate_squared_per_channel(mu, n_channels=2), [5.0, 25.0])
+            aggregate_squared_per_context_feature(mu, n_context_features=2), [5.0, 25.0])
 
-    def test_degenerate_channel_counts(self):
+    def test_degenerate_context_feature_counts(self):
         mu = np.array([1.0, 2.0])
-        self.assertEqual(aggregate_squared_per_channel(mu, 0).size, 0)
-        # More channels than features: window_size floors to 0.
+        self.assertEqual(aggregate_squared_per_context_feature(mu, 0).size, 0)
+        # More context features than features: window_size floors to 0.
         np.testing.assert_array_almost_equal(
-            aggregate_squared_per_channel(mu, 4), np.zeros(4))
+            aggregate_squared_per_context_feature(mu, 4), np.zeros(4))
 
     def test_gap_sums_to_the_score_difference(self):
         rng = np.random.default_rng(11)
         a, b = rng.normal(size=48), rng.normal(size=48)
-        gap = rank_gap_decomposition(a, b, n_channels=8)
+        gap = rank_gap_decomposition(a, b, n_context_features=8)
         expected = float(np.dot(a, a)) - float(np.dot(b, b))
         self.assertAlmostEqual(float(gap.sum()), expected)
 

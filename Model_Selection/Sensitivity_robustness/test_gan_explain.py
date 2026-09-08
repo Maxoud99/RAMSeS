@@ -78,8 +78,12 @@ if not hasattr(sys.modules["Utils"], "__path__"):
 _set("Metrics.metrics",
      range_based_precision_recall_f1_auc=lambda *a, **k: (0, 0, 0.5, 0.5, None),
      prauc=lambda *a, **k: 0.5,
-     f1_score=lambda *a, **k: 0.5)
-_set("Utils.model_selection_utils", evaluate_model=lambda *a, **k: {})
+     f1_score=lambda *a, **k: 0.5,
+     rank_key=lambda v: v,
+     vus_score=lambda *a, **k: 0.5,
+     vus_window=lambda *a, **k: 8)
+_set("Utils.model_selection_utils", evaluate_model=lambda *a, **k: {},
+     ScoringTimeout=type("ScoringTimeout", (Exception,), {}))
 _set("loguru", logger=_Logger())
 _keras = _set("tensorflow.keras", layers=types.SimpleNamespace(),
               models=types.SimpleNamespace())
@@ -101,7 +105,7 @@ def _sklearn_or_skip(test):
 # ── Stubs for the adversarial pair ──────────────────────────────────────────
 
 class _RecordingDiscriminator:
-    """Scores a candidate from its first channel: a known, orderable verdict."""
+    """Scores a candidate from its first feature: a known, orderable verdict."""
 
     def __init__(self):
         self.seen = []
@@ -149,7 +153,7 @@ def _random_candidates(num_samples, noise_dim):
 
 
 def _ramped_candidates(num_samples, noise_dim):
-    """Channel 0 sweeps [-1, 1], so discriminator scores are a known ramp."""
+    """Feature 0 sweeps [-1, 1], so discriminator scores are a known ramp."""
     out = np.zeros((num_samples, noise_dim))
     out[:, 0] = np.linspace(-1.0, 1.0, num_samples)
     return out

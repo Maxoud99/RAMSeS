@@ -13,11 +13,12 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 
-from Utils.pipeline_spec import abbreviate_detector
+from Utils.pipeline_spec import (abbreviate_detector, combine_metrics,
+                                 DEFAULT_DECISION_METRICS, metrics_required)
 from Utils.plot_labels import draw_abbreviation_key
 
-from Metrics.metrics import prauc, f1_score
-from Utils.model_selection_utils import evaluate_model
+from Metrics.metrics import prauc, f1_score, vus_score
+from Utils.model_selection_utils import evaluate_model, ScoringTimeout
 from Explainability import ir
 
 
@@ -248,7 +249,10 @@ def evaluate_individual_models(algorithm_list, test_data, trained_models):
     for model_name in algorithm_list:
         model = trained_models.get(model_name)
         if model:
-            y_true, y_scores, y_true_agg_dict, y_scores_dict = evaluate_model_consistently(test_data, model, model_name)
+            try:
+                y_true, y_scores, y_true_agg_dict, y_scores_dict = evaluate_model_consistently(test_data, model, model_name)
+            except ScoringTimeout:
+                continue
             
             # Debug: Check y_true
             logger.info(f"y_true shape: {np.array(y_true).shape}, unique values: {np.unique(y_true)}, sum: {np.sum(y_true)}")
@@ -277,7 +281,8 @@ def fitness_function(ensemble, train_data, test_data, trained_models,
                      individual_predictions,
                      base_model_predictions_train, algorithm_list,
                      base_model_predictions_test, y_true_train, y_true_test,
-                     meta_model_type='svm'):
+                     meta_model_type='svm', metric=DEFAULT_DECISION_METRICS,
+                     vus_win=None):
     """
     Evaluate the fitness of an ensemble.
 
@@ -378,9 +383,12 @@ def fitness_function(ensemble, train_data, test_data, trained_models,
     # best_f1 = get_composite_fscore_raw(y_scores, y_true_test)
     pr_auc = prauc(y_true_test, y_scores)
 
-    # Calculate the fitness score as the average of the F1 score and PR AUC
-    # fitness = (best_f1 + pr_auc) / 2
-    fitness = best_f1
+    needed = metrics_required(metric)
+    vus = (vus_score(y_scores, y_true_test, vus_win)
+           if 'vus' in needed and vus_win is not None else float('nan'))
+    fitness = combine_metrics(metric, {'f1': best_f1, 'pr_auc': pr_auc, 'vus': vus})
+    if np.isnan(fitness):
+        fitness = best_f1
     logger.info(
         f"Evaluated fitness for ensemble {ensemble} with F1 score {best_f1} and PR AUC {pr_auc}, resulting in fitness {fitness}")
     # The trained meta-model is appended (6th element) so the combination-
@@ -616,7 +624,8 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 
 def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, trained_models, meta_model_type,
-                      population_size, generations, mutation_rate, explain: bool = False):
+                      population_size, generations, mutation_rate, explain: bool = False,
+                      metric=DEFAULT_DECISION_METRICS, vus_win=None):
     """
     Run the genetic algorithm to find the best ensemble of models.
 
@@ -640,6 +649,12 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
 
     individual_predictions, adjusted_y_pred_ind, F1_Score_list_ind, PR_AUC_Score_list_ind = evaluate_individual_models(
         algorithm_list, test_data, trained_models)
+    # Ensembles are bred from algorithm_list but scored from individual_predictions,
+    # so a detector that never scored has to leave both.
+    dropped = [m for m in algorithm_list if m not in individual_predictions]
+    if dropped:
+        algorithm_list = [m for m in algorithm_list if m in individual_predictions]
+        logger.warning(f"⚠ Excluded from the GA pool (no score): {', '.join(dropped)}")
     logger.info(f"  ✓ Individual model evaluation complete ({len(algorithm_list)} models)")
     
     # Skip plotting to save time (but keep path definitions for later use)
@@ -670,6 +685,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     best_fitness = 0
     best_ensemble = None
     best_meta_model = None   # the trained meta-model of the best ensemble (for combination explainability)
+    best_scores = None       # its continuous scores, for the final decision's VUS
     adjusted_y_pred_list = []
     F1_Score_list = []
     list_ensemble = []
@@ -724,7 +740,8 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
                                                       individual_predictions,
                                                       base_model_predictions_train, algorithm_list,
                                                       base_model_predictions_test, y_true_train, y_true_test,
-                                                      meta_model_type=meta_model_type)
+                                                      meta_model_type=meta_model_type,
+                                                      metric=metric, vus_win=vus_win)
                     evaluated_ensembles[ensemble_key] = fitness_result
 
 
@@ -768,6 +785,9 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
             # fitness tuple) for the combination-explainability layer. Aligned with
             # f1_scores / fitness_scores, which are all derived from fitness_results.
             best_meta_model = fitness_results[best_idx][5]
+            # Index 3 is this ensemble's continuous scores, which the final decision
+            # needs to compute VUS.
+            best_scores = fitness_results[best_idx][3]
         population = new_population
 
         logger.info(f"End of Generation {generation + 1}, Population: {population}")
@@ -869,7 +889,8 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
                                    individual_predictions, base_model_predictions_train,
                                    algorithm_list, base_model_predictions_test,
                                    y_true_train, y_true_test,
-                                   meta_model_type=meta_model_type)
+                                   meta_model_type=meta_model_type,
+                                   metric=metric, vus_win=vus_win)
             evaluated_ensembles[key] = res
             return res[2]
 
@@ -880,9 +901,10 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
         explain_ga_combination(best_ensemble, algorithm_list,
                                base_model_predictions_train, base_model_predictions_test,
                                y_true_train, y_true_test, meta_model_type,
-                               dataset, entity, meta_model=best_meta_model, explain=True)
+                               dataset, entity, meta_model=best_meta_model, explain=True,
+                               metric=metric, vus_win=vus_win)
 
-    return best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type
+    return best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type, best_scores
 
 # Usage
 # Assuming train_data and test_data are already loaded and preprocessed
@@ -1669,7 +1691,7 @@ def explain_ga_selection(
 #  its output to the per-detector score columns via two methods, then merging
 #  their rankings with a Markov-chain rank aggregation:
 #    • SHAP — exact interventional Shapley (single mean baseline), label-free.
-#    • PFI  — permutation feature importance measured as F1 drop, label-based.
+#    • PFI  — permutation feature importance measured as fitness drop, label-based.
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -1776,6 +1798,30 @@ def compute_meta_shap(
     phi = compute_meta_shap_values(predict_fn, X_explain, baseline_row, d)
     agg = np.abs(phi).mean(axis=0) if mode == "abs" else phi.mean(axis=0)
     return {f: float(agg[i]) for i, f in enumerate(feature_names)}
+
+
+def score_fn_for(metric=DEFAULT_DECISION_METRICS, vus_win=None):
+    """The (y_true, y_scores) -> float scorer matching the GA's fitness.
+
+    Kept beside `combine_metrics` so a weighted spec changes one function
+    rather than every caller.
+    """
+    needed = metrics_required(metric)
+
+    def score(y_true, y_scores):
+        values = {}
+        if 'f1' in needed:
+            values['f1'] = _best_threshold_f1(y_true, y_scores)
+        if 'pr_auc' in needed:
+            values['pr_auc'] = float(prauc(np.asarray(y_true).flatten(),
+                                           np.asarray(y_scores).flatten()))
+        if 'vus' in needed:
+            values['vus'] = (vus_score(y_scores, y_true, vus_win)
+                             if vus_win is not None else float('nan'))
+        value = combine_metrics(metric, values)
+        return _best_threshold_f1(y_true, y_scores) if np.isnan(value) else value
+
+    return score
 
 
 def compute_meta_pfi(
@@ -2127,7 +2173,7 @@ def plot_ga_combination(
     y = np.arange(len(feature_names))
     h = 0.27
     ax_imp.barh(y - h, _norm(shap_abs), height=h, label="mean|SHAP|", color="#1f77b4")
-    ax_imp.barh(y, _norm(pfi_imp), height=h, label="PFI (F1 drop)", color="#ff7f0e")
+    ax_imp.barh(y, _norm(pfi_imp), height=h, label="PFI", color="#ff7f0e")
     ax_imp.barh(y + h, _norm(ale_total), height=h, label="total |ALE|", color="#2ca02c")
     ax_imp.axvline(0, color="black", linewidth=0.6)
     ax_imp.set_yticks(y)
@@ -2319,6 +2365,8 @@ def explain_ga_combination(
     predict_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     max_explain: int = 200,
     explain: bool = False,
+    metric: str = DEFAULT_DECISION_METRICS,
+    vus_win: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Combination-layer explainability: attribute the best-ensemble meta-learner's
@@ -2386,7 +2434,8 @@ def explain_ga_combination(
     phi = compute_meta_shap_values(predict_fn, X_explain, baseline_row, d)
     shap_abs = {f: float(np.abs(phi[:, i]).mean()) for i, f in enumerate(feature_names)}
     shap_signed = {f: float(phi[:, i].mean()) for i, f in enumerate(feature_names)}
-    pfi_imp = compute_meta_pfi(predict_fn, X_test_f, y_true_test, feature_names)
+    pfi_imp = compute_meta_pfi(predict_fn, X_test_f, y_true_test, feature_names,
+                               score_fn=score_fn_for(metric, vus_win))
     # ALE on the FULL test set, matching PFI rather than SHAP's subsample: at
     # ~2*n*d predictions it is an order of magnitude cheaper than the SHAP pass,
     # so subsampling would buy nothing.
@@ -2444,8 +2493,8 @@ def explain_ga_combination(
             vs = f"{v:.6f}" if not np.isnan(v) else "N/A"
             f.write(f"      {f_:<14} {vs:>12} {shap_abs_rank[f_]:>6}\n")
 
-        f.write("\n--- PFI (F1 drop when the detector's column is shuffled; label-based) ---\n")
-        f.write(f"      {'detector':<14} {'F1 drop':>12} {'rank':>6}\n")
+        f.write("\n--- PFI (fitness drop when the detector's column is shuffled; label-based) ---\n")
+        f.write(f"      {'detector':<14} {'drop':>12} {'rank':>6}\n")
         f.write("      " + "-" * 34 + "\n")
         for f_ in sorted(feature_names, key=lambda x: pfi_rank[x]):
             v = pfi_imp[f_]
@@ -2513,7 +2562,7 @@ def explain_ga_combination(
         f.write("\nFinal ranking (Markov): "
                 + " > ".join(f"{r}.{' = '.join(fs)}" for r, fs in groups) + "\n")
         f.write("\nNote: three magnitude measures feed the ranking. mean|SHAP| = the size of the "
-                "detector's influence on the meta-learner's output (label-free); PFI = the F1 drop "
+                "detector's influence on the meta-learner's output (label-free); PFI = the fitness drop "
                 "when its column is shuffled (label-based); total |ALE| = how far the output moves "
                 "in total as the detector sweeps its own observed range (label-free). A "
                 "Markov-chain rank aggregation over the pairwise preferences of all three gives "

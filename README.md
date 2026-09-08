@@ -109,7 +109,9 @@ RAMSeS/
 ├── Explainability/                     # Grounded natural-language explanations
 │   ├── ir.py                           # Intermediate Representation: facts as JSON "atoms"
 │   ├── llm.py                          # LLM client
-│   └── narrate.py                      # Renders the IR into prose
+│   ├── narrate.py                      # Renders the IR into prose
+│   └── verifier.py                     # Scores narratives for hallucination/omission
+│                                       #   against the IR they were generated from
 │
 ├── WebUI/                              # Local Flask UI: configure, watch, explain
 │   ├── server.py                       # Routes, JSON API, SSE progress stream
@@ -401,6 +403,20 @@ python app.py \
                                   #   exist; overrides `overwrite` in the config.
                                   #   Training dominates runtime, so 'false' is
                                   #   much faster.
+  --anomaly_type <name>           # Synthetic anomaly injected at stage 4: spikes
+                                  #   (default), contextual, flip, speedup, noise,
+                                  #   cutoff, scale, wander, average
+  --anomaly_rate <float>          # Target fraction of timesteps labelled anomalous,
+                                  #   in (0, 1]. For 'spikes' this is the per-timestep
+                                  #   injection probability; for other types it sizes
+                                  #   the injected segment. Omit for per-type defaults.
+  --decision_metric <list>        # Metrics the fitness function is built from: f1,
+                                  #   pr_auc (both by default), vus. Each may carry a
+                                  #   weight ('f1:0.5,pr_auc:0.3,vus:0.2'); unweighted
+                                  #   metrics count equally and weights are normalised.
+                                  #   The weighted mean is what the GA, Thompson
+                                  #   Sampling and the final ensemble-vs-single
+                                  #   comparison all maximise.
   --parallel <true|false>         # Enable parallel model selection
   --skip_gan                      # Skip GAN robustness testing (faster; debugging)
   --explain                       # Write explainability reports and plots.
