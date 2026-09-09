@@ -258,11 +258,22 @@ python -c "import torch; print('PyTorch version:', torch.__version__)"
 - **PyOD** 3.6 (outlier detection)
 - **NumPy**, **Pandas**, **Matplotlib** (data processing & visualization)
 - **loguru** (structured logging)
-
 - **Flask** 3.1 (serves the local WebUI)
 
 All 26 dependencies are pinned in `requirements.txt`; `environment.yml`
 installs from it, so the conda and pip routes cannot drift apart.
+
+### On a machine without a GPU
+
+Use `requirements-server.txt` instead. It swaps `tensorflow` for
+`tensorflow-cpu` (230 MB against 616 MB; TensorFlow is used by the GAN
+robustness stage alone) and takes torch from PyTorch's CPU index, avoiding
+~5 GB of `nvidia-*` CUDA runtime that a GPU-less box cannot use. Its header
+documents the reasoning and the exact two-command install.
+
+Do not install both files into one environment: `requirements.txt` brings
+`tensorflow` and `requirements-server.txt` brings `tensorflow-cpu`, and the two
+distributions overwrite each other's `tensorflow` package.
 
 ---
 
@@ -508,6 +519,40 @@ or per run, without editing the config:
 ```bash
 python app.py --detectors LOF_1,CBLOF_3,NN_2 --dataset SKAB --entity 5
 ```
+
+---
+
+## 🧪 Running the Tests
+
+```bash
+python -m pip install pytest     # test-only; not in requirements.txt
+./run_tests.sh                   # everything
+./run_tests.sh Utils WebUI       # only these paths
+```
+
+Three things the script handles that a bare `pytest` invocation does not:
+
+**One process per test module.** `Model_Selection/test_thompson_sampling.py`
+and `Model_Selection/test_rank_aggregation.py` install fake `Metrics`, `Metrics.Ensemble_GA`
+and `Metrics.metrics` entries into `sys.modules` at import time, so they can
+exercise the module under test without pulling in the pipeline. Any test
+sharing that interpreter afterwards receives the stubs instead of the real
+package — running the suite in a single pytest process makes
+`test_reward_domain` fail with "Metrics is not a package".
+
+**`PYTHONPATH` = repo root plus each file's own directory.** The suite mixes
+dotted imports (`from Metrics.metrics import ...`) with bare ones
+(`from Thompson_Sampling import ...`), so neither path alone satisfies it.
+
+**`MPLBACKEND=Agg`.** On a headless machine matplotlib's Qt backend aborts with
+"Could not find the Qt platform plugin xcb".
+
+Expected: **16 modules, ~650 tests and subtests, all passing.**
+
+If you see a wall of `ModuleNotFoundError` for `torchinfo`, `arch`, `timesfm`
+or `dill`, or `Invalid model name: SpectralResidual`, the environment has
+drifted from `requirements.txt` rather than the code being broken — reinstall
+it (see [Installation](#-installation)).
 
 ---
 

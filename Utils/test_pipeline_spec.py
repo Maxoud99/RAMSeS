@@ -415,8 +415,18 @@ class TestFamilies(unittest.TestCase):
             alone = windowed.score_windows(model, probe)[0]
             with_a = windowed.score_windows(model, t.cat([probe, pad_a]))[0]
             with_b = windowed.score_windows(model, t.cat([probe, pad_b]))[0]
-            self.assertAlmostEqual(alone, with_a, places=6, msg=family)
-            self.assertAlmostEqual(with_a, with_b, places=6, msg=family)
+            # Scaled, not absolute. These scores are float32, where one ulp
+            # at 8.64 is 9.54e-07 — larger than the 5e-07 that `places=6`
+            # allows — so AutoEncoder failed on two ADJACENT floats, the
+            # closest a float32 can come to agreeing. The tolerance has to
+            # track magnitude. Ten ulps of slack still catches a real batch
+            # dependency: that moves a score by orders of magnitude more than
+            # a reduction-order wobble, which is all this can now absorb.
+            def _tol(value):
+                return max(abs(value) * 1e-6, 1e-6)
+
+            self.assertAlmostEqual(alone, with_a, delta=_tol(alone), msg=family)
+            self.assertAlmostEqual(with_a, with_b, delta=_tol(with_a), msg=family)
         self.assertGreaterEqual(checked, 5, "no pyod-backed family was checked")
 
     def test_detector_names_match_what_the_generic_trainer_writes(self):

@@ -133,7 +133,8 @@ def get_args_from_cmdline():
                         type=str,
                         default=None,
                         help="Comma-separated base detectors to select among, e.g. "
-                             "'LOF_1,NN_2,CBLOF_3'. Default: all 11. Only the families of the "
+                             "'LOF_1,NN_2,CBLOF_3'. Default: every detector in "
+                             "Utils.pipeline_spec.ALL_DETECTORS. Only the families of the "
                              "requested detectors are trained. Detectors with no trained model "
                              "for the chosen dataset/entity are skipped with a warning; at least "
                              "two must remain.")
