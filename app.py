@@ -1421,8 +1421,9 @@ def perform_reoptimization_task(
 def run_app(algorithm_list, algorithm_list_instances):
     args = get_args_from_cmdline()
 
-    # Get dataset and entity from args (command line overrides, or use defaults)
-    dataset = args.get('dataset', 'skab')
+    # Get dataset and entity from args (command line overrides, or use defaults).
+
+    dataset = str(args.get('dataset', 'skab')).lower()
     entity = str(args.get('entity', '3'))
     use_parallel = args.get('parallel', False)
     enable_online_phase = args.get('enable_online', False)  # Online phase OFF by default

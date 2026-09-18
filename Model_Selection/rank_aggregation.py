@@ -25,6 +25,7 @@ from scipy.stats import kendalltau
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import MinMaxScaler
+from Utils.pipeline_spec import dataset_label
 
 logger = logging.getLogger(__name__)
 
@@ -774,7 +775,7 @@ def explain_rank_aggregation_kendall_only(
     with open(report_path, "w") as f:
         f.write(f"=== Rank Aggregation Explainability (Kendall-tau-only method) "
                 f"— {stage_name} stage ===\n")
-        f.write(f"Dataset: {dataset}  |  Entity: {entity}  |  Iteration: {iteration}\n")
+        f.write(f"Dataset: {dataset_label(dataset)}  |  Entity: {entity}  |  Iteration: {iteration}\n")
         f.write(f"Sources (n=2): {', '.join(source_names)}\n")
         f.write(f"Final ranking: {full_ranking}\n\n")
         f.write("This method applies only when exactly two ranking lists feed the\n")
@@ -856,7 +857,7 @@ def explain_rank_aggregation(
     )
     with open(report_path, "w") as f:
         f.write(f"=== Rank Aggregation Explainability — {stage_name} stage ===\n")
-        f.write(f"Dataset: {dataset}  |  Entity: {entity}  |  Iteration: {iteration}\n")
+        f.write(f"Dataset: {dataset_label(dataset)}  |  Entity: {entity}  |  Iteration: {iteration}\n")
         f.write(f"Sources (n={len(source_names)}): {', '.join(source_names)}\n")
         f.write(f"Final ranking: {full_ranking}\n\n")
 
