@@ -266,6 +266,18 @@ def detectors_for(dataset: str, entity: str) -> List[Dict[str, Any]]:
     return out
 
 
+def is_presplit(directory: Path) -> bool:
+    """true - train/ test/ test_label/ split exists."""
+    return all((directory / sub).is_dir()
+               for sub in ("train", "test", "test_label"))
+
+
+def _preferred_label(key: str, dirs: List[Path]) -> str:
+    if str(key).lower() in DATASET_LABELS:
+        return dataset_label(key)
+    return dirs[0].name if dirs else dataset_label(key)
+
+
 def _dataset_dirs() -> Dict[str, List[Path]]:
     """dataset key -> every directory that holds it, across both roots.
 
@@ -286,7 +298,8 @@ def _dataset_dirs() -> Dict[str, List[Path]]:
             if not child.is_dir():
                 continue
             key = DIRECTORY_ALIASES.get(child.name.lower(), child.name.lower())
-            if key not in VALID_DATASETS:
+            if (key not in VALID_DATASETS and not is_presplit(child)
+                    and key not in out):
                 continue      # NASA/, TCPD/ — present but not loadable
             out.setdefault(key, []).append(child)
     return out
@@ -356,8 +369,8 @@ def datasets() -> List[Dict[str, Any]]:
             # aliases it, so the canonical key is always safe to pass.
             "name": key,
             "key": key,
-            "label": display_name(key),
-            "runnable": key not in UNRUNNABLE,
+            "label": _preferred_label(key, dirs),
+            "runnable": key not in UNRUNNABLE or any(is_presplit(d) for d in dirs),
             "n_entities": len(entities),
             "directories": [d.name for d in dirs],
         })
