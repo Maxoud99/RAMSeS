@@ -3,7 +3,7 @@ Tests for the WebUI backend.
 
 Follows the repo's test style (unittest, no network). Every test builds a
 synthetic artifact tree in a temporary directory and repoints WebUI.paths at
-it, so nothing depends on the contents of the real myresults/ and no test ever
+it, so nothing depends on the contents of the real results/ and no test ever
 starts the pipeline or the LLM.
 """
 
@@ -93,21 +93,21 @@ class ArtifactTreeCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
-        self.myresults = root / "myresults"
-        self.ir_dir = self.myresults / "explanations_ir" / self.DATASET / self.ENTITY
-        self.nl_dir = self.myresults / "explanations_nl" / self.DATASET / self.ENTITY
-        self.report_dir = self.myresults / "comprehensive" / self.DATASET / self.ENTITY
-        self._saved = (paths.MYRESULTS, paths.EXPLANATIONS_IR, paths.EXPLANATIONS_NL,
+        self.results_root = root / "results"
+        self.ir_dir = self.results_root / "explanations_ir" / self.DATASET / self.ENTITY
+        self.nl_dir = self.results_root / "explanations_nl" / self.DATASET / self.ENTITY
+        self.report_dir = self.results_root / "comprehensive" / self.DATASET / self.ENTITY
+        self._saved = (paths.RESULTS, paths.EXPLANATIONS_IR, paths.EXPLANATIONS_NL,
                        paths.COMPREHENSIVE)
-        paths.MYRESULTS = self.myresults
-        paths.EXPLANATIONS_IR = self.myresults / "explanations_ir"
-        paths.EXPLANATIONS_NL = self.myresults / "explanations_nl"
-        paths.COMPREHENSIVE = self.myresults / "comprehensive"
+        paths.RESULTS = self.results_root
+        paths.EXPLANATIONS_IR = self.results_root / "explanations_ir"
+        paths.EXPLANATIONS_NL = self.results_root / "explanations_nl"
+        paths.COMPREHENSIVE = self.results_root / "comprehensive"
         artifacts.paths = paths
         self.build()
 
     def tearDown(self):
-        (paths.MYRESULTS, paths.EXPLANATIONS_IR, paths.EXPLANATIONS_NL,
+        (paths.RESULTS, paths.EXPLANATIONS_IR, paths.EXPLANATIONS_NL,
          paths.COMPREHENSIVE) = self._saved
         self._tmp.cleanup()
 
@@ -1483,23 +1483,23 @@ class TestPlots(unittest.TestCase):
         from WebUI import plots
         self.plots = plots
         self._tmp = tempfile.TemporaryDirectory()
-        self.myresults = Path(self._tmp.name) / "myresults"
-        self._saved = paths.MYRESULTS
-        paths.MYRESULTS = self.myresults
+        self.results_root = Path(self._tmp.name) / "results"
+        self._saved = paths.RESULTS
+        paths.RESULTS = self.results_root
 
     def tearDown(self):
-        paths.MYRESULTS = self._saved
+        paths.RESULTS = self._saved
         self._tmp.cleanup()
 
     def _touch(self, rel):
-        p = self.myresults / rel
+        p = self.results_root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"\x89PNG")
         return p
 
     def test_dedupe_keeps_newest_of_each_real_pattern(self):
         """The four naming irregularities that actually occur on disk."""
-        d = self.myresults / "robustness" / "off_by" / "SKAB" / "7"
+        d = self.results_root / "robustness" / "off_by" / "SKAB" / "7"
         files = []
         for ts in ("2026-01-01_00-00-00", "2026-08-05_19-19-42", "2026-03-02_11-11-11"):
             # off-by: trailing underscore, and a literal SPACE in the stem
@@ -1750,26 +1750,26 @@ class TestSafeMediaPath(unittest.TestCase):
         from WebUI import plots
         self.plots = plots
         self._tmp = tempfile.TemporaryDirectory()
-        self.myresults = Path(self._tmp.name) / "myresults"
-        (self.myresults / "GA_Ens").mkdir(parents=True)
-        self.png = self.myresults / "GA_Ens" / "plot.png"
+        self.results_root = Path(self._tmp.name) / "results"
+        (self.results_root / "GA_Ens").mkdir(parents=True)
+        self.png = self.results_root / "GA_Ens" / "plot.png"
         self.png.write_bytes(b"\x89PNG")
         self.secret = Path(self._tmp.name) / "secret.png"
         self.secret.write_bytes(b"\x89PNG")
-        (self.myresults / "model.pth").write_bytes(b"x")
-        (self.myresults / "report.json").write_text("{}")
-        self._saved = paths.MYRESULTS
-        paths.MYRESULTS = self.myresults
+        (self.results_root / "model.pth").write_bytes(b"x")
+        (self.results_root / "report.json").write_text("{}")
+        self._saved = paths.RESULTS
+        paths.RESULTS = self.results_root
 
     def tearDown(self):
-        paths.MYRESULTS = self._saved
+        paths.RESULTS = self._saved
         self._tmp.cleanup()
 
     def test_serves_a_png_inside_the_tree(self):
         self.assertIsNotNone(self.plots.safe_media_path("GA_Ens/plot.png"))
 
     def test_bracketed_filename_is_servable(self):
-        odd = self.myresults / "GA_Ens" / "ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png"
+        odd = self.results_root / "GA_Ens" / "ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png"
         odd.write_bytes(b"\x89PNG")
         self.assertIsNotNone(self.plots.safe_media_path(
             "GA_Ens/ensemble_scores_SKAB_7_Data_vs_anomalies_['spikes'].png"))
@@ -1782,7 +1782,7 @@ class TestSafeMediaPath(unittest.TestCase):
     def test_rejects_a_symlink_pointing_outside(self):
         """resolve() runs before the containment check, so a symlink out of the
         tree is caught — send_from_directory alone would follow it."""
-        link = self.myresults / "GA_Ens" / "escape.png"
+        link = self.results_root / "GA_Ens" / "escape.png"
         try:
             link.symlink_to(self.secret)
         except (OSError, NotImplementedError):
@@ -2063,10 +2063,10 @@ class TestJobLifecycle(unittest.TestCase):
         self.jobs = jobs
         self._tmp = tempfile.TemporaryDirectory()
         # COMPREHENSIVE too: the report decides whether a finished job links to
-        # it, and a test must never read the developer's real myresults/ tree.
+        # it, and a test must never read the developer's real results/ tree.
         self._saved = (paths.WEBUI_LOGS, paths.COMPREHENSIVE)
         paths.WEBUI_LOGS = Path(self._tmp.name) / "webui_logs"
-        paths.COMPREHENSIVE = Path(self._tmp.name) / "myresults" / "comprehensive"
+        paths.COMPREHENSIVE = Path(self._tmp.name) / "results" / "comprehensive"
         self.mgr = jobs.JobManager(repo_root=Path(self._tmp.name))
 
     def tearDown(self):
@@ -2367,7 +2367,7 @@ class TestRoutes(ArtifactTreeCase):
         self.assertIn("event: status", body)     # already finished -> closes
 
     def test_media_route_enforces_the_path_rules(self):
-        png = self.myresults / "GA_Ens" / "x.png"
+        png = self.results_root / "GA_Ens" / "x.png"
         png.parent.mkdir(parents=True, exist_ok=True)
         png.write_bytes(b"\x89PNG\r\n\x1a\n")
         self.assertEqual(self.client.get("/media/GA_Ens/x.png").status_code, 200)
@@ -2407,16 +2407,16 @@ class TestOnDemandRankingGap(unittest.TestCase):
         from WebUI import ondemand
         self.ondemand = ondemand
         self._tmp = tempfile.TemporaryDirectory()
-        self.myresults = Path(self._tmp.name) / "myresults"
-        self._saved = paths.MYRESULTS
-        paths.MYRESULTS = self.myresults
+        self.results_root = Path(self._tmp.name) / "results"
+        self._saved = paths.RESULTS
+        paths.RESULTS = self.results_root
 
     def tearDown(self):
-        paths.MYRESULTS = self._saved
+        paths.RESULTS = self._saved
         self._tmp.cleanup()
 
     def _write_ir(self, shares):
-        d = self.myresults / "explanations_ir" / "SKAB" / "7"
+        d = self.results_root / "explanations_ir" / "SKAB" / "7"
         d.mkdir(parents=True, exist_ok=True)
         doc = {"ir_version": "1.0", "stage": "thompson_ranking", "dataset": "SKAB",
                "entity": "7", "output": {}, "evidence": [], "caveats": [],
@@ -2481,12 +2481,12 @@ class TestOnDemandPerWindowFrames(unittest.TestCase):
         self.ondemand, self.plots = ondemand, plots
         self.ondemand._PW_CACHE.clear()
         self._tmp = tempfile.TemporaryDirectory()
-        self.myresults = Path(self._tmp.name) / "myresults"
-        self._saved = paths.MYRESULTS
-        paths.MYRESULTS = self.myresults
+        self.results_root = Path(self._tmp.name) / "results"
+        self._saved = paths.RESULTS
+        paths.RESULTS = self.results_root
 
     def tearDown(self):
-        paths.MYRESULTS = self._saved
+        paths.RESULTS = self._saved
         self.ondemand._PW_CACHE.clear()
         self._tmp.cleanup()
 
@@ -2513,7 +2513,7 @@ class TestOnDemandPerWindowFrames(unittest.TestCase):
                      "ranking": [frame(t, 2.0) for t in range(self.N_WINDOWS)]},
         }
         doc.update(overrides)
-        d = self.myresults / "Thomposon" / "SKAB" / "7"
+        d = self.results_root / "Thomposon" / "SKAB" / "7"
         d.mkdir(parents=True, exist_ok=True)
         (d / "per_window_channels_50.json").write_text(json.dumps(doc))
         (d / "expected_rewards_50.png").write_bytes(b"\x89PNG")
@@ -2570,7 +2570,7 @@ class TestOnDemandPerWindowFrames(unittest.TestCase):
     def test_older_runs_still_list_their_folders(self):
         """No document means a tree written before this existed; those frames
         are still PNGs on disk and are listed the way they always were."""
-        d = self.myresults / "Thomposon" / "SKAB" / "7"
+        d = self.results_root / "Thomposon" / "SKAB" / "7"
         (d / "shap_per_window_50").mkdir(parents=True)
         (d / "expected_rewards_50.png").write_bytes(b"\x89PNG")
         for i in range(5):
@@ -2594,13 +2594,13 @@ class TestOnDemandPerWindowFrames(unittest.TestCase):
 
     def test_nothing_is_written_to_the_result_tree(self):
         """Same guarantee the ranking-gap figure carries: a browsing session
-        cannot litter myresults/ or race a run writing into it."""
+        cannot litter results/ or race a run writing into it."""
         self._write_doc()
         before = sorted(p.name for p in
-                        (self.myresults / "Thomposon" / "SKAB" / "7").iterdir())
+                        (self.results_root / "Thomposon" / "SKAB" / "7").iterdir())
         self.ondemand.render_per_window("SKAB", "7", "ranking", 1, "all")
         after = sorted(p.name for p in
-                       (self.myresults / "Thomposon" / "SKAB" / "7").iterdir())
+                       (self.results_root / "Thomposon" / "SKAB" / "7").iterdir())
         self.assertEqual(before, after)
 
 
@@ -2615,16 +2615,16 @@ class TestOffByTreeSelector(unittest.TestCase):
         from WebUI import plots
         self.plots = plots
         self._tmp = tempfile.TemporaryDirectory()
-        self.myresults = Path(self._tmp.name) / "myresults"
-        self._saved = paths.MYRESULTS
-        paths.MYRESULTS = self.myresults
+        self.results_root = Path(self._tmp.name) / "results"
+        self._saved = paths.RESULTS
+        paths.RESULTS = self.results_root
 
     def tearDown(self):
-        paths.MYRESULTS = self._saved
+        paths.RESULTS = self._saved
         self._tmp.cleanup()
 
     def _touch(self, rel):
-        p = self.myresults / rel
+        p = self.results_root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"\x89PNG")
 
@@ -2667,7 +2667,7 @@ class TestOffByTreeSelector(unittest.TestCase):
             self._touch(f"{base}/skab_7_off_by_point_tree_CBLOF_4_vs_{competitor}.png")
         # Make the CBLOF_4 set unambiguously the newer one.
         for competitor in ("LOF_1", "NN_1", "NN_3"):
-            p = self.myresults / base / f"skab_7_off_by_point_tree_CBLOF_4_vs_{competitor}.png"
+            p = self.results_root / base / f"skab_7_off_by_point_tree_CBLOF_4_vs_{competitor}.png"
             os.utime(p, (p.stat().st_atime + 60, p.stat().st_mtime + 60))
         headline, _ = self.plots._off_by("SKAB", "7")
         picker = next(f for f in headline if "variants" in f)
@@ -2699,16 +2699,16 @@ class TestGanPlotSelector(unittest.TestCase):
         from WebUI import plots
         self.plots = plots
         self._tmp = tempfile.TemporaryDirectory()
-        self.myresults = Path(self._tmp.name) / "myresults"
-        self._saved = paths.MYRESULTS
-        paths.MYRESULTS = self.myresults
+        self.results_root = Path(self._tmp.name) / "results"
+        self._saved = paths.RESULTS
+        paths.RESULTS = self.results_root
 
     def tearDown(self):
-        paths.MYRESULTS = self._saved
+        paths.RESULTS = self._saved
         self._tmp.cleanup()
 
     def _touch(self, rel):
-        p = self.myresults / rel
+        p = self.results_root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"\x89PNG")
         return p
@@ -2739,7 +2739,7 @@ class TestGanPlotSelector(unittest.TestCase):
         for competitor in ("LOF_1", "NN_1", "NN_3"):
             self._touch(f"{base}/skab_7_gan_point_tree_CBLOF_4_vs_{competitor}.png")
         for competitor in ("LOF_1", "NN_1", "NN_3"):
-            p = self.myresults / base / f"skab_7_gan_point_tree_CBLOF_4_vs_{competitor}.png"
+            p = self.results_root / base / f"skab_7_gan_point_tree_CBLOF_4_vs_{competitor}.png"
             os.utime(p, (p.stat().st_atime + 60, p.stat().st_mtime + 60))
         headline, _ = self.plots._gan("SKAB", "7")
         picker = next(f for f in headline if "variants" in f)

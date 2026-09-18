@@ -8,14 +8,15 @@ import json
 import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
+from Utils.paths import results_root
 
 class ResultsFormatter:
     """Handles formatting and saving of model selection results with timing analysis"""
     
-    def __init__(self, dataset: str, entity: str, output_dir: str = "myresults"):
+    def __init__(self, dataset: str, entity: str, output_dir: str = None):
         self.dataset = dataset
         self.entity = entity
-        self.output_dir = output_dir
+        self.output_dir = output_dir or str(results_root())
         self.timings = {}
         self.results = {}
         self.start_time = time.time()

@@ -15,8 +15,8 @@ from typing import Any, Dict, List, Optional
 
 from WebUI import paths
 
-# Trees the plots live under, relative to myresults/. "Thomposon" is a typo in
-# the pipeline that is load-bearing — every writer uses it; myresults/Thompson/
+# Trees the plots live under, relative to results/. "Thomposon" is a typo in
+# the pipeline that is load-bearing — every writer uses it; results/Thompson/
 # is a stale leftover.
 TREE_GA = "GA_Ens"
 TREE_THOMPSON = "Thomposon"
@@ -40,8 +40,8 @@ _GAN_TREE_RE = re.compile(r"_gan_point_tree_(?P<winner>.+?)_vs_(?P<competitor>.+
 
 
 def _dir_for(tree: str, dataset: str, entity: str) -> Optional[Path]:
-    """`myresults/{tree}/{dataset}/{entity}`, both name levels case-insensitive."""
-    root = paths.MYRESULTS
+    """`results/{tree}/{dataset}/{entity}`, both name levels case-insensitive."""
+    root = paths.RESULTS
     for part in tree.split("/"):
         root = root / part
     return paths.resolve_entity_dir(root, dataset, entity)
@@ -95,7 +95,7 @@ def _iteration_tag(directory: Optional[Path]) -> Optional[str]:
 
 def _fig(path: Path, title: str, caption: str = "", **extra) -> Dict[str, Any]:
     fig = {"title": title, "caption": caption,
-           "src": "/media/" + paths.rel_to_myresults(path).replace(os.sep, "/"),
+           "src": "/media/" + paths.rel_to_results(path).replace(os.sep, "/"),
            "name": path.name}
     fig.update(extra)
     return fig
@@ -714,7 +714,7 @@ ALLOWED_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 
 
 def safe_media_path(relpath: str) -> Optional[Path]:
-    """Resolve a /media/<relpath> request, or None if it escapes myresults/.
+    """Resolve a /media/<relpath> request, or None if it escapes results/.
 
     `resolve()` runs BEFORE the containment check so it defeats both `..` and
     symlinks pointing outside the tree (send_from_directory alone stops the
@@ -725,7 +725,7 @@ def safe_media_path(relpath: str) -> Optional[Path]:
         return None
     if len(relpath) > 3 and relpath[1] == ":":      # Windows drive-absolute
         return None
-    root = paths.MYRESULTS.resolve()
+    root = paths.RESULTS.resolve()
     try:
         candidate = (root / relpath).resolve()
     except (OSError, RuntimeError):

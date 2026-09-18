@@ -17,6 +17,7 @@ from Utils.model_selection_utils import evaluate_model, ScoringTimeout
 from Utils.pipeline_spec import DEFAULT_DECISION_METRICS, metrics_required
 from Explainability import ir
 from Model_Selection.Sensitivity_robustness import exclusive_win_surrogates as ews
+from Utils.paths import results_dir
 
 
 # Define the generator and discriminator models for GAN
@@ -402,7 +403,7 @@ def run_Gan(test_data, trained_models, model_names, dataset, entity, explain=Fal
     plt.grid(True)
 
     # Specify the directory
-    directory = f'myresults/robustness/GAN/{dataset}/{entity}/'
+    directory = results_dir("robustness", "GAN", dataset, entity)
     filename = f'{dataset}_{entity}_Misclassified_Anomalies_{date_time_string}_.png'
     full_path = os.path.join(directory, filename)
 
@@ -463,7 +464,7 @@ def plot_data_with_injected_points(original_data, augmented_data, injected_norma
 
     # Format the date and time as a string
     date_time_string = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    directory = f'myresults/robustness/GAN/{dataset}/{entity}/'
+    directory = results_dir("robustness", "GAN", dataset, entity)
     filename = f'{dataset}_{entity}_Data_vs_DataWithAnomalies_{date_time_string}.png'
     full_path = os.path.join(directory, filename)
 
@@ -550,7 +551,7 @@ def train_gan_point_surrogates(table, winner, max_depth: int = 3,
 # ── Plots ────────────────────────────────────────────────────────────────────
 
 def _gan_explain_dir(dataset, entity) -> str:
-    directory = f"myresults/robustness/GAN/{dataset}/{entity}/"
+    directory = results_dir("robustness", "GAN", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     return directory
 
@@ -579,7 +580,7 @@ def explain_gan_robustness(point_records, adjusted_y_pred_dict, true_labels, ran
     """
     GAN robustness explainability orchestrator (explain-only). Builds the per-point
     table from the production run, picks the F1 winner, fits per-competitor exclusive-win
-    surrogates, writes a report + two plots under myresults/robustness/GAN/{ds}/{ent}/,
+    surrogates, writes a report + two plots under results/robustness/GAN/{ds}/{ent}/,
     and returns the structures. explain=False → None; infeasible table → None.
 
     The body is `exclusive_win_surrogates.explain_exclusive_win_stage`, shared

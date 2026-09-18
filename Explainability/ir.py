@@ -43,6 +43,7 @@ from Utils.pipeline_spec import (decision_metric_formula, decision_metric_label,
                                  metric_weights, ranking_metrics_for)
 
 import numpy as np
+from Utils.paths import results_dir
 
 IR_VERSION = "1.0"
 NOT_AVAILABLE = "not_available"
@@ -293,8 +294,9 @@ def _envelope(stage: str, dataset: str, entity: str, output: Dict[str, Any],
 
 
 def write_stage_ir(ir: Dict[str, Any], dataset: str, entity: str, filename: str,
-                   base_dir: str = "myresults/explanations_ir") -> str:
-    directory = os.path.join(base_dir, str(dataset), str(entity))
+                   base_dir: str = None) -> str:
+    directory = os.path.join(base_dir or results_dir("explanations_ir"),
+                             str(dataset), str(entity))
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{filename}.json")
     with open(path, "w") as f:
@@ -2296,7 +2298,7 @@ _STAGE_FILES = {
 
 def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
                        iteration: int,
-                       base_dir: str = "myresults/explanations_ir") -> str:
+                       base_dir: str = None) -> str:
     """
     Combine the per-stage IR JSONs (written by each explainability orchestrator)
     with the pipeline's decision context into ir_global_iter{iteration}.json.
@@ -2309,7 +2311,8 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     narrative is prompted from canonical sentences rather than key:value dumps
     and its omissions are measurable like any stage's.
     """
-    directory = os.path.join(base_dir, str(dataset), str(entity))
+    directory = os.path.join(base_dir or results_dir("explanations_ir"),
+                             str(dataset), str(entity))
 
     def _load(fname: str, pattern: Optional[str] = None) -> Optional[Dict[str, Any]]:
         path = os.path.join(directory, f"{fname}.json")

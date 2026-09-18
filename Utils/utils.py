@@ -3,6 +3,7 @@ import torch as t
 import matplotlib.pyplot as plt
 from argparse import ArgumentParser
 from Utils.config import Config
+from Utils import paths as ramses_paths
 from Utils.pipeline_spec import (parse_anomaly_rate, parse_anomaly_type,
                                  parse_decision_metrics, parse_detectors,
                                  parse_stages)
@@ -149,7 +150,11 @@ def get_args_from_cmdline():
         config_file = config_path
     
     args = Config(config_file_path=config_file).parse()
-    
+
+    for _key in ('dataset_path', 'trained_model_path', 'results_path'):
+        args[_key] = str(ramses_paths.resolve(args.get(_key),
+                                              ramses_paths.DEFAULTS[_key]))
+
     # Override with command line arguments if provided
     if cmd_args.dataset is not None:
         args['dataset'] = cmd_args.dataset

@@ -63,6 +63,7 @@ from Utils.pipeline_spec import (
 from Utils.pipeline_spec import ALL_STAGES as _SPEC_ALL_STAGES
 from Utils.pipeline_spec import OFFLINE_ITERATION as _SPEC_OFFLINE_ITERATION
 from Utils.utils import get_args_from_cmdline
+from Utils.paths import results_dir
 # from comprehensive_results_writer import write_comprehensive_results
 
 # ------------------------------------------------------------------------------
@@ -901,7 +902,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     # -----------------------
     # Persist a concise report
     # -----------------------
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(
         directory, f"robust_aggregated_results_{dataset}_{entity}_{iteration}.txt"
@@ -1154,7 +1155,7 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
                      f"(Peak: unavailable on this platform)")
 
     # Persist results
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(
         directory, f"robust_aggregated_results_{dataset}_{entity}_{iteration}.txt"
@@ -1261,7 +1262,7 @@ def save_current_selection(dataset, entity, window_idx, best_ensemble, best_sing
     from pathlib import Path
     
     # Create output directory
-    output_dir = Path(f"results/{dataset}/{entity}")
+    output_dir = Path(results_dir("online", dataset, entity))
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # CSV file for tracking selections over time
@@ -1317,7 +1318,7 @@ def find_num_falses(adjusted_y_pred_ind_current, test_data_copy, dataset, entity
         incorrect = predicted_int != true_values
         misclassified_ensemble.append(int(np.sum(incorrect)))
 
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(
         directory, f"new_robust_aggregated_results_{dataset}_{entity}_{iteration}.txt"
@@ -1589,7 +1590,7 @@ def run_app(algorithm_list, algorithm_list_instances):
         axes[1].plot(test_data.entities[0].labels.flatten(), color='red')
         axes[1].set_title('Anomaly Scores', fontsize=16)
 
-        out_dir = f"myresults/GA_Ens/{dataset}/{entity}/"
+        out_dir = results_dir("GA_Ens", dataset, entity)
         os.makedirs(out_dir, exist_ok=True)
         # The anomaly type used to be in this name, so switching type accumulated
         # variants in the gallery instead of replacing the previous run's figure.
@@ -1929,7 +1930,7 @@ def run_app(algorithm_list, algorithm_list_instances):
 
         logger.info("📝 STAGE 7/7: Writing Comprehensive Results...")
         # Write comprehensive results
-        comp_results_dir = f"myresults/comprehensive/{dataset}/{entity}/"
+        comp_results_dir = results_dir("comprehensive", dataset, entity)
         os.makedirs(comp_results_dir, exist_ok=True)
         comp_results_file = os.path.join(
             comp_results_dir, f"comprehensive_results_{dataset}_{entity}_iter{iteration}.txt"
@@ -2200,7 +2201,7 @@ def run_app(algorithm_list, algorithm_list_instances):
             logger.info(f"⏱️  Online Phase Total Time: {online_total_time:.2f}s ({online_total_time/60:.2f} min)")
             
             # Write online phase summary
-            online_summary_file = f"myresults/comprehensive/{dataset}/{entity}/online_phase_timing.txt"
+            online_summary_file = results_dir("comprehensive", dataset, entity) + f"online_phase_timing.txt"
             with open(online_summary_file, 'w') as f:
                 f.write("="*80 + "\n")
                 f.write("RAMSeS Online Phase Timing Summary\n")

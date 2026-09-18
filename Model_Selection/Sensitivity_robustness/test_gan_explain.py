@@ -23,6 +23,8 @@ import unittest
 
 import numpy as np
 import matplotlib
+import pathlib
+from Utils import paths as ramses_paths
 matplotlib.use("Agg")
 
 
@@ -396,12 +398,13 @@ class TestOrchestrator(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cwd = os.getcwd()
             os.chdir(tmp)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmp) / "results"
             try:
                 res = gt.explain_gan_robustness(recs, ad, true_labels, ["A", "B"],
                                                 ["A", "B"], "TEST", "e1", explain=True)
                 self.assertIsInstance(res, dict)
                 self.assertEqual(res["winner"], "A")
-                out = os.path.join("myresults", "robustness", "GAN", "TEST", "e1")
+                out = os.path.join("results", "robustness", "GAN", "TEST", "e1")
                 for fname in (
                     "TEST_e1_gan_explainability.txt",
                     "TEST_e1_gan_point_tree_A_vs_B.png",
@@ -413,7 +416,7 @@ class TestOrchestrator(unittest.TestCase):
                 self.assertIn("held-out accuracy", report_txt.lower())
                 # Intermediate Representation JSON is emitted alongside.
                 import json
-                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                ir_path = os.path.join("results", "explanations_ir", "TEST", "e1",
                                        "ir_gan.json")
                 self.assertTrue(os.path.exists(ir_path), ir_path)
                 with open(ir_path) as fh:
@@ -422,7 +425,7 @@ class TestOrchestrator(unittest.TestCase):
                 self.assertEqual(ir_doc["output"]["winner"], "A")
             finally:
                 os.chdir(cwd)
-
+                ramses_paths.reset_cache()
     def test_explain_false_returns_none(self):
         recs, ad, true_labels = self._materials()
         self.assertIsNone(gt.explain_gan_robustness(recs, ad, true_labels, ["A", "B"],

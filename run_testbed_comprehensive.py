@@ -26,6 +26,7 @@ import re
 from collections import defaultdict
 import logging
 from typing import Dict, List, Tuple
+from Utils.paths import results_dir
 
 # Setup logging
 logging.basicConfig(
@@ -242,7 +243,7 @@ class TestbedRunner:
         
         # Check if results already exist (use lowercase domain for consistency)
         domain_lower = domain.lower()
-        results_file = f"myresults/comprehensive/{domain_lower}/{entity}/comprehensive_results_{domain_lower}_{entity}_iter0.txt"
+        results_file = results_dir("comprehensive", domain_lower, entity) + f"comprehensive_results_{domain_lower}_{entity}_iter0.txt"
         logger.info(f"  Checking for existing results: {results_file}")
         
         if os.path.exists(results_file):
@@ -417,7 +418,7 @@ class TestbedRunner:
         return None
         
         # Find and parse comprehensive results
-        results_file = f"myresults/comprehensive/{domain}/{entity}/comprehensive_results_{domain}_{entity}_iter0.txt"
+        results_file = results_dir("comprehensive", domain, entity) + f"comprehensive_results_{domain}_{entity}_iter0.txt"
         metrics = self.parse_comprehensive_results(results_file)
         
         # Add memory and total time info

@@ -22,7 +22,7 @@ The contract that makes this safe:
   * Titles, axis labels and footnotes for the per-window frames travel IN the
     persisted file (`kinds`), written by the producer, so this module formats
     them rather than restating them.
-  * Nothing is written to `myresults/`. These bytes are a response, so a
+  * Nothing is written to `results/`. These bytes are a response, so a
     browsing session cannot litter the result tree or race the pipeline.
   * matplotlib is imported lazily and pinned to Agg. The web process should not
     pay for it, or try to open a window, unless someone asks for a figure.
@@ -44,7 +44,7 @@ TOP_N_CONTEXT_FEATURES = 12
 
 
 def _ir_path(dataset: str, entity: str, stem: str):
-    root = paths.MYRESULTS / "explanations_ir"
+    root = paths.RESULTS / "explanations_ir"
     directory = paths.resolve_entity_dir(root, dataset, entity)
     if directory is None:
         return None
@@ -155,7 +155,7 @@ def per_window_document(dataset: str, entity: str) -> Optional[Dict[str, Any]]:
     `*_per_window_*` folders are still on disk rather than treating it as an
     error.
     """
-    directory = paths.resolve_entity_dir(paths.MYRESULTS / "Thomposon", dataset, entity)
+    directory = paths.resolve_entity_dir(paths.RESULTS / "Thomposon", dataset, entity)
     if directory is None:
         return None
     candidates = sorted(directory.glob("per_window_channels_*.json"))

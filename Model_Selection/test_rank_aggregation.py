@@ -41,6 +41,9 @@ sys.modules["sklearn.cluster"].AgglomerativeClustering = type("AgglomerativeClus
 sys.modules["sklearn.neighbors"].NearestNeighbors = type("NearestNeighbors", (), {})
 sys.modules["sklearn.preprocessing"].MinMaxScaler = type("MinMaxScaler", (), {})
 
+import pathlib
+from Utils import paths as ramses_paths
+
 # ── Import the module under test ────────────────────────────────────────────
 from rank_aggregation import (
     enhanced_markov_chain_rank_aggregator_text,
@@ -311,6 +314,7 @@ class TestExplainRankAggregationIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd_before = os.getcwd()
             os.chdir(tmpdir)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
             try:
                 result = explain_rank_aggregation(
                     rankings=sources,
@@ -329,21 +333,21 @@ class TestExplainRankAggregationIntegration(unittest.TestCase):
                 # 3 sources → the Kendall-only method does not apply.
                 self.assertIsNone(result["kendall_only"])
 
-                out_dir = os.path.join("myresults", "robust_aggregated", "TEST", "e1")
+                out_dir = os.path.join("results", "robust_aggregated", "TEST", "e1")
                 self.assertTrue(os.path.exists(
                     os.path.join(out_dir, "aggregation_explainability_robust_0.png")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out_dir, "aggregation_explainability_robust_0.txt")))
                 # Intermediate Representation JSON is emitted alongside.
                 import json
-                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                ir_path = os.path.join("results", "explanations_ir", "TEST", "e1",
                                        "ir_rank_aggregation_robust_0.json")
                 self.assertTrue(os.path.exists(ir_path), ir_path)
                 with open(ir_path) as fh:
                     self.assertEqual(json.load(fh)["stage"], "rank_aggregation_robust")
             finally:
                 os.chdir(cwd_before)
-
+                ramses_paths.reset_cache()
     def test_explain_false_is_noop_and_returns_none(self):
         result = explain_rank_aggregation(
             rankings=[["A"], ["B"]],
@@ -380,11 +384,13 @@ class TestKendallOnly(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = os.getcwd()
             os.chdir(tmpdir)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
             try:
                 result = explain_rank_aggregation_kendall_only(
                     sources, names, full, "final", "TEST", "e1", 5)
             finally:
                 os.chdir(cwd)
+                ramses_paths.reset_cache()
         self.assertIsNotNone(result)
         self.assertEqual(result["winner"], "aligned")
         self.assertAlmostEqual(result["winner_tau"], 1.0)
@@ -399,17 +405,18 @@ class TestKendallOnly(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = os.getcwd()
             os.chdir(tmpdir)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
             try:
                 explain_rank_aggregation_kendall_only(
                     sources, names, full, "final", "TEST", "e1", 5)
-                out_dir = os.path.join("myresults", "robust_aggregated", "TEST", "e1")
+                out_dir = os.path.join("results", "robust_aggregated", "TEST", "e1")
                 self.assertTrue(os.path.exists(os.path.join(
                     out_dir, "aggregation_explainability_final_kendall_only_5.txt")))
                 self.assertTrue(os.path.exists(os.path.join(
                     out_dir, "aggregation_explainability_final_kendall_only_5.png")))
             finally:
                 os.chdir(cwd)
-
+                ramses_paths.reset_cache()
     def test_explain_rank_aggregation_triggers_kendall_only_for_two_sources(self):
         full = ["A", "B", "C"]
         sources = [["A", "B", "C"], ["C", "B", "A"]]
@@ -417,12 +424,13 @@ class TestKendallOnly(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = os.getcwd()
             os.chdir(tmpdir)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
             try:
                 result = explain_rank_aggregation(
                     sources, names, full, "final", "TEST", "e1", 5, explain=True)
                 # Intermediate Representation JSON with the kendall-only block.
                 import json
-                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                ir_path = os.path.join("results", "explanations_ir", "TEST", "e1",
                                        "ir_rank_aggregation_final_5.json")
                 self.assertTrue(os.path.exists(ir_path), ir_path)
                 with open(ir_path) as fh:
@@ -432,6 +440,7 @@ class TestKendallOnly(unittest.TestCase):
                               [a["id"] for a in ir_doc["evidence"]])
             finally:
                 os.chdir(cwd)
+                ramses_paths.reset_cache()
         # 2 sources → the nested kendall_only result is populated.
         self.assertIsNotNone(result["kendall_only"])
         self.assertIn("winner", result["kendall_only"])
