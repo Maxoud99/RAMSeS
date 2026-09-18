@@ -11,7 +11,7 @@
 # Script to train algorithm on a dataset of entities
 #######################################
 import json
-from typing import List, Union, Optional
+from typing import List, Sequence, Union, Optional
 from sklearn.model_selection import ParameterGrid
 import os
 from tqdm import tqdm
@@ -82,12 +82,14 @@ class TrainModels(object):
                  training_size:float=1,
                  overwrite:bool = False,
                  verbose:bool = True,
-                 save_dir:str='Mononito/trained_models'):
+                 save_dir:str='Mononito/trained_models',
+                 detectors:Optional[Sequence[str]]=None):
 
         if training_size > 1.0:
             raise ValueError('Training size must be <= 1.0')
         self.save_dir = save_dir
         self.overwrite = overwrite  # Store overwrite flag
+        self.detectors = None if detectors is None else set(detectors)
 
         self.img_dir = os.path.join(self.save_dir, f"{dataset}/{entity}")
         logger.info(f'self.img_dir is {self.img_dir}')
@@ -157,6 +159,9 @@ class TrainModels(object):
             return self.batch_size
         n_time = max(e.Y.shape[1] for e in self.test_data.entities)
         return max(1, n_time + max(1, int(window_size)))
+
+    def _should_train(self, instance_name: str) -> bool:
+        return self.detectors is None or instance_name in self.detectors
 
     def train_models(self, model_architectures: List[str] = 'all'):
         """Function to selected algorithm.
@@ -259,13 +264,16 @@ class TrainModels(object):
             ParameterGrid(LOF_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"LOF_{MODEL_ID}"):
+                    continue
                 model = TsadLof(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"LOF_{MODEL_ID + 1}"):
-                        print(f'Model LOF_{MODEL_ID + 1} already trained!')
+                            obj_name=f"LOF_{MODEL_ID}"):
+                        print(f'Model LOF_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -281,7 +289,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"LOF_{MODEL_ID + 1}.png"
+                img_name = f"LOF_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -316,7 +324,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"LOF_{MODEL_ID}",
@@ -336,13 +343,16 @@ class TrainModels(object):
             ParameterGrid(KDE_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"KDE_{MODEL_ID}"):
+                    continue
                 model = TsadKde(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"KDE_{MODEL_ID + 1}"):
-                        print(f'Model KDE_{MODEL_ID + 1} already trained!')
+                            obj_name=f"KDE_{MODEL_ID}"):
+                        print(f'Model KDE_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -358,7 +368,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"KDE_{MODEL_ID + 1}.png"
+                img_name = f"KDE_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -390,7 +400,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"KDE_{MODEL_ID}",
@@ -409,13 +418,16 @@ class TrainModels(object):
             ParameterGrid(ABOD_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"ABOD_{MODEL_ID}"):
+                    continue
                 model = TsadABOD(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"ABOD_{MODEL_ID + 1}"):
-                        print(f'Model ABOD_{MODEL_ID + 1} already trained!')
+                            obj_name=f"ABOD_{MODEL_ID}"):
+                        print(f'Model ABOD_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -431,7 +443,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"ABOD_{MODEL_ID + 1}.png"
+                img_name = f"ABOD_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -463,7 +475,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"ABOD_{MODEL_ID}",
@@ -483,13 +494,16 @@ class TrainModels(object):
             ParameterGrid(CBLOF_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"CBLOF_{MODEL_ID}"):
+                    continue
                 model = TsadCblof(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"CBLOF_{MODEL_ID + 1}"):
-                        print(f'Model CBLOF_{MODEL_ID + 1} already trained!')
+                            obj_name=f"CBLOF_{MODEL_ID}"):
+                        print(f'Model CBLOF_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -505,7 +519,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"CBLOF_{MODEL_ID + 1}.png"
+                img_name = f"CBLOF_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -537,7 +551,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"CBLOF_{MODEL_ID}",
@@ -556,13 +569,16 @@ class TrainModels(object):
             ParameterGrid(COF_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"COF_{MODEL_ID}"):
+                    continue
                 model = TsadCof(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"COF_{MODEL_ID + 1}"):
-                        print(f'Model COF_{MODEL_ID + 1} already trained!')
+                            obj_name=f"COF_{MODEL_ID}"):
+                        print(f'Model COF_{MODEL_ID} already trained!')
                         print("Params")
                         # print(model_hyper_params)
                         continue
@@ -580,7 +596,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"COF_{MODEL_ID + 1}.png"
+                img_name = f"COF_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -613,7 +629,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"COF_{MODEL_ID}",
@@ -633,6 +648,9 @@ class TrainModels(object):
             ParameterGrid(DGHL_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"DGHL_{MODEL_ID}"):
+                    continue
                 if self.train_data.entities[
                         0].X is not None:  # DGHL also considers covariates
                     model_hyper_params[
@@ -648,8 +666,8 @@ class TrainModels(object):
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"DGHL_{MODEL_ID+1}"):
-                        print(f'Model DGHL_{MODEL_ID+1} already trained!')
+                            obj_name=f"DGHL_{MODEL_ID}"):
+                        print(f'Model DGHL_{MODEL_ID} already trained!')
                         continue
 
                 trainer = Trainer(model=model,
@@ -658,7 +676,6 @@ class TrainModels(object):
                                   eval_dataset=None,
                                   verbose=self.verbose)
                 trainer.train()
-                MODEL_ID = MODEL_ID + 1
 
 
 
@@ -718,6 +735,9 @@ class TrainModels(object):
             ParameterGrid(MD_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"MD_{MODEL_ID}"):
+                    continue
                 model_hyper_params['n_features'] = self.train_data.n_features
                 training_args = TrainingArguments(**train_hyper_params)
                 model = MeanDeviation(**model_hyper_params)
@@ -725,8 +745,8 @@ class TrainModels(object):
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"MD_{MODEL_ID+1}"):
-                        print(f'Model MD_{MODEL_ID+1} already trained!')
+                            obj_name=f"MD_{MODEL_ID}"):
+                        print(f'Model MD_{MODEL_ID} already trained!')
                         continue
 
                 trainer = Trainer(model=model,
@@ -735,7 +755,6 @@ class TrainModels(object):
                                   eval_dataset=None,
                                   verbose=self.verbose)
                 trainer.train()
-                MODEL_ID = MODEL_ID + 1
 
                 # eval the model
                 trainer.model.eval()
@@ -795,6 +814,9 @@ class TrainModels(object):
             ParameterGrid(LSTMVAE_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"LSTMVAE_{MODEL_ID}"):
+                    continue
                 model_hyper_params['n_features'] = self.train_data.n_features
                 training_args = TrainingArguments(**train_hyper_params)
                 model = LSTMVAE(**model_hyper_params)
@@ -802,8 +824,8 @@ class TrainModels(object):
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"LSTMVAE_{MODEL_ID+1}"):
-                        print(f'Model LSTMVAE_{MODEL_ID+1} already trained!')
+                            obj_name=f"LSTMVAE_{MODEL_ID}"):
+                        print(f'Model LSTMVAE_{MODEL_ID} already trained!')
                         continue
 
                 trainer = Trainer(model=model,
@@ -812,7 +834,6 @@ class TrainModels(object):
                                   eval_dataset=None,
                                   verbose=self.verbose)
                 trainer.train()
-                MODEL_ID = MODEL_ID + 1
 
                 # eval the model
                 trainer.model.eval()
@@ -867,14 +888,17 @@ class TrainModels(object):
             ParameterGrid(RNN_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"RNN_{MODEL_ID}"):
+                    continue
                 training_args = TrainingArguments(**train_hyper_params)
                 model = RNN(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"RNN_{MODEL_ID+1}"):
-                        print(f'Model RNN_{MODEL_ID+1} already trained!')
+                            obj_name=f"RNN_{MODEL_ID}"):
+                        print(f'Model RNN_{MODEL_ID} already trained!')
                         continue
 
                 trainer = Trainer(model=model,
@@ -883,7 +907,6 @@ class TrainModels(object):
                                   eval_dataset=None,
                                   verbose=self.verbose)
                 trainer.train()
-                MODEL_ID = MODEL_ID + 1
 
                 # eval the model
                 test_dataloader = Loader(
@@ -945,16 +968,18 @@ class TrainModels(object):
             ParameterGrid(RM_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"RM_{MODEL_ID}"):
+                    continue
                 model = RunningMean(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"RM_{MODEL_ID+1}"):
-                        print(f'Model RM_{MODEL_ID+1} already trained!')
+                            obj_name=f"RM_{MODEL_ID}"):
+                        print(f'Model RM_{MODEL_ID} already trained!')
                         continue
 
-                MODEL_ID = MODEL_ID + 1
 
                 # eval the model
                 test_dataloader = Loader(
@@ -1008,9 +1033,12 @@ class TrainModels(object):
             ParameterGrid(NN_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"NN_{MODEL_ID}"):
+                    continue
                 model = NearestNeighbors(**model_hyper_params)
                 model_hyper_params_str = json.dumps(model_hyper_params)
-                print(f"Model NN_{MODEL_ID+1} Params")
+                print(f"Model NN_{MODEL_ID} Params")
                 with open('output1.txt', 'a') as file:
                     # Write data to the file
                     file.write(model_hyper_params_str)
@@ -1018,8 +1046,8 @@ class TrainModels(object):
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"NN_{MODEL_ID+1}"):
-                        print(f'Model NN_{MODEL_ID+1} already trained!')
+                            obj_name=f"NN_{MODEL_ID}"):
+                        print(f'Model NN_{MODEL_ID} already trained!')
 
                         continue
 
@@ -1036,7 +1064,6 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(train_dataloader)
 
-                MODEL_ID = MODEL_ID + 1
 
 
                 # eval the model
@@ -1093,13 +1120,16 @@ class TrainModels(object):
             ParameterGrid(SOS_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"SOS_{MODEL_ID}"):
+                    continue
                 model = TsadSOS(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"SOS_{MODEL_ID + 1}"):
-                        print(f'Model SOS_{MODEL_ID + 1} already trained!')
+                            obj_name=f"SOS_{MODEL_ID}"):
+                        print(f'Model SOS_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -1115,7 +1145,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"SOS_{MODEL_ID + 1}.png"
+                img_name = f"SOS_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -1148,7 +1178,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"SOS_{MODEL_ID}",
@@ -1167,13 +1196,16 @@ class TrainModels(object):
             ParameterGrid(ALAD_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"ALAD_{MODEL_ID}"):
+                    continue
                 model = TsadALAD(**model_hyper_params)
 
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"ALAD_{MODEL_ID + 1}"):
-                        print(f'Model ALAD_{MODEL_ID + 1} already trained!')
+                            obj_name=f"ALAD_{MODEL_ID}"):
+                        print(f'Model ALAD_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -1189,7 +1221,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"ALAD_{MODEL_ID + 1}.png"
+                img_name = f"ALAD_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -1221,7 +1253,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"ALAD_{MODEL_ID}",
@@ -1277,6 +1308,9 @@ class TrainModels(object):
             ParameterGrid(PYOD_TRAIN_PARAM_GRID))
         for train_hyper_params in tqdm(train_hyper_param_configurations):
             for model_hyper_params in tqdm(model_hyper_param_configurations):
+                MODEL_ID = MODEL_ID + 1
+                if not self._should_train(f"{checkpoint_family}_{MODEL_ID}"):
+                    continue
                 # `detector__x` is the PyOD estimator's own parameter x; the rest
                 # are the framework's. Both spell some of them the same way.
                 framework = {k: v for k, v in model_hyper_params.items()
@@ -1288,8 +1322,8 @@ class TrainModels(object):
                 if not self.overwrite:
                     if self.logging_obj.check_file_exists(
                             obj_class=self.logging_hierarchy,
-                            obj_name=f"{checkpoint_family}_{MODEL_ID + 1}"):
-                        print(f'Model {checkpoint_family}_{MODEL_ID + 1} already trained!')
+                            obj_name=f"{checkpoint_family}_{MODEL_ID}"):
+                        print(f'Model {checkpoint_family}_{MODEL_ID} already trained!')
                         continue
 
                 dataloader = Loader(
@@ -1305,7 +1339,7 @@ class TrainModels(object):
                     n_masked_timesteps=0)
                 model.fit(dataloader)
 
-                img_name = f"{checkpoint_family}_{MODEL_ID + 1}.png"
+                img_name = f"{checkpoint_family}_{MODEL_ID}.png"
                 img_path = os.path.join(self.img_dir, img_name)
                 logger.info(f'img_path is {img_path} ')
 
@@ -1338,7 +1372,6 @@ class TrainModels(object):
                 plt.clf()
                 plt.close()
 
-                MODEL_ID = MODEL_ID + 1
                 # Save the model
                 self.logging_obj.save(obj=model,
                                       obj_name=f"{checkpoint_family}_{MODEL_ID}",

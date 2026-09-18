@@ -1520,6 +1520,7 @@ def run_app(algorithm_list, algorithm_list_instances):
         dataset=dataset,
         entity=entity,
         algorithm_list=families_to_train,
+        detectors=detectors_to_load,
         downsampling=args['downsampling'],
         min_length=args['min_length'],
         root_dir=args['dataset_path'],
