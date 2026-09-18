@@ -1455,16 +1455,16 @@ def run_app(algorithm_list, algorithm_list_instances):
     logger.info("📂 STAGE 1/7: Loading Training Data...")
     train_data = load_data(
         dataset=dataset, group='train',
-        entities=entity, downsampling=10,
-        min_length=256, root_dir=data_dir, normalize=True, verbose=False
+        entities=entity, downsampling=args['downsampling'],
+        min_length=args['min_length'], root_dir=data_dir, normalize=True, verbose=False
     )
     logger.info(f"✓ Training data loaded: {len(train_data.entities)} entity(ies)")
     
     logger.info("📂 STAGE 2/7: Loading Test Data...")
     test_data = load_data(
         dataset=dataset, group='test',
-        entities=entity, downsampling=10,
-        min_length=256, root_dir=data_dir, normalize=True, verbose=False
+        entities=entity, downsampling=args['downsampling'],
+        min_length=args['min_length'], root_dir=data_dir, normalize=True, verbose=False
     )
     logger.info(f"✓ Test data loaded: {len(test_data.entities)} entity(ies)")
 

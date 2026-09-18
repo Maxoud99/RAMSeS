@@ -4,7 +4,7 @@ n_jobs: 5
 overwrite: True  # MUST RETRAIN: Models have 10 features (bug), need 9 features (fixed)
 
 # Model training parameters
-downsampling: 10
+downsampling: !!null
 trained_model_path: "trained_models"
 dataset_path: "Datasets"
 

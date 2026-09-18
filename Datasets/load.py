@@ -1,6 +1,7 @@
 import csv
 import os
 import shutil
+import warnings
 from typing import List, Optional, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ def load_data(dataset: str, group: str, entities: Union[str, List[str]], downsam
 
     if find_presplit_entity(root_dir, dataset, entities) is not None:
         return load_presplit(group=group, root_dir=root_dir, dataset=dataset, entity=entities,
+                             downsampling=downsampling, min_length=min_length,
                              normalize=normalize, verbose=verbose)
 
     dataset = dataset.lower()
@@ -107,7 +109,15 @@ def find_presplit_entity(root_dir, dataset, entities):
     return stem if os.path.isfile(os.path.join(base, 'train', f'{stem}.txt')) else None
 
 
-def load_presplit(group, root_dir, dataset, entity, normalize=True, verbose=True):
+def load_presplit(group, root_dir, dataset, entity, downsampling=None,
+                  min_length=None, normalize=True, verbose=True):
+    if downsampling is not None:
+        warnings.warn(
+            f"downsampling={downsampling} ignored for '{dataset}': it is stored "
+            f"as a train/test/test_label split. Drop the "
+            f"setting, or max-pool the files on disk.",
+            stacklevel=2)
+
     stem = find_presplit_entity(root_dir, dataset, entity)
     base = resolve_dataset_dir(root_dir, dataset)
     if stem is None or base is None:
