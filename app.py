@@ -1433,6 +1433,7 @@ def run_app(algorithm_list, algorithm_list_instances):
     explain = args.get('explain', False)  # Explainability OFF by default; --explain enables it
     stages = set(args.get('stages', ALL_STAGES))  # Which stage-6 sub-stages to run
     is_partial = stages != ALL_STAGES  # Strict subset → partial run (stop after selected stages)
+    skip_gan = args.get('skip_gan', False)  # --skip_gan drops the GAN sub-stage, keeping the rest
     anomaly_type = args.get('anomaly_type', DEFAULT_ANOMALY_TYPE)  # Synthetic anomaly injected at stage 4
     anomaly_rate = args.get('anomaly_rate')  # None = the per-type defaults in anomaly_parameters.py
     decision_metric = args.get('decision_metrics', DEFAULT_DECISION_METRICS)  # Fitness the run maximises
@@ -1446,7 +1447,7 @@ def run_app(algorithm_list, algorithm_list_instances):
     data_dir = args['dataset_path']
 
     logger.info("="*80)
-    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}, stages={','.join(sorted(stages))}, detectors={len(detectors_to_load)}/{len(algorithm_list_instances)}")
+    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}, stages={','.join(sorted(stages))}, skip_gan={skip_gan}, detectors={len(detectors_to_load)}/{len(algorithm_list_instances)}")
     logger.info("="*80)
     
     logger.info("📂 STAGE 1/7: Loading Training Data...")
@@ -1683,7 +1684,7 @@ def run_app(algorithm_list, algorithm_list_instances):
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_2(
                 train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
                 trained_models=trained_models, model_list=loaded_model_names,
-                test_data_gan=test_data_before, explain=explain,
+                test_data_gan=test_data_before, skip_gan=skip_gan, explain=explain,
                 decision_metric=decision_metric
             )
         else:
@@ -1693,7 +1694,8 @@ def run_app(algorithm_list, algorithm_list_instances):
              individual_predictions, base_model_predictions_train, base_model_predictions_test,
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_1(
                 train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
-                model_list=loaded_model_names, test_data_gan=test_data_before, explain=explain,
+                model_list=loaded_model_names, test_data_gan=test_data_before,
+                skip_gan=skip_gan, explain=explain,
                 stages=stages, decision_metric=decision_metric
             )
 
