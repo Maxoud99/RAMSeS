@@ -48,11 +48,16 @@ def load_data(dataset: str, group: str, entities: Union[str, List[str]], downsam
     verbose: bool
         Controls verbosity
     """
+
+    if find_presplit_entity(root_dir, dataset, entities) is not None:
+        return load_presplit(group=group, root_dir=root_dir, dataset=dataset, entity=entities,
+                             normalize=normalize, verbose=verbose)
+
     dataset = dataset.lower()
     # Handle aliases
     if dataset == 'servermachinedataset':
         dataset = 'smd'
-    
+
     if dataset == 'smd':
         return load_smd(group=group, machines=entities, downsampling=downsampling, root_dir=root_dir,
                         normalize=normalize, verbose=verbose)
@@ -76,6 +81,63 @@ def load_data(dataset: str, group: str, entities: Union[str, List[str]], downsam
     else:
         return load_any_dataset(group=group, root_dir=root_dir, dataset=dataset, entity=entities,
                                 normalize=normalize, verbose=verbose)
+
+
+def resolve_dataset_dir(root_dir, dataset):
+    exact = os.path.join(root_dir, dataset)
+    if os.path.isdir(exact):
+        return exact
+    if not os.path.isdir(root_dir):
+        return None
+    lowered = str(dataset).lower()
+    for name in os.listdir(root_dir):
+        if name.lower() == lowered and os.path.isdir(os.path.join(root_dir, name)):
+            return os.path.join(root_dir, name)
+    return None
+
+
+def find_presplit_entity(root_dir, dataset, entities):
+    entity = entities[0] if isinstance(entities, list) else entities
+    if entity is None:
+        return None
+    base = resolve_dataset_dir(root_dir, dataset)
+    if base is None:
+        return None
+    stem = str(entity)[:-4] if str(entity).endswith('.txt') else str(entity)
+    return stem if os.path.isfile(os.path.join(base, 'train', f'{stem}.txt')) else None
+
+
+def load_presplit(group, root_dir, dataset, entity, normalize=True, verbose=True):
+    stem = find_presplit_entity(root_dir, dataset, entity)
+    base = resolve_dataset_dir(root_dir, dataset)
+    if stem is None or base is None:
+        raise FileNotFoundError(
+            f'No train/{entity}.txt under {os.path.join(root_dir, dataset)}')
+
+    train = np.atleast_2d(np.loadtxt(f'{base}/train/{stem}.txt', delimiter=','))
+    test = np.atleast_2d(np.loadtxt(f'{base}/test/{stem}.txt', delimiter=','))
+    if train.shape[1] != test.shape[1]:
+        raise ValueError(f'{stem}: train has {train.shape[1]} features, '
+                         f'test has {test.shape[1]}')
+
+    if normalize:
+        scaler = MinMaxScaler().fit(train)
+        train, test = scaler.transform(train), scaler.transform(test)
+
+    if group == 'train':
+        name = f'{dataset}-train'
+        entities_out = [Entity(Y=train.T, name=stem, verbose=verbose)]
+    elif group == 'test':
+        name = f'{dataset}-test'
+        labels = np.loadtxt(f'{base}/test_label/{stem}.txt').reshape(1, -1)
+        if labels.shape[-1] != test.shape[0]:
+            raise ValueError(f'{stem}: {labels.shape[-1]} labels for '
+                             f'{test.shape[0]} test rows')
+        entities_out = [Entity(Y=test.T, name=stem, labels=labels, verbose=verbose)]
+    else:
+        raise ValueError(f"group must be 'train' or 'test', got {group!r}")
+
+    return Dataset(entities=entities_out, name=name, verbose=verbose)
 
 
 def detect_delimiter(file_path):
