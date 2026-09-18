@@ -1,7 +1,7 @@
 """
 Where everything lives, and how to resolve a dataset/entity directory.
 
-The pipeline writes `myresults/{tree}/{dataset}/{entity}/…` using the dataset
+The pipeline writes `results/{tree}/{dataset}/{entity}/…` using the dataset
 string exactly as it was typed on the command line, so `--dataset skab` creates
 `skab/` while an earlier `--dataset SKAB` created `SKAB/`. That only appears to
 work because macOS is case-insensitive; on Linux the two are different
@@ -13,17 +13,19 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from Utils import paths as ramses_paths
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MYRESULTS = REPO_ROOT / "myresults"
+RESULTS = ramses_paths.results_root()
 CONFIG_YML = REPO_ROOT / "Configs" / "config.yml"
-WEBUI_LOGS = MYRESULTS / "webui_logs"
+WEBUI_LOGS = RESULTS / "webui_logs"
 
 # Artifact trees the UI reads.
-EXPLANATIONS_IR = MYRESULTS / "explanations_ir"
-EXPLANATIONS_NL = MYRESULTS / "explanations_nl"
+EXPLANATIONS_IR = RESULTS / "explanations_ir"
+EXPLANATIONS_NL = RESULTS / "explanations_nl"
 # The pipeline's own numeric report: timings, memory, per-stage rankings and the
 # final decision. Written by run_app, independent of the explainability layer.
-COMPREHENSIVE = MYRESULTS / "comprehensive"
+COMPREHENSIVE = RESULTS / "comprehensive"
 
 _CONFIG_CACHE: Optional[dict] = None
 
@@ -45,10 +47,17 @@ def config() -> dict:
             data = yaml.safe_load(f) or {}
     except Exception:
         data = {}
+    # Resolved, not raw: the config ships relative paths so nobody has to edit
+    # it before a first run, and they are relative to the repository root rather
+    # than to wherever the Flask process happens to have been started.
     _CONFIG_CACHE = {
-        "dataset_path": data.get("dataset_path"),
-        "trained_model_path": data.get("trained_model_path"),
-        "results_path": data.get("results_path"),
+        "dataset_path": str(ramses_paths.resolve(
+            data.get("dataset_path"), ramses_paths.DEFAULTS["dataset_path"])),
+        "trained_model_path": str(ramses_paths.resolve(
+            data.get("trained_model_path"),
+            ramses_paths.DEFAULTS["trained_model_path"])),
+        "results_path": str(ramses_paths.resolve(
+            data.get("results_path"), ramses_paths.DEFAULTS["results_path"])),
         # Surfaced as a run-form warning: with overwrite on, every run retrains
         # all base detectors, which is most of the wall-clock time.
         "overwrite": bool(data.get("overwrite", False)),
@@ -100,6 +109,6 @@ def natural_key(name: str):
             for part in _NUM_CHUNK.split(str(name))]
 
 
-def rel_to_myresults(path: Path) -> str:
-    """Path relative to `myresults/`, for building /media URLs."""
-    return os.path.relpath(str(Path(path).resolve()), str(MYRESULTS.resolve()))
+def rel_to_results(path: Path) -> str:
+    """Path relative to the results root, for building /media URLs."""
+    return os.path.relpath(str(Path(path).resolve()), str(RESULTS.resolve()))

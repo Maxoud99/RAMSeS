@@ -30,6 +30,7 @@ from Utils.pipeline_spec import dataset_label
 logger = logging.getLogger(__name__)
 
 from distributions import mallows_kendall as mk
+from Utils.paths import results_dir
 
 
 ##########################################
@@ -633,7 +634,7 @@ def plot_aggregation_explainability(
     by dividing by their max-possible value 2(N − 1). The report retains raw values.
 
     Saves to:
-        myresults/robust_aggregated/{dataset}/{entity}/aggregation_explainability_{stage_name}_{iteration}.png
+        results/robust_aggregated/{dataset}/{entity}/aggregation_explainability_{stage_name}_{iteration}.png
     """
     plt.rcParams.update({
         "font.family": "serif",
@@ -668,7 +669,7 @@ def plot_aggregation_explainability(
               bbox_to_anchor=(1.01, 1), borderaxespad=0)
 
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f"{directory}/aggregation_explainability_{stage_name}_{iteration}.png",
                 format="png", dpi=300, bbox_inches="tight")
@@ -689,7 +690,7 @@ def plot_kendall_only_alignment(
     ranking. The more-aligned source (the winner) is highlighted in green.
 
     Saves to:
-        myresults/robust_aggregated/{dataset}/{entity}/aggregation_explainability_{stage_name}_kendall_only_{iteration}.png
+        results/robust_aggregated/{dataset}/{entity}/aggregation_explainability_{stage_name}_kendall_only_{iteration}.png
     """
     plt.rcParams.update({
         "font.family": "serif",
@@ -717,7 +718,7 @@ def plot_kendall_only_alignment(
     ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
 
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(
         f"{directory}/aggregation_explainability_{stage_name}_kendall_only_{iteration}.png",
@@ -766,7 +767,7 @@ def explain_rank_aggregation_kendall_only(
     plot_kendall_only_alignment(source_names, align, winner,
                                 stage_name, dataset, entity, iteration)
 
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     report_path = os.path.join(
         directory,
@@ -819,7 +820,7 @@ def explain_rank_aggregation(
     Compute LOO contributions, Kendall τ alignments, Borda alignments, then for
     every source decide via Borda whether the LOO or Kendall perspective wins.
     Write a structured text report and a grouped bar plot to:
-        myresults/robust_aggregated/{dataset}/{entity}/
+        results/robust_aggregated/{dataset}/{entity}/
     Files:
         aggregation_explainability_{stage_name}_{iteration}.txt
         aggregation_explainability_{stage_name}_{iteration}.png
@@ -850,7 +851,7 @@ def explain_rank_aggregation(
         stage_name, dataset, entity, iteration,
     )
 
-    directory = f"myresults/robust_aggregated/{dataset}/{entity}/"
+    directory = results_dir("robust_aggregated", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     report_path = os.path.join(
         directory, f"aggregation_explainability_{stage_name}_{iteration}.txt"

@@ -372,7 +372,7 @@ def create_app(**overrides) -> Flask:
         Eleven detectors is 55 unordered pairs per entity and a reader looks at
         one or two, so these are rendered rather than written by the pipeline.
         Everything it needs is the IR's `context_feature_shares` block; nothing is
-        written to myresults/.
+        written to results/.
         """
         a = (request.args.get("a") or "").strip()
         b = (request.args.get("b") or "").strip()

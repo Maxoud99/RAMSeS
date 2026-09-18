@@ -2,10 +2,10 @@
 CLI for the LLM narration layer.
 
 Reads the Intermediate Representation JSONs an `--explain` pipeline run wrote
-under myresults/explanations_ir/{dataset}/{entity}/, generates natural-language
+under results/explanations_ir/{dataset}/{entity}/, generates natural-language
 narratives with a local open-weights LLM, verifies each narrative against its
 IR (atom-matching faithfulness), and writes everything under
-myresults/explanations_nl/{dataset}/{entity}/.
+results/explanations_nl/{dataset}/{entity}/.
 
 Usage:
     python -m Explainability.narrate --dataset SMD --entity machine-1-6 --iteration 5
@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+
+from Utils.paths import results_dir
 
 try:
     from Explainability.llm import (DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient,
@@ -40,8 +42,8 @@ def main(argv=None) -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--base-dir", default="myresults/explanations_ir")
-    parser.add_argument("--out-dir", default="myresults/explanations_nl")
+    parser.add_argument("--base-dir", default=results_dir("explanations_ir"))
+    parser.add_argument("--out-dir", default=results_dir("explanations_nl"))
     parser.add_argument("--stages", default=None,
                         help="Comma-separated subset of: " + ", ".join(_STAGE_TOKENS))
     parser.add_argument("--global-mode", default="concat", choices=list(GLOBAL_MODES),

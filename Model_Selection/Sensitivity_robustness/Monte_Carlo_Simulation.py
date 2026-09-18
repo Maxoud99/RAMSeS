@@ -10,6 +10,7 @@ from loguru import logger
 import matplotlib.pyplot as plt
 from Explainability import ir
 from Model_Selection.Sensitivity_robustness import surrogate_fidelity
+from Utils.paths import results_dir
 
 # Keys `summarize_results` adds beside the per-model entries. Everything that
 # walks the summary skips these, so a new ranking cannot leak into a loop that
@@ -227,7 +228,7 @@ def plot_monte_carlo_results(results, summary, model_names, dataset, entity):
         plt.tight_layout()
 
         # Save the plot
-        directory = f'myresults/robustness/MonteCarlo/{dataset}/{entity}/'
+        directory = results_dir("robustness", "MonteCarlo", dataset, entity)
         os.makedirs(directory, exist_ok=True)
         filename = f'{dataset}_{entity}_{model_name}_MonteCarloResults.png'
         plt.savefig(os.path.join(directory, filename), dpi=300)
@@ -237,7 +238,7 @@ def plot_monte_carlo_results(results, summary, model_names, dataset, entity):
 
 def save_summary(summary, dataset, entity):
     """Save the summary of Monte Carlo simulation to a file."""
-    directory = f'myresults/robustness/MonteCarlo/{dataset}/{entity}/'
+    directory = results_dir("robustness", "MonteCarlo", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     summary_file = os.path.join(directory, f'{dataset}_{entity}_MonteCarloSummary.txt')
 
@@ -701,7 +702,7 @@ def plot_noise_curves(curves, model_names, metric_name, dataset, entity, plain: 
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     ax.legend(loc="upper left", ncol=2, frameon=False, bbox_to_anchor=(1.01, 1), borderaxespad=0)
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/robustness/MonteCarlo/{dataset}/{entity}/"
+    directory = results_dir("robustness", "MonteCarlo", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     tag = metric_name.replace("-", "").replace(" ", "")
     suffix = "_plain" if plain else ""
@@ -732,7 +733,7 @@ def plot_ranking_stability(stab_f1, stab_pr, dataset, entity, stab_vus=None) -> 
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     ax.legend(loc="lower left", frameon=False)
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/robustness/MonteCarlo/{dataset}/{entity}/"
+    directory = results_dir("robustness", "MonteCarlo", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f"{directory}/{dataset}_{entity}_MonteCarlo_ranking_stability.png",
                 format="png", dpi=300, bbox_inches="tight")
@@ -750,7 +751,7 @@ def plot_surrogate_tree(clf, metric_name, dataset, entity) -> None:
               filled=True, rounded=True, fontsize=8, ax=ax)
     ax.set_title(f"Monte Carlo · winner surrogate ({metric_name}): noise_level → winning model")
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/robustness/MonteCarlo/{dataset}/{entity}/"
+    directory = results_dir("robustness", "MonteCarlo", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     tag = metric_name.replace("-", "").replace(" ", "")
     plt.savefig(f"{directory}/{dataset}_{entity}_MonteCarlo_surrogate_tree_{tag}.png",
@@ -772,7 +773,7 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
     explain with performance-vs-noise curves + ranking stability (Method A) and a
     1-D decision-tree surrogate (Method B), for each metric the run's fitness
     names. Writes a report + plots under
-    myresults/robustness/MonteCarlo/{dataset}/{entity}/.
+    results/robustness/MonteCarlo/{dataset}/{entity}/.
 
     Returns the computed structures when explain=True; None otherwise (and None,
     with a logged note, when the sweep is infeasible).
@@ -831,7 +832,7 @@ def explain_monte_carlo(test_data, trained_models, model_names, dataset, entity,
         if clf is not None:
             plot_surrogate_tree(clf, label, dataset, entity)
 
-    directory = f"myresults/robustness/MonteCarlo/{dataset}/{entity}/"
+    directory = results_dir("robustness", "MonteCarlo", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     report_path = os.path.join(directory, f"{dataset}_{entity}_MonteCarlo_explainability.txt")
     n_trials = len(noise)

@@ -20,6 +20,7 @@ from Utils.plot_labels import draw_abbreviation_key
 from Metrics.metrics import prauc, f1_score, vus_score
 from Utils.model_selection_utils import evaluate_model, ScoringTimeout
 from Explainability import ir
+from Utils.paths import results_dir
 
 
 def initialize_population(algorithm_list, population_size):
@@ -616,7 +617,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
     axes[-1].set_xlabel('Time (index)')
 
     plt.tight_layout()
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     if not os.path.exists(directory):
         os.makedirs(directory)
     #plt.savefig(f'{directory}/performance_plot_nigg.png')
@@ -665,7 +666,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     # Format the date and time as a string
     date_time_string = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     plot_name = f'ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_UMS_{date_time_string}.png'
-    plot_path = f'myresults/Outputs/GA_Ens/{dataset}/{entity}'
+    plot_path = results_dir("Outputs", "GA_Ens", dataset, entity)
     # plot_scores_vs_true(test_data, F1_Score_list_ind, PR_AUC_Score_list_ind, adjusted_y_pred_ind, algorithm_list,
     #                     plot_name, plot_path)
     # logger.info(f"  ✓ Plot saved to {plot_path}/{plot_name}")
@@ -678,7 +679,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     logger.info(f"  ✓ Population initialized in {time_module.time() - start_init:.2f}s")
     print(population)
     evaluated_ensembles = {}  # HashMap to track evaluated ensembles and their scores
-    file_name = f'myresults/Outputs/GA_Ens/ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_{date_time_string}.txt'
+    file_name = results_dir("Outputs", "GA_Ens") + f'ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_{date_time_string}.txt'
 
     best_f1 = 0
     best_pr_auc = 0
@@ -818,7 +819,7 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
     f1_scores = [result[0] for result in evaluated_ensembles.values()]
     pr_auc_scores = [result[1] for result in evaluated_ensembles.values()]
     flat_ensemble_names = ['_'.join(names) for names in ensemble_names]
-    plot_name = f'myresults/Outputs/GA_Ens/ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_ensemble_{date_time_string}.png'
+    plot_name = results_dir("Outputs", "GA_Ens") + f'ensemble_scores_{dataset}_{entity}_{meta_model_type}_{population_size}_{generations}_{mutation_rate}_ensemble_{date_time_string}.png'
     plot_models_scores(list_ensemble, test_data, adjusted_y_pred_list, dataset, entity, F1_Score_list,
                        PR_AUC_Score_list)
     plot_scores_vs_true(test_data, F1_Score_list, PR_AUC_Score_list, adjusted_y_pred_list, list_ensemble, plot_name,
@@ -1176,7 +1177,7 @@ def plot_ga_utility(
       Bottom — mean marginal contribution across evaluated subsets for ALL
                detectors. NaN values are drawn as faded grey bars at zero.
 
-    Saves to myresults/GA_Ens/{dataset}/{entity}/ga_selection_utility_{dataset}_{entity}.png.
+    Saves to results/GA_Ens/{dataset}/{entity}/ga_selection_utility_{dataset}_{entity}.png.
     """
     _ga_plot_rcparams()
     fig, (ax_top, ax_bot) = plt.subplots(
@@ -1226,7 +1227,7 @@ def plot_ga_utility(
     ax_bot.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
 
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f"{directory}/ga_selection_utility_{dataset}_{entity}.png",
                 format="png", dpi=300, bbox_inches="tight")
@@ -1292,7 +1293,7 @@ def plot_ga_survival(
         so their trajectories can be compared without any pre-selection bias.
         → ga_selection_survival_all_{dataset}_{entity}.png
     """
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     in_best = set(best_ensemble or [])
 
@@ -1517,7 +1518,7 @@ def plot_ga_archetypes(
 
     fig.suptitle("Functional Archetypes · utility × stability", y=1.0)
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f"{directory}/ga_selection_archetypes_{dataset}_{entity}.png",
                 format="png", dpi=300, bbox_inches="tight")
@@ -1541,7 +1542,7 @@ def explain_ga_selection(
     GA-ensemble selection explainability: explain *why* each detector ended up
     in best_ensemble, along two analytical axes (utility, stability). Produces
     three plots and a structured text report under
-        myresults/GA_Ens/{dataset}/{entity}/
+        results/GA_Ens/{dataset}/{entity}/
 
     Returns a dict with the computed structures when explain=True; None otherwise.
     """
@@ -1560,7 +1561,7 @@ def explain_ga_selection(
     plot_ga_survival(survival, best_ensemble, dataset, entity)
     plot_ga_archetypes(archetypes, algorithm_list, dataset, entity)
 
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     report_path = os.path.join(
         directory, f"ga_selection_explainability_{dataset}_{entity}.txt")
@@ -2164,7 +2165,7 @@ def plot_ga_combination(
         m = m if m > 0 else 1.0
         return [0.0 if np.isnan(v) else v / m for v in vals]
 
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     height = max(4, 0.6 * len(feature_names) + 2)
 
@@ -2343,7 +2344,7 @@ def plot_ga_combination_ale(
              ha="center", va="top", fontsize=8, color="dimgrey")
 
     plt.tight_layout(pad=1.2)
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     stem = "ga_combination_ale_bins" if mark_bins else "ga_combination_ale"
     plt.savefig(f"{directory}/{stem}_{dataset}_{entity}.png",
@@ -2373,7 +2374,7 @@ def explain_ga_combination(
     output to its detector score-columns via SHAP and PFI, then merge the three
     magnitude rankings (mean|SHAP| and PFI) with a Markov-chain rank aggregation;
     ALE supplies each detector's sign; signed SHAP is superseded.
-    Writes a report + plot under myresults/GA_Ens/{dataset}/{entity}/ and returns a
+    Writes a report + plot under results/GA_Ens/{dataset}/{entity}/ and returns a
     dict (None if explain=False).
 
     The meta-learner is, in priority order: an injected predict_fn (tests); the
@@ -2473,7 +2474,7 @@ def explain_ga_combination(
     shap_abs_rank, shap_signed_rank = _ranks(shap_abs), _ranks(shap_signed)
     pfi_rank, ale_rank = _ranks(pfi_imp), _ranks(ale_total)
 
-    directory = f"myresults/GA_Ens/{dataset}/{entity}/"
+    directory = results_dir("GA_Ens", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     report_path = os.path.join(
         directory, f"ga_combination_explainability_{dataset}_{entity}.txt")

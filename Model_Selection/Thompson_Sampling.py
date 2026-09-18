@@ -24,6 +24,7 @@ from Utils.pipeline_spec import (DEFAULT_DECISION_METRICS, combine_metrics,
 from Metrics.metrics import vus_score, vus_window
 from Metrics.metrics import prauc, range_based_precision_recall_f1_auc
 from Explainability import ir
+from Utils.paths import results_dir
 
 
 def initialize_sliding_windows(data: np.ndarray, targets: np.ndarray, mask: np.ndarray, window_size: int,
@@ -932,7 +933,7 @@ def plot_history(history: List[Dict[str, np.ndarray]], models: Dict[str, Any],
     plt.tight_layout(pad=1.2)
 
     # Save as high-resolution PNG
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f'{directory}/history_plot_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
     plt.close()
@@ -1021,7 +1022,7 @@ def plot_expected_rewards(
     draw_abbreviation_key(fig, model_names)
     plt.tight_layout(pad=1.2)
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     fname = (f'expected_rewards_smoothed_{iterations}.png' if smooth
              else f'expected_rewards_{iterations}.png')
@@ -1042,7 +1043,7 @@ def plot_selection_states(
       - Top: a per-window coloured timeline strip showing the state at each window.
       - Bottom: a bar chart with total counts and percentage labels.
 
-    Saves to myresults/Thomposon/{dataset}/{entity}/selection_states_{iterations}.png.
+    Saves to results/Thomposon/{dataset}/{entity}/selection_states_{iterations}.png.
     """
     plt.rcParams.update({
         "font.family": "serif",
@@ -1109,7 +1110,7 @@ def plot_selection_states(
 
     plt.tight_layout(pad=1.2)
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f'{directory}/selection_states_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
     plt.close()
@@ -1329,7 +1330,7 @@ def plot_shap_per_model(
     top_n_context_features with the largest |per-context-feature SHAP| contribution at the
     explanation context. Bars are coloured by sign (green > 0, red < 0).
 
-    Saves to myresults/Thomposon/{dataset}/{entity}/shap_per_model_{iterations}.png.
+    Saves to results/Thomposon/{dataset}/{entity}/shap_per_model_{iterations}.png.
     """
     if not shap_payload or shap_payload.get("n_channels", 0) <= 0:
         return
@@ -1378,7 +1379,7 @@ def plot_shap_per_model(
         ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
 
     plt.tight_layout(pad=1.2)
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.savefig(f'{directory}/shap_per_model_{iterations}.png', format='png', dpi=300, bbox_inches='tight')
     plt.close()
@@ -1424,7 +1425,7 @@ def plot_shap_comparison(
     _render_shap_comparison(
         per_context_feature, sel_models, top_n_context_features,
         title=title,
-        save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_comparison{suffix}_{iterations}.png',
+        save_path=results_dir("Thomposon", dataset, entity) + f'shap_comparison{suffix}_{iterations}.png',
         n_context_features_total=n_context_features,
     )
 
@@ -1474,7 +1475,7 @@ def _plot_per_regime(
                                            fallback_model=fallback)
     every_model = _top_k_models_by_norm(means, len(means)) if all_models else None
     folder = f'{stem}_all_{iterations}' if all_models else f'{stem}_{iterations}'
-    directory = _fresh_plot_dir(f'myresults/Thomposon/{dataset}/{entity}/{folder}/')
+    directory = _fresh_plot_dir(results_dir("Thomposon", dataset, entity) + f'{folder}/')
     mu_hist = shap_payload.get("means_history") or []
     for i, (start, end, model, _duration) in enumerate(segments):
         regime_ctx = contexts[start:end + 1]
@@ -1607,8 +1608,8 @@ def plot_reward_average_all(
     _render_shap_comparison(
         per_context_feature, sel_models, top_n_context_features,
         title=f'Mean expected-reward contribution across all windows — {scope}',
-        save_path=(f'myresults/Thomposon/{dataset}/{entity}/'
-                   f'reward_average_{suffix}_{iterations}.png'),
+        save_path=(results_dir("Thomposon", dataset, entity)
+                   + f'reward_average_{suffix}_{iterations}.png'),
         ylabel=_REWARD_YLABEL,
         n_context_features_total=n_context_features,
         note=("Averaged over every window; each detector's bars sum to its "
@@ -1663,7 +1664,7 @@ def plot_shap_average_all(
     _render_shap_comparison(
         per_context_feature, sel_models, top_n_context_features,
         title=title,
-        save_path=f'myresults/Thomposon/{dataset}/{entity}/shap_average_{suffix}_{iterations}.png',
+        save_path=results_dir("Thomposon", dataset, entity) + f'shap_average_{suffix}_{iterations}.png',
         n_context_features_total=n_context_features,
     )
 
@@ -1695,7 +1696,7 @@ def explain_thompson_sampling(
     model's expected reward is identical (e.g. window 0, all means still the zero
     vector) there is no meaningful winner, so both columns print 'N/A'.
 
-    Saves to myresults/Thomposon/{dataset}/{entity}/explainability_{iterations}.txt.
+    Saves to results/Thomposon/{dataset}/{entity}/explainability_{iterations}.txt.
     """
     model_list = list(expected_rewards_history.keys())
     T = len(list_of_chosen_models)
@@ -1846,7 +1847,7 @@ def explain_thompson_sampling(
         logger.error(f"Thompson per-regime computation failed (non-fatal): {e}")
         regimes_data = []
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(directory, f'explainability_{iterations}.txt')
 
@@ -2170,7 +2171,7 @@ def plot_ranking_criterion(means_history: List[Dict[str, np.ndarray]],
     # regime band is only as wide as the regime.
     draw_abbreviation_key(fig, list(series))
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.tight_layout(pad=1.2)
     plt.savefig(os.path.join(directory, f'ranking_criterion_{iterations}.png'),
@@ -2221,7 +2222,7 @@ def plot_ranking_final(means: Dict[str, np.ndarray],
     ax.set_title('Final ranking, with the number of windows each detector was tried')
     ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.tight_layout(pad=1.2)
     plt.savefig(os.path.join(directory, f'ranking_final_{iterations}.png'),
@@ -2242,7 +2243,7 @@ def plot_ranking_channels(means: Dict[str, np.ndarray], n_context_features: int,
                    for m in models}
     suffix = '_all' if all_models else ''
     scope = 'all models' if all_models else f'top {top_k_models} by score'
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     _render_shap_comparison(
         per_context_feature, models, top_n_context_features,
@@ -2289,7 +2290,7 @@ def plot_ranking_gap(means: Dict[str, np.ndarray], n_context_features: int,
                  f'(green: {winner} ahead, red: {runner} ahead)')
     ax.grid(True, axis='x', linestyle='--', linewidth=0.5, alpha=0.6)
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     plt.tight_layout(pad=1.2)
     plt.savefig(os.path.join(directory, f'ranking_gap_{iterations}.png'),
@@ -2436,7 +2437,7 @@ def save_per_window_context_features(
         "sets": sets,
     }
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f'per_window_channels_{iterations}.json')
     with open(path, "w", encoding="utf-8") as handle:
@@ -2460,7 +2461,7 @@ def plot_ranking_per_regime(means_history: List[Dict[str, np.ndarray]],
     if not means_history or not segments or n_context_features <= 0:
         return
     directory = _fresh_plot_dir(
-        f'myresults/Thomposon/{dataset}/{entity}/ranking_per_regime_{iterations}/')
+        results_dir("Thomposon", dataset, entity) + f'ranking_per_regime_{iterations}/')
     for fact in _regime_ranking_facts(means_history, segments, n_context_features,
                                       top_n_context_features=n_context_features):
         end, leader, runner = fact["end"], fact["leader"], fact["runner_up"]
@@ -2543,7 +2544,7 @@ def explain_thompson_ranking(
 
     regimes_data = _regime_ranking_facts(means_history, segments, n_context_features)
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(directory, f'ranking_explainability_{iterations}.txt')
     with open(output_file, 'w') as f:
@@ -2707,7 +2708,7 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
     axes[-1].set_xlabel('Time (index)')
 
     plt.tight_layout()
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     if not os.path.exists(directory):
         os.makedirs(directory)
     plt.savefig(f'{directory}/performance_plot_{iterations}.png')
@@ -2760,7 +2761,7 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
     # Rank models
     ranked_models = rank_models(means)
 
-    directory = f'myresults/Thomposon/{dataset}/{entity}/'
+    directory = results_dir("Thomposon", dataset, entity)
     os.makedirs(directory, exist_ok=True)
     output_file = os.path.join(directory, f"thompson_sampling_results_{dataset}_{entity}_{iterations}_{iteration}.txt")
 

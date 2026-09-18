@@ -28,6 +28,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional
 
 from Utils.pipeline_spec import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from Utils.paths import results_dir
 
 # Re-exported under the names this module has always used, so callers and tests
 # keep working; the values themselves live in the shared spec.
@@ -713,8 +714,8 @@ def _stage_file_map(iteration: int) -> Dict[str, str]:
 
 
 def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
-                   base_dir: str = "myresults/explanations_ir",
-                   out_dir: str = "myresults/explanations_nl",
+                   base_dir: str = None,
+                   out_dir: str = None,
                    stages: Optional[List[str]] = None,
                    global_mode: str = "concat") -> Dict[str, Any]:
     """
@@ -734,8 +735,10 @@ def narrate_entity(dataset: str, entity: str, iteration: int, client: LLMClient,
     if global_mode not in GLOBAL_MODES:
         raise ValueError(f"global_mode must be one of {GLOBAL_MODES}, got {global_mode!r}")
     verifier = _verifier_module()
-    ir_dir = os.path.join(base_dir, str(dataset), str(entity))
-    nl_dir = os.path.join(out_dir, str(dataset), str(entity))
+    ir_dir = os.path.join(base_dir or results_dir("explanations_ir"),
+                          str(dataset), str(entity))
+    nl_dir = os.path.join(out_dir or results_dir("explanations_nl"),
+                          str(dataset), str(entity))
     os.makedirs(nl_dir, exist_ok=True)
 
     def _load(fname: str, pattern: Optional[str] = None) -> Optional[Dict[str, Any]]:

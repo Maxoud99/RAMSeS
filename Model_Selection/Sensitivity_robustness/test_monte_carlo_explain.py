@@ -15,6 +15,8 @@ import unittest
 
 import numpy as np
 import matplotlib
+import pathlib
+from Utils import paths as ramses_paths
 matplotlib.use("Agg")
 
 
@@ -305,6 +307,7 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cwd = os.getcwd()
             os.chdir(tmp)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmp) / "results"
             try:
                 res = mc.explain_monte_carlo(
                     _fake_data(), {"A": object(), "B": object()}, models,
@@ -320,7 +323,7 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
                 self.assertEqual(res["sweep"]["F1_fixed"].shape, res["sweep"]["F1"].shape)
                 # A→B crossover should be detected on the F1 curves.
                 self.assertGreaterEqual(len(res["curves_f1"]["crossovers"]), 1)
-                out = os.path.join("myresults", "robustness", "MonteCarlo", "TEST", "e1")
+                out = os.path.join("results", "robustness", "MonteCarlo", "TEST", "e1")
                 for fname in (
                     "TEST_e1_MonteCarlo_explainability.txt",
                     "TEST_e1_MonteCarlo_noise_curves_F1.png",
@@ -335,7 +338,7 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
                     self.assertTrue(os.path.exists(os.path.join(out, fname)), fname)
                 # Intermediate Representation JSON is emitted alongside.
                 import json
-                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                ir_path = os.path.join("results", "explanations_ir", "TEST", "e1",
                                        "ir_monte_carlo.json")
                 self.assertTrue(os.path.exists(ir_path), ir_path)
                 with open(ir_path) as fh:
@@ -348,7 +351,7 @@ class TestExplainMonteCarloIntegration(unittest.TestCase):
                 self.assertIn("R² (held-out)", report_txt)
             finally:
                 os.chdir(cwd)
-
+                ramses_paths.reset_cache()
     def test_explain_false_returns_none(self):
         self.assertIsNone(mc.explain_monte_carlo(
             _fake_data(), {}, ["A"], "X", "Y", explain=False))
@@ -424,6 +427,7 @@ class TestExplainMetricGating(unittest.TestCase):
     def _run(self, metrics, tmp):
         cwd = os.getcwd()
         os.chdir(tmp)
+        ramses_paths._RESULTS_ROOT = pathlib.Path(tmp) / "results"
         try:
             return mc.explain_monte_carlo(
                 _fake_data(), {}, ["A", "B"], "DS", "e1",
@@ -432,7 +436,7 @@ class TestExplainMetricGating(unittest.TestCase):
                 metrics=metrics)
         finally:
             os.chdir(cwd)
-
+            ramses_paths.reset_cache()
     def test_f1_only_computes_no_pr_auc_structures(self):
         with tempfile.TemporaryDirectory() as tmp:
             res = self._run(("f1",), tmp)
@@ -459,7 +463,7 @@ class TestExplainMetricGating(unittest.TestCase):
         """The result page's metric switcher is built from what is on disk."""
         with tempfile.TemporaryDirectory() as tmp:
             self._run(("f1", "vus"), tmp)
-            figs = os.listdir(os.path.join(tmp, "myresults", "robustness",
+            figs = os.listdir(os.path.join(tmp, "results", "robustness",
                                            "MonteCarlo", "DS", "e1"))
         names = " ".join(figs)
         self.assertIn("noise_curves_F1_plain.png", names)
@@ -469,7 +473,7 @@ class TestExplainMetricGating(unittest.TestCase):
 
 
 def _read_report(tmp):
-    directory = os.path.join(tmp, "myresults", "robustness", "MonteCarlo", "DS", "e1")
+    directory = os.path.join(tmp, "results", "robustness", "MonteCarlo", "DS", "e1")
     name = [f for f in os.listdir(directory) if f.endswith("_explainability.txt")][0]
     with open(os.path.join(directory, name)) as f:
         return f.read()

@@ -3,7 +3,7 @@ What is available to run: datasets, entities, and which detectors are trained.
 
 Discovery is driven by `trained_model_path` from Configs/config.yml — a run
 needs trained checkpoints, so that tree is the authoritative answer to "what
-can I run right now". Results in `myresults/` are a separate question, answered
+can I run right now". Results in `results/` are a separate question, answered
 by artifacts.known_entities().
 """
 

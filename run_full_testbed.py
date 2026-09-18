@@ -15,11 +15,12 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 import subprocess
 import traceback
+from Utils.paths import results_dir
 
 class TestbedRunner:
-    def __init__(self, config_file: str, output_dir: str = "myresults/testbed_aggregated"):
+    def __init__(self, config_file: str, output_dir: str = None):
         self.config_file = config_file
-        self.output_dir = output_dir
+        self.output_dir = output_dir or results_dir("testbed_aggregated")
         self.results = []
         self.start_time = None
         self.end_time = None
@@ -86,7 +87,7 @@ class TestbedRunner:
                 }
             
             # Load the JSON results
-            json_pattern = f"myresults/comprehensive/{dataset}/{entity}/results_*.json"
+            json_pattern = results_dir("comprehensive", dataset, entity) + "results_*.json"
             json_files = list(Path(".").glob(json_pattern))
             
             if not json_files:
@@ -366,7 +367,7 @@ def main():
     parser = argparse.ArgumentParser(description='Run RAMSeS on full testbed')
     parser.add_argument('-c', '--config', default='Configs/custom_config.yml',
                         help='Path to config file')
-    parser.add_argument('-o', '--output', default='myresults/testbed_aggregated',
+    parser.add_argument('-o', '--output', default=None,
                         help='Output directory for aggregated results')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from last completed experiment')

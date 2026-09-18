@@ -14,6 +14,8 @@ import unittest
 import unittest.mock
 
 import numpy as np
+import pathlib
+from Utils import paths as ramses_paths
 
 
 # ── Mock heavy module-level imports so Ensemble_GA.py loads ─────────────────
@@ -590,6 +592,7 @@ class TestCombination(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = os.getcwd()
             os.chdir(tmpdir)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
             try:
                 result = explain_ga_combination(
                     best_ensemble, algorithm_list, Xtr, Xte, ytr, yte,
@@ -611,7 +614,7 @@ class TestCombination(unittest.TestCase):
                 self.assertEqual(result["ale_sign"]["A"], "positive")
                 self.assertAlmostEqual(result["ale_total_variation"]["C"], 0.0,
                                        places=9)
-                out = os.path.join("myresults", "GA_Ens", "TEST", "e1")
+                out = os.path.join("results", "GA_Ens", "TEST", "e1")
                 self.assertTrue(os.path.exists(os.path.join(
                     out, "ga_combination_explainability_TEST_e1.txt")))
                 self.assertTrue(os.path.exists(os.path.join(
@@ -630,15 +633,14 @@ class TestCombination(unittest.TestCase):
                 self.assertIn("Markov aggregation (SHAP |.| + PFI + ALE)", report)
                 # Intermediate Representation JSON is emitted alongside.
                 import json
-                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                ir_path = os.path.join("results", "explanations_ir", "TEST", "e1",
                                        "ir_ga_combination.json")
                 self.assertTrue(os.path.exists(ir_path), ir_path)
                 with open(ir_path) as fh:
                     self.assertEqual(json.load(fh)["stage"], "ga_combination")
             finally:
                 os.chdir(cwd)
-
-
+                ramses_paths.reset_cache()
 # ════════════════════════════════════════════════════════════════════════════
 # 7.  explain_ga_selection — integration smoke test
 # ════════════════════════════════════════════════════════════════════════════
@@ -672,6 +674,7 @@ class TestExplainGASelection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = os.getcwd()
             os.chdir(tmpdir)
+            ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
             try:
                 result = explain_ga_selection(
                     best_ensemble, ee, gen_pops, algorithm_list,
@@ -685,14 +688,14 @@ class TestExplainGASelection(unittest.TestCase):
                             "archetypes", "n_subsets_evaluated", "n_generations"):
                     self.assertIn(key, result)
 
-                out = os.path.join("myresults", "GA_Ens", "TEST", "e1")
+                out = os.path.join("results", "GA_Ens", "TEST", "e1")
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_explainability_TEST_e1.txt")))
                 self.assertTrue(os.path.exists(
                     os.path.join(out, "ga_selection_utility_TEST_e1.png")))
                 # Intermediate Representation JSON is emitted alongside.
                 import json
-                ir_path = os.path.join("myresults", "explanations_ir", "TEST", "e1",
+                ir_path = os.path.join("results", "explanations_ir", "TEST", "e1",
                                        "ir_ga_selection.json")
                 self.assertTrue(os.path.exists(ir_path), ir_path)
                 with open(ir_path) as fh:
@@ -706,7 +709,7 @@ class TestExplainGASelection(unittest.TestCase):
                     os.path.join(out, "ga_selection_archetypes_TEST_e1.png")))
             finally:
                 os.chdir(cwd)
-
+                ramses_paths.reset_cache()
     def test_explain_false_is_noop(self):
         result = explain_ga_selection(
             ["A", "B"], {}, [], ["A", "B"],
