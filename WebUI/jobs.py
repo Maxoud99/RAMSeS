@@ -27,14 +27,64 @@ from typing import Any, Dict, List, Optional
 from Utils.pipeline_spec import (ALL_DETECTORS, ALL_STAGES,
                                  DEFAULT_ANOMALY_TYPE, DEFAULT_DECISION_METRICS,
                                  format_decision_metrics, OFFLINE_ITERATION,
-                                 parse_decision_metrics)
-from WebUI import artifacts, markers, paths
+                                 ONLINE_SCENARIO_LABELS, parse_adaptive_k,
+                                 parse_adaptive_window, parse_anomaly_types,
+                                 parse_decision_metrics,
+                                 parse_drop_pct, parse_max_online_windows,
+                                 parse_online_labels,
+                                 parse_online_strategy, parse_reopt_delay,
+                                 parse_update_interval)
+from WebUI import artifacts, markers, online, paths
 
 LOG_RING = 20000            # lines kept in memory; the full log also goes to disk
 DEFAULT_TIMEOUT = 14400     # 4 hours. A 38-channel SMD entity with the neural
                             # networks and foundation models in the pool spends
                             # well over an hour before narration even starts.
 _LINE_SPLIT = re.compile(r"[\r\n]")   # tqdm rewrites lines with \r
+
+# Online-phase run parameter -> (CLI flag, parser). The parsers are the CLI's
+# own (Utils.pipeline_spec), so a value the pipeline would refuse after a
+# fork-and-load is refused here instead. An omitted parameter emits no flag and
+# the pipeline falls back to Configs/config.yml.
+ONLINE_PARAMS = (
+    ("update_interval", "--update_interval", parse_update_interval),
+    ("drop_pct", "--drop_pct", parse_drop_pct),
+    ("adaptive_window", "--adaptive_window", parse_adaptive_window),
+    ("adaptive_k", "--adaptive_k", parse_adaptive_k),
+    ("max_online_windows", "--max_online_windows", parse_max_online_windows),
+    ("reopt_delay", "--reopt_delay", parse_reopt_delay),
+)
+
+
+def _unset(value) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _online_flags(params: Dict[str, Any]) -> List[str]:
+    """The online-phase flags of a run. Raises ValueError on a bad value."""
+    flags = ["--enable_online"]
+    # `strategy` is the parameter's spelling from before the four scenarios;
+    # `online_strategy` wins when both are sent.
+    strategy = params.get("online_strategy")
+    if _unset(strategy):
+        strategy = params.get("strategy")
+    if not _unset(strategy):
+        parse_online_strategy(strategy)
+        flags += ["--strategy", str(strategy).strip()]
+    for key, flag, parse in ONLINE_PARAMS:
+        if _unset(params.get(key)):
+            continue
+        value = parse(params[key])
+        if value is not None:
+            flags += [flag, str(value) if isinstance(value, int) else format(value, ".10g")]
+    # Unset ("auto") emits no flag: the pipeline then uses real labels where
+    # the dataset has them, exactly as the configure page previews.
+    labels = parse_online_labels(params.get("online_labels"))
+    if labels is not None:
+        flags += ["--online_labels", labels]
+    if params.get("inject_online_regime"):
+        flags.append("--inject_online_regime")
+    return flags
 
 
 def build_argv(params: Dict[str, Any]) -> List[str]:
@@ -52,9 +102,13 @@ def build_argv(params: Dict[str, Any]) -> List[str]:
             "--entity", entity,
             "--parallel", "true" if params.get("parallel") else "false"]
 
-    anomaly_type = str(params.get("anomaly_type") or "").strip().lower()
-    if anomaly_type and anomaly_type != DEFAULT_ANOMALY_TYPE:
-        argv += ["--anomaly_type", anomaly_type]
+    # One type or several: `anomaly_types` (a list) from the multi-select, or
+    # the older single `anomaly_type`, which may itself be a list or "a,b".
+    raw_types = params.get("anomaly_types", params.get("anomaly_type"))
+    anomaly_types = (parse_anomaly_types(raw_types) if raw_types not in (None, "")
+                     else [DEFAULT_ANOMALY_TYPE])
+    if anomaly_types != [DEFAULT_ANOMALY_TYPE]:
+        argv += ["--anomaly_type", ",".join(anomaly_types)]
     if params.get("anomaly_rate") is not None:
         argv += ["--anomaly_rate", str(float(params["anomaly_rate"]))]
 
@@ -71,17 +125,13 @@ def build_argv(params: Dict[str, Any]) -> List[str]:
 
     if params.get("iteration") is not None:
         argv += ["--iteration", str(int(params["iteration"]))]
-    if params.get("strategy"):
-        argv += ["--strategy", str(params["strategy"])]
     if params.get("explain", True):
         argv.append("--explain")
     # Always explicit: the config file ships with overwrite: True, so omitting
     # the flag would silently retrain every detector on every run.
     argv += ["--overwrite", "true" if params.get("overwrite") else "false"]
     if params.get("enable_online"):
-        argv.append("--enable_online")
-        if params.get("max_online_windows"):
-            argv += ["--max_online_windows", str(int(params["max_online_windows"]))]
+        argv += _online_flags(params)
 
     stages = params.get("stages")
     if stages:
@@ -146,10 +196,17 @@ class Job:
         self.saw_complete = False
         self.saw_partial_complete = False
         self.saw_fatal = False
+        # A traceback AFTER the completion marker. The online phase runs after
+        # "EXECUTION COMPLETE!", so a crash there used to read as a clean run.
+        self.saw_fatal_after_complete = False
+        # The online phase as the log tells it: None until it starts, then
+        # {"status", "strategy", "order", "scenarios": {key: progress}, "error"}.
+        self.online: Optional[Dict[str, Any]] = None
         self.cancel_requested = False
         self.log_path: Optional[Path] = None
         self.result_url: Optional[str] = None
         self.report_url: Optional[str] = None
+        self.online_url: Optional[str] = None
         self.condition = threading.Condition()
         self._proc: Optional[subprocess.Popen] = None
 
@@ -173,6 +230,8 @@ class Job:
                 "cursor": self.cursor,
                 "result_url": self.result_url,
                 "report_url": self.report_url,
+                "online": _copy_online(self.online),
+                "online_url": self.online_url,
             }
 
     def tail(self, offset: int = 0) -> Dict[str, Any]:
@@ -200,7 +259,12 @@ class Job:
                 kind = event["type"]
                 if kind == "phase":
                     self.phase = {"number": event["number"], "title": event["title"]}
-                elif kind == "stage" and event.get("key"):
+                # `not self.saw_complete`: after the completion marker no
+                # offline sub-stage can run. The online phase's background
+                # re-optimisations re-run the offline pipeline and log its
+                # "Sub-stage 6.x" lines, which would otherwise flip the finished
+                # offline rail back to "running".
+                elif kind == "stage" and event.get("key") and not self.saw_complete:
                     # Status only, deliberately no timing. The pipeline measures
                     # each module itself and writes those numbers to the
                     # comprehensive report; wall-clock deltas between log lines
@@ -210,6 +274,8 @@ class Job:
                     entry = self.stages.setdefault(event["key"], {})
                     entry["status"] = event["status"]
                     entry["text"] = event.get("text") or entry.get("text")
+                elif kind == "online":
+                    self._record_online(event)
                 elif kind == "warning":
                     if not any(w["code"] == event["code"] for w in self.warnings):
                         self.warnings.append({"code": event["code"], "text": event["text"]})
@@ -218,7 +284,118 @@ class Job:
                     self.saw_partial_complete = bool(event.get("partial"))
                 elif kind == "fatal_marker":
                     self.saw_fatal = True
+                    if self.saw_complete:
+                        self.saw_fatal_after_complete = True
             self.condition.notify_all()
+
+    def _record_online(self, event: Dict[str, Any]) -> None:
+        """Fold one `ONLINE ...` line into the phase rail and `self.online`.
+
+        Each scenario is a stage entry `online_<key>` (group "online") carrying
+        its window progress, so the existing stage stream delivers it; the rail
+        moves to phase 8 when the online phase starts. Called with the
+        condition held.
+        """
+        kind, fields = event["kind"], event.get("fields") or {}
+
+        def scenario_entry(key):
+            if self.online is None:
+                return None
+            return self.online["scenarios"].get(key)
+
+        def sync_stage(key):
+            prog = scenario_entry(key)
+            if prog is None:
+                return
+            text = f"window {prog['window']}/{prog['total']}" if prog["total"] else None
+            if prog["reopts_applied"]:
+                text = f"{text} · {prog['reopts_applied']} re-optimization(s) applied"
+            waiting = prog.get("waiting")
+            if waiting:
+                # Waiting is not stalling: say what for, so a long pause reads
+                # as the re-optimisation it is.
+                text = (f"{text} · waiting for the re-optimization started at "
+                        f"window {waiting['since_window']} (due at window "
+                        f"{waiting['until_window']})")
+            if prog.get("error"):
+                text = prog["error"]
+            # The rail knows running/done/failed; a waiting scenario is still
+            # running, and its text and `waiting` say what it waits for.
+            self.stages[f"online_{key}"] = {
+                "status": "running" if prog["status"] == "waiting" else prog["status"],
+                "text": text or prog["label"],
+                "group": "online", "label": prog["label"],
+                "window": prog["window"], "total": prog["total"],
+                "waiting": dict(waiting) if waiting else None}
+
+        if kind == "phase_start":
+            order = [k for k in (fields.get("scenarios") or "").split("+") if k]
+            total = _to_int(fields.get("windows"))
+            self.online = {"status": "running", "strategy": fields.get("strategy"),
+                           "order": order, "scenarios": {}, "error": None}
+            self.phase = {"number": markers.ONLINE_PHASE_NUMBER,
+                          "title": markers.PHASE_TITLES[markers.ONLINE_PHASE_NUMBER]}
+            for key in order:
+                self.online["scenarios"][key] = {
+                    "status": "pending", "label": ONLINE_SCENARIO_LABELS.get(key, key),
+                    "window": 0, "total": total or 0, "triggers": 0,
+                    "reopts_started": 0, "reopts_applied": 0, "suppressed": 0,
+                    "failed": 0, "not_applied": 0, "aborted": 0, "waiting": None,
+                    "error": None}
+                sync_stage(key)
+            return
+        if kind == "phase_skipped":
+            self.online = {"status": "skipped", "strategy": None, "order": [],
+                           "scenarios": {}, "error": fields.get("reason")}
+            return
+        if kind in ("phase_failed", "phase_complete"):
+            if self.online is None:
+                self.online = {"status": None, "strategy": None, "order": [],
+                               "scenarios": {}, "error": None}
+            self.online["status"] = "failed" if kind == "phase_failed" else "complete"
+            if kind == "phase_failed":
+                self.online["error"] = fields.get("error") or event.get("text")
+            return
+
+        key = fields.get("scenario")
+        prog = scenario_entry(key)
+        if prog is None:
+            return
+        if kind == "scenario_start":
+            prog["status"] = "running"
+        elif kind == "window":
+            done, _, total = (fields.get("window") or "").partition("/")
+            prog["status"] = "running"
+            prog["window"] = _to_int(done) or prog["window"]
+            prog["total"] = _to_int(total) or prog["total"]
+            trigger = fields.get("trigger")
+            if trigger in ("started", "suppressed"):
+                prog["triggers"] += 1
+                prog["reopts_started" if trigger == "started" else "suppressed"] += 1
+        elif kind == "reopt":
+            what = fields.get("event")
+            if what == "waiting":
+                prog["status"] = "waiting"
+                started = _to_int(fields.get("started_at_window"))
+                prog["waiting"] = {"since_window": started,
+                                   "until_window": _to_int(fields.get("window"))}
+            elif what in ("applied", "failed"):
+                if prog.get("waiting"):
+                    prog["status"] = "running"
+                prog["waiting"] = None
+                prog["reopts_applied" if what == "applied" else "failed"] += 1
+            elif what == "not_applied":
+                prog["not_applied"] += 1
+            elif what == "aborted":
+                prog["aborted"] += 1
+        elif kind == "scenario_complete":
+            prog["status"] = "done"
+            prog["waiting"] = None
+        elif kind == "scenario_failed":
+            prog["status"] = "failed"
+            prog["waiting"] = None
+            prog["error"] = fields.get("error")
+        sync_stage(key)
 
     def _finish(self, status: str, reason: Optional[str] = None) -> None:
         with self.condition:
@@ -228,6 +405,62 @@ class Job:
             self.condition.notify_all()
 
 
+def _to_int(value) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _copy_online(online: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if online is None:
+        return None
+    return {**online, "order": list(online.get("order") or []),
+            "scenarios": {k: dict(v) for k, v in (online.get("scenarios") or {}).items()}}
+
+
+def online_problem(job: Job) -> Optional[str]:
+    """Why the online phase of a finished run is not a clean success, or None.
+
+    The online phase runs after "EXECUTION COMPLETE!", so the completion marker
+    alone cannot vouch for it. The offline results are already written by then
+    and stay valid, which is why a problem here is a warning on the run rather
+    than a failure of it.
+    """
+    if job.saw_fatal_after_complete:
+        detail = next((l for l in reversed(job.lines) if markers.FATAL_SIGNATURE in l), "")
+        return ("The offline phase finished, but the pipeline raised an exception "
+                f"after it. {detail}").strip()
+    online_state = job.online
+    if not job.params.get("enable_online"):
+        return None
+    if online_state is None:
+        return "The online phase was requested but never started."
+    status = online_state.get("status")
+    if status == "skipped":
+        return f"The online phase was skipped: {online_state.get('error') or 'no reason given'}"
+    if status == "failed":
+        return ("The offline phase finished, but the online phase failed: "
+                f"{online_state.get('error') or 'see the log'}")
+    if status != "complete":
+        return "The online phase did not finish."
+    scenarios = online_state.get("scenarios") or {}
+    problems = []
+    failed = [k for k, v in scenarios.items() if v.get("status") == "failed"]
+    if failed:
+        problems.append(f"Online scenario(s) failed: {', '.join(failed)}.")
+    # A failed re-optimisation does not fail its scenario, which keeps
+    # streaming with the selection it had. Left unreported, a scenario whose
+    # every re-optimisation died would read as a clean run while behaving like
+    # `fixed`, which is how the old NameError went unnoticed.
+    for key, prog in scenarios.items():
+        n = prog.get("failed") or 0
+        if n and key not in failed:
+            problems.append(f"{n} re-optimization(s) failed or timed out in {key} "
+                            f"(see the log); the scenario kept its previous selection.")
+    return " ".join(problems) or None
+
+
 def classify_outcome(job: Job, expect_partial: bool,
                      explain_requested: bool = False,
                      artifacts_written: Optional[bool] = None) -> Dict[str, Any]:
@@ -235,11 +468,31 @@ def classify_outcome(job: Job, expect_partial: bool,
 
     Exit code 0 is NOT sufficient evidence of success: run_app catches every
     exception, logs it and returns normally, so a crashed run still exits 0.
-    A completion marker in the log is the discriminator.
+    A completion marker in the log is the discriminator — for the OFFLINE
+    phase. The online phase runs after it, so its problems are judged
+    separately (`online_problem`) and turn a success into one with warnings.
     """
+    expected_marker_seen = (job.saw_partial_complete if expect_partial
+                            else job.saw_complete and not job.saw_partial_complete)
+    no_artifacts = ("The run finished but wrote no explanation artifacts — "
+                    "the LLM server was most likely unreachable.")
+
     if job.cancel_requested:
         return {"status": "cancelled", "reason": "Cancelled from the UI."}
     if job.status == "timeout":
+        if job.saw_complete and expected_marker_seen:
+            # The watchdog is one absolute timer for the whole run, and the
+            # online phase runs after the completion marker. The offline
+            # results are on disk and valid, so the run keeps its result and
+            # report links; only what came after the marker was cut short.
+            during_online = (job.online or {}).get("status") == "running"
+            where = ("during the online phase, whose results are incomplete"
+                     if during_online else "after the offline phase finished")
+            problems = [f"The offline phase finished, but the run was killed by the "
+                        f"{job.timeout}s run timeout {where}."]
+            if explain_requested and artifacts_written is False:
+                problems.append(no_artifacts)
+            return {"status": "succeeded_with_warnings", "reason": " ".join(problems)}
         return {"status": "timeout",
                 "reason": f"No completion after {job.timeout}s; the process was killed."}
     if job.exit_code not in (0, None):
@@ -247,13 +500,16 @@ def classify_outcome(job: Job, expect_partial: bool,
         return {"status": "failed",
                 "reason": f"Exited with code {job.exit_code}. {last}".strip()}
 
-    expected_marker_seen = (job.saw_partial_complete if expect_partial
-                            else job.saw_complete and not job.saw_partial_complete)
     if job.saw_complete and expected_marker_seen:
+        problems = []
         if explain_requested and artifacts_written is False:
-            return {"status": "succeeded_with_warnings",
-                    "reason": "The run finished but wrote no explanation artifacts — "
-                              "the LLM server was most likely unreachable."}
+            problems.append(no_artifacts)
+        # A partial run stops before the online phase by design.
+        problem = None if expect_partial else online_problem(job)
+        if problem:
+            problems.append(problem)
+        if problems:
+            return {"status": "succeeded_with_warnings", "reason": " ".join(problems)}
         return {"status": "succeeded", "reason": None}
 
     if job.saw_complete and not expected_marker_seen:
@@ -426,12 +682,28 @@ class JobManager:
             explain_requested=bool(job.params.get("explain", True)),
             artifacts_written=self._artifacts_written(job))
         dataset, entity = job.params.get("dataset"), job.params.get("entity")
+        if job.params.get("enable_online"):
+            # A process killed by the timeout or a cancel (or one that crashed)
+            # cannot say so in its own files, and its summary would read
+            # "running" forever. Only THIS run's summary is touched.
+            try:
+                online.mark_interrupted(
+                    dataset or "", entity or "", since=job.started_at - 5,
+                    reason=f"The run ended ({outcome['status']}) before the online "
+                           f"phase finished.")
+            except OSError as e:
+                job._record(f"[webui] could not mark the online results interrupted: {e}")
         if outcome["status"] in ("succeeded", "succeeded_with_warnings"):
             job.result_url = f"/result/{dataset}/{entity}"
             # Only link the report when it is actually on disk: partial runs
             # return before the pipeline writes it.
             if artifacts.comprehensive_path(dataset, entity) is not None:
                 job.report_url = f"/report/{dataset}/{entity}"
+            # Likewise the online results, and only THIS run's: an older run's
+            # summary for the same entity must not be offered as this one's.
+            summary = online.info(dataset, entity) if job.params.get("enable_online") else None
+            if summary and (summary.get("generated_at") or 0) >= job.started_at - 5:
+                job.online_url = summary["page_url"]
         job._finish(outcome["status"], outcome["reason"])
 
         with self._lock:

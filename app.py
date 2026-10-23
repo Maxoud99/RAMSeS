@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch as t
 
-from Datasets.load import load_data
+from Datasets.load import load_data, provides_real_labels
+from Datasets import tsb_ad
 from Metrics.Ensemble_GA import (
     genetic_algorithm,
     evaluate_individual_models,
@@ -29,22 +30,30 @@ from Model_Selection.Sensitivity_robustness.Monte_Carlo_Simulation import (
 from Model_Selection.Sensitivity_robustness.off_by_threshold_testing import (
     run_off_by_threshold,
 )
-from Model_Selection.Thompson_Sampling import (
-    run_linear_thompson_sampling,
-    initialize_sliding_windows,
-)
+from Model_Selection.Thompson_Sampling import run_linear_thompson_sampling
 from Model_Selection.inject_anomalies import Inject
 from Model_Selection.rank_aggregation import (
     enhanced_markov_chain_rank_aggregator_text,
     explain_rank_aggregation,
 )
-from Model_Training.train import TrainModels
+from Model_Training.train import TrainModels, TRAINING_TIMEOUT_SECONDS
 from Metrics.metrics import vus_score, vus_window
-from Utils.model_io import load_checkpoint
-from Utils.model_selection_utils import timed_out_detectors
+from Utils.model_io import load_detector
+from Utils.model_selection_utils import (
+    describe_failure,
+    probe_detector,
+    timed_out_detectors,
+)
 from Utils.pipeline_spec import (
     ALL_DETECTORS,
     combine_metrics,
+    count_windows,
+    online_feasibility,
+    online_split,
+    ONLINE_LABELS_REAL,
+    ONLINE_LABEL_SOURCE_LABELS,
+    resolve_online_labels,
+    REGIME_SHIFT_TYPES,
     dataset_label,
     DEFAULT_ANOMALY_TYPE,
     DEFAULT_DECISION_METRICS,
@@ -64,6 +73,7 @@ from Utils.pipeline_spec import ALL_STAGES as _SPEC_ALL_STAGES
 from Utils.pipeline_spec import OFFLINE_ITERATION as _SPEC_OFFLINE_ITERATION
 from Utils.utils import get_args_from_cmdline
 from Utils.paths import results_dir
+from Utils.set_all_seeds import set_all_seeds
 # from comprehensive_results_writer import write_comprehensive_results
 
 # ------------------------------------------------------------------------------
@@ -496,9 +506,9 @@ def write_comprehensive_results(output_file, dataset, entity, iteration, results
     logger.info(f"Comprehensive results saved to: {output_file}")
 
 
-def load_trained_models(model_names, models_dir):
+def load_trained_models(model_names, models_dir, probe_data=None):
     """
-    Load trained models from disk.
+    Load trained models from disk, keeping only those that can score the data.
 
     Parameters
     ----------
@@ -506,53 +516,168 @@ def load_trained_models(model_names, models_dir):
         List of model instance names (e.g., 'CBLOF_1', 'LOF_3', ...).
     models_dir : str
         Directory where .pth files are stored.
+    probe_data : Dataset, optional
+        The data this run will score. When given, every checkpoint that loads
+        is also probed against it, and one that cannot score it is excluded
+        rather than returned.
 
     Returns
     -------
-    dict[str, torch.nn.Module]
+    (dict[str, torch.nn.Module], dict[str, str])
+        The usable models, and {name: reason} for every checkpoint that exists
+        but was excluded — because it could not be loaded at all, or because
+        the probe found it cannot score `probe_data`. A name in neither had no
+        checkpoint.
     """
     trained = {}
     missing = []
+    excluded = {}
+
+    def exclude(name, failure, reason):
+        excluded[name] = reason
+        # Worded for WebUI/markers.py, which turns each of these lines into its
+        # own banner: the name, the reason and the remedy all have to be on
+        # this one line, and both kinds of exclusion share the prefix so one
+        # pattern there catches them.
+        logger.warning(
+            f"⚠ Incompatible checkpoint {name} excluded: it {failure} — "
+            f"{reason.rstrip('.')}. Remedy: retrain it with --overwrite true. "
+            f"The checkpoint file was left untouched.")
+
     for name in model_names:
         path = os.path.join(models_dir, f"{name}.pth")
         if not os.path.exists(path):
             missing.append(name)
             logger.warning(f"Model {name} not found in {models_dir}, skipping")
             continue
-        with open(path, 'rb') as fh:
-            # map_location: checkpoints trained on a GPU box carry CUDA storages
-            # and fail to unpickle at all on a CPU-only machine.
-            model = load_checkpoint(fh, map_location='cpu')
-            # …and that is only half of it. MD, LSTMVAE and DGHL also pickle
-            # `device = cuda` as plain state, so their forward passes went on
-            # allocating CUDA tensors after map_location had moved every weight
-            # to the CPU, and every one of them died on "Torch not compiled with
-            # CUDA enabled". Redirecting the attribute (and any submodule that
-            # came with it) is what actually makes a GPU-trained checkpoint
-            # runnable here; it is a no-op when CUDA is present or the model
-            # never carried a device.
-            if not t.cuda.is_available() and str(getattr(model, 'device', 'cpu')) != 'cpu':
-                model.device = t.device('cpu')
-                for attribute in vars(model).values():
-                    if isinstance(attribute, t.nn.Module):
-                        attribute.to('cpu')
-            try:
-                model.eval()
-            except AttributeError:
-                # If the checkpoint isn't a nn.Module, we still store it as-is.
-                pass
-            trained[name] = model
-    
+        try:
+            with open(path, 'rb') as fh:
+                # One call owns both halves of reading a checkpoint back: the
+                # pickler the save used, and putting the weights AND every
+                # device the model recorded on one device. The repair that used
+                # to sit here ran only when CUDA was absent, so on a GPU host a
+                # GPU-trained detector kept `device='cuda'` over CPU weights and
+                # crashed on its first forward pass; Utils/model_io.py has the
+                # full account.
+                model = load_detector(fh)
+        except Exception as e:
+            # A checkpoint that cannot be read at all is the stalest kind
+            # there is, and the store has two sorts of it: pickles that name
+            # the `algorithm` package this code was once laid out as (whole
+            # entities of the smd and anomaly_archive trees, every family), and
+            # files cut short by a save that died partway, since
+            # Logger.save_torch_model writes the .pth in place. With
+            # --overwrite false TrainModels takes any .pth on disk as trained,
+            # so this is the last place to catch either before it ends the run
+            # with a traceback that names no detector and throws away every
+            # model that did load. Any Exception, because what unpickling can
+            # raise is open-ended — ModuleNotFoundError, AttributeError for a
+            # renamed class, torch's zip reader's RuntimeError, EOFError — and
+            # every one of them means the same thing for this run.
+            exclude(name, "cannot be loaded", describe_failure(e))
+            continue
+        if probe_data is not None:
+            # A checkpoint that unpickles can still be unable to score this
+            # data — written by an older version of its detector, or for a
+            # dataset with another channel count — and that used to surface as
+            # a traceback from inside the GA that ended the whole run. Probing
+            # here turns it into one exclusion with a reason, before any stage
+            # starts. Nothing is retrained, deleted or rewritten: a checkpoint
+            # is the user's to replace.
+            reason = probe_detector(probe_data, model, name)
+            if reason is not None:
+                if name in timed_out_detectors():
+                    # A probe that ran out of time has already been reported by
+                    # the deadline itself, and retraining is not its remedy.
+                    excluded[name] = reason
+                else:
+                    exclude(name, "cannot score this data", reason)
+                continue
+        trained[name] = model
+
     logger.info("Loaded %d trained models from %s", len(trained), models_dir)
     if missing:
         logger.warning(f"Missing {len(missing)} models: {', '.join(missing)}")
-    return trained
+    return trained, excluded
 
 # ------------------------------------------------------------------------------
 # Model-Selection Pipelines
 # ------------------------------------------------------------------------------
 
-def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=False, stages=None, decision_metric=DEFAULT_DECISION_METRICS):
+# The leading phrase of the warning a failed GAN stage logs. WebUI/markers.py
+# matches this exact text to list it among the run's warnings, so change the
+# two together (test_app.py checks they still agree).
+GAN_FAILED_WARNING = "GAN robustness test failed"
+
+
+def _run_gan_or_skip(*args, **kwargs):
+    """`run_Gan`, failing soft: returns None where it would have raised.
+
+    The GAN test supplies one of the three robustness rankings. If it is lost,
+    the consensus is built from the other two. If it raises, run_app's
+    catch-all marks the whole entity as failed, and Off-by, Monte Carlo, rank
+    aggregation, the final decision and the report are lost with it. The known
+    trigger is TensorFlow's GPU stack (see Utils/tf_device.py), but any failure
+    here is handled the same way: one warning, then the run continues as it
+    would with --skip_gan.
+
+    Only Exception is caught. A KeyboardInterrupt still stops the run, and a
+    native abort inside TensorFlow cannot be caught by Python at all. Keeping
+    TensorFlow off the GPU is the defence against that.
+    """
+    try:
+        return run_Gan(*args, **kwargs)
+    except Exception as e:
+        # First line only: TensorFlow's errors run to dozens of lines, and the
+        # warning should stay a single log line. The full text and traceback
+        # follow it through exc_info.
+        detail = str(e).strip().splitlines()
+        logger.warning(
+            f"⚠ {GAN_FAILED_WARNING} and was skipped "
+            f"({type(e).__name__}: {detail[0] if detail else 'no message'}). "
+            f"The remaining robustness tests and the rank aggregation run "
+            f"without it, as with --skip_gan.",
+            exc_info=True)
+        return None
+
+
+def _retire_gan_explanation(dataset, entity):
+    """Delete the GAN explanation an earlier run left for this entity.
+
+    Call it when an --explain run that covers the GAN stage ends up with no GAN
+    result, because the stage failed soft or --skip_gan was set. A successful
+    stage overwrites ir_gan.json and nl_gan.txt. A failed or skipped one writes
+    neither, so the earlier run's pair stays on disk. Three readers then take
+    it for this run's explanation: the global IR lists it as an "ok" stage
+    summary, the narrator rewrites its prose, and the result page shows the
+    GAN card next to the warning that the test failed.
+
+    Only these two files go. The plots under robustness/GAN are left in place,
+    because the result page shows them only on a GAN card, and without these
+    files there is no card. A partial run that leaves GAN out of --stages does
+    not call this. It keeps the earlier GAN files, as it does for every stage
+    it did not run, and it assembles no global IR that could claim them as its
+    own.
+    """
+    for path in (
+            os.path.join(results_dir("explanations_ir"), str(dataset), str(entity), "ir_gan.json"),
+            os.path.join(results_dir("explanations_nl"), str(dataset), str(entity), "nl_gan.txt")):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            # Not fatal. The global IR still marks the stage not available,
+            # because it reads this run's empty GAN ranking and ignores the
+            # file (see Explainability.ir.assemble_global_ir).
+            logger.warning(f"Could not remove the earlier run's GAN explanation "
+                           f"{path} ({e}); the result page may still show it.")
+            continue
+        logger.info(f"     Removed the GAN explanation from an earlier run "
+                    f"({path}): this run has no GAN result to explain.")
+
+
+def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, iteration, model_list=None, test_data_gan=None, skip_gan=False, explain=False, stages=None, decision_metric=DEFAULT_DECISION_METRICS, real_labels=False):
     """
     One-pass model selection pipeline in the order:
       1) GA (stacking ensemble search)
@@ -571,6 +696,11 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         GAN creates its own perturbations internally. If None, uses test_data.
     skip_gan : bool, optional
         If True, skips GAN test for faster re-optimization in online phase.
+    real_labels : bool, optional
+        `test_data` carries REAL labels and nothing injected (a real-label
+        re-optimisation of the online phase). Thompson Sampling then skips
+        windows whose labels are one class instead of rewarding a detector
+        for a metric that is undefined there. False everywhere else.
 
     Returns (exactly 11 items):
         thompson_model_names[0],
@@ -608,6 +738,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
     y_true_train = y_true_test = None
     meta_model_type = None
     ensemble_scores = None
+    # The GA's fitted meta-model of best_ensemble; the online phase deploys it.
+    best_meta_model = None
     thompson_model_names = []
     Gan_ranked_by_f1 = Gan_ranked_by_pr_auc = []
     Gan_ranked_by_f1_names = Gan_ranked_by_pr_auc_names = Gan_ranked_by_vus_names = []
@@ -637,7 +769,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         start_time = time.time()
         best_ensemble, best_f1, best_pr_auc, best_fitness, \
         individual_predictions, base_model_predictions_train, base_model_predictions_test, \
-        y_true_train, y_true_test, meta_model_type, ensemble_scores = genetic_algorithm(
+        y_true_train, y_true_test, meta_model_type, ensemble_scores, best_meta_model = genetic_algorithm(
             dataset, entity, train_data, test_data,
             still_usable(), trained_models,
             population_size=20, generations=20,
@@ -645,6 +777,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             explain=explain,
             metric=decision_metric,
             vus_win=vus_window(test_data.entities[0].Y),
+            return_meta_model=True,
         )
         timing_dict['1_Genetic_Algorithm'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -676,6 +809,7 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             iteration=iteration,
             explain=explain,
             metrics=decision_metric,
+            skip_one_class_windows=real_labels,
         )
         timing_dict['2_Thompson_Sampling'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
@@ -698,10 +832,12 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
         # GAN uses separate dataset (full original data) to avoid circularity
         # GAN creates its own perturbations internally
         test_data_for_gan = copy.deepcopy(test_data_gan if test_data_gan is not None else test_data)
-        gan_results = run_Gan(
+        gan_results = _run_gan_or_skip(
             test_data_for_gan, trained_models, still_usable(), dataset, entity,
             explain=explain, metrics=decision_metric
         )
+        # Time and memory are recorded on failure too: the stage did run for
+        # that long, and the end-to-end total includes it.
         timing_dict['3_GAN_Robustness'] = time.time() - start_time
         mem_after = get_memory_usage_mb()
         memory_dict['modules']['3_GAN_Robustness'] = {
@@ -710,18 +846,30 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             'delta': mem_after - mem_before,
             'peak': _MEM_TRACE.peak_between(start_time, time.time()),
         }
-        Gan_ranked_by_f1, Gan_ranked_by_pr_auc, \
-        Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names, Gan_ranked_by_vus_names = (
-            gan_results[0], gan_results[1], gan_results[2], gan_results[3], gan_results[4]
-        )
-        logger.info("  ✓ [GAN] F1 names top-5: %s | Time=%.4fs", Gan_ranked_by_f1_names[:5],
-                    timing_dict['3_GAN_Robustness'])
-        logger.info("     [GAN] PR names top-5: %s", Gan_ranked_by_pr_auc_names[:5])
+        if gan_results is None:
+            # Failed soft: the GAN rankings keep their empty defaults from
+            # above, exactly as under --skip_gan. The SKIPPED marker moves the
+            # web UI's stage rail off "running".
+            logger.info("  ⏩ Sub-stage 6.3: GAN Robustness Testing SKIPPED "
+                        "(the stage failed; see the warning above)")
+            if explain:
+                _retire_gan_explanation(dataset, entity)
+        else:
+            Gan_ranked_by_f1, Gan_ranked_by_pr_auc, \
+            Gan_ranked_by_f1_names, Gan_ranked_by_pr_auc_names, Gan_ranked_by_vus_names = (
+                gan_results[0], gan_results[1], gan_results[2], gan_results[3], gan_results[4]
+            )
+            logger.info("  ✓ [GAN] F1 names top-5: %s | Time=%.4fs", Gan_ranked_by_f1_names[:5],
+                        timing_dict['3_GAN_Robustness'])
+            logger.info("     [GAN] PR names top-5: %s", Gan_ranked_by_pr_auc_names[:5])
     else:
         reason = "skip_gan=True" if ("gan" in stages and skip_gan) else "not in --stages"
         logger.info(f"  ⏩ Sub-stage 6.3: GAN Robustness Testing SKIPPED ({reason})")
         # Empty placeholders already set above for skipped GAN
         timing_dict['3_GAN_Robustness'] = 0.0
+        # --skip_gan, not a partial run that leaves GAN out of --stages.
+        if explain and "gan" in stages:
+            _retire_gan_explanation(dataset, entity)
 
     # --------------------------------------------
     # 4) Off-by-threshold (borderline sensitivity)
@@ -791,7 +939,8 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             meta_model_type,
             {
                 'ga': {'f1': best_f1, 'pr_auc': best_pr_auc, 'fitness': best_fitness,
-                       'scores': ensemble_scores, 'y_true': y_true_test},
+                       'scores': ensemble_scores, 'y_true': y_true_test,
+                       'meta_model': best_meta_model},
                 'thompson': thompson_model_names,
                 'gan': {
                     'f1_names': Gan_ranked_by_f1_names,
@@ -860,7 +1009,13 @@ def run_model_selection_algorithms_1(train_data, test_data, dataset, entity, ite
             _sources.append(_by_metric[_m][_stage])
     rank_source_names = [n for n, _ in _sources]
     test_for_rank = [r for _, r in _sources]
-    logger.info(f"  → Consensus sources ({len(test_for_rank)}): {', '.join(rank_source_names)}")
+    # A stage that produced no ranking (skipped, failed soft, or too little
+    # data) gets no vote: the aggregator drops empty rankings. The log names
+    # those sources so the count printed here matches the sources that vote.
+    _voting = [n for n, r in _sources if len(r) > 0]
+    _silent = [n for n, r in _sources if len(r) == 0]
+    logger.info(f"  → Consensus sources ({len(_voting)}): {', '.join(_voting)}"
+                + (f" | no ranking from: {', '.join(_silent)}" if _silent else ""))
     robust_agg = enhanced_markov_chain_rank_aggregator_text(test_for_rank)
     explain_rank_aggregation(
         rankings=test_for_rank,
@@ -1007,8 +1162,11 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         )
         
         if not skip_gan:
+            # Through the fail-soft wrapper: an exception in this worker would
+            # otherwise re-raise from gan_future.result() below and lose the
+            # other four stages' finished work along with the GAN.
             gan_future = executor.submit(
-                run_Gan,
+                _run_gan_or_skip,
                 test_data_gan_copy, trained_models, models_to_use,
                 dataset, entity, explain=explain, metrics=decision_metric
             )
@@ -1055,9 +1213,11 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
         }
         logger.info("     ✓ Thompson: top-5=%s", thompson_model_names[:5])
         
-        if not skip_gan:
+        # None when the stage failed soft; it then takes the --skip_gan branch.
+        gan_results = None if skip_gan else gan_future.result()
+        if gan_results is not None:
             Gan_ranked_by_f1, Gan_ranked_by_pr_auc, Gan_ranked_by_f1_names, \
-            Gan_ranked_by_pr_auc_names, Gan_ranked_by_vus_names = gan_future.result()
+            Gan_ranked_by_pr_auc_names, Gan_ranked_by_vus_names = gan_results
             timing_dict['3_GAN'] = time.time() - overall_start
             mem_gan = get_memory_usage_mb()
             memory_dict['modules']['3_GAN'] = {
@@ -1069,15 +1229,23 @@ def run_model_selection_algorithms_2(train_data, test_data, dataset, entity, ite
             }
             logger.info("     ✓ GAN: F1 top-5=%s", Gan_ranked_by_f1_names[:5])
         else:
-            logger.info("     ⏩ GAN: SKIPPED (skip_gan=True)")
+            logger.info("     ⏩ GAN: SKIPPED (%s)", "skip_gan=True" if skip_gan
+                        else "the stage failed; see the warning above")
             Gan_ranked_by_f1 = []
             Gan_ranked_by_pr_auc = []
             Gan_ranked_by_f1_names = []
             Gan_ranked_by_pr_auc_names = []
             Gan_ranked_by_vus_names = []
-            timing_dict['3_GAN'] = 0.0
-        
-        ranked_by_f1, ranked_by_pr_auc, \
+            # A failed stage still took time to fail; only --skip_gan costs nothing.
+            timing_dict['3_GAN'] = 0.0 if skip_gan else time.time() - overall_start
+            # This pipeline always runs every stage, so both causes count.
+            if explain:
+                _retire_gan_explanation(dataset, entity)
+
+        # run_off_by_threshold returns five values. This used to unpack seven,
+        # because a merge had left a duplicate of the first two names in front.
+        # Every full --parallel run then raised "not enough values to unpack
+        # (expected 7, got 5)" here, before rank aggregation.
         ranked_by_f1, ranked_by_pr_auc, ranked_by_f1_names_sensitivity, \
         ranked_by_pr_auc_names_sensitivity, ranked_by_vus_names_sensitivity = borderline_future.result()
         timing_dict['4_Borderline'] = time.time() - overall_start
@@ -1299,121 +1467,412 @@ def save_current_selection(dataset, entity, window_idx, best_ensemble, best_sing
     #     pickle.dump(state, f)
     # logger.info(f"  💾 Saved complete state to {state_file}")
 
-def find_num_falses(adjusted_y_pred_ind_current, test_data_copy, dataset, entity, values,
-                    full_aggregated, best_ensemble, iteration):
-    """
-    Compute and persist the number of misclassifications for current single model(s) and ensemble.
-    """
-    misclassified_current = []
-    for predicts in adjusted_y_pred_ind_current:
-        true_values = np.array(test_data_copy.entities[0].labels)
-        predicted_int = np.array(predicts).astype(int)
-        incorrect = predicted_int != true_values
-        misclassified_current.append(int(np.sum(incorrect)))
-
-    misclassified_ensemble = []
-    for predicts in [values[3]]:
-        true_values = np.array(values[4])
-        predicted_int = np.array(predicts).astype(int)
-        incorrect = predicted_int != true_values
-        misclassified_ensemble.append(int(np.sum(incorrect)))
-
-    directory = results_dir("robust_aggregated", dataset, entity)
-    os.makedirs(directory, exist_ok=True)
-    output_file = os.path.join(
-        directory, f"new_robust_aggregated_results_{dataset}_{entity}_{iteration}.txt"
-    )
-    with open(output_file, 'w') as f:
-        f.write("Summary of falses:\n")
-        f.write(f"chosen model (aggregated): {full_aggregated}\n")
-        f.write(f"misclassified_current: {misclassified_current}\n")
-        f.write("Falses for the ensemble:\n")
-        f.write(f"chosen ensemble: {best_ensemble}\n")
-        f.write(f"misclassified_ensemble: {misclassified_ensemble}\n")
+# The per-window misclassification counts that `find_num_falses` wrote to
+# robust_aggregated/new_robust_aggregated_results_*.txt now travel in each
+# window's record of results/online/<dataset>/<entity>/<scenario>.json
+# (`misclassified`). One file per window index could not hold four scenarios,
+# and its ensemble count cast meta-model PROBABILITIES to int, so it counted
+# the positives rather than the errors.
 
 # ------------------------------------------------------------------------------
-# Background Re-optimization
+# Re-optimization (runs in its own process; see Model_Selection/online_reopt.py)
 # ------------------------------------------------------------------------------
 
-def perform_reoptimization_task(
-    window_idx, cumulative_online_windows, offline_data, offline_targets, offline_mask,
-    test_data, train_data, dataset, entity, trained_models, loaded_model_names,
-    anomaly_list, individual_predictions, base_model_predictions_train, 
-    base_model_predictions_test, y_true_train, y_true_test, meta_model_type,
-    use_parallel, test_data_before, logger, current_best_ensemble, current_best_single,
-    algorithm_list_instances, anomaly_rate=None
-):
+# What a re-optimisation process calls (Model_Selection/online_reopt.py).
+REOPT_TARGET = "app:perform_reoptimization_task"
+
+
+def perform_reoptimization_task(*, window_idx, scenario, train_data, sliding,
+                                sliding_raw, dataset, entity, models_dir,
+                                model_names, decision_metric, seed,
+                                label_source="injected"):
     """
-    Background task for re-optimization.
-    Returns: (candidate_best_ensemble, candidate_best_single, individual_predictions,
-              base_model_predictions_train, base_model_predictions_test, 
-              y_true_train, y_true_test, meta_model_type, reopt_time)
+    One re-optimisation of the online phase, run inside its own child process
+    (Model_Selection/online_reopt.py), which seeds every generator with `seed`
+    and redirects all results into a scratch directory before calling this.
+
+    It re-runs the offline model-selection pipeline — GAN skipped, explanations
+    off, the sequential path — on what the offline phase selected on, slid
+    forward in time (online_scoring.sliding_series): `sliding` is the offline
+    phase's injected series followed by the injected online samples seen up
+    to the triggering window, each sample once, cut to the offline length;
+    `sliding_raw` is the same window before injection, which the robustness
+    stages score, as they do offline. The labels are the injected ones the
+    online windows are scored on.
+
+    With `label_source` "real" nothing is injected: `sliding` and
+    `sliding_raw` are the same raw series with its TRUE labels (the offline
+    part slid forward plus the online samples seen so far, each once), so
+    every stage selects on what was really labelled — a supervised
+    re-selection that assumes the labels are fed back. The caller has checked
+    that it holds a labelled anomaly (online_scoring.require_labelled_anomaly).
+
+    The detectors are loaded from the checkpoints the pipeline loaded
+    (`model_names` from `models_dir`); the pipeline already probed them, so
+    they are not probed again. Returns the new Selection, its ensemble carrying
+    the GA's own fitted meta-model.
     """
-    reopt_start = time.time()
-    logger.info(f"  🔄 [BACKGROUND] Starting re-optimization for window {window_idx}...")
-    
-    # ========== SLIDING WINDOW RE-TRAINING LOGIC ==========
-    # 1. Concatenate the accumulated online windows
-    online_concat_data = np.concatenate([w['data'] for w in cumulative_online_windows], axis=1)
-    online_concat_labels = np.concatenate([w['labels'] for w in cumulative_online_windows], axis=1) \
-        if cumulative_online_windows[0]['labels'].ndim > 1 else \
-        np.concatenate([w['labels'].flatten() for w in cumulative_online_windows])
-    online_concat_mask = np.concatenate([w['mask'] for w in cumulative_online_windows], axis=1)
-    online_samples_count = online_concat_data.shape[1]
-    
-    # 2. Drop same number of samples from BEGINNING of offline data (sliding window)
-    adjusted_offline_data = offline_data[:, online_samples_count:]
-    adjusted_offline_labels = offline_targets[:, online_samples_count:] if offline_targets.ndim > 1 else offline_targets[online_samples_count:]
-    adjusted_offline_mask = offline_mask[:, online_samples_count:]
-    
-    # 3. Create new training/test data by combining adjusted offline + new online
-    sliding_test_data = np.concatenate([adjusted_offline_data, online_concat_data], axis=1)
-    sliding_test_labels = np.concatenate([adjusted_offline_labels.flatten(), online_concat_labels.flatten()]).reshape(1, -1) \
-        if adjusted_offline_labels.ndim > 1 or online_concat_labels.ndim > 1 else \
-        np.concatenate([adjusted_offline_labels, online_concat_labels])
-    sliding_test_mask = np.concatenate([adjusted_offline_mask, online_concat_mask], axis=1)
-    
-    logger.info(f"  📏 [BACKGROUND] Sliding window: dropped {online_samples_count} old, added {online_samples_count} new samples")
-    logger.info(f"  📏 [BACKGROUND] New test data size: {sliding_test_data.shape[1]} samples")
-    
-    # 4. Update test_data with sliding window
-    test_data_sliding = copy.deepcopy(test_data)
-    test_data_sliding.entities[0].Y = sliding_test_data
-    test_data_sliding.entities[0].labels = sliding_test_labels
-    test_data_sliding.entities[0].mask = sliding_test_mask
-    test_data_sliding.entities[0].n_time = sliding_test_data.shape[1]
-    test_data_sliding.total_time = sliding_test_data.shape[1]
-    
-    # 5. Use REAL DATA without injection for online phase
-    logger.info(f"  ⚠️  [BACKGROUND] Using REAL data (no injection) for adaptation")
-    test_data_new_sliding = copy.deepcopy(test_data_sliding)
-    
-    # 6. Re-run model selection with sliding window data (SKIP GAN for speed)
-    if use_parallel:
-        (best_thompson, robust_agg, full_aggregated, best_ensemble,
-         individual_predictions_new, base_model_predictions_train_new, base_model_predictions_test_new,
-         y_true_train_new, y_true_test_new, meta_model_type_new, _) = run_model_selection_algorithms_2(
-            train_data, test_data_new_sliding, dataset, entity, iteration=window_idx,
-            trained_models=trained_models, model_list=loaded_model_names,
-            test_data_gan=test_data_before, skip_gan=True, explain=explain
-        )
-    else:
-        (best_thompson, robust_agg, full_aggregated, best_ensemble,
-         individual_predictions_new, base_model_predictions_train_new, base_model_predictions_test_new,
-         y_true_train_new, y_true_test_new, meta_model_type_new, _) = run_model_selection_algorithms_1(
-            train_data, test_data_new_sliding, dataset, entity, iteration=window_idx,
-            model_list=loaded_model_names, test_data_gan=test_data_before, skip_gan=True, explain=explain
-        )
-    
-    candidate_best_ensemble = best_ensemble.copy()
-    candidate_best_single = full_aggregated[0] if isinstance(full_aggregated, (list, tuple)) else full_aggregated
-    
-    reopt_time = time.time() - reopt_start
-    logger.info(f"  ✓ [BACKGROUND] Re-optimization completed in {reopt_time:.2f}s")
-    
-    return (candidate_best_ensemble, candidate_best_single, individual_predictions_new,
-            base_model_predictions_train_new, base_model_predictions_test_new,
-            y_true_train_new, y_true_test_new, meta_model_type_new, reopt_time)
+    global trained_models
+    from Model_Selection.online_scoring import fit_selection
+
+    started = time.time()
+    real = label_source == ONLINE_LABELS_REAL
+    logger.info(f"  🔄 [REOPT] Re-optimization for scenario {scenario}, window "
+                f"{window_idx}: {sliding.entities[0].Y.shape[1]} "
+                f"{'real-labelled' if real else 'injected'} samples "
+                f"({int(np.sum(np.asarray(sliding.entities[0].labels) > 0))} anomalous), "
+                f"{len(model_names)} detectors, seed {seed}")
+    trained_models, excluded = load_trained_models(model_names, models_dir)
+    missing = [m for m in model_names if m not in trained_models]
+    if missing:
+        raise RuntimeError(f"could not load {', '.join(missing)} from {models_dir}"
+                           + (f" ({'; '.join(f'{k}: {v}' for k, v in excluded.items())})"
+                              if excluded else ""))
+    try:
+        (_, _, full_aggregated, best_ensemble, individual_predictions,
+         base_model_predictions_train, _, y_true_train, _, meta_model_type,
+         extra) = run_model_selection_algorithms_1(
+            train_data, sliding, dataset, entity, iteration=window_idx,
+            model_list=list(model_names), test_data_gan=sliding_raw,
+            skip_gan=True, explain=False, decision_metric=decision_metric,
+            real_labels=real)
+    finally:
+        # The GA's plotting helpers open figures they never close.
+        plt.close('all')
+
+    if not best_ensemble:
+        raise ValueError("the re-optimization selected no ensemble")
+    single = (full_aggregated[0] if isinstance(full_aggregated, (list, tuple))
+              else full_aggregated)
+    if not single:
+        raise ValueError("the re-optimization ranked no single model")
+    selection = fit_selection(
+        best_ensemble, single, meta_model_type, individual_predictions,
+        base_model_predictions_train, y_true_train, origin="reoptimization",
+        origin_window=window_idx, train_data=train_data, trained_models=trained_models,
+        meta_model=(extra.get('ga') or {}).get('meta_model'), seed=seed)
+    logger.info(f"  ✓ [REOPT] Re-optimization for scenario {scenario}, window "
+                f"{window_idx} completed in {time.time() - started:.2f}s: "
+                f"ensemble={selection.ensemble}, single={selection.single}")
+    return selection
+
+
+def run_online_phase(*, args, dataset, entity, train_data, trained_models,
+                     loaded_model_names, models_dir, offline_copies, offline_raw,
+                     stream_raw, feasibility, window_size, step_size, total_samples,
+                     offline_size, online_size, anomaly_list, anomaly_rate,
+                     best_ensemble, best_single_model, meta_model_type, ga_meta_model,
+                     individual_predictions, base_model_predictions_train,
+                     y_true_train, offline_summary, vus_win, iteration, offline_time):
+    """
+    The online phase: the online windows replayed under each requested scenario.
+
+    The synthetic anomalies are injected once into the whole online stream and
+    every window is cut from it — or, with real labels (args
+    'online_label_source' == "real"), nothing is injected and every window is
+    the raw test slice with its true labels — and every scenario starts from its own copy
+    of the offline selection, so scenarios differ in their re-optimisation
+    policy and nothing else. A re-optimisation runs in a child process and is
+    switched in exactly --reopt_delay windows after its trigger. Results go to
+    results/online/<dataset>/<entity>/ (schema: Model_Selection/online_phase.py).
+
+    `offline_copies` are the offline phase's injected copies (Inject with
+    return_copies); `offline_raw` and `stream_raw` are (Y, labels, mask) of the
+    offline part and of the online stream before the synthetic anomalies.
+
+    Never raises. The offline results are already written by the time this
+    runs, so a failure here is logged as `ONLINE PHASE FAILED`, recorded in
+    summary.json, and the run's offline outcome stands.
+    """
+    from Model_Selection.online_phase import (OnlineResultsWriter, run_online,
+                                              scenario_params)
+    from Model_Selection.online_policy import PolicyParams
+    from Model_Selection.online_reopt import CompletedReopt, ProcessReopt
+    from Model_Selection.online_scoring import (WindowScorer, build_online_stream,
+                                                build_online_windows, fit_selection,
+                                                identity_copy, isolated_models,
+                                                random_selection, real_label_stream,
+                                                require_labelled_anomaly,
+                                                sliding_series)
+    from Utils.pipeline_spec import count_windows, format_decision_metrics
+
+    scenarios = tuple(args['online_scenarios'])
+    params = PolicyParams(update_interval=args['update_interval'],
+                          drop_pct=args['drop_pct'],
+                          adaptive_window=args['adaptive_window'],
+                          adaptive_k=args['adaptive_k'],
+                          reopt_delay=args['reopt_delay'])
+    reopt_timeout = args.get('reopt_timeout')
+    # The fitness the offline phase OPTIMISED, not the possibly narrowed one
+    # its final decision fell back to.
+    decision_metric = args.get('decision_metrics', DEFAULT_DECISION_METRICS)
+    seed = args.get('random_seed')
+    seed = 13 if seed is None else int(seed)
+    stream_Y, stream_labels, stream_mask = stream_raw
+    stream_len = int(stream_Y.shape[1])
+    available = count_windows(stream_len, window_size, step_size) if feasibility['ok'] else 0
+    max_windows = args.get('max_online_windows')
+    n_windows = available if max_windows is None else min(available, max_windows)
+    indices = list(range(n_windows))           # window 0 is the first online window
+    regime = bool(args.get('inject_online_regime'))
+    label_source = args.get('online_label_source') or "injected"
+    real = label_source == ONLINE_LABELS_REAL
+
+    # Resolved here: every write of this phase goes to this one directory.
+    online_dir = results_dir("online", dataset, entity)
+    header = {
+        "dataset": dataset,
+        "dataset_label": dataset_label(dataset),
+        "entity": entity,
+        "strategy": args.get('strategy'),
+        "decision_metric": {"spec": format_decision_metrics(decision_metric),
+                            "label": decision_metric_label(decision_metric),
+                            "formula": decision_metric_formula(decision_metric)},
+        "window_size": int(window_size),
+        "step_size": int(step_size),
+        "n_windows": n_windows,
+        "n_windows_available": available,
+        "first_window_index": 0,
+        "total_samples": int(total_samples),
+        "offline_size": int(offline_size),
+        "online_size": int(online_size),
+        "online_samples": stream_len,
+        "window_coordinates": "online_stream" if regime else "test_series",
+        "inject_online_regime": regime,
+        # What the windows are scored on, and whether anything was injected
+        # into the online stream: "real" = the test series' own labels and
+        # no online injection (`injection` stays null); "injected" = the
+        # synthetic anomalies below.
+        "label_source": label_source,
+        "label_source_label": ONLINE_LABEL_SOURCE_LABELS.get(label_source, label_source),
+        "n_windows_scorable": None,
+        "n_windows_with_anomaly": None,
+        # The offline phase's injection, which the online stream repeats
+        # only when label_source is "injected".
+        "anomaly_type": anomaly_list[0] if len(anomaly_list) == 1 else list(anomaly_list),
+        "anomaly_rate": anomaly_rate,
+        "injection": None,
+        "seed": seed,
+        "vus_window": vus_win if "vus" in metrics_required(decision_metric) else None,
+        "reopt_delay": params.reopt_delay,
+        "reopt_timeout": reopt_timeout,
+        "feasibility": feasibility,
+        "offline_selection": offline_summary,
+    }
+    writer = None
+    try:
+        writer = OnlineResultsWriter(online_dir, header, scenarios,
+                                     scenario_params=scenario_params(scenarios, params),
+                                     n_windows_planned=n_windows)
+        if not feasibility['ok'] or n_windows < 1:
+            reason = feasibility.get('reason') or (
+                f"{available} window(s) of {window_size} samples fit in the "
+                f"{stream_len}-sample online stream.")
+            writer.finish("skipped", reason)
+            logger.warning(f"⚠️  ONLINE PHASE SKIPPED: reason={reason}")
+            return
+
+        logger.info(f"  📊 Online phase: {n_windows} of {available} windows, "
+                    f"scenarios={', '.join(scenarios)}, M={params.update_interval}, "
+                    f"X={params.drop_pct:g}%, N={params.adaptive_window}, "
+                    f"k={params.adaptive_k:g}, L={params.reopt_delay}, "
+                    f"reopt_timeout={reopt_timeout if reopt_timeout else 'none'}")
+        if args.get('parallel'):
+            logger.info("  ℹ️  Re-optimizations run the sequential pipeline in their "
+                        "own process, whatever --parallel says.")
+
+        if real:
+            # Nothing is injected online: the stream is the online part with
+            # its true labels, and a re-optimisation slides the RAW offline
+            # part forward, so every label it selects on is a real one.
+            stream = real_label_stream(stream_Y, stream_labels, stream_mask)
+            reopt_copies = [identity_copy(offline_raw[0], offline_raw[1])]
+            writer.summary["injection"] = None
+        else:
+            stream = build_online_stream(stream_Y, stream_labels, stream_mask,
+                                         anomaly_list, anomaly_rate, seed)
+            reopt_copies = offline_copies
+            writer.summary["injection"] = {"seed": seed, "n_copies": len(stream.copies),
+                                           "copies": stream.copy_params()}
+        windows = build_online_windows(stream, indices, offset=offline_size,
+                                       step_size=step_size, window_size=window_size,
+                                       name=f"{entity}_online")
+        # The live monitor's stream files (Model_Selection/online_stream.py):
+        # the series as replayed, its labels, and per window what each
+        # scenario's detectors said. Optional: the phase runs without them.
+        stream_writer = None
+        try:
+            from Model_Selection.online_stream import StreamWriter
+            show_real = bool(args.get('labels_available')) and not regime
+            stream_writer = StreamWriter(
+                online_dir, dataset=dataset, entity=entity, label_source=label_source,
+                offline_Y=offline_raw[0],
+                offline_real_labels=offline_raw[1] if show_real else None,
+                online_copies=stream.copies,
+                online_real_labels=stream.raw_labels if show_real else None,
+                offline_size=offline_size, window_size=window_size, step_size=step_size,
+                n_windows=n_windows,
+                window_coordinates="online_stream" if regime else "test_series",
+                injected=not real)
+        except Exception as e:
+            logger.warning(f"⚠ Live-monitor stream files not written: {type(e).__name__}: {e}")
+        writer.summary["n_windows_scorable"] = sum(1 for w in windows if w.scorable)
+        writer.summary["n_windows_with_anomaly"] = sum(1 for w in windows
+                                                       if (w.n_anomalous or 0) > 0)
+        writer.write_summary()
+        logger.info(f"  🏷️  Online labels: {label_source} — "
+                    f"{writer.summary['n_windows_scorable']} of {len(windows)} windows "
+                    f"scorable (both classes), {writer.summary['n_windows_with_anomaly']} "
+                    f"hold a{' labelled' if real else 'n injected'} anomaly")
+        # The stream scores its own copies: scoring has side effects on a model
+        # object, and the pipeline's `trained_models` stay as the offline
+        # phase left them.
+        stream_models = isolated_models(trained_models)
+        offline_selection = fit_selection(
+            best_ensemble, best_single_model, meta_model_type, individual_predictions,
+            base_model_predictions_train, y_true_train, origin="offline",
+            train_data=train_data, trained_models=stream_models,
+            meta_model=ga_meta_model, seed=seed)
+        writer.summary["offline_selection"] = {
+            **(offline_summary or {}),
+            "ensemble": {**((offline_summary or {}).get("ensemble") or {}),
+                         "members": list(offline_selection.ensemble),
+                         "meta_model_source": offline_selection.meta_model_source}}
+        writer.write_summary()
+        baseline_selection = None
+        if "fixed_random" in scenarios:
+            pool = list(individual_predictions or loaded_model_names)
+            baseline_selection = random_selection(
+                pool, seed, meta_model_type, individual_predictions,
+                base_model_predictions_train, y_true_train,
+                train_data=train_data, trained_models=stream_models)
+            logger.info(f"  🎲 Fixed random baseline: single={baseline_selection.single}, "
+                        f"ensemble={baseline_selection.ensemble}")
+
+        def initial_selection(key):
+            # A deep copy per scenario: nothing one scenario does to its
+            # selection can reach the next one's starting point.
+            start = baseline_selection if key == "fixed_random" else offline_selection
+            return copy.deepcopy(start)
+
+        # A re-optimisation's input depends only on its triggering window (and
+        # the detectors still usable), and its seed is seed + window, so a
+        # second scenario triggering at the same window reuses the first one's
+        # result instead of computing it again.
+        reopt_cache = {}
+
+        def start_reopt(window, selection, scenario):
+            models = [m for m in loaded_model_names if m not in timed_out_detectors()]
+            key = (window.index, tuple(models))
+            if key in reopt_cache:
+                value, duration, first = reopt_cache[key]
+                return CompletedReopt(value, duration, reused_from=first)
+            injected, raw = sliding_series(reopt_copies, offline_raw, stream,
+                                           window.online_end, name=f"{entity}_sliding")
+            if real:
+                # Raises before anything is forked: recorded as a re-optimisation
+                # that could not start, and the next trigger may try again.
+                require_labelled_anomaly(
+                    injected, what=f"the {injected.entities[0].Y.shape[1]}-sample "
+                                   f"series seen up to window {window.index}")
+
+            def remember(value, duration):
+                reopt_cache.setdefault(key, (value, duration, scenario))
+
+            return ProcessReopt(
+                REOPT_TARGET,
+                dict(window_idx=window.index, scenario=scenario, train_data=train_data,
+                     sliding=injected, sliding_raw=raw, dataset=dataset, entity=entity,
+                     models_dir=models_dir, model_names=models,
+                     decision_metric=decision_metric, seed=seed + window.index,
+                     label_source=label_source),
+                workdir=os.path.join(online_dir, "_reopt_scratch", f"{scenario}_w{window.index}"),
+                seed=seed + window.index, timeout=reopt_timeout, on_success=remember)
+
+        online_start = time.time()
+        # ONE scorer for every scenario: it scores each (window, detector) pair
+        # once, so all scenarios read the same numbers for it.
+        scorer = WindowScorer(stream_models, decision_metric, seed=seed, vus_win=vus_win)
+        try:
+            results = run_online(scenarios, params, windows, initial_selection,
+                                 scorer, start_reopt, writer, log=logger,
+                                 on_window=(stream_writer.record if stream_writer else None))
+            logger.info(f"  🧮 Detector scorings on the stream: {scorer.computed} run, "
+                        f"{scorer.reused} reused from an earlier scenario or member.")
+        finally:
+            # Each re-optimisation removes its own scratch directory; this
+            # removes their parent once it is empty.
+            try:
+                os.rmdir(os.path.join(online_dir, "_reopt_scratch"))
+            except OSError:
+                pass
+        online_total = time.time() - online_start
+    except Exception as e:
+        if writer is not None:
+            try:
+                writer.finish("failed", f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+        logger.error(f"❌ ONLINE PHASE FAILED: error={type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
+        return
+
+    logger.info(f"⏱️  Online Phase Total Time: {online_total:.2f}s ({online_total/60:.2f} min)")
+    try:
+        timing_file = _write_online_timing(
+            dataset, entity, iteration, available, n_windows, scenarios, params,
+            results, online_total, offline_time)
+        logger.info(f"📝 Online results: {online_dir} | timing: {timing_file}")
+    except OSError as e:
+        logger.error(f"Could not write the online timing summary: {e}")
+
+
+def _write_online_timing(dataset, entity, iteration, available, n_windows, scenarios,
+                         params, results, online_total, offline_time):
+    """The online phase's timing summary, beside the comprehensive report.
+
+    Counts the windows each scenario actually processed; this file used to
+    report every available window even when --max_online_windows cut the
+    stream short.
+    """
+    timing_file = os.path.join(results_dir("comprehensive", dataset, entity),
+                               "online_phase_timing.txt")
+    os.makedirs(os.path.dirname(timing_file), exist_ok=True)
+    with open(timing_file, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("RAMSeS Online Phase Timing Summary\n")
+        f.write("="*80 + "\n")
+        f.write(f"Dataset: {dataset_label(dataset)}\n")
+        f.write(f"Entity: {entity}\n")
+        f.write(f"Iteration: {iteration}\n")
+        f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("="*80 + "\n\n")
+        f.write(f"Windows Available: {available}\n")
+        f.write(f"Windows Processed per Scenario: {n_windows}\n")
+        f.write(f"Scenarios: {', '.join(scenarios)}\n")
+        f.write(f"Update Interval (M): {params.update_interval}\n")
+        f.write(f"Drop (X): {params.drop_pct:g}%\n")
+        f.write(f"Adaptive Window (N): {params.adaptive_window}\n")
+        f.write(f"Adaptive k: {params.adaptive_k:g}\n")
+        f.write(f"Re-optimization Delay (L): {params.reopt_delay}\n\n")
+        for row in results:
+            f.write(f"[{row['key']}] windows={row['n_windows']} "
+                    f"triggers={row['n_triggers']} started={row['n_reopts_started']} "
+                    f"applied={row['n_reopts_applied']} suppressed={row['n_suppressed']} "
+                    f"failed={row['n_reopts_failed']} "
+                    f"not_applied={row['n_reopts_not_applied']} "
+                    f"reused={row['n_reopts_reused']} "
+                    f"reopt={row['total_reopt_seconds']:.2f}s "
+                    f"waited={row['total_wait_s']:.2f}s "
+                    f"stream={row['stream_time_s'] or 0:.2f}s "
+                    f"wall={row['wall_time_s'] or 0:.2f}s "
+                    f"per-window={(row['stream_time_s'] or 0)/max(row['n_windows'], 1):.2f}s\n")
+        f.write(f"\nTotal Online Time: {online_total:.2f}s ({online_total/60:.2f} min)\n")
+        f.write(f"Offline Phase Time: {offline_time:.2f}s ({offline_time/60:.2f} min)\n")
+        f.write(f"Grand Total Time: {online_total + offline_time:.2f}s "
+                f"({(online_total + offline_time)/60:.2f} min)\n")
+        f.write("="*80 + "\n")
+    return timing_file
 
 # ------------------------------------------------------------------------------
 # Main Runner
@@ -1429,14 +1888,18 @@ def run_app(algorithm_list, algorithm_list_instances):
     use_parallel = args.get('parallel', False)
     enable_online_phase = args.get('enable_online', False)  # Online phase OFF by default
     iteration = args.get('iteration', 5)  # Default to 5 iterations for window sizing
-    strategy = args.get('strategy', 'adaptive')  # adaptive, fixed-best, or fixed-random
+    # Online scenario: 'all' or one scenario key (aliases already resolved by
+    # Utils.pipeline_spec.resolve_online_settings).
+    strategy = args.get('strategy', 'periodic')
     inject_online_regime = args.get('inject_online_regime', False)  # Regime shifts on online data only
     max_online_windows = args.get('max_online_windows', None)  # Limit online windows (None = no limit)
     explain = args.get('explain', False)  # Explainability OFF by default; --explain enables it
     stages = set(args.get('stages', ALL_STAGES))  # Which stage-6 sub-stages to run
     is_partial = stages != ALL_STAGES  # Strict subset → partial run (stop after selected stages)
     skip_gan = args.get('skip_gan', False)  # --skip_gan drops the GAN sub-stage, keeping the rest
-    anomaly_type = args.get('anomaly_type', DEFAULT_ANOMALY_TYPE)  # Synthetic anomaly injected at stage 4
+    # Synthetic anomalies injected at stage 4: one type or several (--anomaly_type a,b).
+    anomaly_types = list(args.get('anomaly_types')
+                         or [args.get('anomaly_type', DEFAULT_ANOMALY_TYPE)])
     anomaly_rate = args.get('anomaly_rate')  # None = the per-type defaults in anomaly_parameters.py
     decision_metric = args.get('decision_metrics', DEFAULT_DECISION_METRICS)  # Fitness the run maximises
 
@@ -1448,8 +1911,33 @@ def run_app(algorithm_list, algorithm_list_instances):
 
     data_dir = args['dataset_path']
 
+    if tsb_ad.is_tsb_ad(dataset):
+        # A TSB-AD series may be named by its id, its full file stem or its
+        # file name; every directory this run writes (checkpoints, results)
+        # uses the one id, so two spellings never split one series' results.
+        entity = tsb_ad.canonical_entity(data_dir, dataset, entity)
+        args['entity'] = entity
+
+    # What the online windows are scored on, resolved before anything trains:
+    # a request the data cannot honour (real labels on a dataset without
+    # them, or real labels with --inject_online_regime) stops the run here
+    # rather than after the offline phase. Only checked when the phase runs.
+    online_label_source = None
+    args['labels_available'] = False
+    if enable_online_phase:
+        args['labels_available'] = provides_real_labels(dataset, entity, data_dir)
+        try:
+            online_label_source = resolve_online_labels(
+                args.get('online_labels'),
+                args['labels_available'],
+                inject_online_regime=inject_online_regime, dataset=dataset)
+        except ValueError as e:
+            logger.error(f"❌ {e}")
+            return
+    args['online_label_source'] = online_label_source
+
     logger.info("="*80)
-    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, max_windows={max_online_windows}, stages={','.join(sorted(stages))}, skip_gan={skip_gan}, detectors={len(detectors_to_load)}/{len(algorithm_list_instances)}")
+    logger.info(f"🚀 STARTING RAMSeS EXECUTION: dataset={dataset}, entity={entity}, parallel={use_parallel}, online_phase={enable_online_phase}, iteration={iteration}, strategy={strategy}, online_regime={inject_online_regime}, online_labels={online_label_source or '-'}, max_windows={max_online_windows}, stages={','.join(sorted(stages))}, skip_gan={skip_gan}, detectors={len(detectors_to_load)}/{len(algorithm_list_instances)}")
     logger.info("="*80)
     
     logger.info("📂 STAGE 1/7: Loading Training Data...")
@@ -1477,10 +1965,12 @@ def run_app(algorithm_list, algorithm_list_instances):
     # Declaring the restriction is not enough on its own: nothing else consumed
     # UNIVARIATE_FAMILIES, so selecting one of these on a multivariate entity
     # reached `_TSBADEstimator._check_width`, whose ValueError is raised from
-    # inside `TrainModels.train_models` — a loop with no per-family recovery, so
-    # one unusable detector aborted training for every family after it. Dropping
-    # them up front turns that into a warning naming the detectors, and leaves
-    # the rest of the pool intact.
+    # inside `TrainModels.train_models` — then a loop with no per-family
+    # recovery, so one unusable detector aborted training for every family
+    # after it. Training now survives a failing instance, but dropping them up
+    # front is still the better answer: the warning names the actual reason
+    # (the channel count) instead of reporting each one as a training failure,
+    # and nothing is forked just to be refused.
     n_channels = test_data.entities[0].Y.shape[0]
     if n_channels > 1:
         dropped = [d for d in detectors_to_load
@@ -1516,6 +2006,17 @@ def run_app(algorithm_list, algorithm_list_instances):
                 return
 
     logger.info("🔧 STAGE 3/7: Training/Loading Models...")
+    # `random_seed` from the config, which this file never applied. Runs were
+    # reproducible only by accident: training in this process seeded the
+    # global RNGs on its way (LSTMVAE, RNN and DGHL call torch.manual_seed,
+    # the Trainer calls np.random.seed), and whatever trained after them, or
+    # ran after stage 3, inherited that. With `training_timeout` set each
+    # instance trains in a forked child, which inherits the RNG state this
+    # process has at the fork and hands nothing back. Seeded here, every child
+    # starts from the configured seed — CBLOF's KMeans, for one, draws its
+    # initial centres from the global numpy RNG, and was measured to fit
+    # different centres on skab/1 from one unseeded run to the next.
+    set_all_seeds(args['random_seed'])
     model_trainer = TrainModels(
         dataset=dataset,
         entity=entity,
@@ -1528,6 +2029,10 @@ def run_app(algorithm_list, algorithm_list_instances):
         overwrite=args['overwrite'],
         verbose=args['verbose'],
         save_dir=args['trained_model_path'],
+        # A config written before the key existed gets the default; an explicit
+        # null or 0 turns the limit off. Safe to fork here because this process
+        # has run nothing but data loading yet — see Model_Training/deadline.py.
+        training_timeout=args.get('training_timeout', TRAINING_TIMEOUT_SECONDS),
     )
 
     try:
@@ -1536,36 +2041,87 @@ def run_app(algorithm_list, algorithm_list_instances):
         model_trainer.train_models(model_architectures=args['model_architectures'])
         logger.info("  ✓ Model training phase complete")
 
+        # A detector that failed to train in THIS run is left out even when an
+        # older checkpoint of it is on disk. With --overwrite true that file is
+        # what the run was asked to replace, possibly written by code the
+        # current scoring no longer accepts, and the failed retrain leaves it
+        # untouched (checkpoints are renamed into place only once complete).
+        # Loading it would quietly mix model generations; the file stays, the
+        # run goes on without it, and the log says so.
+        failed_to_train = [d for d in detectors_to_load if d in model_trainer.failed]
+        if failed_to_train:
+            logger.warning(
+                f"⚠ Left out of this run because they failed to train: "
+                f"{', '.join(failed_to_train)}. The warnings above give each reason.")
+
         # Load trained models using the dynamic path (base_dir/dataset/entity/)
         logger.info("  → Loading trained models from disk...")
         global trained_models
         models_dir = os.path.join(args['trained_model_path'], dataset, entity)
-        trained_models = load_trained_models(detectors_to_load, models_dir)
-        if not trained_models:
-            raise ValueError("No models loaded. Check model paths and ensure models are trained.")
+        # Probed against the test split as loaded, before injection. The probe
+        # scores copies and restores every random generator it touched, so the
+        # injection below draws exactly what it would have without it.
+        trained_models, excluded = load_trained_models(
+            [d for d in detectors_to_load if d not in model_trainer.failed],
+            models_dir, probe_data=test_data)
 
         # Filter to only the detectors that actually loaded. A requested detector
-        # with no checkpoint degrades to "run without it, say so loudly" rather
-        # than failing the run — but below two detectors there is nothing to
-        # select between, and GA fitness / rank aggregation / the off-by
-        # pairwise surrogates would all be vacuous.
+        # with no checkpoint, or with one that cannot be loaded or cannot score
+        # this data, degrades to "run without it, say so loudly" rather than
+        # failing the run — but
+        # below two detectors there is nothing to select between, and GA
+        # fitness / rank aggregation / the off-by pairwise surrogates would all
+        # be vacuous.
         loaded_model_names = list(trained_models.keys())
-        missing = [d for d in detectors_to_load if d not in trained_models]
+        missing = [d for d in detectors_to_load
+                   if d not in trained_models and d not in excluded
+                   and d not in model_trainer.failed]
         if missing:
             logger.warning(f"⚠ Requested detectors with no trained model (skipped): {', '.join(missing)}")
         if len(loaded_model_names) < MIN_DETECTORS:
-            raise ValueError(
-                f"Need at least {MIN_DETECTORS} trained detectors to run model selection; "
-                f"got {len(loaded_model_names)} ({', '.join(loaded_model_names) or 'none'}). "
-                f"Train the missing models or widen --detectors.")
+            # Logged and returned rather than raised: the outer handler would
+            # print a traceback that says nothing the sentence below does not,
+            # and the web UI reports the last ERROR line as the failure reason
+            # but a traceback only as "the pipeline raised an exception".
+            why = ""
+            if failed_to_train:
+                why += (f" Failed to train in this run: "
+                        f"{'; '.join(f'{d} ({model_trainer.failed[d]})' for d in failed_to_train)}.")
+            slow = [d for d in excluded if d in timed_out_detectors()]
+            incompatible = [d for d in excluded if d not in slow]
+            if incompatible:
+                why += (f" Excluded because their checkpoint cannot be loaded or "
+                        f"cannot score this data: {', '.join(incompatible)} — retrain them with "
+                        f"--overwrite true (the reasons are in the warnings above).")
+            if slow:
+                why += (f" Excluded for exceeding the scoring deadline on a short "
+                        f"probe: {', '.join(slow)}.")
+            if missing:
+                why += (f" No trained model: {', '.join(missing)} — train them or "
+                        f"widen --detectors.")
+            logger.error(
+                f"❌ Need at least {MIN_DETECTORS} usable detectors to run model "
+                f"selection; {len(loaded_model_names)} remain "
+                f"({', '.join(loaded_model_names) or 'none'}).{why}")
+            return
         if len(loaded_model_names) < 3:
             logger.warning(f"⚠ Only {len(loaded_model_names)} detectors available — ensemble and "
                            f"ranking explanations will be degenerate.")
         logger.info(f"✓ Loaded {len(loaded_model_names)} models: {', '.join(loaded_model_names)}")
 
+        # Seeded again, because what stage 3 leaves in the RNGs depends on how
+        # it ran: trained here (each DL family re-seeds and then draws), trained
+        # in forked children (untouched), or skipped because every checkpoint
+        # was on disk (untouched). Everything from here on draws from them —
+        # the injected anomaly's position and shape, LSTMVAE's latent sampling
+        # in every scoring call — and the selected ensemble was measured to
+        # change between two identical forked runs without this. Re-seeding
+        # makes stages 4-6 start from one state in all three cases.
+        set_all_seeds(args['random_seed'])
+
         logger.info("💉 STAGE 4/7: Injecting Synthetic Anomalies...")
         # Inject anomalies
-        anomaly_list = [anomaly_type]
+        anomaly_list = list(anomaly_types)
         test_data_before = copy.deepcopy(test_data)
         train_data_before = copy.deepcopy(train_data)
 
@@ -1602,22 +2158,29 @@ def run_app(algorithm_list, algorithm_list_instances):
         logger.info("🔍 STAGE 6/7: Running Model Selection Algorithms...")
         logger.info("  This includes: GA, Thompson Sampling, GAN, Monte Carlo, Off-by-Threshold")
         
-        # Data splitting: 80% for offline phase, 20% for online phase (as per paper)
+        # Data splitting: 80% for offline phase, 20% for online phase (as per
+        # paper). The split, the window geometry and the feasibility verdict
+        # come from Utils.pipeline_spec, which the web UI's feasibility check
+        # calls too, so the two cannot disagree.
         data = test_data_before.entities[0].Y
         targets = test_data_before.entities[0].labels
         mask = test_data_before.entities[0].mask
         total_samples = int(np.size(targets.flatten()))
-        
-        # Split: 80% offline (for model selection), 20% online (for streaming evaluation)
-        offline_size = int(total_samples * 0.8)
-        online_size = total_samples - offline_size
+        offline_size, online_size = online_split(total_samples)
+        # With real labels the verdict also needs a window that can be scored
+        # on them: an online part without a labelled anomaly has nothing to
+        # score, and the phase is skipped with that reason.
+        feasibility = online_feasibility(
+            total_samples, iteration,
+            online_labels=(targets.flatten()[offline_size:]
+                           if online_label_source == ONLINE_LABELS_REAL else None))
         
         # For offline phase: use first 80% of data
         offline_data = data[:, :offline_size]
         offline_targets = targets.flatten()[:offline_size].reshape(1, -1) if targets.ndim > 1 else targets[:offline_size]
         offline_mask = mask[:, :offline_size]
         
-        # For online phase: sliding windows over remaining 20%
+        # For online phase: the remaining 20%, cut into sliding windows later
         online_data = data[:, offline_size:]
         online_targets = targets.flatten()[offline_size:].reshape(1, -1) if targets.ndim > 1 else targets[offline_size:]
         online_mask = mask[:, offline_size:]
@@ -1629,29 +2192,35 @@ def run_app(algorithm_list, algorithm_list_instances):
             # Create temporary dataset for injection
             online_entity = Entity(Y=online_data, name=f"{entity}_online", labels=online_targets, verbose=False)
             online_dataset = Dataset(entities=[online_entity], name=f"{dataset}_online", verbose=False)
-            # Inject regime shifts (scale + wander) 
-            online_dataset, regime_sizes = Inject(online_dataset, ['scale', 'wander'])
-            # Extract modified data
+            # Inject regime shifts (scale + wander). Seeded, with numpy's global
+            # generator restored afterwards, so the shifted series is the same
+            # on every run and the offline phase's randomness is untouched.
+            _rng_state = np.random.get_state()
+            np.random.seed(int(13 if args.get('random_seed') is None else args['random_seed']))
+            try:
+                online_dataset, regime_sizes = Inject(online_dataset, list(REGIME_SHIFT_TYPES))
+            finally:
+                np.random.set_state(_rng_state)
+            # Extract modified data. Inject concatenates one copy of the series
+            # per parameter combination, so the mask must be taken from it too:
+            # the original one no longer matched the data's length. The online
+            # stream is that concatenation, and window positions count in it.
             online_data = online_dataset.entities[0].Y
             online_targets = online_dataset.entities[0].labels
-            logger.info(f"  ✓ Regime shifts injected: scale + wander (sizes: {regime_sizes})")
+            online_mask = online_dataset.entities[0].mask
+            logger.info(f"  ✓ Regime shifts injected: scale + wander "
+                        f"({online_data.shape[1]} online samples after injection)")
         
-        # Online phase: create sliding windows
-        # Window size is determined by number of iterations from the 20% online data
-        # iteration parameter determines how many windows we want: window_size = online_size / iteration
-        # step_size = 5% of window size for 95% overlap between consecutive windows
-        window_size = max(int(online_size / iteration), 100) if iteration > 0 else max(int(online_size * 0.2), 100)
-        step_size = max(int(window_size * 0.05), 5)  # 5% of window size, at least 5
+        # Online phase: sliding windows over the online stream. window_size =
+        # online_size / iteration (at least 100 samples), step_size = 5% of the
+        # window (at least 5), i.e. 95% overlap between consecutive windows.
+        window_size, step_size = feasibility['window_size'], feasibility['step_size']
+        num_windows = count_windows(online_data.shape[1], window_size, step_size)
         
         logger.info(f"  📊 Data split: Total={total_samples}, Offline={offline_size} (80%), Online={online_size} (20%)")
         logger.info(f"  📊 Online windows: window_size={window_size} (online_size/{iteration}), step_size={step_size} (5% of window)")
-        
-        data_windows, targets_windows, new_mask, num_windows = initialize_sliding_windows(
-            online_data, online_targets, online_mask,
-            window_size, step_size
-        )
-        
-        logger.info(f"  📊 Created {num_windows} sliding windows for online phase")
+        logger.info(f"  📊 {num_windows} sliding windows fit the online stream"
+                    + ("" if feasibility['ok'] else f" — {feasibility['reason']}"))
         
         # ==================== OFFLINE PHASE ====================
         logger.info("  🔧 OFFLINE PHASE: Running full model selection on 80% of data...")
@@ -1663,14 +2232,23 @@ def run_app(algorithm_list, algorithm_list_instances):
         test_data.entities[0].n_time = offline_size
         test_data.total_time = offline_size
 
+        # The robustness stages (GAN, off-by-threshold, Monte Carlo) score the
+        # offline part WITHOUT the synthetic anomalies. They used to receive
+        # the whole test series, online 20% included: future data leaking into
+        # the offline selection.
+        offline_raw_data = copy.deepcopy(test_data)
+
         test_data_new = copy.deepcopy(test_data)
         logger.info(f"  📏 Before Inject: test_data size = {test_data.entities[0].labels.shape[1] if test_data.entities[0].labels.ndim > 1 else test_data.entities[0].labels.shape[0]}")
-        test_data_new, _ = Inject(test_data_new, anomaly_list, rate=anomaly_rate)
+        # The copies are kept for the online phase: a re-optimisation slides
+        # each injected copy forward in time on its own.
+        test_data_new, _, offline_copies = Inject(test_data_new, anomaly_list,
+                                                  rate=anomaly_rate, return_copies=True)
 
         # Log data sizes for architecture verification
-        test_data_before_size = test_data_before.entities[0].labels.shape[1] if test_data_before.entities[0].labels.ndim > 1 else test_data_before.entities[0].labels.shape[0]
+        offline_raw_size = offline_raw_data.entities[0].labels.shape[1] if offline_raw_data.entities[0].labels.ndim > 1 else offline_raw_data.entities[0].labels.shape[0]
         test_data_new_size = test_data_new.entities[0].labels.shape[1] if test_data_new.entities[0].labels.ndim > 1 else test_data_new.entities[0].labels.shape[0]
-        logger.info(f"  📏 After Inject: test_data_before (full, for GAN) = {test_data_before_size}, test_data_new (injected, for others) = {test_data_new_size}")
+        logger.info(f"  📏 After Inject: offline raw (GAN, off-by, Monte Carlo) = {offline_raw_size}, test_data_new (injected, for GA and Thompson) = {test_data_new_size}")
 
         # Save a clean copy of injected test data BEFORE model selection mutates it
         # (Thompson Sampling processes it window-by-window, leaving only the last window)
@@ -1687,7 +2265,7 @@ def run_app(algorithm_list, algorithm_list_instances):
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_2(
                 train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
                 trained_models=trained_models, model_list=loaded_model_names,
-                test_data_gan=test_data_before, skip_gan=skip_gan, explain=explain,
+                test_data_gan=offline_raw_data, skip_gan=skip_gan, explain=explain,
                 decision_metric=decision_metric
             )
         else:
@@ -1697,7 +2275,7 @@ def run_app(algorithm_list, algorithm_list_instances):
              individual_predictions, base_model_predictions_train, base_model_predictions_test,
              y_true_train, y_true_test, meta_model_type, extra_results) = run_model_selection_algorithms_1(
                 train_data, test_data_new, dataset, entity, iteration=OFFLINE_ITERATION,
-                model_list=loaded_model_names, test_data_gan=test_data_before,
+                model_list=loaded_model_names, test_data_gan=offline_raw_data,
                 skip_gan=skip_gan, explain=explain,
                 stages=stages, decision_metric=decision_metric
             )
@@ -1944,285 +2522,66 @@ def run_app(algorithm_list, algorithm_list_instances):
         logger.info("="*80)
 
         # ==================== ONLINE PHASE ====================
-        # Real-time evaluation loop on remaining 20% of data using sliding windows
-        # update_interval controls how often we re-run the expensive model selection pipeline
-        enable_online_phase = args.get('enable_online', False)  # Off by default
-        update_interval = args.get('update_interval', 5)  # Re-optimize every N windows (default: 5)
-        
+        # The remaining 20% of the series, window by window, under each
+        # requested re-optimisation scenario (see run_online_phase).
+
         # Save initial offline phase selection (window 0)
         save_current_selection(
             dataset, entity, window_idx=0, best_ensemble=best_ensemble,
-            best_single_model=full_aggregated[0] if isinstance(full_aggregated, (list, tuple)) else full_aggregated,
+            best_single_model=best_single_model,
             meta_model_type=meta_model_type, trained_models=trained_models,
             individual_predictions=individual_predictions,
             base_model_predictions_train=base_model_predictions_train,
             base_model_predictions_test=base_model_predictions_test,
             y_true_train=y_true_train, y_true_test=y_true_test
         )
-        
-        # ========== STRATEGY SETUP ==========
-        # For fixed strategies, lock in the models now (no re-optimization during online phase)
-        if strategy == 'fixed-best':
-            logger.info(f"  🔒 STRATEGY: FIXED-BEST - Using best offline models throughout (no re-optimization)")
-            fixed_ensemble = best_ensemble.copy()
-            fixed_single_model = full_aggregated[0] if isinstance(full_aggregated, (list, tuple)) else full_aggregated
-        elif strategy == 'fixed-random':
-            logger.info(f"  🎲 STRATEGY: FIXED-RANDOM - Randomly selecting fixed model (no re-optimization)")
-            import random
-            available_models = list(trained_models.keys())
-            fixed_single_model = random.choice(available_models)
-            # Random ensemble: pick 3-6 random models
-            ensemble_size = random.randint(3, min(6, len(available_models)))
-            fixed_ensemble = random.sample(available_models, ensemble_size)
-            logger.info(f"  🎲 Fixed random model: {fixed_single_model}")
-            logger.info(f"  🎲 Fixed random ensemble: {fixed_ensemble}")
-        else:  # adaptive
-            logger.info(f"  🔄 STRATEGY: ADAPTIVE - Will re-optimize every {update_interval} windows")
-        
-        if enable_online_phase:
-            logger.info(f"📊 ONLINE PHASE ENABLED: {num_windows} windows, update_interval={update_interval}")
-            from tqdm import tqdm
-        else:
+
+        if not enable_online_phase:
             logger.info(f"  ℹ️  Online phase disabled (20% of data reserved but not processed)")
             logger.info(f"  ℹ️  To enable online phase, add --enable_online flag")
-        
-        if enable_online_phase and num_windows > 1:
-            online_start_time = time.time()
-            i = 1
-            # Track cumulative online windows for sliding window re-training
-            cumulative_online_windows = []
-            
-            # Apply max_online_windows limit if specified
-            effective_num_windows = num_windows if max_online_windows is None else min(num_windows, max_online_windows + 1)
-            if max_online_windows is not None:
-                logger.info(f"⚠️  LIMITING online phase to {max_online_windows} windows (out of {num_windows-1} available)")
-            
-            # Create progress bar for online windows
-            pbar = tqdm(total=effective_num_windows-1, desc="Online Windows", unit="window", 
-                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
-            
-            # Initialize background re-optimization executor and tracking
-            reopt_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            pending_reopt_future = None  # Track the running background task
-            pending_reopt_window = None  # Track which window triggered the reopt
-            
-            while i < effective_num_windows:
-                pbar.set_description(f"Window {i}/{effective_num_windows-1}")
-                logger.info(f"🔄 Processing online window {i}/{effective_num_windows-1}")
-                current_window_data = data_windows[i]
-                current_window_labels = targets_windows[i]
-                current_window_mask = new_mask[i]
-                
-                # Accumulate this window for potential re-training
-                cumulative_online_windows.append({
-                    'data': current_window_data,
-                    'labels': current_window_labels,
-                    'mask': current_window_mask
-                })
-                
-                # Set up test data for current window evaluation
-                test_data.entities[0].Y = current_window_data
-                test_data.entities[0].labels = current_window_labels
-                test_data.entities[0].mask = current_window_mask
-                test_data.entities[0].n_time = int(np.size(current_window_labels.flatten()))
-                test_data.total_time = int(np.size(current_window_labels.flatten()))
-
-                # ========== CHECK FOR COMPLETED BACKGROUND RE-OPTIMIZATION ==========
-                # If we have a pending re-optimization task, check if it's done
-                if pending_reopt_future is not None and pending_reopt_future.done():
-                    try:
-                        # Get results from completed background task
-                        (candidate_best_ensemble, candidate_best_single, individual_predictions_new,
-                         base_model_predictions_train_new, base_model_predictions_test_new,
-                         y_true_train_new, y_true_test_new, meta_model_type_new, reopt_time) = pending_reopt_future.result()
-                        
-                        logger.info(f"  ✅ [BACKGROUND] Re-optimization completed for window {pending_reopt_window} in {reopt_time:.2f}s")
-                        logger.info(f"  📊 Applying results from background re-optimization...")
-                        
-                        # Apply the new models (they've already been selected as best)
-                        best_ensemble = candidate_best_ensemble
-                        if isinstance(full_aggregated, (list, tuple)):
-                            full_aggregated = (candidate_best_single,) + tuple(full_aggregated[1:])
-                        else:
-                            full_aggregated = candidate_best_single
-                        
-                        # Update predictions and meta-model
-                        individual_predictions = individual_predictions_new
-                        base_model_predictions_train = base_model_predictions_train_new
-                        base_model_predictions_test = base_model_predictions_test_new
-                        y_true_train = y_true_train_new
-                        y_true_test = y_true_test_new
-                        meta_model_type = meta_model_type_new
-                        
-                        logger.info(f"  → Updated ensemble: {best_ensemble}")
-                        logger.info(f"  → Updated single model: {candidate_best_single}")
-                        
-                        # Save the updated selection
-                        save_current_selection(
-                            dataset, entity, window_idx=pending_reopt_window, best_ensemble=best_ensemble,
-                            best_single_model=candidate_best_single,
-                            meta_model_type=meta_model_type, trained_models=trained_models,
-                            individual_predictions=individual_predictions,
-                            base_model_predictions_train=base_model_predictions_train,
-                            base_model_predictions_test=base_model_predictions_test,
-                            y_true_train=y_true_train, y_true_test=y_true_test
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"  ❌ Background re-optimization failed: {e}")
-                        logger.error(f"  ↩️  Keeping current models")
-                    finally:
-                        # Clear the pending task
-                        pending_reopt_future = None
-                        pending_reopt_window = None
-                
-                # ========== TRIGGER NEW BACKGROUND RE-OPTIMIZATION IF NEEDED ==========
-                # EXPENSIVE: Re-run full model selection pipeline only every N windows
-                # Strategy check: only re-optimize if strategy is 'adaptive'
-                if strategy == 'adaptive' and i % update_interval == 0 and pending_reopt_future is None:
-                    logger.info(f"  🔄 Triggering BACKGROUND re-optimization at window {i} (every {update_interval} windows)...")
-                    
-                    # ========== EVALUATE CURRENT MODELS (FOR LOGGING) ==========
-                    logger.info(f"  📊 Evaluating CURRENT models on window {i}...")
-                    
-                    # Save current models
-                    current_best_ensemble = best_ensemble.copy()
-                    current_best_single = full_aggregated[0] if isinstance(full_aggregated, (list, tuple)) else full_aggregated
-                    
-                    logger.info(f"  → Current single model: {current_best_single}")
-                    logger.info(f"  → Current ensemble: {current_best_ensemble}")
-                    logger.info(f"  → Starting re-optimization in background (will apply when ready)...")
-                    
-                    # ========== SUBMIT BACKGROUND RE-OPTIMIZATION TASK ==========
-                    pending_reopt_future = reopt_executor.submit(
-                        perform_reoptimization_task,
-                        i, cumulative_online_windows, offline_data, offline_targets, offline_mask,
-                        test_data, train_data, dataset, entity, trained_models, loaded_model_names,
-                        anomaly_list, individual_predictions, base_model_predictions_train,
-                        base_model_predictions_test, y_true_train, y_true_test, meta_model_type,
-                        use_parallel, test_data_before, logger, current_best_ensemble, current_best_single,
-                        loaded_model_names, anomaly_rate
-                    )
-                    pending_reopt_window = i
-                    logger.info(f"  🚀 Background re-optimization task submitted for window {i}")
-                    
-                    # Continue immediately with evaluation using current models (don't wait)
-                    did_reoptimization = False  # We'll evaluate normally since reopt is async
-                else:
-                    # No re-optimization: either because not at update_interval or strategy is fixed
-                    if strategy in ['fixed-best', 'fixed-random']:
-                        # Use the fixed models (set at beginning)
-                        best_ensemble = fixed_ensemble
-                        if isinstance(full_aggregated, (list, tuple)):
-                            full_aggregated = (fixed_single_model,) + tuple(full_aggregated[1:])
-                        else:
-                            full_aggregated = fixed_single_model
-                        logger.info(f"  🔒 Using fixed models (strategy={strategy})")
-                    else:
-                        # Adaptive but not at update interval yet
-                        logger.info(f"  ⏩ Skipping re-optimization (next at window {((i // update_interval) + 1) * update_interval})")
-                    did_reoptimization = False
-                
-                # Only evaluate if we didn't just do re-optimization
-                # (At reoptimization windows, evaluation already happened in Step 3)
-                if not did_reoptimization:
-                    logger.info(f"  📊 Evaluating models on window {i}...")
-                    # Restrict to best ensemble's models
-                    trained_models_new = {}
-                    algorithm_list_new = []
-                    for model in best_ensemble:
-                        trained_models_new[model] = trained_models[model]
-                        algorithm_list_new.append(model)
-
-                    test_data_new = copy.deepcopy(test_data)
-                    test_data_new, _ = Inject(test_data_new, anomaly_list, rate=anomaly_rate)
-
-                    # LIGHTWEIGHT: Evaluate current best single model on this window
-                    test_data_new_copy = copy.deepcopy(test_data_new)
-                    _, adjusted_y_pred_ind_current, _, _ = evaluate_individual_models(
-                        [full_aggregated[0]], test_data_new_copy, trained_models
-                    )
-
-                    # LIGHTWEIGHT: Evaluate ensemble fitness on current window
-                    test_data_new_copy = copy.deepcopy(test_data_new)
-                    values = fitness_function(
-                        best_ensemble, train_data, test_data_new_copy, trained_models_new,
-                        individual_predictions, base_model_predictions_train, loaded_model_names,
-                        base_model_predictions_test, y_true_train, y_true_test,
-                        meta_model_type=meta_model_type
-                    )
-
-                    # Persist falses (TP/FP/FN tracking)
-                    test_data_new_copy = copy.deepcopy(test_data_new)
-                    find_num_falses(
-                        adjusted_y_pred_ind_current, test_data_new_copy, dataset, entity, values,
-                        full_aggregated[0], best_ensemble, iteration=i
-                    )
-                
-                i += 1
-                pbar.update(1)
-            
-            pbar.close()
-            
-            # ========== WAIT FOR ANY PENDING BACKGROUND RE-OPTIMIZATION ==========
-            if pending_reopt_future is not None:
-                logger.info(f"  ⏳ Waiting for pending background re-optimization to complete...")
-                try:
-                    (candidate_best_ensemble, candidate_best_single, individual_predictions_new,
-                     base_model_predictions_train_new, base_model_predictions_test_new,
-                     y_true_train_new, y_true_test_new, meta_model_type_new, reopt_time) = pending_reopt_future.result()
-                    
-                    logger.info(f"  ✅ Final background re-optimization completed in {reopt_time:.2f}s")
-                    # Apply the results
-                    best_ensemble = candidate_best_ensemble
-                    if isinstance(full_aggregated, (list, tuple)):
-                        full_aggregated = (candidate_best_single,) + tuple(full_aggregated[1:])
-                    else:
-                        full_aggregated = candidate_best_single
-                    individual_predictions = individual_predictions_new
-                    base_model_predictions_train = base_model_predictions_train_new
-                    base_model_predictions_test = base_model_predictions_test_new
-                    y_true_train = y_true_train_new
-                    y_true_test = y_true_test_new
-                    meta_model_type = meta_model_type_new
-                    
-                    logger.info(f"  → Final ensemble: {best_ensemble}")
-                    logger.info(f"  → Final single model: {candidate_best_single}")
-                except Exception as e:
-                    logger.error(f"  ❌ Final background re-optimization failed: {e}")
-            
-            # Shutdown the executor
-            reopt_executor.shutdown(wait=True)
-            logger.info("  ✓ Background re-optimization executor shut down")
-            
-            online_end_time = time.time()
-            online_total_time = online_end_time - online_start_time
-            
-            logger.info("✓ Online phase completed")
-            logger.info(f"⏱️  Online Phase Total Time: {online_total_time:.2f}s ({online_total_time/60:.2f} min)")
-            
-            # Write online phase summary
-            online_summary_file = results_dir("comprehensive", dataset, entity) + f"online_phase_timing.txt"
-            with open(online_summary_file, 'w') as f:
-                f.write("="*80 + "\n")
-                f.write("RAMSeS Online Phase Timing Summary\n")
-                f.write("="*80 + "\n")
-                f.write(f"Dataset: {dataset_label(dataset)}\n")
-                f.write(f"Entity: {entity}\n")
-                f.write(f"Iteration: {iteration}\n")
-                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("="*80 + "\n\n")
-                f.write(f"Total Windows Processed: {num_windows-1}\n")
-                f.write(f"Update Interval: {update_interval}\n")
-                f.write(f"Total Online Time: {online_total_time:.2f}s ({online_total_time/60:.2f} min)\n")
-                f.write(f"Average Time per Window: {online_total_time/(num_windows-1):.2f}s\n")
-                f.write(f"Offline Phase Time: {e2e_time:.2f}s ({e2e_time/60:.2f} min)\n")
-                f.write(f"Grand Total Time: {online_total_time + e2e_time:.2f}s ({(online_total_time + e2e_time)/60:.2f} min)\n")
-                f.write("="*80 + "\n")
-            
-            logger.info(f"📝 Online timing saved to: {online_summary_file}")
         else:
-            logger.info("  ℹ️  Online phase skipped (insufficient windows)")
+            run_online_phase(
+                args=args, dataset=dataset, entity=entity, train_data=train_data,
+                trained_models=trained_models, loaded_model_names=loaded_model_names,
+                models_dir=models_dir, offline_copies=offline_copies,
+                offline_raw=(offline_data, np.asarray(offline_targets).reshape(-1),
+                             offline_mask),
+                stream_raw=(online_data, np.asarray(online_targets).reshape(-1),
+                            online_mask),
+                feasibility=feasibility, window_size=window_size, step_size=step_size,
+                total_samples=total_samples, offline_size=offline_size,
+                online_size=online_size, anomaly_list=anomaly_list,
+                anomaly_rate=anomaly_rate, best_ensemble=best_ensemble,
+                best_single_model=best_single_model, meta_model_type=meta_model_type,
+                ga_meta_model=extra_results['ga'].get('meta_model'),
+                individual_predictions=individual_predictions,
+                base_model_predictions_train=base_model_predictions_train,
+                y_true_train=y_true_train,
+                offline_summary={
+                    'framework_choice': framework_choice,
+                    'decision_formula': decision_metric_formula(decision_metric),
+                    'ensemble': {'members': list(best_ensemble or []),
+                                 'meta_model_type': meta_model_type,
+                                 'scores': {'f1': ensemble_f1, 'pr_auc': ensemble_pr_auc,
+                                            'vus': ensemble_vus, 'score': ensemble_score}},
+                    'single': {'model': best_single_model,
+                               'scores': {'f1': single_model_f1,
+                                          'pr_auc': single_model_pr_auc,
+                                          'vus': single_model_vus,
+                                          'score': single_model_score}},
+                    # The range-based metrics' tolerance grows with the series
+                    # (about a tenth of it), so these offline scores are on a
+                    # different scale from any window's.
+                    'comparable_with_windows': False,
+                    'comparability_note': (
+                        'Offline scores were measured on the whole offline series, '
+                        'window scores on 100-sample windows; the range-based F1 and '
+                        'PR-AUC tolerance grows with the series length, so the two '
+                        'are not on one scale. Each window signal is compared only '
+                        'with its own online baseline.'),
+                },
+                vus_win=vus_win, iteration=iteration, offline_time=e2e_time,
+            )
 
     except Exception:
         logger.info('Traceback for Entity: %s Dataset: %s', entity, dataset)

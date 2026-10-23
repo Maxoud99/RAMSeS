@@ -1,7 +1,12 @@
-/* A sticky contents sidebar, shared by the documentation and report pages.
- * Items are `{ id, label, children }`; `children` renders as a second level. */
+/* A sticky contents rail, shared by the documentation and report pages — and
+ * built from the same parts as the explanation's own "On this page" rail
+ * (result.html), so the three views of one result carry one component: one
+ * width, one title, one way of marking where the reader is, a strip of chips
+ * on a narrow screen. Items are `{ id, num, label, children }`; `num` is
+ * optional and `children` renders as a second level. */
 
 import { el } from "./dom.js";
+import { trackSections, revealInRail } from "./spy.js";
 
 const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -20,58 +25,100 @@ export function jumpToHash(root) {
   target.classList.add("is-target");
 }
 
-/* Taking the click keeps the fragment in the URL (so Back works and the link is
- * copyable) but leaves the movement to us — a native jump is instant, and the
- * smooth scroll would then run from a position already at the destination. */
-function followLink(root, event, id) {
-  event.preventDefault();
-  if (location.hash !== `#${id}`) history.pushState(null, "", `#${id}`);
-  jumpToHash(root);
-}
-
-function link(root, item) {
-  return el("a", { href: `#${item.id}`, text: item.label,
-                   onclick: (event) => followLink(root, event, item.id) });
-}
-
-function contentsList(root, items) {
-  return el("ol", { class: "sidenav-list" },
-    items.map((item) => el("li", {},
-      link(root, item),
-      (item.children || []).length
-        ? el("ol", { class: "sidenav-sublist" },
-            item.children.map((child) => el("li", {}, link(root, child))))
-        : null)));
-}
-
-/* Contents on the left, `body` on the right. Collapsing is remembered under
- * `storageKey` — one per page, since the two lists are worth different amounts. */
-export function sideNavLayout(root, { title, items, storageKey, body }) {
-  const list = contentsList(root, items);
-  const toggle = el("button", { type: "button", class: "sidenav-toggle no-print" });
-  const layout = el("div", { class: "sidenav-layout" });
-
+/* Hiding the contents, remembered under `storageKey` — one per page, since the
+ * lists are worth different amounts. Only the wide layout honours it (the
+ * stylesheet keys off `is-collapsed` from the two-column breakpoint up): on a
+ * narrow screen the contents are a one-line strip, and collapsing that left an
+ * empty bordered box around a lone » button. Shared with the explanation's
+ * rail, so collapsing works, and looks, the same on all three views. */
+export function wireCollapse(layout, toggle, storageKey) {
   const apply = (collapsed) => {
     layout.classList.toggle("is-collapsed", collapsed);
     toggle.textContent = collapsed ? "»" : "«";
     toggle.title = collapsed ? "Show the contents" : "Hide the contents";
     toggle.setAttribute("aria-label", toggle.title);
     toggle.setAttribute("aria-expanded", String(!collapsed));
-    list.hidden = collapsed;
     try { localStorage.setItem(storageKey, collapsed ? "1" : "0"); } catch (e) {}
   };
-
   let collapsed = false;
   try { collapsed = localStorage.getItem(storageKey) === "1"; } catch (e) {}
   toggle.addEventListener("click", () => { collapsed = !collapsed; apply(collapsed); });
-
-  layout.append(
-    el("aside", { class: "sidenav card card-tight" },
-      el("div", { class: "row-between sidenav-head" },
-        el("h2", { class: "sidenav-title", text: title }), toggle),
-      list),
-    body);
   apply(collapsed);
-  window.addEventListener("hashchange", () => jumpToHash(root));
+}
+
+/* Taking the click keeps the fragment in the URL (so Back works and the link is
+ * copyable) but leaves the movement to us — a native jump is instant, and the
+ * smooth scroll would then run from a position already at the destination. */
+function followLink(root, event, id, follow) {
+  event.preventDefault();
+  if (location.hash !== `#${id}`) history.pushState(null, "", `#${id}`);
+  follow(id);
+  jumpToHash(root);
+}
+
+function link(root, item, follow) {
+  return el("a", { href: `#${item.id}`, "data-target": item.id,
+                   onclick: (event) => followLink(root, event, item.id, follow) },
+    item.num ? el("span", { class: "rail-num", text: item.num }) : null,
+    el("span", { class: "rail-label", text: item.label }));
+}
+
+function contentsList(root, items, follow) {
+  return el("ol", { class: "rail-list sidenav-list" },
+    items.map((item) => el("li", {},
+      link(root, item, follow),
+      (item.children || []).length
+        ? el("ol", { class: "rail-sublist sidenav-sublist" },
+            item.children.map((child) => el("li", {}, link(root, child, follow))))
+        : null)));
+}
+
+/* Contents on the left (a strip across the top on a narrow screen), `body`
+ * beside it. The reader's position is marked on the links from the scroll —
+ * the link of the section they are in, and its parent section's — so the
+ * contents say "you are here" as well as "go there". */
+export function sideNavLayout(root, { title, items, storageKey, body }) {
+  const order = [];
+  items.forEach((item) => {
+    order.push({ id: item.id, parent: null });
+    (item.children || []).forEach((child) => order.push({ id: child.id, parent: item.id }));
+  });
+  const links = new Map();
+  let list = null;
+  let nav = null;
+
+  const follow = trackSections(order.map((entry) => entry.id), {
+    mark: (id) => {
+      const entry = order.find((e) => e.id === id);
+      const parent = entry && entry.parent;
+      links.forEach((a, key) => {
+        const on = !!entry && key === id;
+        a.classList.toggle("is-current", on);
+        a.classList.toggle("is-current-parent", !!parent && key === parent);
+        if (on) a.setAttribute("aria-current", "location"); else a.removeAttribute("aria-current");
+      });
+      // A subsection's link is not drawn in the narrow strip; its section's is.
+      const shown = entry && links.get(id);
+      const target = shown && shown.getClientRects().length ? shown : links.get(parent);
+      revealInRail(target, list, nav);
+    },
+  });
+
+  list = contentsList(root, items, follow);
+  list.querySelectorAll("a[data-target]").forEach((a) => links.set(a.dataset.target, a));
+
+  const titleId = `${storageKey}-title`;
+  const toggle = el("button", { type: "button", class: "rail-collapse no-print" });
+  nav = el("nav", { class: "page-rail sidenav no-print", "aria-labelledby": titleId },
+    el("div", { class: "rail-head" },
+      el("h2", { class: "rail-title", id: titleId, text: title }), toggle),
+    list);
+  const layout = el("div", { class: "rail-layout sidenav-layout" }, nav, body);
+  wireCollapse(layout, toggle, storageKey);
+
+  window.addEventListener("hashchange", () => {
+    follow(decodeURIComponent((location.hash || "").replace(/^#/, "")));
+    jumpToHash(root);
+  });
   return layout;
 }

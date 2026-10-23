@@ -65,16 +65,19 @@ function header(report, sections) {
   // section: keep its lines here rather than dropping them.
   const titlePage = (sections || []).find((s) => !s.body && s.subtitle.length);
 
-  return el("section", { class: "stack" },
-    el("div", { class: "row-between" },
+  return el("header", { class: "page-head" },
+    el("div", { class: "page-head-main" },
       el("h1", { text: `${report.dataset_label || dataset} · entity ${entity}` }),
-      el("a", { class: "button no-print", href: report.download_url, text: "Download .txt" })),
-    el("p", { class: "muted", style: "max-width: 68ch;" },
-      "The pipeline's comprehensive results — measured timings, memory, the ranking each " +
-      "stage produced and the final decision. These numbers are the binding record; the " +
-      "explanation describes them but does not restate all of them."),
-    titlePage
-      ? el("p", { class: "small muted mono", text: titlePage.subtitle.join(" · ") }) : null);
+      el("p", { class: "page-desc" },
+        "The pipeline's comprehensive results — measured timings, memory, the ranking each " +
+        "stage produced and the final decision. These numbers are the binding record; the " +
+        "explanation describes them but does not restate all of them."),
+      titlePage
+        ? el("p", { class: "small muted mono report-stamp", text: titlePage.subtitle.join(" · ") })
+        : null),
+    el("div", { class: "page-head-actions" },
+      el("a", { class: "button tertiary icon-download no-print", href: report.download_url,
+                text: "Download .txt" })));
 }
 
 async function render() {
@@ -86,7 +89,7 @@ async function render() {
       el("h1", { text: "No comprehensive report" }),
       el("p", { class: "muted", text: (error.detail && error.detail.hint)
         || `Nothing has been written for ${dataset} / ${entity}.` }),
-      el("p", {}, el("a", { class: "button", href: "/", text: "Configure a run" }))));
+      el("p", {}, el("a", { class: "button tertiary", href: "/", text: "Configure a run" }))));
     return;
   }
 
@@ -98,7 +101,8 @@ async function render() {
 
   if (shown.length) {
     children.push(sideNavLayout(root, {
-      title: "Sections",
+      // The same name on all three views of a result: it is one component.
+      title: "On this page",
       items: shown.map((s) => ({ id: slug(s.title), label: s.title })),
       storageKey: "ramses-report-nav-collapsed",
       body: el("div", { class: "stack sidenav-body" }, shown.map(sectionCard)),

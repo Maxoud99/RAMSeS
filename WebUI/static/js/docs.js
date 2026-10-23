@@ -63,13 +63,16 @@ function sectionNode(section, number) {
   return node;
 }
 
-/* The N.M anchors are what the sidebar's second level points at. */
+/* The N.M anchors are what the rail's second level points at. The number is
+ * its own field, set in the rail's number column the way the explanation's
+ * "01"s are, rather than run into the label. */
 function contentsItems(sections) {
   return sections.map((s, i) => ({
     id: s.id,
-    label: `${i + 1}. ${s.title}`,
+    num: `${i + 1}`,
+    label: s.title,
     children: (s.subsections || []).map((sub, j) => ({
-      id: sub.id, label: `${i + 1}.${j + 1} ${sub.title}` })),
+      id: sub.id, num: `${i + 1}.${j + 1}`, label: sub.title })),
   }));
 }
 
@@ -78,20 +81,21 @@ async function main() {
   try {
     payload = await getJSON(`/api/docs/${dataset}/${entity}`);
   } catch (e) {
-    root.replaceChildren(el("p", { class: "notice", text:
+    root.replaceChildren(el("p", { class: "notice notice-glyph", text:
       "No documentation for this entity yet — it has no explanations on disk." }));
     return;
   }
   const sections = payload.sections || [];
   if (!sections.length) {
-    root.replaceChildren(el("p", { class: "notice", text:
+    root.replaceChildren(el("p", { class: "notice notice-glyph", text:
       "No stage documentation for this entity yet." }));
     return;
   }
   const body = el("div", { class: "stack sidenav-body" },
     ...sections.map((s, i) => sectionNode(s, i + 1)));
   root.replaceChildren(sideNavLayout(root, {
-    title: "Stages",
+    // The same name on all three views of a result: it is one component.
+    title: "On this page",
     items: contentsItems(sections),
     storageKey: "ramses-docs-nav-collapsed",
     body,

@@ -12,6 +12,9 @@ let items = [];
 let index = 0;
 let options = {};
 let attached = false;
+// What had focus when the lightbox opened, so closing it can hand focus back
+// instead of dropping the reader at the top of the page behind it.
+let opener = null;
 
 function refs() {
   return {
@@ -102,11 +105,27 @@ function close() {
   box.hidden = true;
   img.src = "";
   document.body.style.removeProperty("overflow");
+  if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+  opener = null;
+}
+
+/* The lightbox is modal, so Tab stays inside it: Close, Previous, the figure
+ * number and Next, in that order, skipping a disabled one. Without this the
+ * first Tab after opening landed on a disclosure behind the overlay. */
+function trapTab(event) {
+  const { close: closeButton, prev, input, next } = refs();
+  const order = [closeButton, prev, input, next].filter((node) => node && !node.disabled);
+  if (!order.length) return;
+  event.preventDefault();
+  const at = order.indexOf(document.activeElement);
+  const step = event.shiftKey ? -1 : 1;
+  order[at < 0 ? 0 : (at + step + order.length) % order.length].focus();
 }
 
 function onKey(event) {
   const { box, input } = refs();
   if (box.hidden) return;
+  if (event.key === "Tab") { trapTab(event); return; }
   // While the number field has focus the arrow keys belong to it — they move
   // the caret and step the value — so only Escape is global there.
   if (event.target === input) {
@@ -139,6 +158,9 @@ export function attachLightbox() {
 }
 
 export async function openLightbox(initialItems, startIndex = 0, opts = {}) {
+  // Read before anything is awaited, while it is still the button the reader
+  // pressed; a second open while one is showing keeps the first opener.
+  const before = document.activeElement;
   options = opts || {};
   items = initialItems ? initialItems.slice() : [];
   if (!items.length && options.lazyAll) {
@@ -146,8 +168,11 @@ export async function openLightbox(initialItems, startIndex = 0, opts = {}) {
   }
   if (!items.length) return;
   index = Math.min(Math.max(0, startIndex), items.length - 1);
-  const { box } = refs();
+  const { box, close: closeButton } = refs();
+  if (box.hidden) opener = before;
   box.hidden = false;
   document.body.style.overflow = "hidden";
   show();
+  // Into the dialog, on its way out: Close is the one control every figure has.
+  closeButton.focus();
 }

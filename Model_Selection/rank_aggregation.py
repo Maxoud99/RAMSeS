@@ -830,7 +830,11 @@ def explain_rank_aggregation(
     explain_rank_aggregation_kendall_only — so both methods are visible side by
     side. The two extra files carry a _kendall_only suffix.
 
-    Returns the dict of computed scores + verdicts when explain=True; None otherwise.
+    Sources whose ranking is empty are left out, as the aggregator leaves them
+    out of the consensus.
+
+    Returns the dict of computed scores + verdicts when explain=True and at
+    least one source has a ranking; None otherwise.
     """
     if not explain:
         return None
@@ -839,6 +843,26 @@ def explain_rank_aggregation(
             f"rankings ({len(rankings)}) and source_names ({len(source_names)}) "
             "must have the same length."
         )
+
+    # Explain exactly the sources the aggregator used. It drops empty rankings
+    # before aggregating (see enhanced_markov_chain_rank_aggregator_text), so a
+    # stage that produced none, such as a GAN stage that was skipped or failed
+    # soft, took no part in the consensus. Kept here, such a source still got
+    # leave-one-out and agreement scores of 0. The report then said "GAN_F1
+    # shaped the robustness consensus fifth most, placing 3rd of 6 for
+    # influence". Its neutral agreement of 0 even outranked real sources that
+    # disagreed with the consensus.
+    silent = [n for r, n in zip(rankings, source_names) if len(r) == 0]
+    if silent:
+        logger.info(f"Rank-aggregation explanation ({stage_name}): no ranking "
+                    f"from {', '.join(silent)}; left out as non-voting sources.")
+        kept = [(r, n) for r, n in zip(rankings, source_names) if len(r) > 0]
+        rankings = [r for r, _ in kept]
+        source_names = [n for _, n in kept]
+    if not rankings:
+        logger.warning(f"Rank-aggregation explanation ({stage_name}) skipped: "
+                       f"no source produced a ranking.")
+        return None
 
     loo = leave_one_out_contributions(rankings, source_names, full_ranking)
     align = kendall_tau_alignments(rankings, source_names, full_ranking)

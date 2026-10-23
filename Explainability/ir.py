@@ -2302,7 +2302,9 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
     """
     Combine the per-stage IR JSONs (written by each explainability orchestrator)
     with the pipeline's decision context into ir_global_iter{iteration}.json.
-    Missing stage files → explicit not_available.
+    Missing stage files → explicit not_available. So is the GAN stage when
+    results_dict shows it produced no ranking in this run, even if an older
+    ir_gan.json is still on disk.
 
     Besides the machine-readable blocks (decision / stage_agreement / stages),
     the global IR carries its own `evidence` atoms — pre-rendered SENTENCES
@@ -2335,7 +2337,22 @@ def assemble_global_ir(results_dict: Dict[str, Any], dataset: str, entity: str,
         f"ir_rank_aggregation_robust_{iteration}", "ir_rank_aggregation_robust_*.json")
     stage_files["rank_aggregation_final"] = (
         f"ir_rank_aggregation_final_{iteration}", "ir_rank_aggregation_final_*.json")
+    # A GAN stage that failed soft or was skipped with --skip_gan writes no
+    # ir_gan.json. Any such file on disk then belongs to an earlier run, so the
+    # stage is marked not available whatever is on disk. app.py deletes that
+    # file in this case, but the global IR does not rely on the deletion having
+    # worked. A results dict with no gan_robustness entry gives no information
+    # about the stage, so the file decides as before.
+    gan_result = results_dict.get("gan_robustness")
+    no_gan_ranking = isinstance(gan_result, dict) and not gan_result.get("f1_names")
     for stage, (fname, pattern) in sorted(stage_files.items()):
+        if stage == "gan" and no_gan_ranking:
+            stages[stage] = {
+                "status": NOT_AVAILABLE,
+                "note": "the GAN robustness test produced no ranking in this "
+                        "run: it failed or was skipped, so it had no vote in "
+                        "the consensus"}
+            continue
         loaded = _load(fname, pattern)
         if loaded is None:
             # Carry a reason rather than a bare status: the page lists these

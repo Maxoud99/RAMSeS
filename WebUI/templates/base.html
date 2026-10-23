@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>{% block title %}RAMSeS{% endblock %}</title>
 <link rel="stylesheet" href="{{ asset('css/ramses.css') }}">
 <script>
@@ -20,21 +21,42 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
+{# The UI shell: the product name, the views of the page beside it, and the
+   one control that acts on the browser rather than the page (the theme) at
+   the far right. The bar is dark in both themes, so it reads as the frame of
+   the application rather than as part of any one page. #}
 <header class="site-header no-print">
-  <div class="page row-between">
-    <div class="row">
-      <a class="brand" href="/">RAMSeS <span>· explainable model selection</span></a>
-    </div>
-    <div class="row">
-      {% block headeractions %}{% endblock %}
-      <button id="theme-toggle" type="button" title="Switch theme" aria-label="Switch theme">◐</button>
-    </div>
+  {# Named explicitly, for where the link leads. No mark beside the name:
+     three bars at the left edge of a Carbon header read as its menu button. #}
+  <a class="brand" href="/" aria-label="RAMSeS — configure a new run">
+    <span class="brand-name">RAMSeS</span>
+    <span class="brand-tag">Explainable model selection</span>
+  </a>
+  {# The views of one result (Explanation · Comprehensive results ·
+     Documentation) on the reading pages. A further view of a result (an
+     Online phase comparison) is one more link in the same list. #}
+  {% block headernav %}{% endblock %}
+  <div class="site-header-actions">
+    {% block headeractions %}{% endblock %}
+    <button id="theme-toggle" class="header-action" type="button" title="Switch theme" aria-label="Switch theme">◐</button>
   </div>
 </header>
 
 <main id="main" class="page">
+  {# Where this page sits, above its title: the breadcrumb on the reading
+     pages and the run page, the workflow's progress indicator on the
+     configure and run pages. #}
+  {% block crumbs %}{% endblock %}
+  {% block steps %}{% endblock %}
   {% block content %}{% endblock %}
 </main>
+
+<footer class="site-footer no-print">
+  <div class="page">
+    <span>RAMSeS — explainable model selection for time-series anomaly detection.</span>
+    <a href="/">Configure a run</a>
+  </div>
+</footer>
 
 {# dom.js is not loaded here: every page's entry script imports it, and a
    stamped tag would resolve to a different URL from their relative "./dom.js"

@@ -64,6 +64,23 @@ class TestAnomalies(unittest.TestCase):
             spec.parse_anomaly_type("spike")
         self.assertIn("unknown type 'spike'", str(cm.exception))
 
+    def test_several_types_keep_their_order_once_each(self):
+        """The multi-select sends a list and the CLI a comma-separated string;
+        both mean the same injection, and a repeat would inject a type twice."""
+        self.assertEqual(spec.parse_anomaly_types(None), [spec.DEFAULT_ANOMALY_TYPE])
+        self.assertEqual(spec.parse_anomaly_types("wander"), ["wander"])
+        self.assertEqual(spec.parse_anomaly_types(" Noise, spikes ,noise"), ["noise", "spikes"])
+        self.assertEqual(spec.parse_anomaly_types(["scale", "Flip"]), ["scale", "flip"])
+
+    def test_several_types_reject_empty_and_unknown(self):
+        for empty in ("", " , ", []):
+            with self.assertRaises(ValueError) as cm:
+                spec.parse_anomaly_types(empty)
+            self.assertIn("at least one anomaly type", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            spec.parse_anomaly_types("spikes,spike")
+        self.assertIn("unknown type 'spike'", str(cm.exception))
+
     def test_rate_none_keeps_the_per_type_defaults(self):
         self.assertIsNone(spec.parse_anomaly_rate(None))
         self.assertIsNone(spec.parse_anomaly_rate(""))
@@ -858,6 +875,13 @@ class TestTSBADFamilies(unittest.TestCase):
         This is the same "two places must know one rule" defect that cost
         LSTMAD its training in the first place, so it gets the same treatment:
         one owner, asserted.
+
+        Device placement is the second rule the three sites share, and it had
+        drifted the same way: app.py repaired a GPU-trained checkpoint only on
+        CPU hosts, and the other two not at all. So the owner a site has to go
+        through is `load_detector`, which reads with the right pickler AND
+        places the whole detector on one device — `load_checkpoint` alone is
+        only half of a load.
         """
         import re
         here = os.path.dirname(os.path.abspath(__file__))
@@ -873,9 +897,13 @@ class TestTSBADFamilies(unittest.TestCase):
                 self.assertFalse(
                     raw.search(source),
                     f"{rel} calls torch.load directly; use "
-                    f"Utils.model_io.load_checkpoint so the pickler matches "
+                    f"Utils.model_io.load_detector so the pickler matches "
                     f"what Logger.save_torch_model wrote")
-                self.assertIn("load_checkpoint", source, rel)
+                self.assertIn("load_detector", source, rel)
+                self.assertNotIn(
+                    "load_checkpoint", source,
+                    f"{rel} reads a checkpoint without placing it; use "
+                    f"Utils.model_io.load_detector")
 
     def test_the_trainer_and_the_scorer_agree_on_who_needs_one_batch(self):
         """Both places that size a batch must read the same set.
@@ -973,9 +1001,11 @@ class TestTSBADFamilies(unittest.TestCase):
         """`app.py` must FILTER the pool, not rely on the adapter's ValueError.
 
         The adapter raises from inside `TrainModels.train_models`, whose family
-        loop has no per-family recovery — so one univariate-only detector on a
-        multivariate entity aborted training for every family after it. The
-        declaration alone was inert: nothing read UNIVARIATE_FAMILIES.
+        loop then had no per-family recovery — so one univariate-only detector
+        on a multivariate entity aborted training for every family after it.
+        The declaration alone was inert: nothing read UNIVARIATE_FAMILIES.
+        Training now survives the raise, but the filter still gives the right
+        reason up front.
         """
         import os
         here = os.path.dirname(os.path.abspath(__file__))

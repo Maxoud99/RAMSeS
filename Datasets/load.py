@@ -9,7 +9,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
 from Datasets.dataset import Entity, Dataset
+from Datasets import tsb_ad
 from Utils.data_utils import download_file
+from Utils.pipeline_spec import dataset_has_real_labels
 
 #
 MACHINES = ['machine-1-1', 'machine-1-2', 'machine-1-3', 'machine-1-4', 'machine-1-5', 'machine-1-6', 'machine-1-7',
@@ -25,7 +27,7 @@ SMD_URL = 'https://raw.githubusercontent.com/NetManAIOps/OmniAnomaly/master/Serv
 NASA_DATA_URI = r'https://s3-us-west-2.amazonaws.com/telemanom/data.zip'
 NASA_LABELS_URI = r'https://raw.githubusercontent.com/khundman/telemanom/master/labeled_anomalies.csv'
 ANOMALY_ARCHIVE_URI = r'https://www.cs.ucr.edu/~eamonn/time_series_data_2018/UCR_TimeSeriesAnomalyDatasets2021.zip'
-VALID_DATASETS = ['msl', 'smap', 'smd', 'anomaly_archive', 'swat', 'synthetic', 'skab', 'apple']
+VALID_DATASETS = ['msl', 'smap', 'smd', 'anomaly_archive', 'swat', 'synthetic', 'skab', 'apple', 'tsb-ad-u', 'tsb-ad-m']
 
 
 def load_data(dataset: str, group: str, entities: Union[str, List[str]], downsampling: float = None,
@@ -59,6 +61,10 @@ def load_data(dataset: str, group: str, entities: Union[str, List[str]], downsam
     if dataset == 'servermachinedataset':
         dataset = 'smd'
 
+    if tsb_ad.is_tsb_ad(dataset):
+        return load_tsb_ad(group=group, dataset=dataset, entity=entities,
+                           downsampling=downsampling, min_length=min_length,
+                           root_dir=root_dir, normalize=normalize, verbose=verbose)
     if dataset == 'smd':
         return load_smd(group=group, machines=entities, downsampling=downsampling, root_dir=root_dir,
                         normalize=normalize, verbose=verbose)
@@ -69,6 +75,11 @@ def load_data(dataset: str, group: str, entities: Union[str, List[str]], downsam
     elif dataset == 'skab':
         return load_any_dataset(group=group, root_dir=root_dir, dataset=dataset, entity=entities,
                                 normalize=normalize, verbose=verbose)
+    elif dataset == 'msl':
+        # Without this branch MSL fell through to load_any_dataset, which looks
+        # for Datasets/msl/<channel> and never finds the NASA files.
+        return load_msl(group=group, channels=entities, downsampling=downsampling, root_dir=root_dir,
+                        normalize=normalize, verbose=verbose)
     elif dataset == 'smap':
         return load_smap(group=group, channels=entities, downsampling=downsampling, root_dir=root_dir,
                          normalize=normalize, verbose=verbose)
@@ -161,6 +172,70 @@ def load_presplit(group, root_dir, dataset, entity, downsampling=None,
         raise ValueError(f"group must be 'train' or 'test', got {group!r}")
 
     return Dataset(entities=entities_out, name=name, verbose=verbose)
+
+
+def load_tsb_ad(group, dataset, entity, downsampling=None, min_length=None,
+                root_dir='./data', normalize=True, verbose=True):
+    """One TSB-AD-U / TSB-AD-M series (see Datasets/tsb_ad.py for the layout).
+
+    The training part is [0, TrainEnd) and the test part [TrainEnd, end), both
+    from the file name; the test part keeps its real labels. Channels are
+    min-max scaled with the training part's range, as for the other loaders.
+    Downsampling follows the UCR loader's rule: it is skipped when either
+    part would end up shorter than `min_length`, and it takes the maximum of
+    each block, labels included, so a downsampled anomaly stays labelled.
+    """
+    path, meta = tsb_ad.find_file(root_dir, dataset, entity)
+    frame = pd.read_csv(path)
+    if 'Label' not in frame.columns:
+        raise ValueError(f'{os.path.basename(path)}: no Label column')
+    labels = frame['Label'].to_numpy(dtype=float)
+    values = frame.drop(columns=['Label']).to_numpy(dtype=float).T   # (channels, time)
+    n_time = values.shape[1]
+    train_end = int(meta['train_end'])
+    if not 0 < train_end < n_time:
+        raise ValueError(f'{os.path.basename(path)}: TrainEnd {train_end} is outside '
+                         f'the {n_time}-sample series')
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f'{os.path.basename(path)}: non-finite values')
+
+    train, test = values[:, :train_end], values[:, train_end:]
+    test_labels = labels[train_end:]
+    if normalize:
+        scaler = MinMaxScaler().fit(train.T)
+        train, test = scaler.transform(train.T).T, scaler.transform(test.T).T
+
+    factor = int(downsampling) if downsampling else None
+    if factor and min_length is not None and (
+            train.shape[1] // factor < min_length or test.shape[1] // factor < min_length):
+        factor = None
+    if factor and factor > 1:
+        train = downsample_max(train.T, factor).T
+        test = downsample_max(test.T, factor).T
+        test_labels = downsample_max(test_labels, factor)
+
+    name = meta['entity']
+    if group == 'train':
+        entities_out = [Entity(Y=train, name=name, verbose=verbose)]
+    elif group == 'test':
+        entities_out = [Entity(Y=test, name=name, labels=test_labels.reshape(1, -1),
+                               verbose=verbose)]
+    else:
+        raise ValueError(f"group must be 'train' or 'test', got {group!r}")
+    return Dataset(entities=entities_out, name=f'{dataset}-{group}', verbose=verbose)
+
+
+def provides_real_labels(dataset, entity, root_dir) -> bool:
+    """Does this dataset's loader give the test split real anomaly labels?
+
+    The named datasets are listed in Utils.pipeline_spec.REAL_LABEL_DATASETS;
+    any dataset in the presplit layout has them in test_label/ too."""
+    if dataset_has_real_labels(dataset):
+        return True
+    try:
+        return find_presplit_entity(root_dir, dataset, entity) is not None
+    except OSError:
+        return False
 
 
 def detect_delimiter(file_path):

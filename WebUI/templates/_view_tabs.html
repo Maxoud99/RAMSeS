@@ -1,0 +1,32 @@
+{# The views of one result, as shell-header tabs: the same set on every page.
+
+   Rendered from `views` (server.result_views), never toggled by a page's own
+   script: the four pages used to decide their tabs separately and disagreed —
+   a run without --explain offered "Explanation" and "Docs" tabs on its report
+   page that led to empty pages, while its online page hid them. A view that
+   does not exist has no tab; the page being shown always keeps its own.
+
+   The ids are what the page scripts and tests look for. #}
+<nav class="view-tabs" aria-label="Views of this result">
+  {% if views.explanation or current == "explanation" %}
+  <a id="to-explanation" href="/result/{{ dataset }}/{{ entity }}"
+     {%- if current == "explanation" %} aria-current="page"{% endif %}>Explanation</a>
+  {% endif %}
+  {% if views.report or current == "report" %}
+  <a id="open-report" href="/report/{{ dataset }}/{{ entity }}"
+     title="The pipeline's own numeric report"
+     {%- if current == "report" %} aria-current="page"{% endif %}><span class="label-wide">Comprehensive results</span><span class="label-narrow">Report</span></a>
+  {% endif %}
+  {% if views.online or current == "online" %}
+  <a id="open-online" href="/online/{{ dataset }}/{{ entity }}"
+     {%- if current == "online" %} aria-current="page"{% endif %}>Online</a>
+  {% endif %}
+  {% if views.docs or current == "docs" %}
+  {# The same tab from every view: these are views of one result. A reader
+     mid-way through a stage who wants a term looked up has that stage's own
+     "Stage description" link, which opens a new tab at the stage's section. #}
+  <a id="open-docs" href="/docs/{{ dataset }}/{{ entity }}"
+     title="How each stage works and what its terms mean"
+     {%- if current == "docs" %} aria-current="page"{% endif %}><span class="label-wide">Documentation</span><span class="label-narrow">Docs</span></a>
+  {% endif %}
+</nav>

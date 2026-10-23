@@ -6,6 +6,10 @@ import dill
 import numpy as np
 import torch as t
 
+# Suffix of a checkpoint that is still being written. See `save_torch_model`.
+PARTIAL_SUFFIX = '.partial'
+
+
 class Logger(object):
 
     def __init__(self,
@@ -46,25 +50,52 @@ class Logger(object):
                                                   str(obj_name) + '.csv'))
 
     def save_torch_model(self):
-        with open(
-                os.path.join(self.obj_save_path,
-                             str(self.obj_name) + '.pth'), 'wb') as f:
-            # t.save(self.obj.state_dict(), f) # TODO: We will not support saving state dicts for now
-            #
-            # `dill` rather than the stdlib pickle torch defaults to, because
-            # one detector in the pool cannot be pickled at all: PyOD 3 defines
-            # LSTMAD's network as a class inside a function
-            # (`_LSTMModel.__init__.<locals>._Net`), and pickle can only
-            # serialise classes reachable at module level. It raised
-            # "Can't pickle local object", after `fit` and after the diagnostic
-            # plot, leaving a truncated .pth that then read as a trained model.
-            # That is why no LSTMAD checkpoint has ever existed on any entity.
-            #
-            # Whole-object saves are what this line already does, so the choice
-            # is only which pickler; dill handles local classes and is a strict
-            # superset here. Loads must pass the same module — see
-            # `Utils.model_io.load_checkpoint`, which every load site uses.
-            t.save(self.obj, f, pickle_module=dill)
+        # Written beside the final name and renamed into place, never written
+        # in place. A `.pth` is what every reader takes to mean "trained" —
+        # `check_file_exists` below, the loader in app.py, the web UI — so a
+        # half-written one is worse than none: it skips retraining and then
+        # fails to load. Two things produced exactly that. A save that raised
+        # part-way (the LSTMAD pickling error described below), and now the
+        # training deadline, which kills the process an instance trains in
+        # whenever its time runs out, including mid-write. `os.replace` is
+        # atomic within a directory, so the `.pth` is either the previous file
+        # or the complete new one; what a kill leaves behind is a
+        # `.pth.partial`, which no reader matches and
+        # `TrainModels._train_instance` removes.
+        path = os.path.join(self.obj_save_path, str(self.obj_name) + '.pth')
+        partial = path + PARTIAL_SUFFIX
+        try:
+            with open(partial, 'wb') as f:
+                # t.save(self.obj.state_dict(), f) # TODO: We will not support saving state dicts for now
+                #
+                # `dill` rather than the stdlib pickle torch defaults to, because
+                # one detector in the pool cannot be pickled at all: PyOD 3 defines
+                # LSTMAD's network as a class inside a function
+                # (`_LSTMModel.__init__.<locals>._Net`), and pickle can only
+                # serialise classes reachable at module level. It raised
+                # "Can't pickle local object", after `fit` and after the diagnostic
+                # plot, leaving a truncated .pth that then read as a trained model.
+                # That is why no LSTMAD checkpoint has ever existed on any entity.
+                #
+                # Whole-object saves are what this line already does, so the choice
+                # is only which pickler; dill handles local classes and is a strict
+                # superset here. Loads must pass the same module — see
+                # `Utils.model_io.load_checkpoint`, which every load site reaches
+                # through `load_detector`.
+                t.save(self.obj, f, pickle_module=dill)
+            os.replace(partial, path)
+        except BaseException:
+            self.discard_partial(self.obj_class, self.obj_name)
+            raise
+
+    def discard_partial(self, obj_class: Union[str, List[str]], obj_name: str):
+        """Remove a checkpoint write that never completed, if one is there."""
+        partial = os.path.join(self.get_obj_save_path(obj_class),
+                               str(obj_name) + '.pth' + PARTIAL_SUFFIX)
+        try:
+            os.remove(partial)
+        except FileNotFoundError:
+            pass
 
     def save_data_object(self):
         with open(

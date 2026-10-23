@@ -165,15 +165,28 @@ DOC_SECTIONS: Tuple[Dict[str, Any], ...] = (
         )},
         {"id": "overview-online", "title": "Online phase and re-optimisation", "blocks": (
             {"text": "The series is split 80% offline / 20% online. The online "
-                     "portion is processed in overlapping windows, and every N "
-                     "windows (default 5) the framework re-optimises, "
-                     "concatenating the most recent online windows while "
-                     "dropping an equal number of the oldest offline samples so "
-                     "the training size stays constant. This adapts to "
-                     "distribution shift without forgetting earlier behaviour. "
-                     "Three strategies are available: adaptive (re-optimise "
-                     "periodically), fixed-best (keep the offline winner), and "
-                     "fixed-random (a baseline)."},
+                     "portion's synthetic anomalies are injected once, and it is "
+                     "processed in overlapping windows cut from that one stream. On "
+                     "each window the deployed ensemble and the deployed single "
+                     "detector are scored with the run's fitness. A "
+                     "re-optimisation re-runs model selection in a separate "
+                     "process on the offline data slid forward by the online "
+                     "samples seen so far, so the amount of data stays constant. "
+                     "Its result is switched in a fixed number of windows (L, "
+                     "default 2) after the trigger; the stream waits for it there "
+                     "if it is not ready, and a trigger in between is recorded as "
+                     "suppressed."},
+            {"text": "Four scenarios decide when to re-optimise. Fixed never "
+                     "does. Periodic does every M windows (default 5). "
+                     "Threshold does when either score falls more than X% "
+                     "(default 20) below its baseline, the first score after the "
+                     "last re-optimisation. Adaptive threshold does when either "
+                     "falls below the mean minus k standard deviations (default "
+                     "2) of its last N scores (default 10), using the X% rule "
+                     "until N scores exist since the last re-optimisation. A "
+                     "comparison run replays the same windows, with the same "
+                     "injected anomalies, under all four, each from the same "
+                     "offline selection."},
         )},
         {"id": "overview-explained", "title": "How the explanations are produced",
          "blocks": (

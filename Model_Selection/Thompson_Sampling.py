@@ -662,7 +662,7 @@ def fit_linear_thompson_sampling(dataset,
                                  epsilon_decay: float = 0.99, f1_weight: float = 0.7, pr_auc_weight: float = 0.3,
                                  iterations: int = 100,
                                  explain: bool = False, metrics=DEFAULT_DECISION_METRICS,
-                                 vus_win=None) -> Tuple[
+                                 vus_win=None, skip_one_class_windows: bool = False) -> Tuple[
     Dict[str, np.ndarray], Dict[str, np.ndarray], List[Dict[str, float]]]:
     """
     Fit models using Linear Thompson Sampling.
@@ -677,6 +677,12 @@ def fit_linear_thompson_sampling(dataset,
     - f1_weight (float): Weight for F1 score in reward calculation.
     - pr_auc_weight (float): Weight for PR AUC in reward calculation.
     - iterations (int): Number of iterations for sampling.
+    - skip_one_class_windows (bool): skip a window whose labels are one class
+      (no arm is drawn, no reward, no posterior update). Set by the online
+      phase's real-label re-optimisations: on real labels most windows hold no
+      anomaly, F1 and PR-AUC are undefined there, and the near-zero reward the
+      metrics return would penalise whichever detector happened to be drawn.
+      Off by default, so the offline phase runs exactly as before.
 
     Returns:
     - Tuple containing dictionaries of means, covariances, and history of means.
@@ -713,6 +719,7 @@ def fit_linear_thompson_sampling(dataset,
     # compares a detector against itself at two different points in its learning.
     _pre_means_hist: List[Dict[str, np.ndarray]] = []
 
+    n_skipped_one_class = 0
     for iteration in range(num_windows):
         logger.info(f"Iteration {iteration + 1}")
         # Offered to the sampler, but never removed from `models`: every
@@ -724,6 +731,11 @@ def fit_linear_thompson_sampling(dataset,
             logger.error("Every detector has been killed for slowness; "
                          "no arm left to sample.")
             break
+        if skip_one_class_windows and len(np.unique(
+                np.asarray(targets_windows[iteration]).ravel() > 0)) < 2:
+            n_skipped_one_class += 1
+            logger.info(f"Window {iteration + 1}: skipped, its labels are one class")
+            continue
         try:
             # Pass the current window as context so selection uses theta_tilde^T * x.
             # Normalise to unit length so that datasets with large sensor values
@@ -837,6 +849,12 @@ def fit_linear_thompson_sampling(dataset,
         history.append({model_name: means[model_name].flatten() for model_name in models})
         logger.info(f"Finished iteration {iteration + 1}")
 
+    if skip_one_class_windows:
+        level = "WARNING" if n_skipped_one_class == num_windows else "INFO"
+        logger.log(level, f"Thompson Sampling: {n_skipped_one_class} of {num_windows} windows "
+                          f"skipped because their labels are one class"
+                   + ("; no window updated a posterior, so the ranking is the prior's"
+                      if n_skipped_one_class == num_windows else ""))
     if explain:
         # Build the SHAP payload from the per-window contexts the bandit actually
         # processed (_window_contexts), which stays index-aligned with the regime
@@ -2717,7 +2735,8 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset, entity, iterations, iteration,
                                  initial_epsilon=0.2, epsilon_decay=0.99, f1_weight=0.5, pr_auc_weight=0.5,
-                                 explain=False, metrics=DEFAULT_DECISION_METRICS):
+                                 explain=False, metrics=DEFAULT_DECISION_METRICS,
+                                 skip_one_class_windows=False):
     """
     Run the entire Linear Thompson Sampling process.
 
@@ -2750,6 +2769,7 @@ def run_linear_thompson_sampling(test_data, trained_models, model_names, dataset
         explain=explain,
         metrics=metrics,
         vus_win=vus_window(test_data.entities[0].Y),
+        skip_one_class_windows=skip_one_class_windows,
     )
     if explain:
         (means, covariances, history, list_of_chosen_models,

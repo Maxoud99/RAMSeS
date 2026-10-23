@@ -12,7 +12,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Model_Selection.inject_anomalies import Inject, InjectAnomalies  # noqa: E402
+from Model_Selection.inject_anomalies import (  # noqa: E402
+    Inject, InjectAnomalies, inject_copies)
 from Model_Selection.anomaly_parameters import ANOMALY_PARAM_GRID  # noqa: E402
 from Utils.pipeline_spec import ALL_ANOMALY_TYPES  # noqa: E402
 
@@ -109,6 +110,55 @@ class TestAnomalyRate(unittest.TestCase):
         self.assertLessEqual(obj.anomaly_end, Y.shape[1])
         self.assertGreaterEqual(obj.anomaly_end - obj.anomaly_start,
                                 int(0.9 * Y.shape[1]) - 2 * obj.min_window_size)
+
+
+class TestInjectedCopies(unittest.TestCase):
+    """`Inject` is `inject_copies` plus a concatenation: the online phase keeps
+    the copies apart to cut every window at the same time positions."""
+
+    def test_inject_is_the_concatenation_of_the_copies_with_the_same_draws(self):
+        from Utils.pipeline_spec import injection_copies
+        Y = series(n_features=2, n_time=400)
+        for anomaly_type in ALL_ANOMALY_TYPES:
+            np.random.seed(11)
+            data, sizes, copies = Inject(_Dataset(Y.copy()), [anomaly_type],
+                                         return_copies=True)
+            after_inject = np.random.random()
+            np.random.seed(11)
+            again = inject_copies(Y.copy(), [anomaly_type])
+            after_copies = np.random.random()
+            self.assertEqual(after_inject, after_copies, anomaly_type)   # same draws
+            self.assertEqual(len(copies), injection_copies([anomaly_type]), anomaly_type)
+            np.testing.assert_array_equal(data.entities[0].Y,
+                                          np.concatenate([c.Y for c in again], axis=1))
+            np.testing.assert_array_equal(data.entities[0].labels,
+                                          np.concatenate([c.labels for c in again]))
+            np.testing.assert_array_equal(sizes, again[-1].sizes)
+
+    def test_the_two_return_forms_agree(self):
+        Y = series(n_features=2, n_time=300)
+        np.random.seed(2)
+        plain = Inject(_Dataset(Y.copy()), ["cutoff"])
+        np.random.seed(2)
+        with_copies = Inject(_Dataset(Y.copy()), ["cutoff"], return_copies=True)
+        self.assertEqual(len(plain), 2)
+        self.assertEqual(len(with_copies), 3)
+        np.testing.assert_array_equal(plain[0].entities[0].Y, with_copies[0].entities[0].Y)
+
+    def test_positions_map_original_times_into_each_copy(self):
+        Y = series(n_features=1, n_time=500)
+        np.random.seed(5)
+        for c in inject_copies(Y.copy(), ["speedup", "scale"]):
+            self.assertEqual((c.position(0), c.position(500)), (0, c.length))
+            steps = [c.position(t) for t in range(501)]
+            self.assertEqual(steps, sorted(steps))            # monotone
+            start, end = c.segment
+            if c.anomaly_type == "scale":
+                self.assertEqual(steps, list(range(501)))      # same length: identity
+            else:
+                # Untouched before the segment; shifted by the resampling after it.
+                self.assertEqual(steps[:start + 1], list(range(start + 1)))
+                self.assertEqual(c.position(end), start + c.segment_length)
 
 
 class TestVocabularyAgreement(unittest.TestCase):

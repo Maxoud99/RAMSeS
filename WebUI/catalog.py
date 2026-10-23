@@ -15,7 +15,9 @@ from typing import Any, Dict, List, Optional
 # Utils/__init__.py is empty and pipeline_spec is stdlib-only, so this import
 # stays cheap — it does not drag torch/matplotlib in the way Utils.utils would.
 from Utils.pipeline_spec import (ALL_DETECTORS, DATASET_LABELS, DECISION_METRICS,
-                                 DETECTOR_FAMILIES,
+                                 DETECTOR_FAMILIES, ONLINE_LABEL_SOURCE_LABELS,
+                                 ONLINE_LABELS_INJECTED, ONLINE_LABELS_REAL,
+                                 dataset_has_real_labels,
                                  DETECTOR_GROUPS, GROUP_LABELS,
                                  MULTIVARIATE_FAMILIES, UNIVARIATE_FAMILIES,
                                  dataset_label, family_of,
@@ -25,13 +27,23 @@ from Utils.pipeline_spec import (ALL_DETECTORS, DATASET_LABELS, DECISION_METRICS
 # pulling torch or sklearn into the Flask process.
 from Model_Training.hyperparameter_grids import (FAMILY_GRIDS, grid_combinations,
                                                  varying_keys)
+# Stdlib only (re, os): the TSB-AD file-name parser, shared with the loader.
+from Datasets import tsb_ad
 from WebUI import paths
 
 # Copied from Datasets/load.py VALID_DATASETS. Importing that module would pull
 # in pandas + sklearn for the sake of eight strings; a test asserts this list
 # still matches the source.
 VALID_DATASETS = ("msl", "smap", "smd", "anomaly_archive", "swat",
-                  "synthetic", "skab", "apple")
+                  "synthetic", "skab", "apple", "tsb-ad-u", "tsb-ad-m")
+
+# A line under a dataset's name in the picker, for the ones whose key says
+# little on its own.
+DATASET_NOTES = {
+    "tsb-ad-u": "TSB-AD univariate benchmark, real labels",
+    "tsb-ad-m": "TSB-AD multivariate benchmark, real labels",
+    "anomaly_archive": "UCR anomaly archive, one labelled anomaly per series",
+}
 
 # Present in VALID_DATASETS but raise NotImplementedError in the loader.
 UNRUNNABLE = frozenset({"swat", "synthetic"})
@@ -68,6 +80,11 @@ def _entity_from_filename(name: str, dataset_key: str) -> Optional[str]:
     if dataset_key == "anomaly_archive":
         parts = stem.split("_")
         return "_".join(parts[:4]) if len(parts) >= 4 else stem
+    if tsb_ad.is_tsb_ad(dataset_key):
+        # `001_NAB_id_1_Facility_tr_1007_1st_2014.csv` -> `001_NAB_id_1_Facility`
+        # (Datasets/tsb_ad.py); a file that does not follow the naming is no
+        # series of the benchmark.
+        return tsb_ad.entity_from_filename(name)
     return stem
 
 _CACHE: Dict[str, Any] = {"at": 0.0, "value": None}
@@ -364,6 +381,7 @@ def datasets() -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     for key, dirs in sorted(_dataset_dirs().items()):
         entities = entities_for(key)
+        has_labels = dataset_has_real_labels(key) or any(is_presplit(d) for d in dirs)
         found.append({
             # `name` is what goes to --dataset; the loader lowercases and
             # aliases it, so the canonical key is always safe to pass.
@@ -373,6 +391,12 @@ def datasets() -> List[Dict[str, Any]]:
             "runnable": key not in UNRUNNABLE or any(is_presplit(d) for d in dirs),
             "n_entities": len(entities),
             "directories": [d.name for d in dirs],
+            "note": DATASET_NOTES.get(key),
+            # Whether the loader gives the test split real anomaly labels, and
+            # so what the online phase scores on by default (--online_labels).
+            "labels_available": has_labels,
+            "default_online_labels": (ONLINE_LABELS_REAL if has_labels
+                                      else ONLINE_LABELS_INJECTED),
         })
     return sorted(found, key=lambda d: d["label"].lower())
 
@@ -454,11 +478,30 @@ def catalog(refresh: bool = False) -> Dict[str, Any]:
              "note": "Perturbation measures below the step-to-step variation on "
                      "downsampled data."},
         ],
+        "online_label_sources": [
+            {"token": token, "label": label}
+            for token, label in ONLINE_LABEL_SOURCE_LABELS.items()],
         "warnings": warnings(),
         "config": {k: paths.config().get(k) for k in ("dataset_path", "trained_model_path")},
     }
+    for entry in value["anomaly_types"]:
+        entry["copies"] = anomaly_copies(entry["token"])
     _CACHE.update(at=now, value=value)
     return value
+
+
+def anomaly_copies(token: str) -> int:
+    """How many copies of the series one anomaly type injects.
+
+    `Inject` makes one copy per parameter combination of each selected type and
+    the stages evaluate on all of them, so the configure page can say what
+    several types cost: spikes adds one copy, scale or wander add four.
+    """
+    from Model_Selection.anomaly_parameters import ANOMALY_PARAM_GRID
+    count = 1
+    for values in ANOMALY_PARAM_GRID.get(token, {}).values():
+        count *= max(1, len(values))
+    return count
 
 
 def reset_cache() -> None:

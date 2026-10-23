@@ -89,7 +89,11 @@ _set("Utils.model_selection_utils", evaluate_model=lambda *a, **k: {},
 _set("loguru", logger=_Logger())
 _keras = _set("tensorflow.keras", layers=types.SimpleNamespace(),
               models=types.SimpleNamespace())
-_set("tensorflow", keras=_keras)
+# GAN_test applies Utils.tf_device's GPU policy at import, which reads
+# tf.config. A machine with no GPU is the right stand-in for it here.
+_set("tensorflow", keras=_keras,
+     config=types.SimpleNamespace(list_physical_devices=lambda *a, **k: [],
+                                  set_visible_devices=lambda *a, **k: None))
 
 # ── Load GAN_test.py by path ────────────────────────────────────────────────
 _THIS = os.path.dirname(os.path.abspath(__file__))

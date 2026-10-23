@@ -1,33 +1,72 @@
 {% extends "base.html" %}
 {% block title %}{{ dataset }} / {{ entity }} — RAMSeS explanation{% endblock %}
 
-{% block headeractions %}
-<a class="button" id="open-report" href="#" hidden
-   title="The pipeline's own numeric report">Comprehensive results</a>
-<a class="button" id="open-docs" href="/docs/{{ dataset }}/{{ entity }}" target="_blank"
-   rel="noopener" title="What the terms on each stage mean">ⓘ Documentation</a>
-<button id="toggle-all-full" type="button" title="Expand or collapse every explanation">Expand all</button>
+{% block crumbs %}
+<nav class="crumbs" aria-label="You are here">
+  <ol>
+    <li><a href="/#results-title">Results</a></li>
+    <li>{{ dataset }}</li>
+    <li aria-current="page">entity {{ entity }}</li>
+  </ol>
+</nav>
+{% endblock %}
+
+{% block headernav %}
+{% include "_view_tabs.html" %}
 {% endblock %}
 
 {% block content %}
-<div id="result-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
-  <p class="muted">Loading explanation…</p>
+{# The contents rail travels with the reader down a page of nine long
+   sections: a sticky column on a wide screen, a sticky strip of tabs on a
+   narrow one. The same component as the report's and the documentation's
+   (sidenav.js builds theirs from these classes), so the three views of a
+   result keep one width, one title and one collapse. Its list is built from
+   the payload by result.js; "Expand all" lives here rather than in the
+   header because it acts on the page. #}
+<div class="result-layout rail-layout">
+  <nav class="page-rail no-print" id="page-rail" aria-labelledby="page-rail-title" hidden>
+    <div class="rail-head">
+      <h2 class="rail-title" id="page-rail-title">On this page</h2>
+      <button type="button" class="rail-collapse" id="rail-collapse"
+              aria-expanded="true" aria-label="Hide the contents" title="Hide the contents">«</button>
+    </div>
+    <ol class="rail-list" id="page-rail-list"></ol>
+    <button id="toggle-all-full" class="rail-toggle" type="button"
+            title="Expand or collapse every explanation">Expand all</button>
+  </nav>
+  <div id="result-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
+    <p class="loading" role="status">Loading explanation…</p>
+  </div>
 </div>
 
-<div class="lightbox no-print" id="lightbox" hidden>
-  <div class="lightbox-bar">
-    <span id="lightbox-title" class="small"></span>
-    <button type="button" id="lightbox-close" aria-label="Close">Close ✕</button>
-  </div>
-  <div class="lightbox-stage"><img id="lightbox-img" alt=""></div>
-  <div class="lightbox-bar">
-    <button type="button" id="lightbox-prev">← Previous</button>
-    <span id="lightbox-count" class="small">
-      <input type="number" id="lightbox-index" min="1" step="1"
-             aria-label="Go to figure number" inputmode="numeric">
-      <span id="lightbox-total"></span>
-    </span>
-    <button type="button" id="lightbox-next">Next →</button>
+{# A modal dialog: gallery.js moves focus into it on open, keeps Tab among its
+   controls while it is open, and hands focus back to the button that opened
+   it on close. A click on the overlay outside the dialog closes it. #}
+<div class="lightbox no-print" id="lightbox" role="dialog" aria-modal="true"
+     aria-labelledby="lightbox-title" hidden>
+  <div class="lightbox-dialog">
+    <div class="lightbox-bar lightbox-head">
+      <span id="lightbox-title"></span>
+      <button type="button" id="lightbox-close" class="icon-button" aria-label="Close">
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </div>
+    <div class="lightbox-stage"><img id="lightbox-img" alt=""></div>
+    <div class="lightbox-bar lightbox-foot">
+      <button type="button" id="lightbox-prev" class="ghost">
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M10 4L6 8l4 4"/></svg>
+        Previous
+      </button>
+      <span id="lightbox-count" class="small">
+        <input type="number" id="lightbox-index" min="1" step="1"
+               aria-label="Go to figure number" inputmode="numeric">
+        <span id="lightbox-total"></span>
+      </span>
+      <button type="button" id="lightbox-next" class="ghost">
+        Next
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 4l4 4-4 4"/></svg>
+      </button>
+    </div>
   </div>
 </div>
 {% endblock %}

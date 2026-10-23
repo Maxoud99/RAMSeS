@@ -10,10 +10,13 @@
 import { $, $$, el, getJSON, pct, proseNode, familyClass, timeAgo, postJSON,
          makeSortable } from "./dom.js";
 import { openLightbox, attachLightbox } from "./gallery.js";
+import { trackSections, revealInRail } from "./spy.js";
+import { wireCollapse } from "./sidenav.js";
 
 const root = $("#result-root");
 const dataset = root.dataset.dataset;
 const entity = root.dataset.entity;
+const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 /* A caption's title and its sentence are now set in the same colour, so the
  * colon is what separates them. Added only when there is a sentence to
@@ -151,21 +154,28 @@ function galleryButton(stage, payload) {
   const extra = [];
   const gallery = group.gallery || [];
   if (gallery.length) {
+    const label = `Browse ${gallery.length} more plot${gallery.length === 1 ? "" : "s"}`;
     extra.push(el("button", {
-      type: "button", class: "no-print",
-      text: `Browse ${gallery.length} more plot${gallery.length === 1 ? "" : "s"}`,
+      type: "button", class: "no-print", "aria-label": label,
       onclick: () => openLightbox(gallery, 0),
-    }));
+    }, el("span", { text: "Browse more plots" }),
+       el("span", { class: "count", "aria-hidden": "true", text: String(gallery.length) })));
   }
   for (const descriptor of (payload.plots || {})._galleries || []) {
     if (!descriptor.id.startsWith(stage.plot_group)) continue;
+    // The frame count is set apart from the title so a row of these scans as
+    // names with numbers, not as one run of text per button.
     extra.push(el("button", {
       type: "button", class: "no-print",
-      text: `${descriptor.title} (${descriptor.count})`,
+      "aria-label": `${descriptor.title} (${descriptor.count})`,
       onclick: () => openGallery(descriptor),
-    }));
+    }, el("span", { text: descriptor.title }),
+       el("span", { class: "count", "aria-hidden": "true", text: String(descriptor.count) })));
   }
-  return extra.length ? el("div", { class: "row" }, extra) : null;
+  return extra.length
+    ? el("div", { class: "gallery-links no-print" },
+        el("span", { class: "gallery-label", text: "More figures" }), extra)
+    : null;
 }
 
 async function openGallery(descriptor) {
@@ -191,11 +201,19 @@ function termsNode(stage) {
   if (!terms.length) return null;
   // flatMap, not map: el() flattens its children exactly one level, so a list
   // of [dt, dd] pairs would reach it as arrays and be stringified.
-  return el("dl", { class: "terms" },
-    terms.flatMap(([term, definition]) => [
-      el("dt", { text: `${term}:` }),
-      el("dd", { text: definition }),
-    ]));
+  //
+  // Wrapped with the sentence that names the list, so the two travel together:
+  // on a wide screen they are one marginal note beside the narrative. The
+  // sentence appears only when there is a list, as before — it otherwise
+  // promises terms that never arrive.
+  return el("aside", { class: "stage-terms" },
+    el("p", { class: "terms-label", text:
+      "The following terms and metrics are used to explain this stage:" }),
+    el("dl", { class: "terms" },
+      terms.flatMap(([term, definition]) => [
+        el("dt", { text: `${term}:` }),
+        el("dd", { text: definition }),
+      ])));
 }
 
 /* The link to this stage's section of the documentation.
@@ -209,10 +227,10 @@ function termsNode(stage) {
  * the opened page a reference to this one otherwise. */
 function docsLink(stage) {
   if (!stage.doc_section) return null;
-  return el("a", { class: "button no-print stage-docs-link",
+  return el("a", { class: "button no-print stage-docs-link icon-launch",
                    href: `/docs/${dataset}/${entity}#${stage.doc_section}`,
                    target: "_blank", rel: "noopener",
-                   text: "Stage description for the interested ↗" });
+                   text: "Stage description for the interested" });
 }
 
 /* What the extended view adds, per stage — the reader should know what a click
@@ -277,10 +295,13 @@ function summaryTable(spec) {
   if (!fold || spec.rows.length <= fold) return wrap;
 
   const hidden = spec.rows.length - fold;
-  const button = el("button", { class: "link-button",
+  // aria-expanded both for assistive tech and for the stylesheet, which turns
+  // the fold's chevron the way a <summary>'s turns.
+  const button = el("button", { type: "button", class: "link-button", "aria-expanded": "false",
     text: `Show all ${spec.rows.length} rows (${hidden} more)` });
   button.addEventListener("click", () => {
     const shown = table.classList.toggle("expanded");
+    button.setAttribute("aria-expanded", String(shown));
     button.textContent = shown
       ? `Show top ${fold} only`
       : `Show all ${spec.rows.length} rows (${hidden} more)`;
@@ -329,37 +350,49 @@ function regimeSection(stage) {
     el("div", { class: "stack" }, rows));
 }
 
-function stageCard(stage, payload) {
-  const faith = stage.faithfulness || {};
-  const header = el("header", {},
-    el("div", { class: "stage-title" },
-      el("h3", { id: `stage-${stage.key}`, text: stage.title }),
-      stage.top_pick ? el("span", { class: familyClass(stage.top_pick) },
-                            `first: ${stage.top_pick}`) : null,
-      stage.words ? el("span", { class: "muted small", text: `${stage.words} words` }) : null,
-      // Beside the word count and pushed to the right edge: it is a way out of
-      // the card, not part of its finding, so it sits with the metadata rather
-      // than in the reading order of the prose.
-      docsLink(stage)),
-    stage.question ? el("p", { class: "muted small", text: stage.question }) : null,
-    // Names what the definition list under it is for. Only when there is one:
-    // the sentence otherwise promises terms that never arrive. "this stage"
-    // rather than the title, which is in the heading directly above it.
-    (stage.terms || []).length
-      ? el("p", { class: "muted small", text:
-          "The following terms and metrics are used to explain this stage:" })
-      : null);
+/* The section's number, as the documentation numbers its sections: the
+ * figures are numbered after it ("Figure 3.2"). */
+const sectionNumber = (n) => String(n);
 
-  const body = el("div", { class: "stack" });
+function stageCard(stage, payload, number) {
+  const faith = stage.faithfulness || {};
+  // The stage's metadata as a small fact list. On a wide screen it is the
+  // margin note beside the title; on a narrow one, a row under it.
+  const facts = [
+    stage.top_pick ? el("div", {},
+      el("dt", { text: "First pick" }),
+      el("dd", {}, el("span", { class: familyClass(stage.top_pick), text: stage.top_pick })))
+      : null,
+    stage.words ? el("div", {},
+      el("dt", { text: "Narrative" }),
+      el("dd", { class: "muted", text: `${stage.words} words` }))
+      : null,
+  ].filter(Boolean);
+  const header = el("header", { class: "stage-head" },
+    el("span", { class: "stage-num", "aria-hidden": "true", text: sectionNumber(number) }),
+    el("div", { class: "stage-heading" },
+      el("h3", { id: `stage-${stage.key}`, text: stage.title }),
+      stage.question ? el("p", { class: "stage-question", text: stage.question }) : null),
+    el("div", { class: "stage-meta" },
+      facts.length ? el("dl", { class: "stage-facts" }, facts) : null,
+      // With the metadata rather than in the prose: it is a way out of the
+      // section, not part of its finding.
+      docsLink(stage)));
+
+  const body = el("div", { class: "stage-body stack" });
   // The prose is older than the facts it describes, so it may be narrating a
   // previous run. Said plainly and at the top, because everything below it —
   // summary, table, regime sentences — inherits the doubt.
   if (stage.stale) {
     body.append(el("p", { class: "notice", text:
-      "⚠ This explanation is older than the results it describes: the stage was "
+      "This explanation is older than the results it describes: the stage was "
       + "re-run without re-generating its narrative. Re-run the narrator to refresh it." }));
   }
-  body.append(termsNode(stage));
+  // Guarded like `regimes` and `gallery` below: termsNode returns null for a
+  // stage with no definitions, and Node.append — unlike el() — does not skip
+  // null; it stringifies it, so the card would open with the word "null".
+  const terms = termsNode(stage);
+  if (terms) body.append(terms);
   body.append(proseNode(stage.summary));
   if (stage.summary_table) body.append(summaryTable(stage.summary_table));
   // `extended_in` means another section of this card already shows what the
@@ -385,7 +418,7 @@ function stageCard(stage, payload) {
   if (gallery) body.append(gallery);
 
   if (stage.caveats && stage.caveats.length) {
-    body.append(el("details", {},
+    body.append(el("details", { class: "caveats" },
       el("summary", { text: `Caveats (${stage.caveats.length})` }),
       el("ul", { class: "small muted" }, stage.caveats.map((c) => el("li", { text: c })))));
   }
@@ -400,9 +433,9 @@ function stageCard(stage, payload) {
     faith.repaired ? el("span", { class: "badge badge-warn", text: "repaired" }) : null,
   ].filter(Boolean);
   const footer = provenance.length
-    ? el("div", { class: "row small dim no-print" }, provenance) : null;
+    ? el("div", { class: "stage-foot row small dim no-print" }, provenance) : null;
 
-  return el("section", { class: "card stage-card stack" }, header, body, footer);
+  return el("section", { class: "stage-card" }, header, body, footer);
 }
 
 /* Two of the algorithms answer two questions each and so occupy two cards. Said
@@ -420,12 +453,12 @@ const PAIR_PREFACE = {
 function pairPreface(stage) {
   const text = PAIR_PREFACE[stage.key];
   if (!text) return null;
-  // `.prose`, so it is set in the same serif face and size as the narratives it
-  // introduces — it is read as part of them, not as a UI label. The 68ch
-  // measure is dropped: it exists to keep a paragraph readable over many lines,
-  // and here it was breaking a single sentence that fits the card.
-  return el("section", { class: "card card-tight" },
-    el("p", { class: "prose", style: "margin: 0; max-width: none;", text }));
+  // `.prose`, so it is set in the same serif face as the narratives it
+  // introduces — it is read as part of them, not as a UI label. Set as a
+  // part-opener (.pair-preface in the stylesheet, which also drops the
+  // measure: one sentence that fits the column should not be broken by it).
+  return el("section", { class: "pair-preface" },
+    el("p", { class: "prose", text }));
 }
 
 function decisionHero(payload) {
@@ -434,27 +467,87 @@ function decisionHero(payload) {
     : decision.chosen ? [decision.chosen] : [];
   const faith = payload.faithfulness || {};
 
-  const byline = [];
-  if (payload.model) byline.push(`generated by ${payload.model}`);
-  if (faith.n_claims) {
-    byline.push(`${pct(faith.hallucination_rate)} unsupported over ${faith.n_claims} claims`);
-    byline.push(`${pct(faith.omission_rate)} of required facts omitted`);
-  }
-
-  return el("section", { class: "decision-hero stack" },
-    el("div", { class: "row-between" },
-      el("h1", { text: `${payload.dataset_label || payload.dataset} · entity ${payload.entity}` }),
-      payload.generated_at
-        ? el("span", { class: "muted small", text: timeAgo(payload.generated_at) }) : null),
-    // Verbatim from the grounded decision atom — the page invents nothing.
-    payload.decision_text
-      ? el("p", { class: "verdict", text: payload.decision_text })
-      : el("p", { class: "muted", text: "No decision recorded for this run." }),
-    chosen.length
-      ? el("div", { class: "row" }, chosen.map((d) => el("span", { class: familyClass(d), text: d })))
+  // What used to be the one-line byline, as a ruled fact list in the margin:
+  // the same fields under the same conditions, each findable on its own.
+  const fact = (term, ...value) => el("div", {}, el("dt", { text: term }), el("dd", {}, ...value));
+  const facts = [
+    decision.framework_choice
+      ? fact("Decision", el("span", { class: "is-decision",
+                                      text: decision.framework_choice.replace(/_/g, " ") }))
       : null,
-    decision.reason ? el("p", { class: "prose small muted", text: decision.reason }) : null,
-    byline.length ? el("p", { class: "byline", text: byline.join(" · ") }) : null);
+    chosen.length
+      ? fact("Chosen", chosen.map((d) => el("span", { class: familyClass(d), text: d })))
+      : null,
+    decision.decision_metric_label ? fact("Fitness", decision.decision_metric_label) : null,
+    payload.model ? fact("Narrated by", el("span", { class: "mono", text: payload.model })) : null,
+    // Claims checked, unsupported and omitted moved to the last tile, under
+    // the same condition, so they are said once.
+    payload.generated_at ? fact("Generated", timeAgo(payload.generated_at)) : null,
+  ].filter(Boolean);
+
+  return el("section", { class: "decision-hero", id: "decision" },
+    el("div", { class: "hero-main" },
+      el("h1", { text: `${payload.dataset_label || payload.dataset} · entity ${payload.entity}` }),
+      // Verbatim from the grounded decision atom — the page invents nothing.
+      payload.decision_text
+        ? el("p", { class: "verdict", text: payload.decision_text })
+        : el("p", { class: "verdict muted", text: "No decision recorded for this run." }),
+      decisionTiles(decision, faith),
+      decision.reason ? el("p", { class: "prose small muted hero-reason", text: decision.reason }) : null),
+    facts.length
+      ? el("aside", { class: "hero-facts", "aria-label": "Decision and provenance" },
+          el("dl", { class: "facts" }, facts))
+      : null);
+}
+
+/* The decision's numbers as a ruled row of figures: the two candidates it
+ * weighed, the margin between them, and how much of the prose the verifier
+ * could not support. Every value is read from the record as written — rounded
+ * nowhere, derived from nothing — and a tile whose number the record does not
+ * hold (an older result tree) is simply not drawn. The margin carries the
+ * record's own sign, set with a true minus so "−0.1463" is as wide as "+0.1463";
+ * which side is ahead is left to that sign rather than worded by the page. */
+function decisionTiles(decision, faith) {
+  const num = (v) => typeof v === "number" && Number.isFinite(v);
+  const metric = decision.decision_metric_label || decision.decision_metric_formula || "fitness";
+  const names = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+  const chips = (list) => list.map((d) => el("span", { class: familyClass(d), text: d }));
+  // The flag sits with the detector it names rather than in the label or
+  // beside the number, so neither of those changes height on the chosen tile.
+  const tile = (label, value, sub, chosen) => el("div",
+    { class: chosen ? "kpi is-chosen" : "kpi" },
+    el("dt", { class: "kpi-label", text: label }),
+    el("dd", { class: "kpi-value", text: value }),
+    el("dd", { class: "kpi-sub" }, sub && sub.length ? sub : null,
+      chosen ? el("span", { class: "kpi-flag", text: "✓ chosen" }) : null));
+
+  const tiles = [];
+  if (num(decision.single_model_score)) {
+    tiles.push(tile(`Single model · ${metric}`, String(decision.single_model_score),
+      chips(names(decision.single_model)), decision.framework_choice === "single_model"));
+  }
+  if (num(decision.ensemble_score)) {
+    tiles.push(tile(`GA ensemble · ${metric}`, String(decision.ensemble_score),
+      chips(names(decision.ensemble)), decision.framework_choice === "ensemble"));
+  }
+  if (num(decision.score_margin_ensemble_minus_single)) {
+    const margin = decision.score_margin_ensemble_minus_single;
+    // No-break spaces round the minus, so a wrapped label never starts its
+    // second line with "− single" and reads like a list bullet.
+    tiles.push(tile("Margin · ensemble\u00a0−\u00a0single",
+      `${margin > 0 ? "+" : ""}${String(margin).replace("-", "−")}`,
+      [el("span", { text: `in ${metric}` })]));
+  }
+  // "Unsupported claims", not "faithfulness": the number is the share the
+  // verifier could not ground, so 0.0% is the good end — a label promising
+  // faithfulness above a big 0.0% reads as the opposite.
+  if (faith && num(faith.n_claims) && faith.n_claims > 0) {
+    tiles.push(tile("Unsupported claims", pct(faith.hallucination_rate),
+      [el("span", { text: `of ${faith.n_claims} checked`
+        + (num(faith.omission_rate) ? ` · ${pct(faith.omission_rate)} of facts omitted` : "") })]));
+  }
+  return tiles.length
+    ? el("dl", { class: "kpis", "aria-label": "The decision in numbers" }, tiles) : null;
 }
 
 /* Display names for the agreement sources.
@@ -535,8 +628,15 @@ function consensusStrip(payload) {
     return chip;
   });
 
-  return el("section", { class: "card card-tight stack" },
-    el("h2", { class: "small muted", text: "Where the stages agreed" }),
+  return el("section", { class: "agreement-panel stack", id: "agreement" },
+    el("div", {},
+      el("h2", { class: "small muted", text: "Where the stages agreed" }),
+      // The key to the glyphs: `agrees` is whether the source's first pick is
+      // the final single model (Explainability/ir.py, agrees_with_final_single).
+      el("p", { class: "agreement-legend" },
+        el("span", { class: "glyph", text: "✓" }), " same first pick as the final single model · ",
+        el("span", { class: "glyph", text: "≠" }), " a different first pick · ",
+        el("span", { class: "glyph", text: "–" }), " not compared. Open one to see its whole ranking.")),
     el("div", { class: "agreement-grid" }, chips),
     panel);
 }
@@ -545,7 +645,7 @@ function missingSection(payload) {
   if (!payload.missing_stages || !payload.missing_stages.length) return null;
   return el("section", { class: "card card-tight stack" },
     el("h2", { class: "small muted", text: "Stages without an explanation" }),
-    el("ul", { class: "small" }, payload.missing_stages.map((m) =>
+    el("ul", { class: "small missing-list" }, payload.missing_stages.map((m) =>
       el("li", {}, el("strong", { text: m.title }), " — ",
          m.note || m.status.replace(/_/g, " ")))));
 }
@@ -562,16 +662,16 @@ function comprehensiveCard(payload) {
     report.name,
   ].filter(Boolean).join(" · ");
 
-  return el("section", { class: "card stack" },
+  return el("section", { class: "card end-card" },
     el("div", { class: "row-between" },
       el("h2", { id: "comprehensive", text: "Comprehensive results" }),
-      el("a", { class: "button primary no-print", href: report.url,
-                text: "Open report →" })),
+      el("a", { class: "button primary icon-arrow no-print", href: report.url,
+                text: "Open report" })),
     el("p", { class: "prose small muted" },
       "Measured module timings, memory, the ranking each stage produced and the final " +
       "decision, exactly as the pipeline wrote them. Separate from the explanation above, " +
       "and the binding record for any number that appears in both."),
-    el("p", { class: "small muted mono", text: meta }));
+    el("p", { class: "small muted mono end-meta", text: meta }));
 }
 
 function appendix(payload) {
@@ -590,16 +690,167 @@ function appendix(payload) {
       el("th", { class: "num", text: "Unsupported" }), el("th", { class: "num", text: "Omitted" }),
       el("th", { class: "num", text: "Claims" }))),
     el("tbody", {}, rows)));
-  return el("details", { class: "card" },
+  return el("details", { class: "card appendix", id: "appendix" },
     el("summary", { text: "Appendix: faithfulness and provenance" }),
     el("div", { class: "stack" },
-      table,
+      // Scrolls in its own box on a phone, like every other wide table.
+      el("div", { class: "table-scroll" }, table),
       el("p", { class: "small muted", text:
         `Explanations read from myresults/explanations_nl/${payload.dataset}/${payload.entity}/` +
         (payload.iteration !== null && payload.iteration !== undefined
           ? ` (iteration ${payload.iteration})` : "") }),
       el("p", {}, el("a", { href: `/api/explanations/${dataset}/${entity}/download?stage=global`,
                             text: "Download the full report (.txt)" }))));
+}
+
+/* Figures are numbered per section — "Figure 3.2" is the second figure of
+ * section 03 — and the number is written once, here, rather than counted in
+ * CSS: a CSS counter skips whatever sits in a closed disclosure, so every
+ * number after it would shift when the reader opened one. */
+function numberFigures() {
+  $$(".stage-card", root).forEach((card, s) => {
+    $$("figure > figcaption", card).forEach((caption, f) => {
+      caption.dataset.fig = `${s + 1}.${f + 1}`;
+    });
+  });
+}
+
+/* "On this page": every section of the explanation, numbered as the
+ * sections are, in the rail beside them (a strip of chips on a narrow screen).
+ * Built from the same payload the sections are, so the two cannot disagree.
+ * Each stage carries the detector it put first — what the contents grid under
+ * the hero used to add, before the rail made that grid a second copy of
+ * itself. Plain fragment links — the browser does the jump, so Back and
+ * copy-link behave as they always have. */
+function pageRail(payload) {
+  const nav = $("#page-rail");
+  const list = $("#page-rail-list");
+  if (!nav || !list) return;
+  const item = (id, num, label, pick) => el("li", {},
+    el("a", { href: `#${id}`, "data-target": id },
+      el("span", { class: "rail-num", "aria-hidden": num ? null : "true", text: num }),
+      el("span", { class: "rail-label", text: label }),
+      pick ? el("span", { class: `rail-pick ${familyClass(pick)}`, text: pick }) : null));
+  const items = [item("decision", "", "Decision")];
+  if (payload.agreement && payload.agreement.length) items.push(item("agreement", "", "Agreement"));
+  payload.stages.forEach((stage, i) =>
+    items.push(item(`stage-${stage.key}`, sectionNumber(i + 1), stage.title, stage.top_pick)));
+  if (payload.comprehensive) items.push(item("comprehensive", "", "Comprehensive results"));
+  items.push(item("appendix", "", "Appendix"));
+  list.replaceChildren(...items);
+  nav.hidden = false;
+  const layout = nav.closest(".rail-layout");
+  const collapse = $("#rail-collapse");
+  if (layout && collapse) wireCollapse(layout, collapse, "ramses-result-nav-collapsed");
+  spyOnSections(nav, list);
+}
+
+/* Marks the rail link of the section being read, with the rule the report and
+ * the documentation use (spy.js). Presentation only: a class and
+ * aria-current on the links. Each target counts from the top of the section
+ * around it — the stage card, not its heading — so a reader in the middle of
+ * a long stage is still in that stage. */
+function spyOnSections(nav, list) {
+  const links = $$("a[data-target]", list);
+  if (!links.length) return;
+  const byId = new Map(links.map((a) => [a.dataset.target, a]));
+  let current = null;
+  const follow = trackSections(links.map((a) => a.dataset.target), {
+    sectionOf: (node) =>
+      node.closest(".stage-card, .end-card, .decision-hero, .agreement-panel, details.card") || node,
+    mark: (id) => {
+      if (current) { current.classList.remove("is-current"); current.removeAttribute("aria-current"); }
+      current = byId.get(id) || null;
+      if (!current) return;
+      current.classList.add("is-current");
+      current.setAttribute("aria-current", "location");
+      revealInRail(current, list, nav);
+    },
+  });
+  // The link the reader followed is the answer, at once and for as long as
+  // the jump takes — not whichever section the scroll happens to pass.
+  links.forEach((a) => a.addEventListener("click", () => follow(a.dataset.target)));
+  window.addEventListener("hashchange", () =>
+    follow(decodeURIComponent((location.hash || "").replace(/^#/, ""))));
+}
+
+/* Land an inbound #fragment on its own heading.
+ *
+ * The browser resolves the fragment before the payload has arrived, so its
+ * jump is missed; and one scroll once the sections exist is not enough either,
+ * because the figures above the target load as it comes into range and push it
+ * down — a cold /result/…#stage-gan used to stop over a thousand pixels short.
+ * So the target's closed disclosures are opened, the jump is made, and it is
+ * made again whenever the page changes height, until the page has been still
+ * for a moment or the reader takes over (wheel, touch, key, click). Instant:
+ * on a cold load there is no "from" for an animation to show. */
+function openFromHash() {
+  const id = decodeURIComponent((location.hash || "").replace(/^#/, ""));
+  if (!id) return false;
+  const target = document.getElementById(id);
+  if (!target || !root.contains(target)) return false;
+  for (let d = target.closest("details:not([open])"); d; d = d.closest("details:not([open])")) {
+    d.open = true;
+  }
+  const pin = () => target.scrollIntoView({ block: "start", behavior: "instant" });
+  pin();
+  const QUIET_MS = 1200, MAX_MS = 8000, INPUTS = ["wheel", "touchstart", "keydown", "pointerdown"];
+  let quiet = 0;
+  const observer = new ResizeObserver(() => {
+    pin();
+    clearTimeout(quiet);
+    quiet = setTimeout(stop, QUIET_MS);
+  });
+  const cap = setTimeout(stop, MAX_MS);
+  function stop() {
+    observer.disconnect();
+    clearTimeout(quiet);
+    clearTimeout(cap);
+    INPUTS.forEach((type) => window.removeEventListener(type, stop, true));
+  }
+  INPUTS.forEach((type) => window.addEventListener(type, stop, { capture: true, passive: true }));
+  observer.observe(root);
+  quiet = setTimeout(stop, QUIET_MS);
+  return true;
+}
+
+/* A margin glossary longer than the prose beside it.
+ *
+ * The terms float into the margin column and a figure band spans that column,
+ * so a band has to clear the float: where six terms sat beside a short summary
+ * (Thompson Sampling: Selection), the reading column stood empty for a quarter
+ * of a screen before the figures. When that would happen, the first band
+ * starts where the prose ends and stays out of the margin — it gives up the
+ * margin's width, not its place — and the glossary carries on beside it.
+ * Measured rather than guessed, because it depends on the fonts, the width and
+ * which disclosures are open, and re-measured when any of those change. */
+const BANDS = ":scope > .figures, :scope > details:not(.narrative):not(.caveats), :scope > .gallery-links";
+const OVERRUN_PX = 48;
+
+function fitMarginNotes() {
+  $$(".stage-body", root).forEach((body) => {
+    $$(".beside-terms", body).forEach((node) => node.classList.remove("beside-terms"));
+    const terms = $(":scope > .stage-terms", body);
+    const band = $(BANDS, body);
+    if (!terms || !band || getComputedStyle(terms).float === "none") return;
+    let prose = band.previousElementSibling;
+    if (prose === terms) prose = null;
+    if (!prose) return;
+    const overrun = terms.getBoundingClientRect().bottom - prose.getBoundingClientRect().bottom;
+    if (overrun > OVERRUN_PX) band.classList.add("beside-terms");
+  });
+}
+
+function watchMarginNotes() {
+  let frame = 0;
+  const later = () => {
+    if (!frame) frame = requestAnimationFrame(() => { frame = 0; fitMarginNotes(); });
+  };
+  fitMarginNotes();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(later);
+  window.addEventListener("resize", later);
+  // `toggle` does not bubble; captured here, it covers every disclosure.
+  root.addEventListener("toggle", later, true);
 }
 
 /* The "ⓘ Definitions" bulk toggle is gone with the glossaries it opened: they
@@ -619,46 +870,47 @@ async function render() {
   try {
     payload = await getJSON(`/api/explanations/${dataset}/${entity}`);
   } catch (error) {
-    root.replaceChildren(el("section", { class: "card stack" },
+    root.replaceChildren(el("section", { class: "card stack empty-card" },
       el("h1", { text: "No explanation yet" }),
       el("p", { class: "muted", text: error.detail && error.detail.hint
         ? error.detail.hint
         : `Nothing has been generated for ${dataset} / ${entity}.` }),
-      el("p", {}, el("a", { class: "button", href: "/", text: "Configure a run" }))));
+      // The page's one way forward, so it is drawn as its primary action.
+      el("p", {}, el("a", { class: "button primary icon-arrow", href: "/", text: "Configure a run" }))));
     return;
   }
 
+  // No second table of contents under the hero: the rail beside the page (a
+  // strip of chips above it on a narrow screen) lists the same sections with
+  // the same numbers, and now carries each stage's first pick too, so a grid
+  // repeating it here made two navigations for one page.
   const children = [decisionHero(payload), consensusStrip(payload)];
   if (payload.degraded) {
     children.push(el("p", { class: "banner banner-warn", text:
       "This result predates the structured global report, so only the per-stage " +
       "explanations are shown." }));
   }
-  payload.stages.forEach((stage) => {
+  payload.stages.forEach((stage, i) => {
     children.push(pairPreface(stage));
-    children.push(stageCard(stage, payload));
+    children.push(stageCard(stage, payload, i + 1));
   });
   children.push(missingSection(payload));
   children.push(comprehensiveCard(payload));
   children.push(appendix(payload));
 
   root.replaceChildren(el("div", { class: "stack-lg" }, children.filter(Boolean)));
+  numberFigures();
 
-  // Reachable from the top of the page too, not only after scrolling past the
-  // stages — but only when the report actually exists on disk.
-  if (payload.comprehensive) {
-    const link = $("#open-report");
-    link.href = payload.comprehensive.url;
-    link.hidden = false;
-  }
 
   bulkToggles();
   attachLightbox();
+  pageRail(payload);
+  watchMarginNotes();
 
-  if (location.hash) {
-    const target = document.querySelector(location.hash);
-    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
+  openFromHash();
+  // A fragment followed later (the rail, the contents) is a native jump; this
+  // only adds what the browser does not do: opening the disclosure it is in.
+  window.addEventListener("hashchange", openFromHash);
 }
 
 render();
