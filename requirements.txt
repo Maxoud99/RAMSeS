@@ -51,6 +51,14 @@ Requests==2.32.5
 scikit_learn==1.7.2
 scipy==1.16.2
 statsmodels==0.14.4
+# tensorflow 2.18.1 is built against cuDNN 9.3, and torch 2.5.1 pins cuDNN
+# 9.1.0 (nvidia-cudnn-cu12==9.1.0.70). They share a process and torch loads
+# first, so TensorFlow rejects the cuDNN on the GPU: "Loaded runtime CuDNN
+# library: 9.1.0 but source was compiled with: 9.3.0". `tensorflow[and-cuda]` cannot be
+# added either, because it pins nvidia-cudnn-cu12==9.3.0.75. So the GAN stage,
+# TensorFlow's only user, keeps TensorFlow on the CPU (Utils/tf_device.py).
+# torch keeps the GPU. RAMSES_TF_GPU=1 opts TensorFlow back in for
+# environments whose TensorFlow CUDA stack matches.
 tensorflow==2.18.1
 timesfm==1.3.0
 torch==2.5.1

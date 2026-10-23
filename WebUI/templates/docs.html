@@ -1,13 +1,30 @@
 {% extends "base.html" %}
 {% block title %}{{ dataset }} / {{ entity }} — stage documentation{% endblock %}
 
-{% block headeractions %}
-<a class="button" id="to-explanation" href="/result/{{ dataset }}/{{ entity }}">Explanation →</a>
+{% block crumbs %}
+<nav class="crumbs" aria-label="You are here">
+  <ol>
+    <li><a href="/#results-title">Results</a></li>
+    <li>{{ dataset }}</li>
+    <li aria-current="page">entity {{ entity }}</li>
+  </ol>
+</nav>
+{% endblock %}
+
+{% block headernav %}
+{% include "_view_tabs.html" %}
 {% endblock %}
 
 {% block content %}
+<header class="page-head docs-head">
+  <div class="page-head-main">
+    <h1>Stage documentation</h1>
+    <p class="page-desc">How each stage of RAMSeS works, and what the terms on its
+      explanation mean.</p>
+  </div>
+</header>
 <div id="docs-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
-  <p class="muted">Loading the stage documentation…</p>
+  <p class="loading" role="status">Loading the stage documentation…</p>
 </div>
 {% endblock %}
 

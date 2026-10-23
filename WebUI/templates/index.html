@@ -1,141 +1,302 @@
 {% extends "base.html" %}
 {% block title %}RAMSeS — configure a run{% endblock %}
 
+{% block steps %}
+<nav class="flow-steps" aria-label="Where this page sits in the workflow">
+  <ol>
+    <li data-step="configure" aria-current="step"><span class="flow-num" data-n="1" aria-hidden="true"></span><span class="flow-label">Configure</span></li>
+    <li data-step="run"><span class="flow-num" data-n="2" aria-hidden="true"></span><span class="flow-label">Run</span></li>
+    <li data-step="explanation"><span class="flow-num" data-n="3" aria-hidden="true"></span><span class="flow-label">Explanation</span></li>
+    <li data-step="report"><span class="flow-num" data-n="4" aria-hidden="true"></span><span class="flow-label">Report</span></li>
+  </ol>
+</nav>
+{% endblock %}
+
 {% block content %}
-<div class="stack-lg">
-  <section class="stack">
+<header class="page-head">
+  <div class="page-head-main">
     <h1>Configure a run</h1>
-    <p class="muted" style="max-width: 60ch;">
+    <p class="page-desc">
       Pick a dataset and entity, choose which detectors compete and which stages run,
       then watch the pipeline work and read the explanation it produces.
     </p>
-    <div id="warnings" class="stack"></div>
-  </section>
+  </div>
+  {# The form's own contents: its parts as jump links, so the length of the
+     page is visible up front. #}
+  <nav class="form-steps no-print" aria-label="Parts of the form">
+    <ol>
+      <li><a href="#sec-data">Data</a></li>
+      <li><a href="#sec-detectors">Detectors</a></li>
+      <li><a href="#sec-stages">Stages</a></li>
+      <li><a href="#sec-options">Options</a></li>
+      <li><a href="#sec-online">Online phase</a></li>
+      <li><a href="#run-summary">Run summary</a></li>
+    </ol>
+  </nav>
+</header>
+<div id="warnings" class="stack"></div>
 
-  <form id="run-form" class="stack-lg">
-    <section class="card stack">
-      <h2>Data</h2>
-      <div class="row" style="gap: var(--sp-5); align-items: flex-end;">
-        <div class="field" style="width: 85px;">
+{# The form on the left, what it adds up to on the right. The summary is part
+   of the form (the Run button submits it) but laid out beside it: on a wide
+   screen it sticks while the detector pool scrolls past, so what will run and
+   why it cannot yet are always in view; on a narrow one it follows the form
+   and its Run row docks to the bottom of the screen. #}
+<form id="run-form" class="configure-layout">
+  <div class="configure-main">
+  <section class="form-section" id="sec-data" aria-labelledby="sec-data-title">
+    <div class="form-section-head">
+      <h2 id="sec-data-title">Data</h2>
+      <p class="sec-help">The series to select a detector for, the synthetic anomalies
+        injected into it, and the metrics that make up the fitness.</p>
+    </div>
+    <div class="form-section-body">
+      <div class="field-grid">
+        <div class="field">
           <label for="dataset">Dataset</label>
           <select id="dataset" name="dataset"></select>
         </div>
-        <div class="field" style="width: 130px;">
+        <div class="field">
           <label for="entity">Entity</label>
           <input id="entity" name="entity" type="text" list="entity-options"
-                 autocomplete="off" placeholder="Type to filter…">
+                 autocomplete="off" placeholder="Type to filter…"
+                 aria-describedby="entity-error">
           <datalist id="entity-options"></datalist>
+          <p id="entity-error" class="field-error" role="alert" hidden></p>
         </div>
-        <div class="field" style="width: 240px;">
-          <label for="anomaly_type">Anomaly type</label>
-          <select id="anomaly_type" name="anomaly_type"></select>
+        {# Carbon's MultiSelect: a select-only combobox whose list keeps
+           focus on the field (aria-activedescendant), so Space or Enter
+           toggles the active type and Escape closes the list where it was
+           opened. configure.js builds the options from the catalogue. #}
+        <div class="field field-wide">
+          <span class="field-label" id="anomaly_types-label">Anomaly types</span>
+          <div class="multiselect" id="anomaly_types">
+            <div class="multiselect-field">
+              <span class="multiselect-tag" id="anomaly_types-tag" hidden>
+                <span class="multiselect-count" id="anomaly_types-count"></span>
+                <button type="button" class="multiselect-clear" id="anomaly_types-clear"
+                        aria-label="Clear the selected anomaly types" title="Clear the selection"></button>
+              </span>
+              <button type="button" class="multiselect-button" id="anomaly_types-button"
+                      role="combobox" aria-haspopup="listbox" aria-expanded="false"
+                      aria-controls="anomaly_types-list"
+                      aria-labelledby="anomaly_types-label anomaly_types-value"
+                      aria-describedby="anomaly-copies"><span id="anomaly_types-value" class="multiselect-value"></span></button>
+            </div>
+            <ul class="multiselect-list" id="anomaly_types-list" role="listbox"
+                aria-multiselectable="true" aria-labelledby="anomaly_types-label" hidden></ul>
+          </div>
+          <p id="anomaly-copies" class="field-note"></p>
         </div>
-        <div class="field" style="max-width: 140px;">
+        <div class="field">
           <label for="anomaly_rate">Anomaly rate</label>
-          <input id="anomaly_rate" type="number" value="0.5" min="0.01" max="1" step="0.01"
-                 style="width: 9ch;">
-        </div>
-        <div class="field grow">
-          <label>Fitness metrics</label>
-          <div id="decision_metrics" class="row small"></div>
+          <input id="anomaly_rate" type="number" value="0.5" min="0.01" max="1" step="0.01">
         </div>
       </div>
-      <p id="entity-error" class="small" style="margin:0; color: var(--error);" hidden></p>
-      <p id="anomaly-note" class="small muted" style="margin:0;"></p>
-      <p id="metric-formula" class="small muted" style="margin:0;"></p>
-      <p id="metric-note" class="small muted" style="margin:0;"></p>
-      <p id="metric-error" class="small" style="margin:0; color: var(--error);" hidden></p>
-    </section>
+      {# The notes of every chosen type that has one, one line each. #}
+      <ul id="anomaly-note" class="field-note anomaly-notes"></ul>
 
-    <section class="card stack">
-      <div class="row-between">
-        <h2>Detectors</h2>
-        <div class="row small">
-          <span id="detector-count" class="muted"></span>
-          <button type="button" data-select="all">All</button>
-          <button type="button" data-select="none">None</button>
+      <fieldset class="field">
+        <legend>Fitness metrics</legend>
+        <div id="decision_metrics" class="row small"></div>
+      </fieldset>
+      <p id="metric-formula" class="formula"></p>
+      <p id="metric-note" class="field-note"></p>
+      <p id="metric-error" class="field-error" hidden></p>
+    </div>
+  </section>
+
+  <section class="form-section" id="sec-detectors" aria-labelledby="sec-detectors-title">
+    <div class="form-section-head">
+      <h2 id="sec-detectors-title">Detectors</h2>
+      <p class="sec-help">The pool the stages choose from, one row per family and grouped
+        as in Table I of the paper. Each family's information icon lists its
+        instances' hyperparameters.</p>
+    </div>
+    <div class="form-section-body">
+      <div class="pool-toolbar">
+        <span id="detector-count" class="pool-count muted" aria-live="polite"></span>
+        <div class="pool-actions">
+          <button type="button" class="small ghost" data-select="all">All</button>
+          <button type="button" class="small ghost" data-select="none">None</button>
+          <span class="toolbar-sep" aria-hidden="true"></span>
           <!-- One button per group in Utils.pipeline_spec.DETECTOR_GROUPS,
                built from the API so a group added there appears here. -->
           <span id="detector-groups" class="row small"></span>
         </div>
       </div>
-      <p class="muted small" style="margin:0;">
+      <p class="pool-help">
         Pick the detector pool for the run. A dashed outline means the detector is not
         trained for this entity yet, picking it trains its family before the run starts.
         At least two are required.
       </p>
-      <div id="detectors" class="stack"></div>
+      {# The samples are neutral, not in any one group's colour: a chosen chip
+         takes its own group's tint (magenta for Statistical, purple for
+         Neural Networks …), so the legend shows the marks that say "chosen"
+         — the tick, the solid border, the fill — and the caption says the
+         colour is the group's. #}
+      <ul class="pool-legend" aria-label="Legend">
+        <li><span class="legend-chip">trained</span></li>
+        <li><span class="legend-chip is-untrained">needs training</span></li>
+        <li><span class="legend-chip is-chosen">in the pool</span> <span class="legend-note">in its group's colour</span></li>
+        <li><span class="legend-chip is-partial">some of a family</span></li>
+        <li><span class="legend-info" aria-hidden="true"></span> hyperparameters, on hover</li>
+      </ul>
+      <div id="detectors" class="pool"></div>
       <p id="training-banner" class="banner banner-warn" hidden></p>
       <p id="detector-error" class="banner banner-error" hidden></p>
-    </section>
+    </div>
+  </section>
 
-    <section class="card stack">
-      <div class="row-between">
-        <h2>Stages</h2>
-        <div class="row small">
-          <button type="button" data-stages="all">All</button>
-          <button type="button" data-stages="robustness">Robustness only</button>
-        </div>
-      </div>
-      <div id="stages" class="row"></div>
-      <div id="partial-banner" class="banner banner-warn stack" hidden></div>
-    </section>
-
-    <section class="card stack">
-      <h2>Options</h2>
+  <section class="form-section" id="sec-stages" aria-labelledby="sec-stages-title">
+    <div class="form-section-head">
+      <h2 id="sec-stages-title">Stages</h2>
+      <p class="sec-help">The selection and robustness stages to run. Leaving any out makes
+        it a partial run.</p>
+    </div>
+    <div class="form-section-body">
       <div class="row">
-        <label class="toggle">
+        <button type="button" class="small ghost" data-stages="all">All stages</button>
+        <button type="button" class="small ghost" data-stages="robustness">Robustness only</button>
+      </div>
+      <div id="stages" class="stage-options"></div>
+      <div id="partial-banner" class="banner banner-warn stack" hidden></div>
+    </div>
+  </section>
+
+  <section class="form-section" id="sec-options" aria-labelledby="sec-options-title">
+    <div class="form-section-head">
+      <h2 id="sec-options-title">Options</h2>
+      <p class="sec-help">Whether the run writes its narratives, whether it retrains, and
+        the settings most runs leave alone.</p>
+    </div>
+    <div class="form-section-body">
+      <div class="options-list">
+        <label class="toggle switch">
           <input type="checkbox" id="explain" checked>
           <span>Generate explanations</span>
           <span class="hint">--explain</span>
         </label>
-        <label class="toggle">
+        <label class="toggle switch">
           <input type="checkbox" id="overwrite">
           <span>Retrain base detectors</span>
           <span class="hint">--overwrite</span>
         </label>
       </div>
-      <p class="small muted" style="margin:0;">
+      <p class="option-help">
         Retraining increases the runtime. Leave overwrite off to reuse the checkpoints
         already on disk, detectors with no checkpoint are trained either way.
       </p>
       <div id="llm-health" class="small muted"></div>
 
-      <details>
+      <details class="advanced">
         <summary>Advanced</summary>
-        <div class="stack" style="margin-top: var(--sp-3);">
-          <div class="row">
-            <div class="field"><label for="iteration">Iteration (window sizing)</label>
-              <input id="iteration" type="number" value="5" min="1" style="width: 8ch;"></div>
-            <div class="field"><label for="timeout">Timeout (seconds)</label>
-              <input id="timeout" type="number" value="14400" min="60" style="width: 10ch;"></div>
-          </div>
+        <div class="advanced-grid">
+          <div class="field"><label for="iteration">Iteration (window sizing)</label>
+            <input id="iteration" type="number" value="5" min="1"></div>
+          <div class="field"><label for="timeout">Timeout (seconds)</label>
+            <input id="timeout" type="number" value="14400" min="60"></div>
           <div class="field"><label for="llm_base_url">LLM base URL</label>
             <input id="llm_base_url" type="text" placeholder="http://localhost:11434/v1"></div>
           <div class="field"><label for="llm_model">LLM model</label>
             <input id="llm_model" type="text" placeholder="qwen2.5:14b-instruct"></div>
         </div>
       </details>
-    </section>
-
-    <section class="card stack">
-      <div class="row-between">
-        <h2>Command</h2>
-        <button type="button" id="copy-command" class="small">Copy</button>
-      </div>
-      <pre id="command" class="mono" style="margin:0; white-space: pre-wrap; word-break: break-all;"></pre>
-      <div class="row">
-        <button type="submit" class="primary" id="start">Run pipeline</button>
-        <span id="start-error" class="small" style="color: var(--error);"></span>
-      </div>
-    </section>
-  </form>
-
-  <section class="stack">
-    <h2>Previous results</h2>
-    <div id="results" class="stack"></div>
+    </div>
   </section>
-</div>
+  {# The online phase: off by default. On, it picks the scenario to replay
+     (or all four, for a comparison) and shows only the parameters that
+     scenario reads. configure.js asks the server whether the entity is long
+     enough and disables the part, with the server's reason, when it is not. #}
+  <section class="form-section" id="sec-online" aria-labelledby="sec-online-title">
+    <div class="form-section-head">
+      <h2 id="sec-online-title">Online phase</h2>
+      <p class="sec-help">After the offline selection, replay the last 20% of the test
+        series window by window and see how re-optimization policies keep up.</p>
+    </div>
+    <div class="form-section-body">
+      <label class="toggle switch">
+        <input type="checkbox" id="enable_online" aria-describedby="online-feasibility">
+        <span>Run the online phase</span>
+        <span class="hint">--enable_online</span>
+      </label>
+      <div id="online-feasibility" class="online-feasibility" aria-live="polite"></div>
+      <div id="online-options" class="online-options" hidden>
+        {# What the windows are scored on (--online_labels). Real labels are
+           the default wherever the dataset has them; configure.js builds the
+           two tiles and disables "real" where it has none. #}
+        <div class="online-labels">
+          <fieldset class="scenario-options" id="online-labels" aria-describedby="online-labels-note">
+            <legend>Labels the windows are scored on</legend>
+          </fieldset>
+          <p id="online-labels-note" class="option-help"></p>
+        </div>
+        <fieldset class="scenario-options" id="online-scenarios">
+          <legend>Scenario</legend>
+        </fieldset>
+        <div class="online-params" id="online-params"></div>
+        <div class="online-regime">
+          <label class="toggle switch">
+            <input type="checkbox" id="inject_online_regime" aria-describedby="online-regime-note">
+            <span>Inject a regime shift into the online stream</span>
+            <span class="hint">--inject_online_regime</span>
+          </label>
+          <p id="online-regime-note" class="option-help"></p>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+
+  <aside class="run-summary" id="run-summary" aria-labelledby="run-summary-title">
+    <div class="summary-card">
+      <header class="summary-head">
+        <h2 class="panel-title" id="run-summary-title">Run summary</h2>
+        <span id="sum-state" class="sum-state" aria-hidden="true"></span>
+      </header>
+      {# A read-only reflection of the form: every row is rewritten by
+         configure.js from the same state the request body is built from. #}
+      <dl class="summary-facts">
+        <div><dt>Target</dt><dd id="sum-target">—</dd></div>
+        <div><dt>Anomalies</dt><dd id="sum-anomalies" class="sum-tags">—</dd></div>
+        <div><dt>Detectors</dt>
+          <dd><span id="sum-detectors" class="sum-count">—</span>
+            <span class="meter" aria-hidden="true"><span id="sum-meter"></span></span>
+            <span id="sum-training" class="sum-warn" hidden></span></dd></div>
+        <div><dt>Stages</dt><dd id="sum-stages" class="sum-tags">—</dd></div>
+        <div><dt>Fitness</dt><dd id="sum-fitness" class="mono">—</dd></div>
+        <div><dt>Narratives</dt><dd id="sum-explain">—</dd></div>
+        <div id="sum-online-row" hidden><dt>Online</dt><dd id="sum-online">—</dd></div>
+      </dl>
+      <ul id="sum-checks" class="checklist" aria-label="Before the run can start"></ul>
+
+      <div class="code-plate">
+        <div class="code-plate-bar">
+          <span>Command</span>
+          <button type="button" id="copy-command" class="small ghost">Copy</button>
+        </div>
+        <pre id="command" class="command mono"></pre>
+      </div>
+      <p class="summary-note">The exact command the server will start, built by the same
+        code that spawns it.</p>
+
+      <div class="summary-actions">
+        {# Announced as it changes, so "Ready to run …" is heard as well as seen;
+           the button points at the checklist that explains a disabled state. #}
+        <p id="sum-next" class="sum-next" role="status" aria-live="polite"></p>
+        <button type="submit" class="primary large" id="start" aria-describedby="sum-checks">Run pipeline</button>
+        <span id="start-error" class="field-error" role="alert"></span>
+      </div>
+    </div>
+  </aside>
+</form>
+
+<section class="archive" aria-labelledby="results-title">
+  <div class="archive-head">
+    <h2 id="results-title">Previous results</h2>
+    <span class="archive-note">Explanations and online results already on disk</span>
+  </div>
+  <div id="results"></div>
+</section>
 {% endblock %}
 
 {% block scripts %}

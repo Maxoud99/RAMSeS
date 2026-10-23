@@ -1,6 +1,10 @@
 import copy
 
 import tensorflow as tf
+# Before any TensorFlow op, for the same reason as GAN_test.py: TensorFlow's
+# GPU is off unless RAMSES_TF_GPU=1. See Utils/tf_device.py.
+from Utils.tf_device import keep_tensorflow_off_gpu
+keep_tensorflow_off_gpu(tf)
 
 from Metrics.metrics import range_based_precision_recall_f1_auc
 from Utils.model_selection_utils import evaluate_model

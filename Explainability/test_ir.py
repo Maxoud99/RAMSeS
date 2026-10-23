@@ -1662,6 +1662,53 @@ class TestWriterAndAssembler(unittest.TestCase):
             dec = next(a for a in g["evidence"] if a["id"] == "global.decision")
             self.assertIn("The final decision is the ensemble", dec["text"])
 
+    def _write_earlier_gan_ir(self, base):
+        """An ir_gan.json left by an earlier run, with a pick of its own."""
+        ir.write_stage_ir({
+            "stage": "gan", "output": {"top_pick": "OLD_RUN_PICK"},
+            "evidence": [{"id": "gn.output.top", "type": "stage_output",
+                          "subject": "OLD_RUN_PICK", "value": {},
+                          "text": "The GAN test ranked OLD_RUN_PICK first."}],
+            "required_atom_ids": ["gn.output.top"],
+            "caveats": [{"id": "gn.caveat.earlier", "text": "Earlier run."}],
+        }, "DS", "e1", "ir_gan", base_dir=base)
+
+    def test_gan_without_a_ranking_in_this_run_ignores_an_earlier_ir_gan(self):
+        """A GAN stage that failed soft or was skipped writes no ir_gan.json,
+        so one on disk is an earlier run's. It used to be listed as this run's
+        GAN explanation, with status ok and its top pick."""
+        results = _results_dict()
+        results["gan_robustness"] = {"best_model": "N/A", "f1_names": [],
+                                     "pr_auc_names": []}
+        with tempfile.TemporaryDirectory() as base:
+            self._write_earlier_gan_ir(base)
+            path = ir.assemble_global_ir(results, "DS", "e1", 0, base_dir=base)
+            with open(path) as f:
+                g = json.load(f)
+        gan = g["stages"]["gan"]
+        self.assertEqual(gan["status"], ir.NOT_AVAILABLE)
+        self.assertNotIn("output", gan)
+        self.assertIn("failed or was skipped", gan["note"])
+        self.assertNotIn("OLD_RUN_PICK", json.dumps(g))
+        self.assertNotIn("global.stage.gan", g["required_atom_ids"])
+        self.assertNotIn("gn.caveat.earlier", {c["id"] for c in g["caveats"]})
+
+    def test_gan_ir_is_read_when_this_run_ranked_or_says_nothing(self):
+        """The file decides as before when the GAN ran, and when the results
+        dict has no GAN entry at all (it then says nothing about the stage)."""
+        without_entry = _results_dict()
+        del without_entry["gan_robustness"]
+        for label, results in (("ranked", _results_dict()),
+                               ("no gan entry", without_entry)):
+            with self.subTest(label), tempfile.TemporaryDirectory() as base:
+                self._write_earlier_gan_ir(base)
+                path = ir.assemble_global_ir(results, "DS", "e1", 0, base_dir=base)
+                with open(path) as f:
+                    g = json.load(f)
+                self.assertEqual(g["stages"]["gan"]["status"], "ok")
+                self.assertEqual(g["stages"]["gan"]["output"]["top_pick"],
+                                 "OLD_RUN_PICK")
+
     def test_decision_metric_selects_the_scores_the_choice_is_read_from(self):
         """PR-AUC reverses this fixture: the ensemble leads on F1 (0.9 vs 0.85)
         but trails on PR-AUC (0.8 vs 0.95), so the prose and the margin must

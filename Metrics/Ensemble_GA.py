@@ -170,6 +170,19 @@ def train_meta_model_svm(base_model_predictions, y_true):
     return meta_model
 
 
+def fit_meta_model(base_model_predictions, y_true, meta_model_type):
+    """Train the stacking meta-model `meta_model_type` ('lr', 'rf', 'gbm', 'svm').
+
+    One dispatch for the GA's fitness and the online phase, which fits the
+    deployed ensemble's meta-model once per selection.
+    """
+    trainers = {'lr': train_meta_model, 'rf': train_meta_model_rf,
+                'gbm': train_meta_model_gbm, 'svm': train_meta_model_svm}
+    if meta_model_type not in trainers:
+        raise ValueError(f"Unknown meta_model_type: {meta_model_type}")
+    return trainers[meta_model_type](base_model_predictions, y_true)
+
+
 def evaluate_model_consistently(data, model, model_name, is_ensemble=False):
     """
     Consistently evaluate a model or ensemble of models on the given data.
@@ -331,16 +344,7 @@ def fitness_function(ensemble, train_data, test_data, trained_models,
         y_true_train = inject_synthetic_anomalies(y_true_train)
 
     # Train the meta-model based on the specified type
-    if meta_model_type == 'lr':
-        meta_model = train_meta_model(base_model_predictions_train, y_true_train)
-    elif meta_model_type == 'rf':
-        meta_model = train_meta_model_rf(base_model_predictions_train, y_true_train)
-    elif meta_model_type == 'gbm':
-        meta_model = train_meta_model_gbm(base_model_predictions_train, y_true_train)
-    elif meta_model_type == 'svm':
-        meta_model = train_meta_model_svm(base_model_predictions_train, y_true_train)
-    else:
-        raise ValueError(f"Unknown meta_model_type: {meta_model_type}")
+    meta_model = fit_meta_model(base_model_predictions_train, y_true_train, meta_model_type)
 
     # Evaluate ensemble on test data
     # y_true_test, base_model_predictions_test, y_true_test_dict, base_model_predictions_test_dict = evaluate_model_consistently(
@@ -352,11 +356,38 @@ def fitness_function(ensemble, train_data, test_data, trained_models,
         logger.warning(f"Ensemble {ensemble} has only one class in the test labels. Injecting synthetic anomalies.")
         y_true_test = inject_synthetic_anomalies(y_true_test)
 
+    scored = score_meta_model(meta_model, base_model_predictions_test, y_true_test,
+                              metric=metric, vus_win=vus_win)
+    best_f1, pr_auc, fitness = scored['f1'], scored['pr_auc'], scored['fitness']
+    y_scores = scored['y_scores']
+    logger.info(
+        f"Evaluated fitness for ensemble {ensemble} with F1 score {best_f1} and PR AUC {pr_auc}, resulting in fitness {fitness}")
+    # The trained meta-model is appended (6th element) so the combination-
+    # explainability layer can attribute the EXACT meta-learner the GA built,
+    # rather than retraining one. Existing callers index [0..4] and are unaffected.
+    return best_f1, pr_auc, fitness, y_scores, y_true_test, meta_model
+
+
+def score_meta_model(meta_model, base_model_predictions_test, y_true_test,
+                     metric=DEFAULT_DECISION_METRICS, vus_win=None):
+    """The GA's fitness of an already-fitted meta-model on one test set.
+
+    Split out of `fitness_function` so the online phase can score the DEPLOYED
+    ensemble on each window with the very definition the GA selected it by,
+    without refitting the meta-model per window: the random forest is unseeded,
+    so refitting would add noise to a signal that thresholds are drawn on.
+
+    Returns a dict: f1 (best over the threshold grid), pr_auc, vus (nan unless
+    the metric spec needs it and a window was given), fitness (the spec's
+    weighted mean, falling back to F1 when nothing else is computable), the
+    meta-model's probabilities `y_scores` and the binary predictions `y_pred`
+    at the F1-optimal threshold.
+    """
     # Clean test predictions: replace inf/nan values before prediction
     base_model_predictions_test = np.array(base_model_predictions_test, dtype=np.float32)
-    base_model_predictions_test = np.nan_to_num(base_model_predictions_test, 
-                                                 nan=0.0, 
-                                                 posinf=1.0, 
+    base_model_predictions_test = np.nan_to_num(base_model_predictions_test,
+                                                 nan=0.0,
+                                                 posinf=1.0,
                                                  neginf=0.0)
 
     # Generate prediction scores using the meta-model
@@ -373,10 +404,10 @@ def fitness_function(ensemble, train_data, test_data, trained_models,
         if temp_f1 > best_temp_f1:
             best_temp_f1 = temp_f1
             best_threshold = threshold
-    
+
     # Use the best threshold for final predictions
     y_pred_binary = (y_scores >= best_threshold).astype(int)
-    
+
     # Calculate evaluation metrics: F1 score and PR AUC
     # _, _, best_f1, pr_auc, adjusted_y_pred = range_based_precision_recall_f1_auc(y_true_test, y_scores)
     best_f1, precision, recall, TP, TN, FP, FN = f1_score(y_pred_binary, y_true_test)
@@ -390,12 +421,11 @@ def fitness_function(ensemble, train_data, test_data, trained_models,
     fitness = combine_metrics(metric, {'f1': best_f1, 'pr_auc': pr_auc, 'vus': vus})
     if np.isnan(fitness):
         fitness = best_f1
-    logger.info(
-        f"Evaluated fitness for ensemble {ensemble} with F1 score {best_f1} and PR AUC {pr_auc}, resulting in fitness {fitness}")
-    # The trained meta-model is appended (6th element) so the combination-
-    # explainability layer can attribute the EXACT meta-learner the GA built,
-    # rather than retraining one. Existing callers index [0..4] and are unaffected.
-    return best_f1, pr_auc, fitness, y_scores, y_true_test, meta_model
+    # `threshold` is the probability the binary predictions were cut at; the
+    # online phase's live monitor draws it under the scores it applies to.
+    return {'f1': best_f1, 'pr_auc': pr_auc, 'vus': vus, 'fitness': fitness,
+            'y_scores': y_scores, 'y_pred': y_pred_binary,
+            'threshold': float(best_threshold)}
 
 
 def selection(population, fitness_scores, num_selected):
@@ -626,7 +656,8 @@ def plot_models_scores(algorithm_list, test_data, y_scores_list, dataset, entity
 
 def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, trained_models, meta_model_type,
                       population_size, generations, mutation_rate, explain: bool = False,
-                      metric=DEFAULT_DECISION_METRICS, vus_win=None):
+                      metric=DEFAULT_DECISION_METRICS, vus_win=None,
+                      return_meta_model: bool = False):
     """
     Run the genetic algorithm to find the best ensemble of models.
 
@@ -643,7 +674,13 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
         mutation_rate (float): Mutation rate.
 
     Returns:
-        tuple: Best ensemble, best F1 score, best PR AUC, and best fitness score.
+        tuple: best ensemble, best F1, best PR-AUC, best fitness, individual
+        predictions, the training and test prediction matrices, their labels,
+        the meta-model type and the best ensemble's scores (11 items). With
+        `return_meta_model`, a 12th item: the fitted meta-model of the best
+        ensemble — the very object its fitness was measured with, its columns
+        in pool order — so the online phase can deploy it instead of a refit
+        (the random forest is unseeded, so a refit is a different model).
     """
     # mevaluation_instance = Mevaluation()
     # mevaluation_instance.evaluate_model(train_data, test_data)  # Evaluate individual models before GA
@@ -905,7 +942,10 @@ def genetic_algorithm(dataset, entity, train_data, test_data, algorithm_list, tr
                                dataset, entity, meta_model=best_meta_model, explain=True,
                                metric=metric, vus_win=vus_win)
 
-    return best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions, base_model_predictions_train, base_model_predictions_test, y_true_train, y_true_test, meta_model_type, best_scores
+    result = (best_ensemble, best_f1, best_pr_auc, best_fitness, individual_predictions,
+              base_model_predictions_train, base_model_predictions_test, y_true_train,
+              y_true_test, meta_model_type, best_scores)
+    return result + (best_meta_model,) if return_meta_model else result
 
 # Usage
 # Assuming train_data and test_data are already loaded and preprocessed

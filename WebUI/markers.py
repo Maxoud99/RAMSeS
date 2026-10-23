@@ -28,10 +28,34 @@ PHASE_TITLES = {
     1: "Loading training data", 2: "Loading test data",
     3: "Training / loading models", 4: "Injecting synthetic anomalies",
     5: "Preparing data and visualisation", 6: "Model selection",
-    7: "Writing results",
+    7: "Writing results", 8: "Online phase",
 }
 
+# The online phase follows the seven numbered stages and has no "STAGE n/7"
+# line of its own; its start marker moves the rail to this phase.
+ONLINE_PHASE_NUMBER = 8
+
+# Lines the online phase writes (Model_Selection/online_phase.py documents
+# them). One prefix, `ONLINE <WHAT>:`, then `field=value` pairs.
+_ONLINE_RE = re.compile(
+    r"ONLINE (PHASE START|PHASE COMPLETE|PHASE FAILED|PHASE SKIPPED|"
+    r"SCENARIO START|SCENARIO COMPLETE|SCENARIO FAILED|WINDOW|REOPT):\s*(.*)")
+_ONLINE_KINDS = {
+    "PHASE START": "phase_start", "PHASE COMPLETE": "phase_complete",
+    "PHASE FAILED": "phase_failed", "PHASE SKIPPED": "phase_skipped",
+    "SCENARIO START": "scenario_start", "SCENARIO COMPLETE": "scenario_complete",
+    "SCENARIO FAILED": "scenario_failed", "WINDOW": "window", "REOPT": "reopt",
+}
+# Free text that may itself contain commas. Each is always the LAST field of
+# its line, so everything after it is taken verbatim instead of being split.
+_TRAILING_FIELDS = ("error=", "reason=")
+
 _PHASE_RE = re.compile(r"STAGE (\d)/7:\s*(.*)")
+# app.load_trained_models logs one of these per checkpoint it excludes. Each
+# gets its own warning code, because Job._record keeps one banner per code and
+# a user with three stale checkpoints needs to see all three names, reasons
+# and remedies — not the first one three times.
+_INCOMPATIBLE_RE = re.compile(r"Incompatible checkpoint (\S+) excluded:.*")
 _SUBSTAGE_RE = re.compile(r"Sub-stage (6\.\d):\s*(.*)")
 _RESULT_RE = re.compile(r"\[([A-Za-z]+)\]\s*(.*)")
 _BANNER_RE = re.compile(r"STARTING RAMSeS EXECUTION:\s*(.*)")
@@ -50,6 +74,17 @@ _WARNINGS = (
     ("Global IR assembly failed", "ir_failed", "Global explanation assembly failed."),
     ("Requested detectors with no trained model", "detectors_missing",
      "Some requested detectors had no trained model and were skipped."),
+    # Logged by Model_Training/train.py per instance (an exception, or the
+    # `training_timeout` limit) and summarised by app.py; the run carries on
+    # without those detectors, so it is a warning, not a failure.
+    ("failed to train", "training_failed",
+     "Some detectors failed to train and were left out of this run; the log "
+     "names each one and the reason."),
+    # app.GAN_FAILED_WARNING. The run continues without the stage, so this is
+    # a warning on a finished run, not a failure.
+    ("GAN robustness test failed", "gan_failed",
+     "The GAN robustness test failed and was skipped. The other robustness "
+     "tests and the rank aggregation ran without it."),
     ("Only", "few_detectors", None),   # refined below
 )
 
@@ -60,6 +95,20 @@ def _banner_fields(rest: str) -> Dict[str, str]:
         key, sep, value = chunk.partition("=")
         if sep:
             fields[key.strip()] = value.strip()
+    return fields
+
+
+def _online_fields(rest: str) -> Dict[str, str]:
+    tail_key = tail = None
+    for marker in _TRAILING_FIELDS:
+        at = rest.find(marker)
+        if at >= 0 and (at == 0 or rest[at - 1] in ", "):
+            tail_key, tail = marker[:-1], rest[at + len(marker):].strip()
+            rest = rest[:at]
+            break
+    fields = _banner_fields(rest)
+    if tail_key:
+        fields[tail_key] = tail
     return fields
 
 
@@ -78,6 +127,13 @@ def classify(line: str) -> Optional[Dict[str, Any]]:
         return {"type": "complete", "partial": False, "text": text}
     if PARTIAL_COMPLETE in text:
         return {"type": "complete", "partial": True, "text": text}
+
+    # Before the generic ERROR rule: a failed online phase is logged at ERROR
+    # level and must still be read as the online event it is.
+    m = _ONLINE_RE.search(text)
+    if m:
+        return {"type": "online", "kind": _ONLINE_KINDS[m.group(1)],
+                "fields": _online_fields(m.group(2)), "text": text}
 
     m = _BANNER_RE.search(text)
     if m:
@@ -106,6 +162,11 @@ def classify(line: str) -> Optional[Dict[str, Any]]:
         number = int(m.group(1))
         return {"type": "phase", "number": number,
                 "title": PHASE_TITLES.get(number, m.group(2).strip())}
+
+    m = _INCOMPATIBLE_RE.search(text)
+    if m:
+        return {"type": "warning", "code": f"checkpoint_incompatible:{m.group(1)}",
+                "text": m.group(0)}
 
     for needle, code, message in _WARNINGS:
         if needle in text:

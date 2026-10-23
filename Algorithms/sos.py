@@ -6,6 +6,48 @@ from Utils.utils import de_unfold
 import numpy as np
 
 
+# SOS is quadratic in the rows of a call, in memory and in time, and none of its
+# hyperparameters changes that. PyOD's `fit` builds the full n x n dissimilarity
+# matrix, then an n x n affinity matrix one row at a time (a Python loop running
+# a binary search for the perplexity on every row), then the n x n binding
+# probabilities, and holds them all at once. Measured on SMD rows: 4,000 rows
+# took 3.9 s and 0.8 GB, 16,000 rows took 52 s and 8.3 GB peak RSS — 32 bytes a
+# cell, i.e. four float64 matrices alive together. And `fit` is only half of it:
+# the diagnostic plot after it scores the whole test split in one call (SOS is
+# transductive, see `Utils.pipeline_spec.TRANSDUCTIVE_FAMILIES`), which repeats
+# the same computation on the test rows.
+#
+# An SMD machine is 28,479 rows with `downsampling` null: ~26 GB and roughly
+# three minutes per call on a 64-core box with memory to spare, two calls per
+# instance, four instances. On a machine without that memory it swaps, which is
+# the training that "hangs for hours". The training deadline
+# (`training_timeout`) stops it as well, but only after the allocation has hit a
+# shared machine and the whole limit has been spent, once per family; checking
+# the size first refuses it before anything is built.
+#
+# 10,000 rows is ~3.2 GB and ~20 s a call. Every SKAB entity (under 1,000
+# rows), UCR entities up to that length and an SMD machine at `downsampling: 3`
+# (9,493 rows) fit under it; a full-length SMD machine does not.
+SOS_MAX_ROWS = 10_000
+
+
+def check_tractable(n_rows: int, split: str) -> None:
+    """Refuse a call SOS cannot finish in reasonable time and memory.
+
+    `n_rows` is what one call would hand the estimator: the number of windows
+    the loader cuts, which at the grid's window_size 1 is the number of
+    timesteps.
+    """
+    if n_rows <= SOS_MAX_ROWS:
+        return
+    gigabytes = 32 * n_rows ** 2 / 1e9
+    raise ValueError(
+        f"SOS would need about {gigabytes:.0f} GB for the {n_rows:,} {split} rows "
+        f"of this entity: it holds four {n_rows:,} x {n_rows:,} matrices at once, "
+        f"and its time grows with the square of the rows too. The limit is "
+        f"{SOS_MAX_ROWS:,} rows (SOS_MAX_ROWS in Algorithms/sos.py). Downsample "
+        f"the entity (`downsampling` in the config) or leave SOS out on it.")
+
 
 # this is Stochastic Outlier Selection class
 class TsadSOS(PyMADModel):

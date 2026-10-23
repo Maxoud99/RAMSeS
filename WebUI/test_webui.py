@@ -1314,6 +1314,32 @@ class TestCatalog(unittest.TestCase):
         catalog.reset_cache()
         self._tmp.cleanup()
 
+    def test_tsb_ad_datasets_and_entities(self):
+        for sub, names in (("TSB-AD-U", ("001_NAB_id_1_Facility_tr_1007_1st_2014.csv",
+                                         "010_NAB_id_10_WebService_tr_500_1st_271.csv",
+                                         "README.md")),
+                           ("TSB-AD-M", ("002_MSL_id_1_Sensor_tr_500_1st_900.csv",))):
+            (self.data / sub).mkdir()
+            for name in names:
+                (self.data / sub / name).write_text("x")
+        catalog.reset_cache()
+        by_name = {d["name"]: d for d in catalog.datasets()}
+        self.assertEqual(by_name["tsb-ad-u"]["label"], "TSB-AD-U")
+        self.assertEqual(by_name["tsb-ad-m"]["label"], "TSB-AD-M")
+        self.assertIn("univariate", by_name["tsb-ad-u"]["note"])
+        self.assertEqual(catalog.entities_for("tsb-ad-u"),
+                         ["001_NAB_id_1_Facility", "010_NAB_id_10_WebService"])
+        self.assertEqual(catalog.entities_for("TSB-AD-M"), ["002_MSL_id_1_Sensor"])
+        self.assertTrue(by_name["tsb-ad-u"]["runnable"])
+        self.assertTrue(by_name["tsb-ad-u"]["labels_available"])
+        self.assertEqual(by_name["tsb-ad-u"]["default_online_labels"], "real")
+        # SKAB's loader labels changepoints, not anomalies: injected by default.
+        self.assertFalse(by_name["skab"]["labels_available"])
+        self.assertEqual(by_name["skab"]["default_online_labels"], "injected")
+        self.assertTrue(by_name["smd"]["labels_available"])
+        self.assertEqual([s["token"] for s in catalog.catalog(refresh=True)
+                          ["online_label_sources"]], ["real", "injected"])
+
     def test_only_loadable_datasets_are_listed(self):
         names = [d["name"] for d in catalog.datasets()]
         self.assertIn("skab", names)
@@ -1852,6 +1878,49 @@ class TestMarkers(unittest.TestCase):
         f = self.m.classify("INFO:app:Traceback for Entity: 7 Dataset: SKAB")
         self.assertEqual(f["type"], "fatal_marker")
 
+    def test_each_incompatible_checkpoint_gets_its_own_banner(self):
+        """app.load_trained_models logs one line per excluded checkpoint, and
+        Job._record keeps one banner per code — so the code must carry the
+        detector, or a second stale checkpoint would vanish behind the first."""
+        from WebUI.jobs import Job
+        lines = [
+            "WARNING:__main__:⚠ Incompatible checkpoint LOF_1 excluded: it cannot "
+            "score this data — ValueError: X has 576 features, but "
+            "LocalOutlierFactor is expecting 1 features as input. Remedy: retrain "
+            "it with --overwrite true. The checkpoint file was left untouched.",
+            "WARNING:__main__:⚠ Incompatible checkpoint CBLOF_1 excluded: it cannot "
+            "score this data — ValueError: X has 576 features, but KMeans is "
+            "expecting 1 features as input. Remedy: retrain it with --overwrite "
+            "true. The checkpoint file was left untouched.",
+        ]
+        e = self.m.classify(lines[0])
+        self.assertEqual((e["type"], e["code"]), ("warning", "checkpoint_incompatible:LOF_1"))
+        self.assertTrue(e["text"].startswith("Incompatible checkpoint LOF_1 excluded"))
+        self.assertIn("--overwrite true", e["text"])
+        job = Job("j", argv=[], params={})
+        for line in lines + lines:                 # repeats must not duplicate
+            job._record(line)
+        self.assertEqual([w["code"] for w in job.warnings],
+                         ["checkpoint_incompatible:LOF_1",
+                          "checkpoint_incompatible:CBLOF_1"])
+
+    def test_a_detector_that_failed_to_train_raises_a_banner(self):
+        """Both the trainer's per-instance line (loguru) and app.py's summary
+        (stdlib logging) must reach the run page, as one banner — the run
+        continues without the detector, so it is a warning, not a failure.
+        `Model_Training/test_train` checks the trainer's real output against
+        this rule as well."""
+        lines = (
+            "2026-10-20 17:00:06.535 | WARNING  | Model_Training.train:_record_failure:388 "
+            "- ⚠ SOS_1 failed to train and is left out of this run: it exceeded "
+            "the 10s training limit (training_timeout in the config) and was stopped",
+            "WARNING:__main__:⚠ Left out of this run because they failed to train: "
+            "SOS_1. The warnings above give each reason.",
+        )
+        for line in lines:
+            w = self.m.classify(line)
+            self.assertEqual((w["type"], w["code"]), ("warning", "training_failed"), line)
+
     def test_noise_is_ignored(self):
         for line in ("", "   ", "INFO:app:Evaluating fitness for ensemble: ['LOF_1']"):
             self.assertIsNone(self.m.classify(line))
@@ -1917,8 +1986,18 @@ class TestBuildArgv(unittest.TestCase):
 
     def test_default_anomaly_type_emits_no_flag(self):
         self.assertNotIn("--anomaly_type", self._argv(anomaly_type="spikes"))
+        self.assertNotIn("--anomaly_type", self._argv(anomaly_types=["spikes"]))
         self.assertNotIn("--anomaly_type", self._argv())
         self.assertNotIn("--anomaly_rate", self._argv())
+
+    def test_several_anomaly_types_become_one_comma_separated_flag(self):
+        """The multi-select sends `anomaly_types`; the CLI takes them as one
+        comma-separated value, in the order chosen and without repeats."""
+        argv = self._argv(anomaly_types=["noise", "spikes", "noise"])
+        self.assertEqual(argv[argv.index("--anomaly_type") + 1], "noise,spikes")
+        self.assertEqual(argv.count("--anomaly_type"), 1)
+        argv = self._argv(anomaly_type=["scale", "wander"])       # older field, list value
+        self.assertEqual(argv[argv.index("--anomaly_type") + 1], "scale,wander")
 
     def test_decision_metric_flag(self):
         argv = self._argv(decision_metric="pr_auc")
@@ -2023,11 +2102,39 @@ class TestClassifyOutcome(unittest.TestCase):
         self.assertEqual(out["status"], "failed")
         self.assertIn("code 2", out["reason"])
 
-    def test_cancel_and_timeout_win_over_everything(self):
+    def test_cancel_wins_over_everything(self):
         job = self._job([self.FULL], cancel_requested=True)
         self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "cancelled")
-        job = self._job([self.FULL], status="timeout")
-        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "timeout")
+        job = self._job(["INFO:app:working..."], cancel_requested=True, status="timeout")
+        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "cancelled")
+
+    def test_a_timeout_before_completion_is_a_timeout(self):
+        job = self._job(["INFO:app:STAGE 6/7: Running Model Selection Algorithms..."],
+                        status="timeout", exit_code=-9)
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "timeout")
+        self.assertIn("No completion after", out["reason"])
+
+    def test_a_timeout_after_the_completion_marker_keeps_the_offline_success(self):
+        """The watchdog is one timer for the whole run and the online phase
+        runs after the marker: the offline results stand, with a warning."""
+        job = self._job([self.FULL], status="timeout", exit_code=-9)
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("killed by the", out["reason"])
+        self.assertIn("after the offline phase finished", out["reason"])
+        online = self._job([self.FULL,
+                            "INFO:x:ONLINE PHASE START: strategy=all, scenarios=fixed, "
+                            "windows=4"],
+                           status="timeout", exit_code=-9, params={"enable_online": True})
+        out = self.jobs.classify_outcome(online, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("during the online phase, whose results are incomplete", out["reason"])
+
+    def test_a_partial_run_timing_out_after_its_marker_is_still_a_success_with_warnings(self):
+        job = self._job([self.PARTIAL], status="timeout", exit_code=-9)
+        out = self.jobs.classify_outcome(job, expect_partial=True)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
 
     def test_explain_requested_but_nothing_written(self):
         out = self.jobs.classify_outcome(self._job([self.FULL]), expect_partial=False,
@@ -2251,11 +2358,46 @@ class TestRoutes(ArtifactTreeCase):
         html = self.client.get("/").get_data(as_text=True)
         self.assertIn('id="training-banner"', html)
 
+    def _tabs(self, path):
+        html = self.client.get(path).get_data(as_text=True)
+        nav = re.search(r'<nav class="view-tabs".*?</nav>', html, re.S)
+        self.assertIsNotNone(nav, path)
+        return re.findall(r'<a id="([\w-]+)"', nav.group(0)), nav.group(0)
+
+    def test_every_view_shows_the_same_tabs(self):
+        """One result, four pages, one tab set: the views that exist."""
+        sets = {p: self._tabs(p)[0] for p in
+                ("/result/SKAB/7", "/report/SKAB/7", "/docs/SKAB/7", "/online/SKAB/7")}
+        # SKAB/7 has an explanation and a report but no online data; the
+        # online page keeps its own tab.
+        self.assertEqual(sets["/result/SKAB/7"], ["to-explanation", "open-report", "open-docs"])
+        self.assertEqual(sets["/report/SKAB/7"], sets["/result/SKAB/7"])
+        self.assertEqual(sets["/docs/SKAB/7"], sets["/result/SKAB/7"])
+        self.assertEqual(sets["/online/SKAB/7"],
+                         ["to-explanation", "open-report", "open-online", "open-docs"])
+        for path in sets:
+            _, nav = self._tabs(path)
+            self.assertEqual(nav.count('aria-current="page"'), 1, path)
+        self.assertEqual(self.client.get("/api/views/SKAB/7").get_json(),
+                         {"explanation": True, "report": True, "online": False, "docs": True})
+
+    def test_a_run_without_explanations_offers_no_explanation_tabs(self):
+        """A report with nothing to explain: no Explanation or Docs tab leading
+        to an empty page, on its report page as on its online page."""
+        _write(self.results_root / "comprehensive" / "SKAB" / "8" /
+               "comprehensive_results_SKAB_8_iter5.txt", REPORT_TEXT)
+        self.assertEqual(self._tabs("/report/SKAB/8")[0], ["open-report"])
+        self.assertEqual(self._tabs("/online/SKAB/8")[0], ["open-report", "open-online"])
+        self.assertEqual(self.client.get("/api/views/SKAB/8").get_json(),
+                         {"explanation": False, "report": True, "online": False, "docs": False})
+
     def test_pages_render(self):
         self.assertEqual(self.client.get("/").status_code, 200)
         self.assertEqual(self.client.get("/result/SKAB/7").status_code, 200)
         self.assertEqual(self.client.get("/report/SKAB/7").status_code, 200)
         self.assertEqual(self.client.get("/docs/SKAB/7").status_code, 200)
+        # No online data yet is the page's own empty state, not a 404.
+        self.assertEqual(self.client.get("/online/SKAB/7").status_code, 200)
         self.assertEqual(self.client.get("/run/nope").status_code, 404)
 
     def test_documentation_is_served_and_missing_entities_404(self):
@@ -2325,6 +2467,9 @@ class TestRoutes(ArtifactTreeCase):
             ({"dataset": "S", "entity": "7", "stages": ["nope"]}, "unknown stage"),
             ({"dataset": "S", "entity": "7", "detectors": ["LOF_1"]}, "at least two"),
             ({"dataset": "S", "entity": "7", "anomaly_type": "nope"}, "unknown anomaly type"),
+            ({"dataset": "S", "entity": "7", "anomaly_types": ["spikes", "nope"]},
+             "unknown anomaly type: nope"),
+            ({"dataset": "S", "entity": "7", "anomaly_types": []}, "at least one anomaly type"),
             ({"dataset": "S", "entity": "7", "anomaly_rate": 0}, "at most 1"),
             ({"dataset": "S", "entity": "7", "anomaly_rate": 1.5}, "at most 1"),
             ({"dataset": "S", "entity": "7", "anomaly_rate": "x"}, "must be a number"),
@@ -2791,3 +2936,1559 @@ class TestGanPlotSelector(unittest.TestCase):
         headline, gallery = self.plots._gan("SKAB", "7")
         self.assertEqual(headline, [])
         self.assertEqual([f["title"] for f in gallery], ["Injected borderline points"])
+
+
+# ── DOM insertion never receives null (configure page "…/v1null") ───────────
+
+_JS_DIR = Path(__file__).parent / "static" / "js"
+_DOM_INSERT = re.compile(r"\.(replaceChildren|append|prepend|before|after|replaceWith)\(")
+# A word before `/` after which the slash opens a regex literal, not a division.
+_REGEX_KEYWORDS = {"return", "typeof", "case", "in", "of", "void", "delete",
+                   "throw", "new", "yield", "await"}
+
+
+def _mask_js(src: str) -> str:
+    """`src` with every comment, string, template literal and regex literal
+    blanked to spaces, same length, so brackets can be matched on what is left.
+
+    The checks below look at the shape of a call's arguments; a "(" inside
+    `Show all ${n} rows (${hidden} more)` or inside a regex would otherwise
+    throw every bracket after it out of step.
+    """
+    n = len(src)
+    out = list(src)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    def end_of_string(i: int) -> int:
+        quote, j = src[i], i + 1
+        while j < n and src[j] != quote:
+            j += 2 if src[j] == "\\" else 1
+        return j + 1
+
+    def end_of_regex(i: int) -> int:
+        j, in_class = i + 1, False
+        while j < n:
+            c = src[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == "[":
+                in_class = True
+            elif c == "]":
+                in_class = False
+            elif c == "/" and not in_class:
+                break
+            j += 1
+        j += 1
+        while j < n and src[j].isalpha():        # flags
+            j += 1
+        return j
+
+    def end_of_template(i: int) -> int:
+        j = i + 1
+        while j < n and src[j] != "`":
+            if src[j] == "\\":
+                j += 2
+            elif src.startswith("${", j):
+                j = scan(j + 2, closer="}")
+            else:
+                j += 1
+        return j + 1
+
+    def scan(i: int, closer: str = "", record: bool = False) -> int:
+        depth, prev = 0, "("
+        j = i
+        while j < n:
+            c = src[j]
+            end = None
+            if c in "'\"":
+                end = end_of_string(j)
+            elif c == "`":
+                end = end_of_template(j)
+            elif src.startswith("//", j):
+                end = src.find("\n", j)
+                end = n if end < 0 else end
+            elif src.startswith("/*", j):
+                end = src.index("*/", j) + 2
+            elif c == "/":
+                after_word = prev.isalnum() or prev in "_$"
+                word = re.search(r"([A-Za-z_$][\w$]*)\s*$", src[:j]) if after_word else None
+                if (not after_word and prev not in ")]") or (
+                        word and word.group(1) in _REGEX_KEYWORDS):
+                    end = end_of_regex(j)
+            if end is not None:
+                if record:
+                    blank(j, end)
+                j, prev = end, "a"
+                continue
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                if depth == 0 and c == closer:
+                    return j + 1
+                depth -= 1
+            if not c.isspace():
+                prev = c
+            j += 1
+        return j
+
+    scan(0, record=True)
+    return "".join(out)
+
+
+def _matching(masked: str, open_index: int) -> int:
+    """Index of the bracket closing the one at `open_index`."""
+    depth = 0
+    for k in range(open_index, len(masked)):
+        if masked[k] in "([{":
+            depth += 1
+        elif masked[k] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return k
+    raise AssertionError(f"unbalanced bracket at {open_index}")
+
+
+def _top_level(text: str) -> str:
+    """`text` with everything inside brackets removed: `a(b, c ? null : d)`
+    becomes `a()`. What is left is what the expression itself evaluates to."""
+    out, depth = [], 0
+    for c in text:
+        if c in ")]}":
+            depth -= 1
+        if depth == 0:
+            out.append(c)
+        if c in "([{":
+            depth += 1
+    return "".join(out)
+
+
+def _split_args(text: str):
+    args, depth, start = [], 0, 0
+    for k, c in enumerate(text):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append(text[start:k])
+            start = k + 1
+    args.append(text[start:])
+    return [a for a in args if a.strip()]
+
+
+def _nullable_dom_insertions(sources):
+    """Every argument of replaceChildren/append/prepend/before/after/replaceWith
+    that can evaluate to null, undefined or false.
+
+    Unlike dom.js's el(), which skips those children, the DOM methods
+    stringify them: `replaceChildren(a, b, ok ? null : c)` renders the word
+    "null". Two shapes are caught — a top-level null/undefined/false or `&&`
+    in the argument itself, and a direct call to a function declaration whose
+    body can `return null` / `return;`. Spreads are not judged: what an array
+    holds is decided where it is built.
+    """
+    masked = {name: _mask_js(src) for name, src in sources.items()}
+    nullable = set()
+    for text in masked.values():
+        for m in re.finditer(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", text):
+            params_end = _matching(text, m.end() - 1)
+            body_open = text.index("{", params_end)
+            body = text[body_open:_matching(text, body_open) + 1]
+            if re.search(r"\breturn\s*(?:null\b|undefined\b)?\s*;", body):
+                nullable.add(m.group(1))
+
+    found = []
+    for name, text in masked.items():
+        for m in _DOM_INSERT.finditer(text):
+            close = _matching(text, m.end() - 1)
+            for arg in _split_args(text[m.end():close]):
+                top = _top_level(arg).strip()
+                if top.startswith("..."):
+                    continue
+                call = re.fullmatch(r"([A-Za-z_$][\w$]*)\(\)", top)
+                if re.search(r"\b(?:null|undefined|false)\b|&&", top) or (
+                        call and call.group(1) in nullable):
+                    line = text.count("\n", 0, m.start()) + 1
+                    found.append(f"{name}:{line}: .{m.group(1)}({' '.join(arg.split())[:60]})")
+    return found
+
+
+class TestDomInsertionNeverGetsNull(unittest.TestCase):
+    """The configure page read "qwen3.5:9b-mlx at http://localhost:11434/v1null":
+    renderHealth passed `llm.reachable ? null : el(...)` to replaceChildren,
+    which stringifies null where el() would have skipped it. The result page
+    had the same bug latent — `body.append(termsNode(stage))`, with a termsNode
+    that returns null for a stage without definitions."""
+
+    def _sources(self):
+        return {p.name: p.read_text(encoding="utf-8") for p in sorted(_JS_DIR.glob("*.js"))}
+
+    def test_the_masker_keeps_every_file_balanced(self):
+        """If the masker misread a string or a regex, every bracket after it
+        would be off and the check below would judge the wrong text, so a
+        lexing slip has to fail loudly instead of passing quietly."""
+        for name, src in self._sources().items():
+            masked = _mask_js(src)
+            self.assertEqual(len(masked), len(src), name)
+            depth = 0
+            for c in masked:
+                depth += (c in "([{") - (c in ")]}")
+                self.assertGreaterEqual(depth, 0, name)
+            self.assertEqual(depth, 0, name)
+
+    def test_no_dom_insertion_can_receive_null(self):
+        self.assertEqual(_nullable_dom_insertions(self._sources()), [])
+
+    def test_the_check_catches_both_original_bugs(self):
+        """The two call sites as they were, so the guard above is known to
+        bite rather than merely to pass."""
+        before = {
+            "configure.js": """
+                $("#llm-health").replaceChildren(
+                  el("span", { class: "badge" }, "✓ LLM server reachable"),
+                  el("span", { text: ` ${llm.model} at ${llm.base_url}` }),
+                  llm.reachable ? null : el("span", { class: "muted", text:
+                    " — the run will finish (eventually)." }));
+            """,
+            "result.js": """
+                function termsNode(stage) {
+                  const terms = stage.terms || [];
+                  if (!terms.length) return null;
+                  return el("dl", { class: "terms" }, terms.flat());
+                }
+                function stageCard(stage) {
+                  body.append(termsNode(stage));
+                  body.append(proseNode(stage.summary));
+                }
+            """,
+        }
+        found = _nullable_dom_insertions(before)
+        self.assertEqual(len(found), 2, found)
+        self.assertTrue(any(f.startswith("configure.js") for f in found), found)
+        self.assertTrue(any("termsNode" in f for f in found), found)
+
+    def test_el_still_skips_null_children(self):
+        """Every `cond ? el(...) : null` passed to el() relies on this; the
+        DOM methods above are exactly the ones that do not."""
+        dom = (_JS_DIR / "dom.js").read_text(encoding="utf-8")
+        self.assertIn("if (child === null || child === undefined || child === false) continue;",
+                      dom)
+
+
+# ── [hidden] wins over component display rules ───────────────────────────────
+
+class TestHiddenAttributeHides(unittest.TestCase):
+    """`a.button { display: inline-block }` beat the browser's own
+    `[hidden] { display: none }`, so a failed run showed "View explanation →"
+    and "Comprehensive results" linking to results that were never written,
+    and every result page offered a report link whether or not one existed."""
+
+    def setUp(self):
+        css = (Path(__file__).parent / "static" / "css" / "ramses.css").read_text(encoding="utf-8")
+        self.css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+    def test_hidden_is_display_none_important_at_the_top_level(self):
+        m = re.search(r"(?:^|[};])\s*\[hidden\]\s*\{\s*display\s*:\s*none\s*!important\s*;?\s*\}",
+                      self.css)
+        self.assertIsNotNone(m, "ramses.css needs `[hidden] { display: none !important; }`")
+        # Inside an @media block it would hide only on that medium.
+        before = self.css[:m.start() + 1]
+        self.assertEqual(before.count("{") - before.count("}"), 0,
+                         "the [hidden] rule must not be nested in an at-rule")
+
+    def test_no_screen_rule_forces_a_display_past_it(self):
+        """`!important` on the [hidden] rule beats every ordinary rule, but
+        another `display: … !important` with a more specific selector would
+        beat it in turn. Outside print, none may exist."""
+        screen = re.sub(r"@media\s+print\s*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}", "", self.css)
+        offenders = [d for d in re.findall(r"display\s*:\s*([\w-]+)\s*!important", screen)
+                     if d != "none"]
+        self.assertEqual(offenders, [])
+
+    def test_the_conditional_links_start_hidden(self):
+        """The scripts only ever reveal these (`link.hidden = false`) once the
+        target exists, so each must start out carrying the attribute. (The
+        header's view tabs are not among them: the server renders only the
+        views that exist — see TestViewTabs.)"""
+        templates = Path(__file__).parent / "templates"
+        run_html = (templates / "run.html").read_text(encoding="utf-8")
+        for html, element_id in ((run_html, "view-result"), (run_html, "view-report")):
+            tag = re.search(rf'<a\b[^>]*\bid="{element_id}"[^>]*>', html)
+            self.assertIsNotNone(tag, element_id)
+            self.assertRegex(tag.group(0), r"\shidden(?=[\s>])", element_id)
+
+
+# ── LLM health: reachable is not enough, the model has to be installed ───────
+
+class _FakeModelsResponse:
+    def __init__(self, status_code=200, payload=None, error=None):
+        self.status_code = status_code
+        self._payload = payload
+        self._error = error
+
+    def json(self):
+        if self._error is not None:
+            raise self._error
+        return self._payload
+
+
+def _listing(*ids):
+    return {"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
+
+
+@unittest.skipUnless(HAS_FLASK, "Flask is not installed in this interpreter")
+class TestLLMHealth(unittest.TestCase):
+    """The default model (qwen3.5:9b-mlx) was not installed on the local
+    Ollama, yet the configure page said "✓ LLM server reachable" — Ollama
+    answers /models either way — and the run then wrote no narratives."""
+
+    def setUp(self):
+        from unittest import mock
+        from WebUI import jobs, server
+        self.mock = mock
+        self.server = server
+        # Scratch environment, so a test that sets a variable cannot leak it.
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        jobs.reset_manager()
+        self.addCleanup(jobs.reset_manager)
+
+    def _health(self, response=None, error=None, model=None, base_url=None):
+        get = self.mock.Mock(return_value=response, side_effect=error)
+        with self.mock.patch("requests.get", get):
+            return self.server._health(model, base_url), get
+
+    def test_a_reachable_server_without_the_model_reports_it_missing(self):
+        health, _ = self._health(_FakeModelsResponse(
+            payload=_listing("qwen3-4b:latest", "phi4:latest")))
+        self.assertTrue(health["reachable"])
+        self.assertEqual(health["model"], self.server.DEFAULT_LLM_MODEL)
+        self.assertIs(health["model_available"], False)
+        self.assertEqual(health["available_models"], ["qwen3-4b:latest", "phi4:latest"])
+        self.assertEqual(health["n_available_models"], 2)
+
+    def test_an_installed_model_is_available(self):
+        health, _ = self._health(_FakeModelsResponse(payload=_listing("qwen3-4b:latest")),
+                                 model="qwen3-4b:latest")
+        self.assertIs(health["model_available"], True)
+        self.assertEqual(health["model"], "qwen3-4b:latest")
+
+    def test_a_bare_name_matches_its_latest_tag_and_nothing_else(self):
+        """Ollama serves "phi4" as "phi4:latest"; a different tag, or a name that
+        is merely a prefix of an installed one, is not the same model."""
+        response = _FakeModelsResponse(payload=_listing("phi4:latest", "qwen3-4b:latest"))
+        for model, expected in (("phi4", True), ("phi4:latest", True),
+                                ("phi4:14b", False), ("qwen3", False)):
+            health, _ = self._health(response, model=model)
+            self.assertIs(health["model_available"], expected, model)
+
+    def test_names_ollama_resolves_to_an_installed_model_are_installed(self):
+        """Ollama 0.12.11 serves all of these as the listed model, so warning
+        that they are missing would send the reader to pull what they have."""
+        response = _FakeModelsResponse(payload=_listing(
+            "phi4:latest", "hf.co/unsloth/Phi-4-mini-instruct-GGUF:Q8_0"))
+        for model, expected in (
+                ("PHI4", True), ("Phi4:LATEST", True), ("library/phi4", True),
+                ("registry.ollama.ai/library/phi4:latest", True),
+                ("hf.co/unsloth/phi-4-mini-instruct-gguf:q8_0", True),
+                # Untagged means :latest, which this repo does not have.
+                ("hf.co/unsloth/Phi-4-mini-instruct-GGUF", False),
+                ("other/phi4", False)):
+            health, _ = self._health(response, model=model)
+            self.assertIs(health["model_available"], expected, model)
+            self.assertEqual(health["model"], model)    # shown as typed
+
+    def test_an_empty_override_falls_back_to_the_default(self):
+        health, _ = self._health(_FakeModelsResponse(payload=_listing()), model="   ")
+        self.assertEqual(health["model"], self.server.DEFAULT_LLM_MODEL)
+        self.assertIs(health["model_available"], False)
+        self.assertEqual(health["available_models"], [])
+
+    def test_the_environment_does_not_change_what_is_checked(self):
+        """The run never reads these variables (app.py falls back to the
+        pipeline defaults), so a check that did said "phi4 installed" while the
+        run asked for the default model, which was not."""
+        from WebUI import jobs
+        os.environ["RAMSES_LLM_MODEL"] = "phi4"
+        os.environ["RAMSES_LLM_BASE_URL"] = "http://llm.local:1234/v1/"
+        health, get = self._health(_FakeModelsResponse(payload=_listing("phi4:latest")))
+        self.assertEqual(health["model"], self.server.DEFAULT_LLM_MODEL)
+        self.assertIs(health["model_available"], False)
+        self.assertEqual(get.call_args[0][0],
+                         self.server.DEFAULT_LLM_BASE_URL.rstrip("/") + "/models")
+        # ...and the run with an empty form asks for that same default.
+        argv = jobs.build_argv({"dataset": "skab", "entity": "1"})
+        self.assertNotIn("--llm_model", argv)
+        self.assertNotIn("--llm_base_url", argv)
+
+    def test_a_custom_server_is_not_checked_and_not_fetched(self):
+        """With "LLM base URL" set, the run talks to that server. Checking the
+        default one instead reported a model the custom server has as "not
+        installed"; fetching the typed URL would make this GET a request relay."""
+        import requests
+        for response, error in ((_FakeModelsResponse(payload=_listing("phi4:latest")), None),
+                                (None, requests.exceptions.ConnectionError("down"))):
+            health, get = self._health(response, error=error,
+                                       model="meta-llama/Llama-3.1-8B-Instruct",
+                                       base_url=" http://127.0.0.1:8000/v1 ")
+            get.assert_not_called()
+            self.assertIs(health["checked"], False)
+            self.assertIsNone(health["reachable"])        # not False: unknown
+            self.assertIsNone(health["model_available"])  # not False: unknown
+            self.assertEqual(health["base_url"], "http://127.0.0.1:8000/v1")
+            self.assertEqual(health["model"], "meta-llama/Llama-3.1-8B-Instruct")
+            self.assertEqual(health["available_models"], [])
+
+    def test_the_default_server_typed_out_is_still_checked(self):
+        """Typing the default URL, with or without the trailing slash LLMClient
+        strips, names the same server, so the verdict still applies."""
+        default = self.server.DEFAULT_LLM_BASE_URL
+        for typed in (default, default.rstrip("/") + "/", "", "   ", None):
+            health, get = self._health(_FakeModelsResponse(payload=_listing("phi4:latest")),
+                                       model="phi4", base_url=typed)
+            get.assert_called_once()
+            self.assertIs(health["checked"], True, typed)
+            self.assertIs(health["model_available"], True, typed)
+
+    def test_the_check_keeps_its_time_budget(self):
+        _, get = self._health(_FakeModelsResponse(payload=_listing()))
+        self.assertEqual(get.call_args.kwargs["timeout"], 1.5)
+
+    def test_an_unreachable_server_never_raises(self):
+        import requests
+        for error in (requests.exceptions.ConnectionError("refused"),
+                      requests.exceptions.Timeout("slow"), RuntimeError("anything")):
+            health, _ = self._health(error=error)
+            self.assertIs(health["reachable"], False, error)
+            self.assertIsNone(health["model_available"], error)
+            self.assertEqual(health["available_models"], [], error)
+
+    def test_a_server_error_is_unreachable(self):
+        health, _ = self._health(_FakeModelsResponse(status_code=503))
+        self.assertIs(health["reachable"], False)
+        self.assertIsNone(health["model_available"])
+
+    def test_an_unreadable_listing_is_unknown_not_missing(self):
+        """Up, but no OpenAI-shaped list: there is nothing to compare against,
+        so the page must not claim the model is missing."""
+        for response in (_FakeModelsResponse(status_code=404),
+                         _FakeModelsResponse(error=ValueError("not json")),
+                         _FakeModelsResponse(payload=["phi4:latest"]),
+                         _FakeModelsResponse(payload={"models": []}),
+                         _FakeModelsResponse(payload={"data": "phi4"})):
+            health, _ = self._health(response)
+            self.assertIs(health["reachable"], True)
+            self.assertIsNone(health["model_available"])
+
+    def test_malformed_entries_are_skipped(self):
+        health, _ = self._health(_FakeModelsResponse(
+            payload={"data": [{"id": "phi4:latest"}, {"name": "x"}, "y", {"id": ""}]}),
+            model="phi4")
+        self.assertEqual(health["available_models"], ["phi4:latest"])
+        self.assertIs(health["model_available"], True)
+
+    def test_the_sample_of_installed_models_is_capped(self):
+        ids = [f"m{i}:latest" for i in range(20)]
+        health, _ = self._health(_FakeModelsResponse(payload=_listing(*ids)))
+        self.assertEqual(health["available_models"], ids[:self.server.HEALTH_MODEL_SAMPLE])
+        self.assertEqual(health["n_available_models"], 20)
+
+    def test_the_route_checks_the_form_override(self):
+        client = self.server.create_app(TESTING=True).test_client()
+        get = self.mock.Mock(return_value=_FakeModelsResponse(payload=_listing("phi4:latest")))
+        with self.mock.patch("requests.get", get):
+            default = client.get("/api/health").get_json()["llm"]
+            override = client.get("/api/health?model=phi4").get_json()["llm"]
+            blank = client.get("/api/health?model=").get_json()["llm"]
+        self.assertEqual(default["model"], self.server.DEFAULT_LLM_MODEL)
+        self.assertIs(default["model_available"], False)
+        self.assertEqual(override["model"], "phi4")
+        self.assertIs(override["model_available"], True)
+        self.assertEqual(blank["model"], self.server.DEFAULT_LLM_MODEL)
+
+    def test_the_route_does_not_judge_a_custom_server(self):
+        client = self.server.create_app(TESTING=True).test_client()
+        get = self.mock.Mock(return_value=_FakeModelsResponse(payload=_listing("phi4:latest")))
+        with self.mock.patch("requests.get", get):
+            custom = client.get("/api/health", query_string={
+                "model": "meta-llama/Llama-3.1-8B-Instruct",
+                "base_url": "http://127.0.0.1:8000/v1"}).get_json()["llm"]
+        get.assert_not_called()
+        self.assertIs(custom["checked"], False)
+        self.assertIsNone(custom["model_available"])
+        self.assertEqual(custom["base_url"], "http://127.0.0.1:8000/v1")
+
+    def test_the_configure_page_warns_about_a_missing_model(self):
+        """The UI half: the missing-model state has a warning of its own that
+        names the model and both ways out, and the Advanced field re-checks."""
+        js = (_JS_DIR / "configure.js").read_text(encoding="utf-8")
+        self.assertIn("llm.model_available === false", js)
+        self.assertIn("! LLM model not installed", js)
+        self.assertIn("ollama pull ${llm.model}", js)
+        self.assertIn('set "LLM model" under Advanced', js)
+        self.assertIn('query.set("model", model)', js)
+        self.assertIn('["#llm_model", "#llm_base_url"].forEach', js)
+
+    def test_the_configure_page_drops_both_verdicts_for_a_custom_server(self):
+        """A custom base URL is sent along, and an unchecked answer is handled
+        before the unreachable and missing-model branches, which would
+        otherwise both fire: `reachable` is null and so falsy."""
+        js = (_JS_DIR / "configure.js").read_text(encoding="utf-8")
+        self.assertIn('query.set("base_url", baseUrl)', js)
+        unchecked = js.index("llm.checked === false")
+        self.assertLess(unchecked, js.index("!llm.reachable"))
+        self.assertLess(unchecked, js.index("llm.model_available === false"))
+        self.assertIn("LLM server not checked", js)
+
+
+# ── online phase ─────────────────────────────────────────────────────────────
+#
+# The fixtures are produced by the pipeline's own runner and writer
+# (Model_Selection/online_phase.py) with fake scoring, so these tests pin the
+# contract between what the pipeline writes and logs and what the UI reads.
+
+def _online_run(results_root: Path, dataset="SKAB", entity="7",
+                keys=("fixed", "periodic"), n=4, log=None):
+    """Run the real online runner with fake scores into `results_root`.
+
+    Re-optimisations finish at once and are switched in one window after
+    their trigger (reopt_delay=1); the one triggered at the last window is
+    due after it and is recorded as not applied.
+    """
+    from Model_Selection.online_phase import (OnlineResultsWriter, OnlineWindow,
+                                              Selection, WindowScores, run_online,
+                                              scenario_params)
+    from Model_Selection.online_policy import PolicyParams
+    from Model_Selection.online_reopt import CompletedReopt
+
+    def score(window, selection):
+        return WindowScores(ensemble=0.8 if window.index != 3 else float("nan"),
+                            single=0.6, metrics={}, misclassified={})
+
+    def start(window, selection, key):
+        return CompletedReopt(Selection([f"E{window.index}"], f"S{window.index}",
+                                        origin="reoptimization",
+                                        origin_window=window.index), 1.5, None)
+
+    params = PolicyParams(update_interval=2, reopt_delay=1)
+    writer = OnlineResultsWriter(
+        str(results_root / "online" / dataset / entity),
+        {"dataset": dataset.lower(), "entity": entity, "strategy": "all",
+         "window_size": 100, "step_size": 5, "n_windows_available": n},
+        keys, scenario_params=scenario_params(keys, params), n_windows_planned=n)
+    windows = [OnlineWindow(index=i, start=800 + 5 * i, end=900 + 5 * i,
+                            online_start=5 * i, online_end=5 * i + 100)
+               for i in range(1, n + 1)]
+    run_online(keys, params, windows, lambda key: Selection(["A", "B"], "A"), score,
+               start, writer, log=log)
+    return writer
+
+
+class _CaptureLog:
+    """Collects what the runner logs, as the pipeline's log lines would read."""
+
+    def __init__(self):
+        self.lines = []
+
+    def info(self, msg):
+        self.lines.append(f"INFO:Model_Selection.online_phase:{msg}")
+
+    def error(self, msg):
+        self.lines.extend(f"ERROR:Model_Selection.online_phase:{part}"
+                          for part in msg.splitlines())
+
+
+class TestOnlineArgv(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+        self.base = {"dataset": "SKAB", "entity": "7"}
+
+    def _argv(self, **kw):
+        return self.jobs.build_argv({**self.base, **kw})
+
+    def test_online_flags_need_enable_online(self):
+        argv = self._argv(online_strategy="all", update_interval=3, drop_pct=10,
+                          inject_online_regime=True)
+        for flag in ("--enable_online", "--strategy", "--update_interval",
+                     "--drop_pct", "--inject_online_regime"):
+            self.assertNotIn(flag, argv)
+
+    def test_every_parameter_reaches_its_flag(self):
+        argv = self._argv(enable_online=True, online_strategy="all", update_interval=3,
+                          drop_pct=12.5, adaptive_window=8, adaptive_k=1.5,
+                          max_online_windows=20, inject_online_regime=True)
+        self.assertIn("--enable_online", argv)
+        self.assertIn("--inject_online_regime", argv)
+        for flag, value in (("--strategy", "all"), ("--update_interval", "3"),
+                            ("--drop_pct", "12.5"), ("--adaptive_window", "8"),
+                            ("--adaptive_k", "1.5"), ("--max_online_windows", "20")):
+            self.assertEqual(argv[argv.index(flag) + 1], value, flag)
+
+    def test_omitted_parameters_fall_back_to_the_config(self):
+        """No flag means config.yml decides, so the UI never has to restate it."""
+        argv = self._argv(enable_online=True)
+        self.assertIn("--enable_online", argv)
+        for flag in ("--strategy", "--update_interval", "--drop_pct", "--adaptive_window",
+                     "--adaptive_k", "--max_online_windows", "--inject_online_regime"):
+            self.assertNotIn(flag, argv)
+        argv = self._argv(enable_online=True, update_interval=None, drop_pct="")
+        self.assertNotIn("--update_interval", argv)
+        self.assertNotIn("--drop_pct", argv)
+
+    def test_online_labels_reach_their_flag_and_auto_sends_none(self):
+        argv = self._argv(enable_online=True, online_labels="real")
+        self.assertEqual(argv[argv.index("--online_labels") + 1], "real")
+        argv = self._argv(enable_online=True, online_labels="Injected")
+        self.assertEqual(argv[argv.index("--online_labels") + 1], "injected")
+        for unset in (None, "", "auto"):
+            self.assertNotIn("--online_labels", self._argv(enable_online=True,
+                                                           online_labels=unset))
+        self.assertNotIn("--online_labels", self._argv(online_labels="real"))
+        with self.assertRaises(ValueError):
+            self._argv(enable_online=True, online_labels="maybe")
+
+    def test_reopt_delay_reaches_its_flag(self):
+        argv = self._argv(enable_online=True, reopt_delay=0)
+        self.assertEqual(argv[argv.index("--reopt_delay") + 1], "0")
+        self.assertNotIn("--reopt_delay", self._argv(enable_online=True))
+        with self.assertRaises(ValueError):
+            self._argv(enable_online=True, reopt_delay=-2)
+
+    def test_whole_number_floats_are_spelled_plainly(self):
+        argv = self._argv(enable_online=True, drop_pct=20.0, adaptive_k=2.0)
+        self.assertEqual(argv[argv.index("--drop_pct") + 1], "20")
+        self.assertEqual(argv[argv.index("--adaptive_k") + 1], "2")
+
+    def test_legacy_strategy_parameter_and_aliases(self):
+        argv = self._argv(enable_online=True, strategy="adaptive")
+        self.assertEqual(argv[argv.index("--strategy") + 1], "adaptive")
+        argv = self._argv(enable_online=True, strategy="fixed-best",
+                          online_strategy="threshold")
+        self.assertEqual(argv[argv.index("--strategy") + 1], "threshold")
+
+    def test_bad_values_are_refused_before_spawning(self):
+        for bad in ({"online_strategy": "sometimes"}, {"update_interval": 0},
+                    {"drop_pct": 100}, {"adaptive_window": 1}, {"adaptive_k": -1},
+                    {"max_online_windows": 0}, {"update_interval": "2.5"}):
+            with self.assertRaises(ValueError, msg=bad):
+                self._argv(enable_online=True, **bad)
+
+
+class TestOnlineMarkers(unittest.TestCase):
+
+    def setUp(self):
+        from WebUI import markers
+        self.m = markers
+
+    def test_every_online_line_kind(self):
+        for line, kind in (
+            ("ONLINE PHASE START: strategy=all, scenarios=fixed+periodic, windows=4",
+             "phase_start"),
+            ("ONLINE SCENARIO START: scenario=fixed, position=1/2, windows=4", "scenario_start"),
+            ("ONLINE WINDOW: scenario=fixed, window=2/4, index=2, ensemble=0.8000",
+             "window"),
+            ("ONLINE REOPT: scenario=periodic, event=applied, window=3", "reopt"),
+            ("ONLINE SCENARIO COMPLETE: scenario=fixed, windows=4", "scenario_complete"),
+            ("ONLINE SCENARIO FAILED: scenario=fixed, error=boom", "scenario_failed"),
+            ("ONLINE PHASE COMPLETE: scenarios=2, failed=0, wall_s=1.0", "phase_complete"),
+            ("ONLINE PHASE FAILED: error=ValueError: x", "phase_failed"),
+            ("ONLINE PHASE SKIPPED: reason=too short", "phase_skipped"),
+        ):
+            e = self.m.classify(f"INFO:__main__:{line}")
+            self.assertEqual((e["type"], e["kind"]), ("online", kind), line)
+
+    def test_fields_and_a_trailing_message_with_commas(self):
+        e = self.m.classify("INFO:x:ONLINE WINDOW: scenario=threshold, window=7/20, "
+                            "deployed_ensemble=CBLOF_1+LOF_1, trigger=suppressed")
+        self.assertEqual(e["fields"]["window"], "7/20")
+        self.assertEqual(e["fields"]["deployed_ensemble"], "CBLOF_1+LOF_1")
+        e = self.m.classify("ERROR:x:❌ ONLINE PHASE FAILED: error=ValueError: a, b, c")
+        self.assertEqual(e["fields"]["error"], "ValueError: a, b, c")
+        e = self.m.classify("INFO:x:ONLINE REOPT: scenario=threshold, event=suppressed, "
+                            "window=4, because=reoptimization_in_progress, "
+                            "reason=relative_drop")
+        self.assertEqual(e["fields"]["because"], "reoptimization_in_progress")
+        self.assertEqual(e["fields"]["reason"], "relative_drop")
+
+    def test_an_error_level_online_failure_is_not_a_generic_error(self):
+        e = self.m.classify("ERROR:__main__:❌ ONLINE PHASE FAILED: error=boom")
+        self.assertEqual(e["type"], "online")
+
+    def test_the_thompson_stage_title_is_not_an_online_line(self):
+        e = self.m.classify("INFO:app:  📊 Sub-stage 6.2: Thompson Sampling - Online model selection...")
+        self.assertEqual(e["type"], "stage")
+
+
+class TestOnlineJobTracking(unittest.TestCase):
+    """What the run page shows for the online phase, from the runner's own lines."""
+
+    FULL = "INFO:app:🎉 EXECUTION COMPLETE! Total Time: 1.0s"
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _job(self, lines, params=None):
+        job = self.jobs.Job("t", ["x"], {"enable_online": True} if params is None else params)
+        for line in lines:
+            job._record(line)
+        job.exit_code = 0
+        return job
+
+    def _runner_lines(self, keys=("fixed", "periodic"), n=4):
+        log = _CaptureLog()
+        _online_run(Path(self._tmp.name), keys=keys, n=n, log=log)
+        return log.lines
+
+    def test_the_runner_lines_drive_phase_8_and_one_entry_per_scenario(self):
+        job = self._job([self.FULL] + self._runner_lines())
+        self.assertEqual(job.phase, {"number": 8, "title": "Online phase"})
+        self.assertEqual(job.online["status"], "complete")
+        self.assertEqual(job.online["order"], ["fixed", "periodic"])
+        periodic = job.online["scenarios"]["periodic"]
+        self.assertEqual((periodic["status"], periodic["window"], periodic["total"]),
+                         ("done", 4, 4))
+        # Triggers at 2 and 4; the one from 2 finished at once and applied at 3.
+        self.assertEqual((periodic["triggers"], periodic["reopts_started"],
+                          periodic["reopts_applied"]), (2, 2, 1))
+        stage = job.stages["online_periodic"]
+        self.assertEqual((stage["status"], stage["group"], stage["window"], stage["total"]),
+                         ("done", "online", 4, 4))
+        self.assertEqual(job.stages["online_fixed"]["status"], "done")
+        snap = job.snapshot()
+        self.assertEqual(snap["online"]["scenarios"]["periodic"]["window"], 4)
+
+    def test_progress_is_visible_mid_scenario(self):
+        lines = [l for l in self._runner_lines(keys=("fixed",), n=4)
+                 if "ONLINE SCENARIO COMPLETE" not in l and "ONLINE PHASE COMPLETE" not in l]
+        lines = [l for l in lines if "window=4/4" not in l]
+        job = self._job([self.FULL] + lines)
+        entry = job.stages["online_fixed"]
+        self.assertEqual((entry["status"], entry["window"]), ("running", 3))
+        self.assertEqual(entry["text"], "window 3/4")
+
+    def test_reoptimization_logs_do_not_reopen_the_offline_rail(self):
+        job = self._job([
+            "INFO:app:  ✓ [GA] Best ensemble=['LOF_1'] | Time=1.0s",
+            self.FULL,
+            "INFO:__main__:  📊 Sub-stage 6.1: Genetic Algorithm (GA) - Finding best ensemble...",
+        ])
+        self.assertEqual(job.stages["ga"]["status"], "done")
+
+    def test_a_succeeded_online_phase_is_a_clean_success(self):
+        job = self._job([self.FULL] + self._runner_lines())
+        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "succeeded")
+
+    def test_an_online_crash_after_completion_is_a_warning_not_a_success(self):
+        job = self._job([self.FULL,
+                         "INFO:x:ONLINE PHASE START: strategy=all, scenarios=fixed, windows=4",
+                         "ERROR:__main__:❌ ONLINE PHASE FAILED: error=ValueError: bad"])
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("online phase failed", out["reason"])
+        self.assertIn("ValueError: bad", out["reason"])
+
+    def test_a_traceback_after_completion_is_a_warning(self):
+        """The old online loop died in run_app's catch-all, after the marker."""
+        job = self._job([self.FULL, "INFO:app:Traceback for Entity: 7 Dataset: SKAB"],
+                        params={})
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("raised an exception", out["reason"])
+
+    def test_a_traceback_before_completion_is_still_a_failure(self):
+        job = self._job(["INFO:app:Traceback for Entity: 7 Dataset: SKAB"])
+        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "failed")
+
+    def test_requested_but_never_started_or_unfinished_or_skipped(self):
+        out = self.jobs.classify_outcome(self._job([self.FULL]), False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("never started", out["reason"])
+        job = self._job([self.FULL,
+                         "INFO:x:ONLINE PHASE START: strategy=all, scenarios=fixed, windows=4"])
+        self.assertIn("did not finish", self.jobs.classify_outcome(job, False)["reason"])
+        job = self._job([self.FULL, "WARNING:x:⚠️  ONLINE PHASE SKIPPED: reason=too short"])
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("skipped: too short", out["reason"])
+
+    def test_one_failed_scenario_is_named(self):
+        lines = [self.FULL,
+                 "INFO:x:ONLINE PHASE START: strategy=all, scenarios=fixed+periodic, windows=4",
+                 "ERROR:x:ONLINE SCENARIO FAILED: scenario=periodic, error=boom",
+                 "INFO:x:ONLINE PHASE COMPLETE: scenarios=2, failed=1, wall_s=1.0"]
+        job = self._job(lines)
+        self.assertEqual(job.stages["online_periodic"]["status"], "failed")
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("periodic", out["reason"])
+
+    def test_online_off_or_partial_runs_are_not_judged_on_it(self):
+        self.assertEqual(self.jobs.classify_outcome(
+            self._job([self.FULL], params={}), False)["status"], "succeeded")
+        partial = "INFO:app:✅ Partial run complete (stages=ga)."
+        self.assertEqual(self.jobs.classify_outcome(
+            self._job([partial]), True)["status"], "succeeded")
+
+    def test_warnings_combine(self):
+        out = self.jobs.classify_outcome(self._job([self.FULL]), False,
+                                         explain_requested=True, artifacts_written=False)
+        self.assertIn("no explanation artifacts", out["reason"])
+        self.assertIn("never started", out["reason"])
+
+
+class TestOnlineJobLinks(unittest.TestCase):
+    """A finished job links to the online results only if THIS run wrote them."""
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self._saved = (paths.WEBUI_LOGS, paths.COMPREHENSIVE, paths.RESULTS)
+        paths.WEBUI_LOGS = root / "webui_logs"
+        paths.RESULTS = root / "results"
+        paths.COMPREHENSIVE = paths.RESULTS / "comprehensive"
+        self.mgr = jobs.JobManager(repo_root=root)
+
+    def tearDown(self):
+        (paths.WEBUI_LOGS, paths.COMPREHENSIVE, paths.RESULTS) = self._saved
+        self._tmp.cleanup()
+
+    def _run(self, script, params):
+        job = self.mgr.start(params, argv=[sys.executable, "-u", "-c", script], timeout=30)
+        for _ in range(300):
+            if job.is_done():
+                break
+            time.sleep(0.02)
+        return job
+
+    def test_online_url_only_for_this_runs_results(self):
+        params = {"dataset": "SKAB", "entity": "7", "explain": False, "enable_online": True}
+        script = ("import sys; print('INFO:app:🎉 EXECUTION COMPLETE! 1s', file=sys.stderr)\n"
+                  "print('INFO:x:ONLINE PHASE START: strategy=fixed, scenarios=fixed, "
+                  "windows=1', file=sys.stderr)\n"
+                  "print('INFO:x:ONLINE PHASE COMPLETE: scenarios=1, failed=0, wall_s=0', "
+                  "file=sys.stderr)\n")
+        job = self._run(script, params)
+        self.assertIsNone(job.online_url)              # nothing on disk
+        _online_run(paths.RESULTS, keys=("fixed",), n=2)
+        job = self._run(script, params)
+        self.assertEqual(job.status, "succeeded")
+        self.assertEqual(job.online_url, "/online/SKAB/7")
+        self.assertEqual(job.snapshot()["online_url"], "/online/SKAB/7")
+        # A summary older than the job is an earlier run's.
+        summary = paths.RESULTS / "online" / "SKAB" / "7" / "summary.json"
+        doc = json.loads(summary.read_text())
+        doc["generated_at"] = time.time() - 3600
+        summary.write_text(json.dumps(doc))
+        self.assertIsNone(self._run(script, params).online_url)
+
+
+class TestOnlineReader(ArtifactTreeCase):
+
+    def setUp(self):
+        super().setUp()
+        from WebUI import online
+        self.online = online
+        _online_run(self.results_root, keys=("fixed", "periodic"), n=4)
+
+    def test_payload_is_the_summary_plus_each_scenarios_series(self):
+        body = self.online.payload("SKAB", "7")
+        self.assertEqual(body["summary"]["status"], "complete")
+        self.assertEqual(set(body["scenarios"]), {"fixed", "periodic"})
+        windows = body["scenarios"]["periodic"]["windows"]
+        self.assertEqual([w["i"] for w in windows], [1, 2, 3, 4])
+        self.assertIsNone(windows[2]["ensemble_score"])          # NaN written as null
+        self.assertEqual(body["dataset_label"], "SKAB")
+
+    def test_case_insensitive_and_absent(self):
+        self.assertIsNotNone(self.online.payload("skab", "7"))
+        self.assertIsNone(self.online.payload("SKAB", "999"))
+        self.assertIsNone(self.online.payload("SMD", "7"))
+
+    def test_scenario_filter_and_summary_only(self):
+        self.assertEqual(set(self.online.payload("SKAB", "7", scenario="fixed")["scenarios"]),
+                         {"fixed"})
+        self.assertEqual(self.online.payload("SKAB", "7", summary_only=True)["scenarios"], {})
+        self.assertEqual(self.online.payload("SKAB", "7", scenario="../x")["scenarios"], {})
+
+    def test_only_known_scenario_files_are_opened(self):
+        """The scenario list comes from disk; a name outside the vocabulary
+        must not become a path."""
+        path = self.results_root / "online" / "SKAB" / "7" / "summary.json"
+        doc = json.loads(path.read_text())
+        doc["scenario_order"] = ["../../../etc/passwd", "fixed"]
+        path.write_text(json.dumps(doc))
+        self.assertEqual(set(self.online.payload("SKAB", "7")["scenarios"]), {"fixed"})
+
+    def test_info_and_known_entities(self):
+        info = self.online.info("SKAB", "7")
+        self.assertEqual(info["url"], "/api/online/SKAB/7")
+        self.assertEqual(info["scenarios"], ["fixed", "periodic"])
+        self.assertEqual(info["scenario_status"], {"fixed": "complete",
+                                                   "periodic": "complete"})
+        self.assertEqual(self.online.known_entities(), [("SKAB", "7")])
+
+    def test_a_corrupt_summary_reads_as_absent(self):
+        (self.results_root / "online" / "SKAB" / "7" / "summary.json").write_text("{")
+        self.assertIsNone(self.online.payload("SKAB", "7"))
+        self.assertIsNone(self.online.info("SKAB", "7"))
+
+
+@unittest.skipUnless(HAS_FLASK, "Flask is not installed in this interpreter")
+class TestOnlineRoutes(ArtifactTreeCase):
+
+    def setUp(self):
+        super().setUp()
+        from WebUI import jobs, online, server
+        jobs.reset_manager()
+        self.jobs = jobs
+        # No datasets: the feasibility check behind enable_online then cannot
+        # read the entity and leaves the verdict to the run, so these tests do
+        # not depend on what data the machine happens to have.
+        self._saved_config = paths._CONFIG_CACHE
+        paths._CONFIG_CACHE = {"dataset_path": str(self.results_root.parent / "no-data"),
+                               "downsampling": None, "min_length": None}
+        online.reset_cache()
+        self.addCleanup(online.reset_cache)
+        self.client = server.create_app(TESTING=True).test_client()
+
+    def tearDown(self):
+        paths._CONFIG_CACHE = self._saved_config
+        self.jobs.reset_manager()
+        super().tearDown()
+
+    def test_endpoint_404_until_there_is_data(self):
+        r = self.client.get("/api/online/SKAB/7")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.get_json()["error"], "no_online_results")
+
+    def test_endpoint_serves_summary_and_series(self):
+        _online_run(self.results_root)
+        r = self.client.get("/api/online/skab/7")            # case-insensitive
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Cache-Control"], "no-store")
+        body = r.get_json()
+        self.assertEqual([s["key"] for s in body["summary"]["scenarios"]],
+                         ["fixed", "periodic"])
+        self.assertEqual(len(body["scenarios"]["fixed"]["windows"]), 4)
+        r = self.client.get("/api/online/SKAB/7?scenario=periodic")
+        self.assertEqual(list(r.get_json()["scenarios"]), ["periodic"])
+        r = self.client.get("/api/online/SKAB/7?summary=1")
+        self.assertEqual(r.get_json()["scenarios"], {})
+
+    def test_catalog_marks_results_with_online_data(self):
+        body = self.client.get("/api/catalog").get_json()
+        self.assertFalse(body["results"][0]["has_online"])
+        self.assertIsNone(body["results"][0]["online"])
+        self.assertEqual(body["online_results"], [])
+        _online_run(self.results_root)
+        # Online data with no explanations (a run without --explain) is listed too.
+        _online_run(self.results_root, dataset="SMD", entity="machine-1-1")
+        body = self.client.get("/api/catalog").get_json()
+        self.assertTrue(body["results"][0]["has_online"])
+        self.assertEqual(body["results"][0]["online"]["url"], "/api/online/SKAB/7")
+        self.assertEqual([(o["dataset"], o["entity"]) for o in body["online_results"]],
+                         [("SKAB", "7"), ("SMD", "machine-1-1")])
+
+    def test_online_validation_errors(self):
+        base = {"dataset": "S", "entity": "7", "enable_online": True}
+        for extra, fragment in (
+            ({"enable_online": "yes"}, "enable_online must be true or false"),
+            ({"inject_online_regime": 1}, "inject_online_regime must be true or false"),
+            ({"online_strategy": "sometimes"}, "online_strategy: unknown strategy"),
+            ({"online_strategy": "fixed-random"}, "command-line baseline"),
+            ({"strategy": "nope"}, "strategy: unknown strategy"),
+            ({"online_strategy": 3}, "online_strategy must be one of"),
+            ({"update_interval": 0}, "update_interval: must be at least 1"),
+            ({"update_interval": 2.5}, "update_interval: expected a whole number"),
+            ({"update_interval": True}, "update_interval: expected a whole number"),
+            ({"drop_pct": 0}, "drop_pct: must be greater than 0"),
+            ({"drop_pct": "x"}, "drop_pct: expected a number"),
+            ({"adaptive_window": 1}, "adaptive_window: must be at least 2"),
+            ({"adaptive_k": -0.5}, "adaptive_k: must not be negative"),
+            ({"max_online_windows": 0}, "max_online_windows: must be at least 1"),
+            ({"reopt_delay": -1}, "reopt_delay: must be 0 or more"),
+            ({"reopt_delay": 1.5}, "reopt_delay: expected a whole number"),
+            ({"iteration": "five"}, "iteration must be a whole number"),
+        ):
+            r = self.client.post("/api/runs", json={**base, **extra})
+            self.assertEqual(r.status_code, 400, extra)
+            self.assertIn(fragment, r.get_json()["error"], extra)
+
+    def test_valid_online_run_previews_its_command(self):
+        r = self.client.post("/api/runs", json={
+            "dataset": "SKAB", "entity": "7", "enable_online": True,
+            "online_strategy": "adaptive_threshold", "update_interval": 4,
+            "drop_pct": 25, "adaptive_window": 6, "adaptive_k": 1.5,
+            "max_online_windows": 15, "inject_online_regime": False, "dry_run": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        argv = r.get_json()["argv"]
+        self.assertEqual(argv[argv.index("--strategy") + 1], "adaptive_threshold")
+        self.assertEqual(argv[argv.index("--max_online_windows") + 1], "15")
+        self.assertNotIn("--inject_online_regime", argv)
+        self.assertIsNone(self.jobs.manager().active())
+        # The aliases from before the scenarios still validate.
+        for legacy in ("adaptive", "fixed-best", "all", "fixed", "periodic", "threshold"):
+            r = self.client.post("/api/runs", json={"dataset": "SKAB", "entity": "7",
+                                                    "enable_online": True,
+                                                    "strategy": legacy, "dry_run": True})
+            self.assertEqual(r.status_code, 200, legacy)
+
+
+# ── live monitor stream ─────────────────────────────────────────────────────
+
+def _stream_run(results_root: Path, dataset="TSB", entity="e1", injected=False, n_channels=2):
+    """Real StreamWriter + the real runner (fake scores with per-sample traces)
+    into `results_root`: 400 offline samples, a 300-sample online part with
+    one real anomaly (150..159), windows of 100 every 10, scenario fixed."""
+    import numpy as np
+    from Model_Selection import online_scoring as sc
+    from Model_Selection.online_phase import (OnlineResultsWriter, Selection, WindowScores,
+                                              run_online)
+    from Model_Selection.online_policy import PolicyParams
+    from Model_Selection.online_stream import StreamWriter
+    rng = np.random.default_rng(0)
+    off_Y = rng.normal(size=(n_channels, 400))
+    on_Y = rng.normal(size=(n_channels, 300))
+    on_Y[0, 200] = 25.0                                  # a one-sample spike
+    labels = np.zeros(300)
+    labels[150:160] = 1
+    stream = (sc.build_online_stream(on_Y, labels, None, ["cutoff"], None, 13) if injected
+              else sc.real_label_stream(on_Y, labels, None))
+    windows = sc.build_online_windows(stream, list(range(21)), offset=400, step_size=10,
+                                      window_size=100)
+    directory = results_root / "online" / dataset / entity
+    sw = StreamWriter(str(directory), dataset=dataset, entity=entity,
+                      label_source="injected" if injected else "real",
+                      offline_Y=off_Y, offline_real_labels=np.zeros(400),
+                      online_copies=stream.copies, online_real_labels=labels,
+                      offline_size=400, window_size=100, step_size=10, n_windows=21,
+                      injected=injected)
+
+    def score(window, selection):
+        n = window.data.entities[0].Y.shape[1]
+        values = np.linspace(0, 1, n)
+        cut = None if not window.scorable else 0.9
+        return WindowScores(
+            ensemble=0.5 if window.scorable else None, single=0.4 if window.scorable else None,
+            trace={"single": {"scores": values, "threshold": cut,
+                              "flagged": None if cut is None else (values >= cut).astype("int8")}})
+
+    writer = OnlineResultsWriter(str(directory), {"dataset": dataset, "entity": entity,
+                                                  "strategy": "fixed"}, ("fixed",))
+    run_online(("fixed",), PolicyParams(), windows, lambda k: Selection(["A"], "A"),
+               score, None, writer, on_window=sw.record)
+    return directory, on_Y, labels
+
+
+class TestStreamDecimation(unittest.TestCase):
+
+    def test_short_ranges_come_back_sample_by_sample(self):
+        import numpy as np
+        from WebUI import stream
+        out = stream.minmax(np.arange(10.0), 2, 7, 100)
+        self.assertEqual((out["x"], out["min"], out["max"], out["bucket"]),
+                         ([2, 3, 4, 5, 6], [2.0, 3.0, 4.0, 5.0, 6.0], [2.0, 3.0, 4.0, 5.0, 6.0], 1))
+
+    def test_buckets_keep_every_spike(self):
+        import numpy as np
+        from WebUI import stream
+        values = np.zeros(100000)
+        values[54321] = 9.0
+        values[777] = -4.0
+        out = stream.minmax(values, 0, 100000, 1000)
+        self.assertLessEqual(len(out["x"]), 500)
+        self.assertEqual(max(out["max"]), 9.0)
+        self.assertEqual(min(out["min"]), -4.0)
+        b = out["bucket"]
+        self.assertEqual(out["max"][54321 // b], 9.0)
+
+    def test_spans_are_exact_and_clipped(self):
+        import numpy as np
+        from WebUI import stream
+        labels = np.zeros(50)
+        labels[3] = 1
+        labels[10:20] = 1
+        self.assertEqual(stream.spans(labels, 0, 50), [[3, 4], [10, 20]])
+        self.assertEqual(stream.spans(labels, 12, 50), [[12, 20]])
+        self.assertEqual(stream.spans(labels, 400, 450, offset=400), [[403, 404], [410, 420]])
+        self.assertEqual(stream.spans(None, 0, 5), [])
+
+    def test_channels(self):
+        from WebUI import stream
+        self.assertEqual(stream.parse_channels(None, 3), [0])
+        self.assertEqual(stream.parse_channels("2,0,2", 3), [2, 0])
+        self.assertEqual(stream.parse_channels("all", 40), list(range(stream.MAX_CHANNELS)))
+        for bad in ("3", "-1", "x"):
+            with self.assertRaises(ValueError):
+                stream.parse_channels(bad, 3)
+
+
+@unittest.skipUnless(HAS_FLASK, "Flask is not installed in this interpreter")
+class TestStreamRoute(ArtifactTreeCase):
+
+    def setUp(self):
+        super().setUp()
+        from WebUI import jobs, server
+        jobs.reset_manager()
+        self.addCleanup(jobs.reset_manager)
+        self.client = server.create_app(TESTING=True).test_client()
+
+    def get(self, query="", entity="e1"):
+        return self.client.get(f"/api/online/TSB/{entity}/stream{query}")
+
+    def test_404_until_there_is_a_stream(self):
+        r = self.get()
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.get_json()["error"], "no_stream")
+
+    def test_series_labels_and_boundary(self):
+        import numpy as np
+        _, on_Y, labels = _stream_run(self.results_root)
+        r = self.get("?channels=0,1&from=380&to=700")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Cache-Control"], "no-store")
+        body = r.get_json()
+        meta = body["meta"]
+        self.assertEqual((meta["offline_size"], meta["total_length"], meta["window_size"],
+                          meta["step_size"], meta["label_source"]), (400, 700, 100, 10, "real"))
+        self.assertTrue(meta["has_real_labels"])
+        self.assertFalse(meta["has_injected_labels"])
+        self.assertEqual([s["channel"] for s in body["series"]], [0, 1])
+        ch0 = body["series"][0]
+        self.assertEqual(ch0["bucket"], 1)
+        # The online part as replayed is the raw test slice (nothing injected).
+        np.testing.assert_allclose(ch0["min"][20:], np.round(on_Y[0], 6), atol=1e-5)
+        self.assertEqual(body["real_spans"], [[550, 560]])
+        self.assertEqual(body["injected_spans"], [])
+
+    def test_decimated_whole_stream_keeps_the_spike_and_the_span(self):
+        _stream_run(self.results_root)
+        body = self.get("?max_points=40").get_json()
+        ch0 = body["series"][0]
+        self.assertGreater(ch0["bucket"], 1)
+        self.assertLessEqual(len(ch0["x"]), 20)
+        self.assertAlmostEqual(max(ch0["max"]), 25.0, places=4)
+        self.assertEqual(body["real_spans"], [[550, 560]])
+
+    def test_a_scenario_window_its_scores_threshold_and_flags(self):
+        _stream_run(self.results_root)
+        body = self.get("?scenario=fixed&window=6&series=0").get_json()
+        self.assertNotIn("series", body)
+        self.assertEqual(body["recorded_windows"], list(range(21)))
+        w = body["window"]
+        self.assertEqual((w["i"], w["start"], w["end"]), (6, 460, 560))
+        self.assertEqual(w["single"]["threshold"], 0.9)
+        self.assertEqual(len(w["single"]["x"]), 100)
+        self.assertEqual(w["single"]["flagged"], [[550, 560]])
+        self.assertEqual(w["single"]["n_flagged"], 10)
+        self.assertIsNone(w["ensemble"])
+        # An unscorable window keeps its scores, with no threshold or flags.
+        w = self.get("?scenario=fixed&window=0&series=0").get_json()["window"]
+        self.assertIsNone(w["single"]["threshold"])
+        self.assertEqual(w["single"]["flagged"], [])
+        self.assertEqual(len(w["single"]["x"]), 100)
+        # Default: the latest written window.
+        self.assertEqual(self.get("?scenario=fixed&series=0").get_json()["window"]["i"], 20)
+
+    def test_injected_copies_are_named_and_their_spans_exact(self):
+        _stream_run(self.results_root, entity="inj", injected=True)
+        body = self.get("?copy=1", entity="inj").get_json()
+        self.assertEqual([c["anomaly_type"] for c in body["meta"]["copies"]], ["cutoff", "cutoff"])
+        self.assertTrue(body["meta"]["has_injected_labels"])
+        self.assertTrue(body["injected_spans"])
+        self.assertTrue(all(len(s) == 3 and s[2] == "cutoff" and 400 <= s[0] < s[1] <= 700
+                            for s in body["injected_spans"]))
+        self.assertEqual(body["real_spans"], [[550, 560]])
+
+    def test_bad_requests(self):
+        _stream_run(self.results_root)
+        for query in ("?channels=5", "?from=600&to=500", "?copy=3", "?scenario=nope",
+                      "?max_points=x", "?window=1.5&scenario=fixed"):
+            r = self.get(query)
+            self.assertEqual(r.status_code, 400, query)
+
+
+# ── online feasibility, liveness and waiting ─────────────────────────────────
+
+def _presplit_entity(root: Path, dataset: str, stem: str, n_test: int, n_train=300,
+                     online_anomaly=True):
+    """A two-channel entity in the pre-split layout Datasets.load reads (one
+    row per timestep; a single column would load as one row). Its labels hold
+    an anomaly in the middle (the offline part) and, with `online_anomaly`,
+    one at 90% (the online part), where real-label mode scores."""
+    import numpy as np
+    base = root / dataset
+    for sub in ("train", "test", "test_label"):
+        (base / sub).mkdir(parents=True, exist_ok=True)
+    t = np.arange(max(n_test, n_train))
+    values = np.column_stack([np.sin(t / 7.0), np.cos(t / 5.0)])
+    np.savetxt(base / "train" / f"{stem}.txt", values[:n_train], delimiter=",")
+    np.savetxt(base / "test" / f"{stem}.txt", values[:n_test], delimiter=",")
+    labels = np.zeros(n_test)
+    labels[n_test // 2:n_test // 2 + 5] = 1
+    if online_anomaly:
+        labels[int(n_test * 0.9):int(n_test * 0.9) + 5] = 1
+    np.savetxt(base / "test_label" / f"{stem}.txt", labels)
+
+
+class _FeasibilityCase(unittest.TestCase):
+    """A data root of pre-split TOY entities: short (no window fits), long
+    (an anomaly in the online part) and quiet (none there)."""
+
+    def setUp(self):
+        from WebUI import jobs, online, server
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        _presplit_entity(root, "TOY", "short", 230)     # like a SKAB entity
+        _presplit_entity(root, "TOY", "long", 1180)     # like UCR 028 downsampled
+        _presplit_entity(root, "TOY", "quiet", 1180, online_anomaly=False)
+        self._saved = paths._CONFIG_CACHE
+        paths._CONFIG_CACHE = {"dataset_path": str(root), "downsampling": None,
+                               "min_length": None}
+        self.addCleanup(setattr, paths, "_CONFIG_CACHE", self._saved)
+        online.reset_cache()
+        self.addCleanup(online.reset_cache)
+        jobs.reset_manager()
+        self.addCleanup(jobs.reset_manager)
+        self.online = online
+        self.client = server.create_app(TESTING=True).test_client()
+
+
+@unittest.skipUnless(HAS_FLASK, "Flask is not installed in this interpreter")
+class TestOnlineFeasibility(_FeasibilityCase):
+    """GET /api/online/feasibility and the enable_online check behind it: the
+    pipeline's own split and window functions on the length it would load."""
+
+    def test_a_short_entity_is_not_feasible_and_says_why(self):
+        r = self.client.get("/api/online/feasibility/TOY/short")
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertFalse(body["ok"])
+        self.assertEqual((body["n_windows"], body["window_size"], body["step_size"],
+                          body["online_size"]), (0, 100, 5, 46))
+        self.assertIn("46 samples", body["reason"])
+
+    def test_a_long_entity_is_feasible(self):
+        body = self.client.get("/api/online/feasibility/TOY/long").get_json()
+        self.assertTrue(body["ok"])
+        self.assertIsNone(body["reason"])
+        self.assertEqual((body["n_windows"], body["window_size"], body["step_size"],
+                          body["online_size"], body["total_samples"]),
+                         (28, 100, 5, 236, 1180))
+        for key in ("ok", "n_windows", "window_size", "step_size", "online_size", "reason"):
+            self.assertIn(key, body)
+
+    def test_iteration_sizes_the_windows(self):
+        body = self.client.get("/api/online/feasibility/TOY/long?iteration=2").get_json()
+        self.assertEqual((body["iteration"], body["window_size"], body["step_size"]),
+                         (2, 118, 5))
+        r = self.client.get("/api/online/feasibility/TOY/long?iteration=two")
+        self.assertEqual(r.status_code, 400)
+
+    def test_an_unreadable_entity_is_404(self):
+        r = self.client.get("/api/online/feasibility/TOY/missing")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.get_json()["error"], "unknown_entity")
+
+    def test_the_length_is_read_once(self):
+        from unittest import mock
+        import Datasets.load as load
+        with mock.patch.object(load, "load_data", wraps=load.load_data) as spy:
+            for _ in range(3):
+                self.client.get("/api/online/feasibility/TOY/long?iteration=5")
+            self.client.get("/api/online/feasibility/TOY/long?iteration=3")
+        self.assertEqual(spy.call_count, 1)
+
+    def test_it_agrees_with_the_pipeline_windowing(self):
+        from Utils.pipeline_spec import count_windows, online_window_geometry
+        body = self.online.feasibility("TOY", "long", 5)
+        window, step = online_window_geometry(236, 5)
+        self.assertEqual(body["n_windows"], count_windows(236, window, step))
+
+    def test_validation_refuses_enable_online_for_an_infeasible_entity(self):
+        r = self.client.post("/api/runs", json={"dataset": "TOY", "entity": "short",
+                                                "enable_online": True, "dry_run": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("enable_online:", r.get_json()["error"])
+        self.assertIn("46 samples", r.get_json()["error"])
+        # Without the online phase the same entity is fine.
+        r = self.client.post("/api/runs", json={"dataset": "TOY", "entity": "short",
+                                                "enable_online": False, "dry_run": True})
+        self.assertEqual(r.status_code, 200)
+        r = self.client.post("/api/runs", json={"dataset": "TOY", "entity": "long",
+                                                "enable_online": True, "dry_run": True})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        # Unreadable: left to the run, which reports why.
+        r = self.client.post("/api/runs", json={"dataset": "TOY", "entity": "missing",
+                                                "enable_online": True, "dry_run": True})
+        self.assertEqual(r.status_code, 200)
+
+
+@unittest.skipUnless(HAS_FLASK, "Flask is not installed in this interpreter")
+class TestRealLabelFeasibility(_FeasibilityCase):
+    """Real-label mode: how many online windows hold a labelled anomaly, and
+    no online phase where none does."""
+
+    def test_real_labels_are_the_default_where_the_data_has_them(self):
+        body = self.client.get("/api/online/feasibility/TOY/long").get_json()
+        self.assertTrue(body["labels_available"])
+        self.assertEqual((body["label_source"], body["default_label_source"]),
+                         ("real", "real"))
+        self.assertEqual(body["label_source_label"], "Real labels — no injection online")
+        # The online anomaly is at 1062 = online position 118; window i covers
+        # [5i, 5i + 100), so windows 4..24 hold it.
+        self.assertEqual((body["n_windows_with_anomaly"], body["n_windows_scorable"],
+                          body["n_windows"]), (21, 21, 28))
+        self.assertIsNone(body["label_error"])
+
+    def test_an_online_part_without_a_labelled_anomaly_has_nothing_to_score(self):
+        body = self.client.get("/api/online/feasibility/TOY/quiet").get_json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["n_windows_with_anomaly"], 0)
+        self.assertIn("No labelled anomaly in the online part", body["reason"])
+        self.assertIn("nothing to score", body["reason"])
+        # Injected anomalies still run it.
+        body = self.client.get(
+            "/api/online/feasibility/TOY/quiet?online_labels=injected").get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["label_source"], "injected")
+        self.assertIsNone(body["n_windows_with_anomaly"])
+
+    def test_real_labels_with_the_regime_shift_are_a_label_error(self):
+        body = self.client.get(
+            "/api/online/feasibility/TOY/long?inject_online_regime=1").get_json()
+        self.assertIsNone(body["label_source"])
+        self.assertIn("inject_online_regime", body["label_error"])
+        r = self.client.get("/api/online/feasibility/TOY/long?online_labels=maybe")
+        self.assertEqual(r.status_code, 400)
+
+    def test_validation_follows_the_label_source(self):
+        post = lambda **kw: self.client.post("/api/runs", json={
+            "dataset": "TOY", "enable_online": True, "dry_run": True, **kw})
+        r = post(entity="quiet")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("No labelled anomaly in the online part", r.get_json()["error"])
+        r = post(entity="quiet", online_labels="injected")
+        self.assertEqual(r.status_code, 200, r.get_json())
+        argv = r.get_json()["argv"]
+        self.assertEqual(argv[argv.index("--online_labels") + 1], "injected")
+        r = post(entity="long", online_labels="real", inject_online_regime=True)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("online_labels:", r.get_json()["error"])
+        r = post(entity="long", online_labels="real")
+        self.assertEqual(r.status_code, 200)
+        argv = r.get_json()["argv"]
+        self.assertEqual(argv[argv.index("--online_labels") + 1], "real")
+        r = post(entity="long", online_labels="bogus")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("online_labels: expected real or injected", r.get_json()["error"])
+
+
+class TestOnlineLiveness(ArtifactTreeCase):
+    """A summary saying "running" whose writer is gone reads (and is marked)
+    "interrupted"; one that is still being written does not."""
+
+    def setUp(self):
+        super().setUp()
+        from WebUI import online
+        self.online = online
+        self.path = self.results_root / "online" / "SKAB" / "7" / "summary.json"
+
+    def _running(self, **changes):
+        from Model_Selection.online_phase import OnlineResultsWriter, scenario_params
+        from Model_Selection.online_policy import PolicyParams
+        keys = ("fixed", "periodic")
+        writer = OnlineResultsWriter(str(self.path.parent), {"strategy": "all"}, keys,
+                                     scenario_params=scenario_params(keys, PolicyParams()),
+                                     n_windows_planned=4)
+        writer.recorder("fixed", {}, 4).flush()         # one scenario under way
+        doc = json.loads(self.path.read_text())
+        doc.update(changes)
+        self.path.write_text(json.dumps(doc))
+        return doc
+
+    @staticmethod
+    def _dead_pid():
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    def test_a_live_writer_keeps_its_status(self):
+        self._running()                               # pid = this process
+        self.assertEqual(self.online.payload("SKAB", "7")["summary"]["status"], "running")
+
+    def test_a_dead_writer_is_interrupted_and_marked_on_disk(self):
+        self._running(pid=self._dead_pid())
+        body = self.online.payload("SKAB", "7")
+        self.assertEqual(body["summary"]["status"], "interrupted")
+        self.assertIn("stopped before the online phase finished", body["summary"]["error"])
+        self.assertEqual({r["key"]: r["status"] for r in body["summary"]["scenarios"]},
+                         {"fixed": "interrupted", "periodic": "interrupted"})
+        self.assertEqual(body["scenarios"]["fixed"]["status"], "interrupted")
+        on_disk = json.loads(self.path.read_text())
+        self.assertEqual(on_disk["status"], "interrupted")
+        self.assertEqual(self.online.info("SKAB", "7")["status"], "interrupted")
+
+    def test_a_live_job_owning_the_entity_is_never_judged(self):
+        self._running(pid=self._dead_pid())
+        body = self.online.payload("SKAB", "7", is_live=lambda d, e: True)
+        self.assertEqual(body["summary"]["status"], "running")
+
+    def test_without_a_process_of_record_only_age_counts(self):
+        import time as _time
+        self._running(pid=None, updated_at=_time.time() - 60)
+        self.assertEqual(self.online.info("SKAB", "7")["status"], "running")
+        self._running(pid=None, updated_at=_time.time() - self.online.STALE_SECONDS - 60)
+        self.assertEqual(self.online.info("SKAB", "7")["status"], "interrupted")
+
+    def test_a_stale_summary_is_interrupted_even_if_its_pid_is_alive(self):
+        """The id may belong to another process by now, or the run hung."""
+        import time as _time
+        self._running(updated_at=_time.time() - self.online.STALE_SECONDS - 60)
+        self.assertEqual(self.online.info("SKAB", "7")["status"], "interrupted")
+
+    def test_finished_summaries_are_left_alone(self):
+        self._running(pid=self._dead_pid(), status="complete")
+        self.assertEqual(self.online.info("SKAB", "7")["status"], "complete")
+
+    def test_mark_interrupted_covers_a_waiting_scenario(self):
+        doc = self._running()
+        doc["scenarios"][0]["status"] = "waiting_for_reopt"
+        doc["scenarios"][0]["waiting"] = {"since_window": 2, "until_window": 4, "since": 1}
+        self.path.write_text(json.dumps(doc))
+        self.assertTrue(self.online.mark_interrupted("SKAB", "7", since=0, reason="x"))
+        row = json.loads(self.path.read_text())["scenarios"][0]
+        self.assertEqual((row["status"], row["waiting"]), ("interrupted", None))
+
+
+class TestOnlineWaitingTracking(unittest.TestCase):
+    """The run page tells a stream waiting for its re-optimisation from a
+    stalled one, and counts what did not end in a switch."""
+
+    FULL = "INFO:app:🎉 EXECUTION COMPLETE! Total Time: 1.0s"
+    START = "INFO:x:ONLINE PHASE START: strategy=all, scenarios=periodic, windows=8"
+
+    def setUp(self):
+        from WebUI import jobs
+        self.jobs = jobs
+
+    def _job(self, lines):
+        job = self.jobs.Job("t", ["x"], {"enable_online": True})
+        for line in lines:
+            job._record(line)
+        job.exit_code = 0
+        return job
+
+    def test_waiting_is_visible_and_cleared_by_the_switch(self):
+        lines = [self.FULL, self.START,
+                 "INFO:x:ONLINE WINDOW: scenario=periodic, window=3/8, index=2, trigger=started",
+                 "INFO:x:ONLINE REOPT: scenario=periodic, event=waiting, window=4, "
+                 "started_at_window=2"]
+        job = self._job(lines)
+        stage = job.stages["online_periodic"]
+        self.assertEqual(stage["status"], "running")
+        self.assertEqual(stage["waiting"], {"since_window": 2, "until_window": 4})
+        self.assertIn("waiting for the re-optimization started at window 2", stage["text"])
+        self.assertEqual(job.online["scenarios"]["periodic"]["status"], "waiting")
+        job._record("INFO:x:ONLINE REOPT: scenario=periodic, event=applied, window=4, "
+                    "started_at_window=2, duration_s=80.0, waited_s=20.0, ensemble=A, single=A")
+        stage = job.stages["online_periodic"]
+        self.assertIsNone(stage["waiting"])
+        self.assertNotIn("waiting", stage["text"])
+        self.assertEqual(job.online["scenarios"]["periodic"]["reopts_applied"], 1)
+
+    def test_not_applied_and_aborted_are_counted(self):
+        job = self._job([self.FULL, self.START,
+                         "INFO:x:ONLINE REOPT: scenario=periodic, event=not_applied, "
+                         "started_at_window=7, apply_window=9, completed=no, "
+                         "reason=stream_ended",
+                         "ERROR:x:ONLINE REOPT: scenario=periodic, event=aborted, window=3, "
+                         "started_at_window=2, error=RuntimeError: x"])
+        prog = job.online["scenarios"]["periodic"]
+        self.assertEqual((prog["not_applied"], prog["aborted"]), (1, 1))
+
+    def test_timed_out_reoptimizations_make_a_warning(self):
+        job = self._job([self.FULL, self.START,
+                         "ERROR:x:ONLINE REOPT: scenario=periodic, event=failed, window=4, "
+                         "started_at_window=2, timed_out=yes, error=ReoptTimedOut: timeout",
+                         "INFO:x:ONLINE SCENARIO COMPLETE: scenario=periodic, windows=8",
+                         "INFO:x:ONLINE PHASE COMPLETE: scenarios=1, failed=0, wall_s=1.0"])
+        out = self.jobs.classify_outcome(job, False)
+        self.assertEqual(out["status"], "succeeded_with_warnings")
+        self.assertIn("1 re-optimization(s) failed or timed out in periodic", out["reason"])
+
+    def test_the_real_runner_lines_with_a_wait_parse(self):
+        """The runner's own lines for a wait and an end-of-stream drop."""
+        from Model_Selection.online_phase import (OnlineResultsWriter, OnlineWindow,
+                                                  Selection, WindowScores, run_online)
+        from Model_Selection.online_policy import PolicyParams
+
+        class Slow:
+            calls = 0
+
+            def done(self):
+                return Slow.calls >= 2
+
+            def wait(self, seconds):
+                Slow.calls += 1
+                return self.done()
+
+            def result(self):
+                return Selection(["B"], "B", origin="reoptimization")
+
+            def kill(self):
+                pass
+
+            def close(self):
+                pass
+
+            duration_s, reused_from = 3.0, None
+
+        log = _CaptureLog()
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = OnlineResultsWriter(tmp, {"strategy": "periodic"}, ("periodic",))
+            run_online(("periodic",), PolicyParams(update_interval=2, reopt_delay=2),
+                       [OnlineWindow(index=i, start=i, end=i + 1) for i in range(5)],
+                       lambda k: Selection(["A"], "A"),
+                       lambda w, s: WindowScores(ensemble=0.5, single=0.5),
+                       lambda w, s, k: Slow(), writer, log=log, heartbeat_s=0)
+        job = self._job([self.FULL] + log.lines)
+        prog = job.online["scenarios"]["periodic"]
+        self.assertEqual((prog["status"], prog["reopts_started"], prog["reopts_applied"],
+                          prog["not_applied"], prog["waiting"]), ("done", 2, 1, 1, None))
+        self.assertEqual(self.jobs.classify_outcome(job, False)["status"], "succeeded")
+
+
+class TestAnomalyTypeCopies(unittest.TestCase):
+    """The configure page tells the user what each extra anomaly type costs;
+    the count must be the number of copies `Inject` really makes."""
+
+    def test_copies_match_the_parameter_grid(self):
+        from Model_Selection.anomaly_parameters import ANOMALY_PARAM_GRID
+        from Model_Selection.inject_anomalies import inject_copies
+        import numpy as np
+        series = np.sin(np.linspace(0, 20, 400))[None, :]
+        for token in ("spikes", "scale", "cutoff"):
+            with self.subTest(token=token):
+                np.random.seed(0)
+                self.assertEqual(catalog.anomaly_copies(token),
+                                 len(inject_copies(series, [token], rate=0.1)))
+        self.assertEqual(catalog.anomaly_copies("spikes"), 1)
+        self.assertEqual(set(catalog.anomaly_copies(t) for t in ANOMALY_PARAM_GRID) - {1, 2, 4}, set())

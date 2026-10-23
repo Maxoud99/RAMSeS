@@ -25,22 +25,65 @@ def moving_average(x, w):
     return np.convolve(x, np.ones(w), 'same') / w
 
 
-def Inject(data, anomaly_types, rate=None):
+class InjectedCopy:
+    """One parameter combination's injected copy of a series.
+
+    `Inject` concatenates these along time. The online phase keeps them apart
+    so it can cut every window at the same time positions from each copy.
+
+    Every type keeps the series length except `speedup`, which resamples its
+    anomalous segment [segment[0], segment[1]) of the original to
+    `segment_length` samples. `position` maps an original time index to this
+    copy's index for both cases.
+    """
+
+    def __init__(self, Y, labels, sizes, anomaly_type, params, segment,
+                 original_length):
+        self.Y = Y
+        self.labels = labels
+        self.sizes = sizes
+        self.anomaly_type = anomaly_type
+        self.params = params                    # the grid values that vary
+        self.original_length = int(original_length)
+        start, end = (int(segment[0]), int(segment[1])) if segment else (0, 0)
+        self.segment = (start, end)
+        self.segment_length = int(Y.shape[1]) - self.original_length + (end - start)
+
+    @property
+    def length(self) -> int:
+        return int(self.Y.shape[1])
+
+    def position(self, t: int) -> int:
+        """Index in this copy of original time index `t` (0..original_length)."""
+        t = int(t)
+        if self.length == self.original_length:
+            return t
+        start, end = self.segment
+        if t <= start:
+            return t
+        if t >= end:
+            return t + self.segment_length - (end - start)
+        return start + ((t - start) * self.segment_length) // (end - start)
+
+
+def inject_copies(T, anomaly_types, rate=None):
+    """The copies `Inject` concatenates, one per parameter combination, in
+    Inject's order and with exactly its random draws: `Inject` is this plus a
+    concatenation, so a seed gives the same anomalies through either."""
     random_state = np.random.randint(1, 10000)
 
     anomaly_obj = InjectAnomalies(random_state=random_state,
                                   verbose=False,
                                   max_window_size=128,
                                   min_window_size=8)
-    T = data.entities[0].Y
     data_std = max(np.std(T), 0.01)
-    T_a_concatenated = []
-    anomaly_sizes_concatenated = []
-    anomaly_labels_concatenated = []
+    copies = []
 
     for anomaly in anomaly_types:
-        for anomaly_params in list(
-                ParameterGrid(ANOMALY_PARAM_GRID[anomaly])):
+        grid = ANOMALY_PARAM_GRID[anomaly]
+        varying = [k for k, values in grid.items() if len(values) > 1]
+        for anomaly_params in list(ParameterGrid(grid)):
+            described = {k: anomaly_params[k] for k in varying}
             anomaly_params['T'] = T
             anomaly_params['scale'] = anomaly_params['scale'] * data_std
             if rate is not None:
@@ -50,22 +93,36 @@ def Inject(data, anomaly_types, rate=None):
             T_a, anomaly_sizes, anomaly_labels = anomaly_obj.inject_anomalies(
                 **anomaly_params)
             anomaly_sizes = anomaly_sizes / data_std
+            copies.append(InjectedCopy(
+                T_a, anomaly_labels, anomaly_sizes, anomaly, described,
+                (getattr(anomaly_obj, 'anomaly_start', 0),
+                 getattr(anomaly_obj, 'anomaly_end', 0)),
+                T.shape[1]))
+    return copies
 
-            T_a_concatenated.append(T_a)
-            anomaly_sizes_concatenated.append(anomaly_sizes)
-            anomaly_labels_concatenated.append(anomaly_labels)
 
-    T_a_concatenated = np.concatenate(T_a_concatenated, axis=1)
-    anomaly_sizes_concatenated = np.concatenate(anomaly_sizes_concatenated,
-                                                axis=0)
-    anomaly_labels_concatenated = np.concatenate(
-        anomaly_labels_concatenated, axis=0)
+def Inject(data, anomaly_types, rate=None, return_copies=False):
+    """Inject synthetic anomalies into the first entity of `data`, in place.
+
+    Returns (data, anomaly_sizes), plus the per-copy list from `inject_copies`
+    when `return_copies` is set.
+    """
+    T = data.entities[0].Y
+    copies = inject_copies(T, anomaly_types, rate=rate)
+
+    T_a_concatenated = np.concatenate([c.Y for c in copies], axis=1)
+    anomaly_sizes_concatenated = np.concatenate([c.sizes for c in copies], axis=0)
+    anomaly_labels_concatenated = np.concatenate([c.labels for c in copies], axis=0)
+    # The last copy's sizes, as before: the visualisation in app.py plots them.
+    anomaly_sizes = copies[-1].sizes
 
     data.entities[0].Y = T_a_concatenated
     data.entities[0].n_time = T_a_concatenated.shape[1]
     data.entities[0].mask = np.ones((T_a_concatenated.shape))
     data.entities[0].labels = anomaly_labels_concatenated
     data.total_time = T_a_concatenated.shape[1]
+    if return_copies:
+        return data, anomaly_sizes, copies
     return data, anomaly_sizes
 
 

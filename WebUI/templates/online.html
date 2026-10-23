@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset }} / {{ entity }} — online phase{% endblock %}
+
+{% block crumbs %}
+<nav class="crumbs" aria-label="You are here">
+  <ol>
+    <li><a href="/#results-title">Results</a></li>
+    <li>{{ dataset }}</li>
+    <li aria-current="page">entity {{ entity }}</li>
+  </ol>
+</nav>
+{% endblock %}
+
+{% block headernav %}
+{% include "_view_tabs.html" %}
+{% endblock %}
+
+{% block content %}
+<div id="online-root" data-dataset="{{ dataset }}" data-entity="{{ entity }}">
+  <p class="loading" role="status">Loading the online phase…</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ asset('js/online.js') }}"></script>
+{% endblock %}

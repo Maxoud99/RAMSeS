@@ -5,6 +5,7 @@ can run in any env that has numpy + scipy + matplotlib.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -358,6 +359,72 @@ class TestExplainRankAggregationIntegration(unittest.TestCase):
             explain=False,
         )
         self.assertIsNone(result)
+
+
+class TestExplainRankAggregationEmptySources(unittest.TestCase):
+    """A source with no ranking, such as a GAN stage that was skipped or failed
+    soft, took no part in the consensus, so the explanation must not give it
+    a role in it."""
+
+    NAMES = ["GAN_F1", "GAN_PR_AUC", "Borderline_F1", "Borderline_PR_AUC",
+             "MonteCarlo_F1", "MonteCarlo_PR_AUC"]
+    REAL = [["A", "B", "C"], ["B", "A", "C"], ["A", "C", "B"], ["C", "A", "B"]]
+
+    def _explain(self, rankings, names, stage="robust"):
+        _, full = enhanced_markov_chain_rank_aggregator_text(rankings)
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        ramses_paths._RESULTS_ROOT = pathlib.Path(tmpdir) / "results"
+        try:
+            result = explain_rank_aggregation(
+                rankings, names, full, stage, "TEST", "e1", 0, explain=True)
+        finally:
+            ramses_paths.reset_cache()
+        return result, full, tmpdir
+
+    def test_aggregator_already_ignores_empty_rankings(self):
+        self.assertEqual(
+            enhanced_markov_chain_rank_aggregator_text([[], []] + self.REAL)[1],
+            enhanced_markov_chain_rank_aggregator_text(self.REAL)[1])
+
+    def test_missing_gan_ranking_is_left_out_of_the_explanation(self):
+        result, full, tmpdir = self._explain([[], []] + self.REAL, self.NAMES)
+        voting = self.NAMES[2:]
+        self.assertEqual(set(result["loo_scores"]), set(voting))
+        self.assertEqual([v["source"] for v in result["verdicts"]], voting)
+        # Same scores as if the GAN stage had never been listed at all.
+        direct, _, _ = self._explain(self.REAL, voting)
+        self.assertEqual(result["loo_scores"], direct["loo_scores"])
+        self.assertEqual(result["align_scores"], direct["align_scores"])
+        self.assertEqual([v["borda_rank"] for v in result["verdicts"]],
+                         [v["borda_rank"] for v in direct["verdicts"]])
+
+        import json
+        ir_path = os.path.join(tmpdir, "results", "explanations_ir", "TEST", "e1",
+                               "ir_rank_aggregation_robust_0.json")
+        with open(ir_path) as fh:
+            ir_doc = json.load(fh)
+        self.assertEqual(ir_doc["output"]["n_sources"], 4)
+        self.assertEqual(ir_doc["output"]["sources"], sorted(voting))
+        self.assertFalse(any("GAN" in a["text"] for a in ir_doc["evidence"]),
+                         [a["text"] for a in ir_doc["evidence"] if "GAN" in a["text"]])
+        report = os.path.join(tmpdir, "results", "robust_aggregated", "TEST", "e1",
+                              "aggregation_explainability_robust_0.txt")
+        with open(report) as fh:
+            self.assertNotIn("GAN", fh.read())
+
+    def test_two_voting_sources_take_the_two_source_method(self):
+        rankings = [[], [], self.REAL[0], self.REAL[1]]
+        names = ["GAN_F1", "GAN_PR_AUC", "Borderline_F1", "MonteCarlo_F1"]
+        result, _, _ = self._explain(rankings, names)
+        self.assertIsNotNone(result["kendall_only"])
+        self.assertEqual(set(result["align_scores"]), {"Borderline_F1", "MonteCarlo_F1"})
+
+    def test_no_voting_source_explains_nothing(self):
+        result, full, tmpdir = self._explain([[], []], ["GAN_F1", "GAN_PR_AUC"])
+        self.assertEqual(full, [])
+        self.assertIsNone(result)
+        self.assertFalse(os.path.exists(os.path.join(tmpdir, "results")))
 
 
 # ════════════════════════════════════════════════════════════════════════════

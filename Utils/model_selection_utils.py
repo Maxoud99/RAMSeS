@@ -7,14 +7,16 @@
 # Modified by the RAMSeS project. This file is NOT identical to the original
 # in mononitogoswami/tsad-model-selection, from which it is derived.
 
+import random
 import signal
 import threading
 from contextlib import contextmanager
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional
 from loguru import logger
 import numpy as np
 import torch as t
 from tqdm import tqdm, trange
+import copy
 from copy import deepcopy
 import pandas as pd
 from sklearn.model_selection import ParameterGrid
@@ -197,6 +199,117 @@ def evaluate_model(data: Union[Dataset, Entity],
         raise
 
 
+# How much of the series the load-time probe scores first. It only has to show
+# that a checkpoint can score THIS data at all — the commonest way it cannot is
+# a feature width fixed at fit time, which is wrong on the first window — and
+# 256 timesteps also clears every per-call minimum the grids set today (COF's
+# 40 neighbours, LSTMAD's 150-step subsequence, TSB-AD's `win_size` of at most
+# 100), so a compatible detector passes here in milliseconds.
+PROBE_TIMESTEPS = 256
+
+
+def probe_detector(data: Union[Dataset, Entity], model: PyMADModel,
+                   model_name: str) -> Optional[str]:
+    """Why `model` cannot score `data`, or None when it can.
+
+    A checkpoint that loads is not therefore usable. One written by an older
+    version of a detector, or for a dataset with a different channel count,
+    unpickles cleanly and then raises from inside the first stage that scores
+    it — on SKAB/1 the Jan-2026 LOF checkpoints died in the GA with
+    "X has 576 features, but LocalOutlierFactor is expecting 1", taking the
+    whole run with them. Probing at load time turns that into an exclusion
+    with a reason, before any stage starts.
+
+    It scores through `evaluate_model` itself, so the probe exercises exactly
+    the code the stages will run (loader, windowing, padding, the detector's
+    own scoring) and sits under the same deadline: a detector that cannot
+    score a probe in SCORING_TIMEOUT_SECONDS is registered as timed out and
+    refused by every stage, as it would have been at its first real call.
+
+    A failure on the short head is re-checked on the whole series before it
+    counts. A detector with a per-call minimum longer than the head would
+    otherwise be excluded for the probe's shortness rather than its own
+    fault; every stage that matters scores the whole series, so that is the
+    call whose failure means something. It costs one extra scoring call, and
+    only for a detector that already failed once.
+    """
+    if isinstance(data, Entity):
+        data = Dataset(entities=[data], name=data.name, verbose=False)
+    n_time = data.entities[0].Y.shape[1]
+    window = getattr(model, 'window_size', 1)
+    window = window if isinstance(window, int) and window > 0 else 1
+    head = min(n_time, max(PROBE_TIMESTEPS, 2 * window))
+    attempts = [head, n_time] if head < n_time else [n_time]
+    failure = None
+    with _isolated_probe():
+        for n in attempts:
+            try:
+                evaluate_model(_first_timesteps(data, n), model, model_name)
+                return None
+            except ScoringTimeout:
+                return (f"it exceeded the {SCORING_TIMEOUT_SECONDS}s scoring "
+                        f"deadline on a {n}-timestep probe")
+            except Exception as e:
+                failure = e
+    return describe_failure(failure)
+
+
+def describe_failure(error: BaseException) -> str:
+    """`error` as one line of at most 300 characters, type name first.
+
+    An exclusion reason is spliced into a single warning line that
+    WebUI/markers.py turns into a banner, so a newline would cut the banner
+    in two and a scikit-learn message several hundred characters long would
+    push the remedy that follows it out of sight. The type name stays because
+    some messages mean nothing without it: a KeyError's is only the key.
+    """
+    message = " ".join(f"{type(error).__name__}: {error}".split())
+    return message if len(message) <= 300 else message[:297] + "..."
+
+
+@contextmanager
+def _isolated_probe():
+    """Leave no trace of the probe on the run that follows it.
+
+    Random state first: the probe runs before anomaly injection, which draws
+    from numpy's global generator, and DGHL/LSTMVAE draw from torch's while
+    scoring. Without restoring them the probe would move every injected
+    anomaly and every stochastic score of a run, so the same seed would stop
+    reproducing results from before it existed. Then the detectors' own
+    warnings: a probe of a short head can trip "scored every window
+    non-finite" on a channel that is constant only within those 256 steps,
+    which would read as a statement about the run. A probe's verdict is its
+    return value.
+    """
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    cuda_devices = list(range(t.cuda.device_count())) if t.cuda.is_available() else []
+    logger.disable("Algorithms")
+    try:
+        with t.random.fork_rng(devices=cuda_devices):
+            yield
+    finally:
+        logger.enable("Algorithms")
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+
+
+def _first_timesteps(data: Dataset, n: int) -> Dataset:
+    """A one-entity Dataset holding copies of the first `n` timesteps.
+
+    Copies, not views: a probe must not be able to write into the series the
+    run is about to inject anomalies into.
+    """
+    e = data.entities[0]
+    head = Entity(Y=np.array(e.Y[:, :n]),
+                  X=None if e.X is None else np.array(e.X[:, :n]),
+                  name=e.name,
+                  labels=np.array(e.labels[..., :n]),
+                  mask=np.array(e.mask[:, :n]),
+                  verbose=False)
+    return Dataset(entities=[head], name=data.name, verbose=False)
+
+
 def _evaluate_model(data: Union[Dataset, Entity],
                     model: PyMADModel,
                     model_name: str,
@@ -338,23 +451,25 @@ def _evaluate_model(data: Union[Dataset, Entity],
     # the ValueError that made RNN unusable.
     #
     # The attribute is swapped rather than the call bypassed because each model
-    # overrides `final_anomaly_score` (NN re-wraps its input), and restored
-    # because the same model object is evaluated again later on data of a
-    # different length, where -1 has to resolve afresh.
-    saved_window_step = model.window_step
-    model.window_step = model_window_step
-    try:
-        entity_scores = model.final_anomaly_score(
-            input=entity_scores, return_detail=False
-        )  # return_detail = False averages the anomaly scores across features.
-        entity_scores = entity_scores.detach().cpu().numpy()
+    # overrides `final_anomaly_score` (NN re-wraps its input). It is swapped on
+    # a SHALLOW COPY, which shares the weights but owns its attribute dict, so
+    # the shared model keeps its -1 and resolves it afresh on data of another
+    # length. Swapping it on the model and restoring it afterwards was not
+    # thread-safe: when two threads scored one object (the online stream and a
+    # background re-optimisation, or the --parallel pipeline's workers), each
+    # read the other's step mid-call and they restored in the wrong order,
+    # leaving RM/RNN with a stale step for the rest of the run.
+    scorer = copy.copy(model)
+    scorer.window_step = model_window_step
+    entity_scores = scorer.final_anomaly_score(
+        input=entity_scores, return_detail=False
+    )  # return_detail = False averages the anomaly scores across features.
+    entity_scores = entity_scores.detach().cpu().numpy()
 
-        Y_hat = de_unfold(windows=Y_hat, window_step=model_window_step)
-        Y = de_unfold(windows=Y, window_step=model_window_step)
-        Y_sigma = de_unfold(windows=Y_sigma, window_step=model_window_step)
-        mask = de_unfold(windows=mask, window_step=model_window_step)
-    finally:
-        model.window_step = saved_window_step
+    Y_hat = de_unfold(windows=Y_hat, window_step=model_window_step)
+    Y = de_unfold(windows=Y, window_step=model_window_step)
+    Y_sigma = de_unfold(windows=Y_sigma, window_step=model_window_step)
+    mask = de_unfold(windows=mask, window_step=model_window_step)
 
     # Remove extra padding from Anomaly Scores and forecasts
     entity_scores = _adjust_scores_with_padding(

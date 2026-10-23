@@ -50,9 +50,12 @@ while IFS= read -r f; do
     pass=$((pass+1))
     printf "  ok    %-58s %s\n" "$f" "$summary"
   fi
+# .claude/ holds Claude Code's git worktrees — whole checkouts of other
+# branches. Their tests would run against this checkout's PYTHONPATH and report
+# another branch's failures as this one's.
 done < <(find "${TARGETS[@]}" -name 'test_*.py' \
            -not -path './Mononito/*' -not -path './archive/*' \
-           -not -path './Misc/*' | sort)
+           -not -path './Misc/*' -not -path './.claude/*' | sort)
 
 echo
 echo "modules passing: $pass   modules with failures: $fail"

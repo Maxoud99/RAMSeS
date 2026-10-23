@@ -367,6 +367,56 @@ class TestIntegration(unittest.TestCase):
             f"Expected DGHL to be ranked first, got {ranked}")
 
 
+class TestSkipOneClassWindows(unittest.TestCase):
+    """skip_one_class_windows: the real-label re-optimisations' Thompson
+    Sampling draws no arm and updates nothing on a window whose labels are
+    one class; off by default, so the offline phase is unchanged."""
+
+    def run_fit(self, skip):
+        import types as _types
+        from unittest import mock
+        import Thompson_Sampling as ts
+
+        n = 200
+        Y = np.sin(np.arange(n) / 5.0).reshape(1, -1)
+        labels = np.zeros((1, n))
+        labels[0, 30:36] = 1                      # one anomaly, early
+        entity = _types.SimpleNamespace(Y=Y.copy(), labels=labels.copy(),
+                                        mask=np.ones_like(Y), n_time=n)
+        dataset = _types.SimpleNamespace(entities=[entity], total_time=n)
+        scored = []
+
+        def fake_eval(data, model, name, is_ensemble=False):
+            y = np.asarray(data.entities[0].labels).ravel()
+            scored.append(int(y.sum()))
+            return y, np.random.rand(y.size), {}, {}
+
+        models = {"A": object(), "B": object()}
+        with mock.patch.object(ts, "evaluate_model_consistently", fake_eval):
+            np.random.seed(0)
+            random.seed(0)
+            means, _, history, chosen = ts.fit_linear_thompson_sampling(
+                dataset, models, Y, labels, iterations=10,
+                skip_one_class_windows=skip)
+        windows, targets, _, n_windows = initialize_sliding_windows(
+            Y, labels, np.ones_like(Y), 20, 10)
+        two_class = sum(1 for t in targets if len(np.unique(t)) == 2)
+        return scored, chosen, history, n_windows, two_class
+
+    def test_off_by_default_every_window_is_scored(self):
+        scored, chosen, history, n_windows, _ = self.run_fit(False)
+        self.assertEqual(len(scored), n_windows)
+        self.assertEqual(len(chosen), n_windows)
+
+    def test_one_class_windows_are_skipped(self):
+        scored, chosen, history, n_windows, two_class = self.run_fit(True)
+        self.assertGreater(n_windows, two_class)
+        self.assertEqual(len(scored), two_class)
+        self.assertTrue(all(k > 0 for k in scored))
+        self.assertEqual(len(chosen), two_class)
+        self.assertEqual(len(history), two_class)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 7.  compute_expected_rewards
 # ════════════════════════════════════════════════════════════════════════════

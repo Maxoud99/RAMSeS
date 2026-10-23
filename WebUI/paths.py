@@ -61,6 +61,10 @@ def config() -> dict:
         # Surfaced as a run-form warning: with overwrite on, every run retrains
         # all base detectors, which is most of the wall-clock time.
         "overwrite": bool(data.get("overwrite", False)),
+        # How the pipeline loads a series (app.py passes both to load_data):
+        # the online feasibility check must count the samples the run will.
+        "downsampling": data.get("downsampling"),
+        "min_length": data.get("min_length"),
     }
     return _CONFIG_CACHE
 

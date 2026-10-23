@@ -16,6 +16,16 @@ min_length: 256
 verbose: True
 training_size: 1
 model_architectures: 'all'
+# Seconds one detector INSTANCE (e.g. SOS_2) may spend training — fit,
+# diagnostic plot and checkpoint write together — before it is stopped. Each
+# instance trains in a child process that is killed at the limit, so this holds
+# even inside a long numpy/BLAS call, which the 120 s scoring limit's alarm
+# cannot interrupt. A stopped instance counts as failed to train: it is logged,
+# left out of the run, and the run continues if at least two detectors remain.
+# After one instance of a family times out, the family's remaining instances
+# are not attempted; any already on disk are still used when overwrite is
+# false. Omitted: 3600. null or 0: no limit (trains in-process).
+training_timeout: 3600
 
 # Model evaluation parametersq
 normalize: True
@@ -37,3 +47,19 @@ use_all_ranks: False
 top_kr: !!null
 
 abn_type_list: ['spikes', 'contextual', 'flip', 'speedup', 'noise', 'cutoff', 'scale', 'wander', 'average']
+
+# Online phase (runs only with --enable_online). Each key is the fallback for
+# the CLI flag of the same name (online_strategy <- --strategy); a flag on the
+# command line wins. --enable_online and --inject_online_regime stay flags only:
+# a config switch could not be turned back off from the command line.
+online_strategy: 'periodic'   # fixed | periodic | threshold | adaptive_threshold | all
+update_interval: 5            # periodic: re-optimize every M windows
+drop_pct: 20.0                # threshold scenarios: re-optimize below baseline * (1 - X/100)
+adaptive_window: 10           # adaptive threshold: N most recent window scores
+adaptive_k: 2.0               # adaptive threshold: mean - k * std of those N scores
+max_online_windows: !!null    # null = every online window
+reopt_delay: 2                # L: a re-optimization triggered at window t is switched
+                              #   in at window t + L (the stream waits for it there)
+reopt_timeout: 3600           # seconds one re-optimization may run; null or 0 = no limit
+online_labels: !!null         # real | injected; null = real where the dataset has
+                              #   labelled test anomalies (TSB-AD, UCR, SMD, MSL, SMAP)

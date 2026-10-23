@@ -279,7 +279,8 @@ def adjusted_precision_recall_f1_auc(y_true: np.ndarray, y_scores: np.ndarray, n
     return adjusted_precision, adjusted_recall, best_adjusted_f1, adjusted_prauc, adjusted_y_pred
 
 
-def range_based_precision_recall_f1_auc(y_true: np.ndarray, y_scores: np.ndarray, n_splits=1000, window_size=None):
+def range_based_precision_recall_f1_auc(y_true: np.ndarray, y_scores: np.ndarray, n_splits=1000, window_size=None,
+                                        return_threshold=False):
     from sklearn.metrics import auc
     import numpy as np
     """Function to compute range-based precision, recall, range-based F1, PR-AUC, and predictions."""
@@ -332,6 +333,10 @@ def range_based_precision_recall_f1_auc(y_true: np.ndarray, y_scores: np.ndarray
     adjusted_y_pred = adjust_predicts(score=y_scores, label=(y_true > 0), threshold=None, pred=adjusted_y_pred,
                                       calc_latency=False)
 
+    if return_threshold:
+        # The score the predictions were cut at, for a caller that shows it
+        # (the online phase's live monitor); the five-item return is unchanged.
+        return range_precision, range_recall, best_range_f1, range_prauc, adjusted_y_pred, float(best_threshold)
     return range_precision, range_recall, best_range_f1, range_prauc, adjusted_y_pred
 
 

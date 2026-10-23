@@ -6,6 +6,11 @@ from typing import Any, Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+# Before any TensorFlow op: TensorFlow 2.18 cannot use the cuDNN 9.1 torch has
+# already loaded into this process, so its GPU is off unless RAMSES_TF_GPU=1.
+# See Utils/tf_device.py.
+from Utils.tf_device import keep_tensorflow_off_gpu
+keep_tensorflow_off_gpu(tf)
 from loguru import logger
 from tensorflow.keras import layers, models
 
